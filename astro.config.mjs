@@ -11,13 +11,14 @@ export default defineConfig({
     sitemap(),
     starlight({
       title: "Tech Docs",
-      favicon: "https://cdn.erfianugrah.com/ea_favicon.png",
+      favicon: "/public/ea_favicon.png",
       head: [
         {
           tag: "meta",
           attrs: {
             name: "description",
-            content: "Technical documentation and guides for various technologies and services",
+            content:
+              "Technical documentation and guides for various technologies and services",
           },
         },
         {
@@ -72,7 +73,8 @@ export default defineConfig({
             "@type": "WebSite",
             "name": "Erfi Tech Docs",
             "url": "https://erfi.dev",
-            "description": "Technical documentation and guides for various technologies and services",
+            "description":
+              "Technical documentation and guides for various technologies and services",
           }),
         },
       ],
@@ -95,40 +97,43 @@ export default defineConfig({
   ],
   markdown: {
     syntaxHighlight: {
-      type: 'shiki',
-      excludeLangs: ['mermaid'],
+      type: "shiki",
+      excludeLangs: ["mermaid"],
     },
     rehypePlugins: [
       [rehypeMermaid, {
-        strategy: 'inline-svg',
+        strategy: "inline-svg",
         mermaidConfig: {
-          theme: 'default',
-          fontFamily: 'arial,sans-serif',
+          theme: "default",
+          fontFamily: "arial,sans-serif",
         },
-        colorScheme: 'light dark',
+        colorScheme: "light dark",
         errorFallback: (element, diagram, error) => {
           // Create a pre element with the diagram source and error message
           return {
-            type: 'element',
-            tagName: 'pre',
-            properties: { className: ['mermaid-error'] },
+            type: "element",
+            tagName: "pre",
+            properties: { className: ["mermaid-error"] },
             children: [
               {
-                type: 'element',
-                tagName: 'code',
-                properties: { className: ['language-mermaid'] },
-                children: [{ type: 'text', value: diagram }]
+                type: "element",
+                tagName: "code",
+                properties: { className: ["language-mermaid"] },
+                children: [{ type: "text", value: diagram }],
               },
               {
-                type: 'element',
-                tagName: 'div',
-                properties: { className: ['mermaid-error-message'] },
-                children: [{ type: 'text', value: `Error rendering diagram: ${error.message}` }]
-              }
-            ]
+                type: "element",
+                tagName: "div",
+                properties: { className: ["mermaid-error-message"] },
+                children: [{
+                  type: "text",
+                  value: `Error rendering diagram: ${error.message}`,
+                }],
+              },
+            ],
           };
-        }
-      }]
+        },
+      }],
     ],
   },
   build: {
@@ -146,3 +151,4 @@ export default defineConfig({
     defaultStrategy: "viewport",
   },
 });
+
