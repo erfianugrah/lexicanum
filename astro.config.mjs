@@ -10,7 +10,7 @@ export default defineConfig({
   integrations: [
     sitemap(),
     starlight({
-      title: "Codex,
+      title: "Codex",
       favicon: "/ea_favicon.png",
       head: [
         {
