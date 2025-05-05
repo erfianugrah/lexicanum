@@ -11,7 +11,7 @@ export default defineConfig({
     sitemap(),
     starlight({
       title: "Tech Docs",
-      favicon: "/public/ea_favicon.png",
+      favicon: "/ea_favicon.png",
       head: [
         {
           tag: "meta",
@@ -151,4 +151,3 @@ export default defineConfig({
     defaultStrategy: "viewport",
   },
 });
-
