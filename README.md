@@ -1,54 +1,60 @@
-# Starlight Starter Kit: Basics
+# Technical Documentation Portal
 
 [![Built with Starlight](https://astro.badg.es/v2/built-with-starlight/tiny.svg)](https://starlight.astro.build)
 
-```
-bun create astro@latest -- --template starlight
-```
+This repository contains technical documentation and guides for various technologies and services. It is built using [Astro](https://astro.build) with the [Starlight](https://starlight.astro.build) documentation theme.
 
-[![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/withastro/starlight/tree/main/examples/basics)
-[![Open with CodeSandbox](https://assets.codesandbox.io/github/button-edit-lime.svg)](https://codesandbox.io/p/sandbox/github/withastro/starlight/tree/main/examples/basics)
-[![Deploy to Netlify](https://www.netlify.com/img/deploy/button.svg)](https://app.netlify.com/start/deploy?repository=https://github.com/withastro/starlight&create_from_path=examples/basics)
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fwithastro%2Fstarlight%2Ftree%2Fmain%2Fexamples%2Fbasics&project-name=my-starlight-docs&repository-name=my-starlight-docs)
+## Features
 
-> 🧑‍🚀 **Seasoned astronaut?** Delete this file. Have fun!
+- Responsive design optimized for both desktop and mobile viewing
+- Dark/light mode support
+- Mermaid diagram integration for clear visualizations
+- Syntax highlighting for code blocks
+- Organized structure with guides and reference materials
 
-## 🚀 Project Structure
+## 📁 Project Structure
 
-Inside of your Astro + Starlight project, you'll see the following folders and files:
+The documentation site is organized as follows:
 
 ```
 .
-├── public/
+├── public/              # Static assets (favicons, etc.)
 ├── src/
-│   ├── assets/
+│   ├── assets/          # Images and other assets
 │   ├── content/
-│   │   ├── docs/
-│   └── content.config.ts
-├── astro.config.mjs
-├── package.json
-└── tsconfig.json
+│   │   ├── docs/        # Documentation content
+│   │   │   ├── guides/  # Step-by-step guides
+│   │   │   └── reference/ # Reference materials
+│   └── styles/          # Custom CSS for styling
+├── astro.config.mjs     # Astro configuration
+└── package.json
 ```
 
-Starlight looks for `.md` or `.mdx` files in the `src/content/docs/` directory. Each file is exposed as a route based on its file name.
+Documentation content is written in `.md` or `.mdx` files in the `src/content/docs/` directory. Each file is exposed as a route based on its file name.
 
-Images can be added to `src/assets/` and embedded in Markdown with a relative link.
+## 🔧 Development
 
-Static assets, like favicons, can be placed in the `public/` directory.
+All commands are run from the root of the project:
 
-## 🧞 Commands
+| Command           | Action                                           |
+| :---------------- | :----------------------------------------------- |
+| `bun install`     | Installs dependencies                            |
+| `bun dev`         | Starts local dev server at `localhost:4321`      |
+| `bun build`       | Build your production site to `./dist/`          |
+| `bun preview`     | Preview your build locally, before deploying     |
 
-All commands are run from the root of the project, from a terminal:
+## 📝 Content Guidelines
 
-| Command                   | Action                                           |
-| :------------------------ | :----------------------------------------------- |
-| `bun install`             | Installs dependencies                            |
-| `bun dev`             | Starts local dev server at `localhost:4321`      |
-| `bun build`           | Build your production site to `./dist/`          |
-| `bun preview`         | Preview your build locally, before deploying     |
-| `bun astro ...`       | Run CLI commands like `astro add`, `astro check` |
-| `bun astro -- --help` | Get help using the Astro CLI                     |
+When adding new documentation:
 
-## 👀 Want to learn more?
+1. Choose the appropriate section (guides or reference)
+2. Use descriptive filenames and titles
+3. Include diagrams for complex architectures using Mermaid
+4. Provide both CLI and Infrastructure-as-Code examples when applicable
+5. Include adequate comments in code samples
 
-Check out [Starlight’s docs](https://starlight.astro.build/), read [the Astro documentation](https://docs.astro.build), or jump into the [Astro Discord server](https://astro.build/chat).
+## 🔗 Resources
+
+- [Starlight Documentation](https://starlight.astro.build/)
+- [Astro Documentation](https://docs.astro.build)
+- [Mermaid Diagram Syntax](https://mermaid.js.org/)
