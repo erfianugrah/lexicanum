@@ -12,6 +12,7 @@ export default defineConfig({
     starlight({
       title: "Codex",
       favicon: "/ea_favicon.png",
+      customCss: ['./src/styles/custom.css'],
       head: [
         {
           tag: "meta",
