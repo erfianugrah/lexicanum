@@ -39,7 +39,7 @@ export default defineConfig({
           tag: "meta",
           attrs: {
             property: "og:site_name",
-            content: "Erfi Tech Docs",
+            content: "Codex",
           },
         },
         {
