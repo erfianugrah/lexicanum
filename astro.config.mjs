@@ -10,7 +10,7 @@ export default defineConfig({
   integrations: [
     sitemap(),
     starlight({
-      title: "Codex",
+      title: "Erfi's Codex",
       favicon: "/ea_favicon.png",
       customCss: ["./src/styles/custom.css"],
       head: [
@@ -18,7 +18,7 @@ export default defineConfig({
           tag: "meta",
           attrs: {
             name: "description",
-            content: "Computer stuff",
+            content: "Working on Computer stuff",
           },
         },
         {
@@ -39,7 +39,7 @@ export default defineConfig({
           tag: "meta",
           attrs: {
             property: "og:site_name",
-            content: "Codex",
+            content: "Erfi's Codex",
           },
         },
         {
