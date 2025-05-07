@@ -25,7 +25,7 @@ export default defineConfig({
           tag: "meta",
           attrs: {
             property: "og:image",
-            content: "/thumbnail.JPG",
+            content: "https://erfi.dev/thumbnail.JPG",
           },
         },
         {
