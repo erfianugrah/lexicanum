@@ -12,14 +12,13 @@ export default defineConfig({
     starlight({
       title: "Codex",
       favicon: "/ea_favicon.png",
-      customCss: ['./src/styles/custom.css'],
+      customCss: ["./src/styles/custom.css"],
       head: [
         {
           tag: "meta",
           attrs: {
             name: "description",
-            content:
-              "Technical documentation and guides for various technologies and services",
+            content: "Computer stuff",
           },
         },
         {
@@ -72,10 +71,9 @@ export default defineConfig({
           content: JSON.stringify({
             "@context": "https://schema.org",
             "@type": "WebSite",
-            "name": "Erfi Tech Docs",
+            "name": "Codex",
             "url": "https://erfi.dev",
-            "description":
-              "Technical documentation and guides for various technologies and services",
+            "description": "Computer stuff",
           }),
         },
       ],
