@@ -25,7 +25,7 @@ export default defineConfig({
           tag: "meta",
           attrs: {
             property: "og:image",
-            content: "https://cdn.erfianugrah.com/Tenhult_3.JPG",
+            content: "/thumbnail.JPG",
           },
         },
         {
