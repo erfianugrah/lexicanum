@@ -13,6 +13,9 @@ export default defineConfig({
       title: "Erfi's Codex",
       favicon: "/ea_favicon.png",
       customCss: ["./src/styles/custom.css"],
+      editLink: {
+        baseUrl: "https://github.com/erfianugrah/erfi-dev-docs/edit/main/",
+      },
       head: [
         {
           tag: "meta",
