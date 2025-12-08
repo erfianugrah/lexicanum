@@ -1,0 +1,394 @@
+---
+title: VyOS DoT with Cloudflare Spectrum
+description: End-to-end setup of a DNS-over-TLS endpoint on VyOS 1.4 using Glory-Hole, DNAT, policy routing, and Cloudflare Spectrum passthrough.
+author: "Erfi Anugrah"
+---
+
+## Overview
+
+Expose a Glory‑Hole DoT listener on VyOS 1.4 via DNAT (8853 → 853) and keep Cloudflare Spectrum in TCP passthrough. Internet replies stay on PPPoE; optional hairpins ride Magic‑WAN IPsec.
+
+## Prereqs
+
+- VyOS 1.4, WAN `pppoe0`, IPsec `vti0`, podman network `podman-2`
+- Glory‑Hole DoT on `10.0.10.10:853` with valid TLS for your DoT hostname
+- Public IP (e.g., `195.240.x.x`)
+- Cloudflare zone + Spectrum entitlement
+
+## 1) Podman container (concise)
+
+```txt
+set container name glory-hole cap-add 'net-bind-service'
+set container name glory-hole environment TZ value 'Europe/Amsterdam'
+set container name glory-hole host-name 'glory-hole'
+set container name glory-hole image 'erfianugrah/glory-hole:v0.9.11'
+set container name glory-hole memory '1024'
+set container name glory-hole network podman-2 address '10.0.10.10'
+set container name glory-hole port dot_tcp destination '853'
+set container name glory-hole port dot_tcp protocol 'tcp'
+set container name glory-hole port dot_tcp source '8853'
+set container name glory-hole port dot_udp destination '853'
+set container name glory-hole port dot_udp protocol 'udp'
+set container name glory-hole port dot_udp source '8853'  # DoT is TCP-only; UDP kept for parity
+set container name glory-hole restart 'always'
+set container name glory-hole shared-memory '512'
+set container name glory-hole volume data destination '/var/lib/glory-hole'
+set container name glory-hole volume data mode 'rw'
+set container name glory-hole volume data source '/config/glory-hole/data'
+set container name glory-hole volume etc destination '/etc/glory-hole'
+set container name glory-hole volume etc mode 'rw'
+set container name glory-hole volume etc source '/config/glory-hole/etc'
+set container name glory-hole volume localtime destination '/etc/localtime'
+set container name glory-hole volume localtime mode 'ro'
+set container name glory-hole volume localtime source '/etc/localtime'
+set container name glory-hole volume logs destination '/var/log/glory-hole'
+set container name glory-hole volume logs mode 'rw'
+set container name glory-hole volume logs source '/config/glory-hole/logs'
+```
+
+Ensure `config.yml` inside `/config/glory-hole/etc` has:
+
+- `server.dot_enabled: true`
+- `server.dot_address: ":853"`
+- TLS configured (manual PEM or ACME) for your DoT hostname.
+
+## 2) DNAT (8853 → 853)
+
+```txt
+set nat destination rule 29 description 'gloryhole-dot'
+set nat destination rule 29 inbound-interface name 'pppoe0'
+set nat destination rule 29 protocol 'tcp_udp'
+set nat destination rule 29 destination port '8853'
+set nat destination rule 29 translation address '10.0.10.10'
+set nat destination rule 29 translation port '853'
+```
+
+## 3) Firewall allow
+
+`EXTERNAL-IN` already allows it; ensure:
+
+```txt
+set firewall ipv4 name EXTERNAL-IN rule 50 action 'accept'
+set firewall ipv4 name EXTERNAL-IN rule 50 description 'Allow DoT to glory-hole'
+set firewall ipv4 name EXTERNAL-IN rule 50 protocol 'tcp'
+set firewall ipv4 name EXTERNAL-IN rule 50 destination address '10.0.10.10'
+set firewall ipv4 name EXTERNAL-IN rule 50 destination port '853'
+```
+
+## 4) Policy routing (hairpin optional, main-table required)
+
+### Overview
+
+Policy routing controls how traffic from glory-hole reaches different destinations:
+
+- **Rule 4**: Returns traffic to Magic WAN edge IPs (critical for hairpins)
+- **Rules 5–8**: Hairpin specific LAN hosts through IPsec (optional)
+- **Rule 100**: Default catch-all sending everything else to main table/pppoe0
+
+**Critical:** Rule order matters—specific rules must come before the catch-all.
+
+### Configuration
+
+```txt
+set policy route magic-wan-ipsec-glory-hole default-log
+set policy route magic-wan-ipsec-glory-hole interface 'pod-podman-2'
+
+# Rule 4: Magic WAN return traffic (REQUIRED for hairpins)
+set policy route magic-wan-ipsec-glory-hole rule 4 description 'gh -> magic wan return'
+set policy route magic-wan-ipsec-glory-hole rule 4 source address '10.0.10.10'
+set policy route magic-wan-ipsec-glory-hole rule 4 destination group network-group 'magic-wan-ips'
+set policy route magic-wan-ipsec-glory-hole rule 4 set table '20'
+
+# Rules 5-8: Hairpin LAN hosts through IPsec (optional)
+set policy route magic-wan-ipsec-glory-hole rule 5 description 'gh -> lan-host-1'
+set policy route magic-wan-ipsec-glory-hole rule 5 source address '10.0.10.10'
+set policy route magic-wan-ipsec-glory-hole rule 5 destination address '<lan-host-1-ip>'
+set policy route magic-wan-ipsec-glory-hole rule 5 set table '20'
+
+set policy route magic-wan-ipsec-glory-hole rule 6 description 'gh -> lan-host-2'
+set policy route magic-wan-ipsec-glory-hole rule 6 source address '10.0.10.10'
+set policy route magic-wan-ipsec-glory-hole rule 6 destination address '<lan-host-2-ip>'
+set policy route magic-wan-ipsec-glory-hole rule 6 set table '20'
+
+# Rule 100: Catch-all for internet traffic via pppoe0
+set policy route magic-wan-ipsec-glory-hole rule 100 description 'gh -> main internet'
+set policy route magic-wan-ipsec-glory-hole rule 100 source address '10.0.10.10'
+set policy route magic-wan-ipsec-glory-hole rule 100 set table 'main'
+
+commit
+save
+```
+
+### Network group for Magic WAN edge IPs
+
+Define a network group containing your Magic WAN provider's edge IP ranges:
+
+```txt
+set firewall group network-group magic-wan-ips network '172.71.0.0/16'
+# Add additional ranges as needed based on your provider
+```
+
+### Why rule 4 is critical
+
+When LAN hosts hairpin traffic through Magic WAN to reach glory-hole:
+
+1. **LAN host → glory-hole**: Packet routed via table 20 (IPsec tunnel)
+2. **Magic WAN NATs**: Source IP changed from VTI IP to Magic WAN edge IP (e.g., 172.71.x.x)
+3. **glory-hole receives**: Packet appears to come from Magic WAN edge IP
+4. **glory-hole replies**: Needs to route back to Magic WAN edge IP
+5. **Without rule 4**: Reply goes out pppoe0 (wrong path) → hairpin fails
+6. **With rule 4**: Reply routes via table 20 (IPsec) → Magic WAN forwards to LAN host → hairpin works
+
+### LAN host policy routes (required for hairpins)
+
+For each LAN host that needs to hairpin through Magic WAN to reach glory-hole, configure:
+
+```txt
+# Example for LAN host at 10.0.69.7 on interface eth1
+set policy route magic-wan-lan-host default-log
+set policy route magic-wan-lan-host interface 'eth1'
+
+# Rule 5: Send traffic to glory-hole via IPsec
+set policy route magic-wan-lan-host rule 5 description 'lan-host -> gh'
+set policy route magic-wan-lan-host rule 5 destination address '10.0.10.10'
+set policy route magic-wan-lan-host rule 5 set table '20'
+set policy route magic-wan-lan-host rule 5 source address '10.0.69.7'
+
+# Rule 100: Everything else uses main table
+set policy route magic-wan-lan-host rule 100 set table 'main'
+set policy route magic-wan-lan-host rule 100 source address '10.0.69.7'
+
+commit
+save
+```
+
+Repeat for each LAN host requiring hairpin access.
+
+### Notes
+
+- Policy route is bound to `pod-podman-2` interface (verify with `show policy route magic-wan-ipsec-glory-hole`)
+- VyOS evaluates rules top-down; specific rules (4–8) must precede catch-all (100)
+- Adjust IP addresses in rules 5–8 to match your LAN hosts requiring hairpin access
+- Each LAN host needs its own policy route to send glory-hole traffic via table 20
+
+## 5) Cloudflare Spectrum (TCP passthrough)
+
+Configure a Spectrum application:
+
+- Type: **TCP/UDP**
+- Edge port: **853**
+- Origin: **195.240.x.x**
+- Origin port: **8853** (matches DNAT)
+- Proxy Protocol: **Off**
+- Edge TLS Termination: **Passthrough**
+- DNS record for your DoT hostname: proxied (orange cloud), points to your WAN IP.
+
+If you prefer IPv6, add an AAAA to your WAN v6 and include it as an origin.
+
+## 6) Validation
+
+From WAN (after Spectrum live):
+
+```sh
+kdig @your-dot-host -p 853 +tls-host=your-dot-host +tls-ca A example.com
+```
+
+Direct to IP (bypassing Spectrum):
+
+```sh
+kdig @195.240.81.42 -p 8853 +tls-host=your-dot-host +tls-ca A example.com
+```
+
+Local sanity:
+
+```sh
+kdig @10.0.10.10 -p 853 +tls-host=your-dot-host +tls-ca A example.com
+```
+
+Routing sanity:
+
+```sh
+# Check IP rules (run from VyOS shell)
+ip rule show
+
+# Test routing decision for glory-hole traffic
+sudo ip route get 8.8.8.8 from 10.0.10.10
+```
+
+Expect `lookup main` via `pppoe0`.
+
+If you see `Network is unreachable`, PBR isn't selecting `main`; ensure rule 100 exists as the catch-all.
+
+Packet capture (if issues):
+
+```sh
+# Capture on podman interface
+sudo tcpdump -i pod-podman-2 -n host 10.0.10.10 and port 8853
+
+# Capture on WAN interface
+sudo tcpdump -i pppoe0 -n host 195.240.81.42 and port 8853
+```
+
+## 7) Common pitfalls
+
+### Spectrum configuration
+
+- Must be set to **TCP Passthrough**; "Proxy"/HTTP modes break DoT
+- Origin port mismatch (853 vs 8853) causes connection failures
+- Disable Proxy Protocol unless your DoT server explicitly supports it
+
+### Policy routing issues
+
+- **PBR catch-all must be highest-numbered rule (100)** so specific hairpin rules (4–8) are evaluated first
+  - If catch-all is rule 1, it matches all traffic before specific rules can apply
+  - This breaks hairpin routing and forces all traffic to main table
+- **Missing Magic WAN return traffic rule (rule 4)** breaks hairpins completely
+  - Magic WAN performs source NAT on hairpinned traffic
+  - Without rule 4, replies go out pppoe0 instead of back through IPsec tunnel
+  - Symptoms: `[UNREPLIED]` in conntrack, DNS queries timeout
+
+### Protocol notes
+
+- DoT is TCP only; UDP 853 mapping is not required but harmless if configured
+
+## 8) Troubleshooting hairpin issues
+
+If LAN hosts cannot reach glory-hole through the hairpin:
+
+### Check policy route order
+
+```sh
+# From VyOS operational mode
+show policy route magic-wan-ipsec-glory-hole
+```
+
+Ensure rule 4 comes before rule 100.
+
+### Verify packet marking
+
+```sh
+# Check nftables rules and counters (run from VyOS shell)
+sudo nft list ruleset | grep -B2 -A10 "magic-wan-ipsec"
+```
+
+Check the counters for both LAN host and glory-hole PBR chains. The `packets` and `bytes` counters should increment when testing hairpin traffic.
+
+### Check routing tables
+
+```sh
+# From VyOS operational mode
+show ip route table 20
+show ip route table main
+
+# From VyOS shell - test routing decision
+sudo ip route get 10.0.10.10 mark 0x7fffffeb
+```
+
+The marked packet should use table 20 and route via vti0.
+
+### Check conntrack for unreplied connections
+
+```sh
+# From VyOS shell
+sudo conntrack -L | grep 10.0.10.10
+```
+
+Look for `[UNREPLIED]` entries—indicates return traffic is failing. Successful hairpins show `[ASSURED]`.
+
+### Capture traffic on VTI tunnel
+
+```sh
+# From VyOS shell - monitor IPsec tunnel traffic
+sudo tcpdump -i vti0 -n host 10.0.10.10
+```
+
+From LAN host, query glory-hole (e.g., `dig @10.0.10.10 example.com`). You should see:
+
+1. **Outbound**: `10.0.100.20.xxxxx > 10.0.10.10.53` (VTI IP → glory-hole)
+2. **Inbound**: `172.71.x.x.xxxxx > 10.0.10.10.53` (Magic WAN edge → glory-hole)
+
+If you only see outbound, Magic WAN isn't routing return traffic back through the tunnel.
+
+### Capture traffic on glory-hole interface
+
+```sh
+# From VyOS shell - monitor podman bridge traffic
+sudo tcpdump -i pod-podman-2 -n host 10.0.10.10 and port 53
+```
+
+From LAN host, query glory-hole. You should see:
+
+- **Inbound**: Packets with `src=172.71.x.x` (Magic WAN edge IP, **not** LAN host IP)
+- **Outbound**: Replies to `dst=172.71.x.x`
+
+If packets arrive with `src=<LAN-host-IP>`, hairpin isn't working—traffic is routing directly instead of through Magic WAN.
+
+### Check LAN host policy routes
+
+```sh
+# From VyOS operational mode - check LAN host PBR
+show policy route magic-wan-lan-host
+
+# From VyOS shell - test LAN host routing decision
+sudo ip route get 10.0.10.10 from 10.0.69.7 iif eth1
+```
+
+The routing decision should show table 20 and vti0. If it shows direct routing via pod-podman-2, the LAN host PBR isn't working.
+
+### Verify IPsec tunnel status
+
+```sh
+# From VyOS operational mode
+show vpn ipsec sa
+show interfaces vti
+```
+
+Ensure IPsec tunnel is UP and passing traffic (check Bytes In/Out).
+
+### Verify Magic WAN static routes
+
+In your Magic WAN dashboard, confirm:
+
+- Both glory-hole subnet (10.0.10.0/24) **and** LAN subnets (10.0.69.0/24, etc.) are configured
+- Routes point to the correct IPsec tunnel (check tunnel name matches)
+- No conflicting routes with higher priority
+- All prefixes show "Healthy" status
+
+## 9) Quick reference
+
+### Key VyOS commands
+
+```sh
+# Policy routing
+show policy route magic-wan-ipsec-glory-hole
+show policy route magic-wan-lan-host
+
+# Routing tables
+show ip route table 20
+show ip route table main
+
+# IPsec status
+show vpn ipsec sa
+show interfaces vti
+
+# Network groups
+show firewall group network-group magic-wan-ips
+```
+
+### Key diagnostic commands (from VyOS shell)
+
+```sh
+# Check routing decision
+sudo ip route get 10.0.10.10 from 10.0.69.7 iif eth1
+sudo ip route get 10.0.10.10 mark 0x7fffffeb
+
+# Check packet marking
+sudo nft list ruleset | grep -B2 -A10 "magic-wan-ipsec"
+
+# Check connection tracking
+sudo conntrack -L | grep 10.0.10.10
+
+# Capture traffic
+sudo tcpdump -i vti0 -n host 10.0.10.10
+sudo tcpdump -i pod-podman-2 -n host 10.0.10.10 and port 53
+```
