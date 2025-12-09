@@ -12,7 +12,7 @@ import react from "@astrojs/react";
 export default defineConfig({
   site: "https://erfi.dev",
   integrations: [sitemap(), starlight({
-    title: "Erfi's Codex",
+    title: "Erfi's Lexicanum",
     favicon: "/ea_favicon.png",
     customCss: ["./src/styles/custom.css"],
     editLink: {
@@ -44,7 +44,7 @@ export default defineConfig({
         tag: "meta",
         attrs: {
           property: "og:site_name",
-          content: "Erfi's Codex",
+          content: "Erfi's Lexicanum",
         },
       },
       {
@@ -76,7 +76,7 @@ export default defineConfig({
         content: JSON.stringify({
           "@context": "https://schema.org",
           "@type": "WebSite",
-          "name": "Codex",
+          "name": "Lexicanum",
           "url": "https://erfi.dev",
           "description": "Computer stuff",
         }),
