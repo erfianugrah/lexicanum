@@ -15,6 +15,9 @@ export default defineConfig({
     title: "Erfi's Lexicanum",
     favicon: "/ea_favicon.png",
     customCss: ["./src/styles/custom.css"],
+    components: {
+      Head: './src/components/Head.astro',
+    },
     editLink: {
       baseUrl: "https://github.com/erfianugrah/erfi-dev-docs/edit/main/",
     },
