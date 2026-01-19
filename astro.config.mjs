@@ -1,7 +1,7 @@
 // @ts-check
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
-import rehypeMermaid from "rehype-mermaid";
+import remarkD2 from "remark-d2";
 import sitemap from "@astrojs/sitemap";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
@@ -102,47 +102,19 @@ export default defineConfig({
     ],
   }), react()],
   markdown: {
-    remarkPlugins: [remarkMath],
+    remarkPlugins: [
+      remarkMath,
+      [remarkD2, {
+        compilePath: "public/d2",
+        linkPath: "/d2",
+        defaultD2Opts: ["-t=100", "--dark-theme=200", "--layout=elk"],
+      }],
+    ],
     syntaxHighlight: {
       type: "shiki",
-      excludeLangs: ["mermaid"],
+      excludeLangs: ["d2"],
     },
-    rehypePlugins: [
-      [rehypeMermaid, {
-        strategy: "inline-svg",
-        mermaidConfig: {
-          theme: "default",
-          fontFamily: "arial,sans-serif",
-        },
-        colorScheme: "light dark",
-        errorFallback: (element, diagram, error) => {
-          // Create a pre element with the diagram source and error message
-          return {
-            type: "element",
-            tagName: "pre",
-            properties: { className: ["mermaid-error"] },
-            children: [
-              {
-                type: "element",
-                tagName: "code",
-                properties: { className: ["language-mermaid"] },
-                children: [{ type: "text", value: diagram }],
-              },
-              {
-                type: "element",
-                tagName: "div",
-                properties: { className: ["mermaid-error-message"] },
-                children: [{
-                  type: "text",
-                  value: `Error rendering diagram: ${error.message}`,
-                }],
-              },
-            ],
-          };
-        },
-      }],
-      rehypeKatex,
-    ],
+    rehypePlugins: [rehypeKatex],
   },
   build: {
     concurrency: 4,

@@ -1,89 +1,159 @@
-# Mermaid Fullscreen Component
+# Diagram Fullscreen Components
 
-Adds interactive fullscreen modal functionality to all Mermaid diagrams in your Starlight documentation.
+Interactive fullscreen modal functionality for Mermaid and D2 diagrams in Starlight documentation.
+
+## Components
+
+- **MermaidFullscreen.astro** - Handles Mermaid diagrams (`svg[id^="mermaid-"]`)
+- **D2Fullscreen.astro** - Handles D2 diagrams (`img[src*="/d2/"]`)
+
+Both components are loaded via `Head.astro` and automatically enhance all diagrams on every page.
 
 ## Features
 
-✨ **Click-to-expand**: Click any Mermaid diagram or the fullscreen button to open it in a modal
-🔍 **Pan & Zoom**: Drag to pan, scroll/pinch to zoom in fullscreen view
-⌨️ **Keyboard shortcuts**: Press `F` to fullscreen, `Escape` to close
-📱 **Mobile support**: Pinch-to-zoom and touch gestures on mobile devices
-🎨 **Dark mode**: Automatically adapts to your Starlight theme
-♿ **Accessible**: ARIA labels and keyboard navigation
+- **Click-to-expand**: Click any diagram or the expand button to open fullscreen modal
+- **Pan & Zoom**: Drag to pan, scroll/pinch to zoom (0.5x-5x range)
+- **Zoom controls**: +/−/1:1 buttons in fullscreen view
+- **Keyboard shortcuts**: Enter/Space to open, Escape to close
+- **Mobile support**: Pinch-to-zoom and touch gestures
+- **Dark mode**: Automatically adapts to Starlight theme
+- **Accessible**: ARIA labels, focus management, keyboard navigation
 
 ## How It Works
 
-The component automatically:
-1. Detects all `.mermaid` elements on the page
-2. Wraps them in a container with a fullscreen button
-3. Adds click handlers to open diagrams in a modal
-4. Enables pan/zoom functionality in the modal view
+### Mermaid Diagrams
+1. Detects all `svg[id^="mermaid-"]` elements
+2. Wraps them in a container with expand button
+3. Clones SVG into modal for interactive viewing
+
+### D2 Diagrams
+1. Detects all `img[src*="/d2/"]` elements
+2. Wraps them in a container with expand button
+3. Fetches SVG content and injects into modal for interactive viewing
 
 ## User Interactions
 
 ### Desktop
-- **Click diagram or button**: Open fullscreen view
-- **Drag**: Pan around the diagram
-- **Scroll**: Zoom in/out
-- **Escape or click outside**: Close modal
-- **Reset View button**: Reset zoom and pan
+| Action | Result |
+|--------|--------|
+| Click diagram or button | Open fullscreen view |
+| Drag | Pan around the diagram |
+| Scroll wheel | Zoom in/out |
+| +/− buttons | Zoom in/out |
+| 1:1 button | Reset zoom and position |
+| Escape or click outside | Close modal |
 
 ### Mobile
-- **Tap diagram**: Open fullscreen view
-- **Drag**: Pan around the diagram
-- **Pinch**: Zoom in/out
-- **Tap outside**: Close modal
+| Action | Result |
+|--------|--------|
+| Tap diagram | Open fullscreen view |
+| Drag | Pan around the diagram |
+| Pinch | Zoom in/out |
+| Tap outside | Close modal |
+
+## D2 Diagram Setup
+
+D2 diagrams use `remark-d2` plugin configured in `astro.config.mjs`:
+
+```js
+remarkPlugins: [
+  [remarkD2, {
+    compilePath: "public/d2",
+    linkPath: "/d2",
+    defaultD2Opts: ["-t=100", "--dark-theme=200", "--layout=elk"],
+  }],
+],
+```
+
+### Theming
+- Light mode: Theme 100 (Vanilla Nitro Cola)
+- Dark mode: Theme 200 (Dark Mauve)
+- SVGs include embedded `@media (prefers-color-scheme: dark)` styles
+- CSS fallback in `custom.css` handles manual theme toggle mismatches
+
+### Writing D2 Diagrams
+
+Use fenced code blocks with `d2` language:
+
+~~~markdown
+```d2
+direction: down
+
+client: Client {
+  shape: person
+}
+
+server: Server
+database: Database {
+  shape: cylinder
+}
+
+client -> server: request
+server -> database: query
+```
+~~~
+
+Let D2's theme handle colors - avoid explicit `style.fill` to maintain light/dark mode support.
 
 ## Implementation Details
 
 ### Security
-- Uses safe DOM methods (no innerHTML) to create SVG icons
+- Safe DOM methods (createElement, not innerHTML for user content)
 - No external dependencies
-- All functionality is self-contained
+- Self-contained functionality
 
 ### Performance
-- Lazy initialization (only processes diagrams when needed)
-- Prevents duplicate processing with flag checks
-- Smooth animations using CSS transforms
-- Efficient event handling with event delegation
+- Lazy initialization on DOMContentLoaded
+- Prevents duplicate processing with data attributes
+- CSS transforms for smooth animations
+- Efficient event handling
 
 ### Accessibility
-- ARIA roles and labels for screen readers
-- Keyboard navigation support
+- `role="button"` and `aria-label` on diagrams
+- `role="dialog"` and `aria-modal` on modals
 - Focus management (focuses close button on open)
-- Semantic HTML structure
+- Keyboard navigation support
+- `tabindex="0"` for keyboard accessibility
 
 ## Customization
 
-You can customize the appearance by modifying the CSS variables in the component or overriding styles in your `custom.css`:
+Override styles in `custom.css`:
 
 ```css
-/* Example: Change fullscreen button position */
-.mermaid-fullscreen-btn {
+/* Change expand button position */
+.d2-expand-btn,
+.mermaid-expand-btn {
   top: 0.5rem;
   right: 0.5rem;
 }
 
-/* Example: Change modal background */
+/* Change modal background */
+.d2-modal,
 .mermaid-modal {
   background: rgba(0, 0, 0, 0.95);
 }
 
-/* Example: Adjust zoom limits */
-/* Modify in the component: scale = Math.min(Math.max(0.5, scale), 5); */
+/* Change wrapper background */
+.d2-diagram-wrapper,
+.mermaid-diagram-wrapper {
+  background: var(--sl-color-gray-6);
+  padding: 1.5rem;
+}
 ```
 
 ## Browser Support
 
-Works in all modern browsers that support:
-- ES6+ JavaScript
-- SVG
+Requires:
+- ES6+ JavaScript (async/await, arrow functions)
+- Fetch API
+- SVG support
 - CSS transforms
 - Touch events (for mobile)
 
 ## Credits
 
 Inspired by:
-- [starlight-codeblock-fullscreen](https://github.com/frostybee/starlight-codeblock-fullscreen) for code block fullscreen
-- [@beoe/pan-zoom](https://astro-digital-garden.stereobooster.com/recipes/svg-pan-zoom/) for pan/zoom patterns
+- [starlight-codeblock-fullscreen](https://github.com/frostybee/starlight-codeblock-fullscreen)
+- [@beoe/pan-zoom](https://astro-digital-garden.stereobooster.com/recipes/svg-pan-zoom/)
 - [Starlight component override system](https://starlight.astro.build/reference/overrides/)
+- [D2 Language](https://d2lang.com/)
