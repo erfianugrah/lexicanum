@@ -77,23 +77,23 @@ Use fenced code blocks with `d2` language:
 
 ~~~markdown
 ```d2
-direction: down
+direction: right
 
-client: Client {
-  shape: person
-}
-
+client: Client {shape: person}
 server: Server
-database: Database {
-  shape: cylinder
-}
+database: Database {shape: cylinder}
 
 client -> server: request
 server -> database: query
 ```
 ~~~
 
-Let D2's theme handle colors - avoid explicit `style.fill` to maintain light/dark mode support.
+#### Best Practices
+
+- **Prefer `direction: right`** for simple flowcharts - horizontal layouts fit better in content widths
+- **Use `direction: down`** only for complex architecture diagrams showing hierarchical layers
+- **Let D2's theme handle colors** - avoid explicit `style.fill` to maintain light/dark mode support
+- **Keep diagrams simple** - complex diagrams with many nodes work better as vertical layouts
 
 ## Implementation Details
 
