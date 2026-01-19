@@ -29,19 +29,19 @@ What's the origin type?
         │                      • Different colos = different caches
         │
         └─► Need global? ────► KV (you build the cache layer)
-                               • Eventual consistency (~60s)
+                               • Eventual consistency (up to cache TTL)
                                • Requires: key generation, TTL management,
                                │   invalidation, chunking for >25 MB
                                │
                                └─► Concurrent writes? ──► Add Durable Objects
 ```
 
-| Scenario | Approach | Complexity |
-|----------|----------|------------|
-| Non-CF or same zone | `fetch()` + `cf` options | Low |
-| Cross-zone, simple needs | Cache API | Low |
-| Cross-zone, global consistency | KV | **High** |
-| Cross-zone, coordinated writes | KV + Durable Objects | **Very High** |
+| Scenario | Approach | Effort |
+|----------|----------|--------|
+| Non-CF or same zone | `fetch()` + `cf` options | Minimal |
+| Cross-zone, simple needs | Cache API | Minimal |
+| Cross-zone, global consistency | KV | **Significant** |
+| Cross-zone, coordinated writes | KV + Durable Objects | **Extensive** |
 
 <Aside type="tip" title="Start with Cache API">
 If per-colo consistency is acceptable, Cache API is significantly simpler than KV. Only choose KV if you specifically need global cache coherence or metadata-driven purging.
@@ -125,7 +125,76 @@ This means if you want caching, the **origin zone** must configure it via:
 | `image` | Yes | **Yes** |
 | `polish`, `minify`, `mirage` | Yes | **No** (uses origin zone) |
 
-## Workarounds
+### Custom cache keys
+
+The `cacheKey` option lets you control what makes two requests "the same" for caching purposes. The value is a **string** that becomes the cache key identifier.
+
+```typescript
+// Example: Cache based on normalized URL (strip tracking params)
+const url = new URL(request.url);
+['utm_source', 'utm_medium', 'utm_campaign', 'fbclid'].forEach(p => url.searchParams.delete(p));
+const normalizedKey = url.toString();
+
+const response = await fetch(request, {
+  cf: {
+    cacheTtl: 3600,
+    cacheKey: normalizedKey,
+  },
+});
+```
+
+```typescript
+// Example: Separate cache entries by device type
+const device = request.headers.get('CF-Device-Type') || 'desktop';
+const deviceCategory = device === 'desktop' ? 'desktop' : 'mobile';
+const cacheKey = `${request.url}-${deviceCategory}`;
+
+const response = await fetch(request, {
+  cf: {
+    cacheTtl: 3600,
+    cacheKey: cacheKey,
+  },
+});
+```
+
+```typescript
+// Example: Include language in cache key
+const lang = request.headers.get('Accept-Language')?.split(',')[0] || 'en';
+const cacheKey = `${request.url}-${lang}`;
+
+const response = await fetch(request, {
+  cf: {
+    cacheTtl: 3600,
+    cacheKey: cacheKey,
+  },
+});
+```
+
+You can build arbitrarily complex cache keys by constructing the string yourself - include/exclude query params, add headers, cookies, or any request property. [Cache Rules](https://developers.cloudflare.com/cache/how-to/cache-rules/) offer a no-code alternative for the same functionality.
+
+### Tiered Cache and Cache Reserve
+
+Two additional caching features affect how content is stored and retrieved:
+
+**[Tiered Cache](https://developers.cloudflare.com/cache/how-to/tiered-cache/)** reduces origin load by having upper-tier data centers serve as intermediaries. When a lower-tier colo has a cache miss, it checks upper-tier colos before going to origin.
+
+- Works with `fetch()` and `cf` options (same zone/non-CF)
+- **Does NOT work with Cache API** - Cache API is per-colo only
+- Enabled at the zone level, not per-request
+
+**[Cache Reserve](https://developers.cloudflare.com/cache/advanced-configuration/cache-reserve/)** provides persistent storage for cached content, preventing eviction during traffic spikes or for infrequently accessed content.
+
+- Extends cache retention beyond standard TTL limits
+- Useful for large files or content with long TTLs
+- Billed based on storage and operations
+
+<Aside type="note" title="When to consider these">
+Tiered Cache helps reduce origin load for high-traffic zones. Cache Reserve helps when you need guaranteed cache persistence for specific content. Both are zone-level features and work alongside Worker caching strategies.
+</Aside>
+
+## Cross-zone caching solutions
+
+When `cf` options don't work (cross-zone fetches), you have two choices: Cache API for simplicity, or KV for global consistency.
 
 ### Cache API
 
@@ -189,13 +258,44 @@ async function fetchWithCache(request: Request, originUrl: string, ctx: Executio
 }
 ```
 
-<Aside type="caution" title="Memory limits with clone()">
-Workers have a **128 MB memory limit**. `response.clone()` buffers the entire body into memory. For large responses, use `body.tee()` instead to stream without full buffering. See [Memory limits](#memory-limits-and-cloning) below.
+#### Handling large responses
+
+Workers have a **128 MB memory limit**. `response.clone()` buffers the entire body into memory. For large responses, use `body.tee()` instead:
+
+```typescript
+async function fetchLargeWithCache(originUrl: string, ctx: ExecutionContext): Promise<Response> {
+  const cache = caches.default;
+  const cacheKey = new Request(originUrl, { method: 'GET' });
+  
+  const cached = await cache.match(cacheKey);
+  if (cached) return cached;
+  
+  const originResp = await fetch(originUrl);
+  if (!originResp.ok || !originResp.body) return originResp;
+  
+  // tee() creates two streams from one - avoids buffering entire body
+  const [stream1, stream2] = originResp.body.tee();
+  
+  const headers = new Headers(originResp.headers);
+  headers.delete('Set-Cookie');
+  if (!headers.has('Cache-Control')) {
+    headers.set('Cache-Control', 'public, max-age=3600');
+  }
+  
+  const responseToCache = new Response(stream1, { status: originResp.status, headers });
+  ctx.waitUntil(cache.put(cacheKey, responseToCache));
+  
+  return new Response(stream2, { status: originResp.status, headers });
+}
+```
+
+<Aside type="caution" title="tee() still buffers under load">
+If one stream is consumed faster than the other, the slower stream's data will be buffered. For very large responses with slow consumers, consider whether caching is the right approach.
 </Aside>
 
 ### KV for global consistency
 
-KV provides global replication with eventual consistency (up to 60s). However, using KV as a cache means **building your own caching layer** - you're responsible for cache key generation, TTL management, invalidation, and purging.
+KV provides global replication with eventual consistency (propagation time depends on cache TTL settings). However, using KV as a cache means **building your own caching layer** - you're responsible for cache key generation, TTL management, invalidation, and purging.
 
 #### Cache API vs KV trade-offs
 
@@ -205,7 +305,7 @@ KV provides global replication with eventual consistency (up to 60s). However, u
 | **TTL management** | Automatic via `Cache-Control` headers | Manual via `expirationTtl` |
 | **Invalidation** | `cache.delete()` per-colo only | `KV.delete()` propagates globally |
 | **Purge tooling** | Built-in via Cloudflare dashboard/API | Roll your own or use [cache-kv-purger](https://github.com/erfianugrah/cache-kv-purger) |
-| **Value size limit** | 512 MB (but cloning limited by 128 MB Worker memory) | 25 MB (chunking required for larger) |
+| **Value size limit** | No hard limit (but cloning limited by 128 MB Worker memory) | 25 MB (chunking required for larger) |
 
 #### When to use KV over Cache API
 
@@ -213,174 +313,6 @@ KV provides global replication with eventual consistency (up to 60s). However, u
 - **Programmatic invalidation** - Need to purge specific items globally (not just per-colo)
 - **Cross-Worker sharing** - Multiple Workers need to share cached data
 - **Metadata-driven purging** - Need to find and purge items by tags/metadata
-
-#### The hidden complexity
-
-KV caching requires building infrastructure that Cache API provides automatically:
-
-1. **Cache key generation** - Consistent keys across requests
-2. **TTL refresh** - Extending TTL on cache hits without rewriting the value
-3. **Purge mechanisms** - Finding and deleting related items
-4. **Chunking for large files** - Splitting files > 25 MB across multiple keys
-
-#### KV caching architecture
-
-When building a KV-based cache, you need these components:
-
-```
-Request Flow with KV Cache
-==========================
-
-Request ──► Cache Key ──► KV Lookup ──┬──► HIT ──► TTL Check ──┬──► Fresh ──► Return
-            Generation     (+ metadata) │                       │
-                                        │                       └──► Stale ──► Background
-                                        │                                       Refresh
-                                        │
-                                        └──► MISS ──► Origin Fetch ──► Transform ──► KV Store ──► Return
-
-
-Components needed:
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                                                                                 │
-│  1. Cache Key Generation                                                        │
-│     └─► Deterministic keys from request params                                  │
-│         e.g., "video:sample.mp4:w=1280:h=720:q=high"                           │
-│                                                                                 │
-│  2. Metadata Storage                                                            │
-│     └─► Store headers, content-type, timestamps alongside value                 │
-│         KV metadata field (limited to 1KB)                                      │
-│                                                                                 │
-│  3. TTL Management                                                              │
-│     └─► expirationTtl on write                                                  │
-│     └─► Track cachedAt for refresh decisions                                    │
-│     └─► Background refresh to avoid blocking                                    │
-│                                                                                 │
-│  4. Chunking (for values > 25 MB)                                               │
-│     └─► Split into chunks with manifest                                         │
-│     └─► Reassemble on read                                                      │
-│                                                                                 │
-│  5. Invalidation / Purging                                                      │
-│     └─► By exact key                                                            │
-│     └─► By prefix/pattern (requires key listing)                                │
-│     └─► By metadata tags (requires search)                                      │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-#### Cache versioning for invalidation
-
-Instead of purging individual keys, increment a version number to invalidate all cached content:
-
-```
-Cache Versioning
-================
-
-                    ┌─────────────────┐
-                    │ Version Store   │
-                    │ (KV or config)  │
-                    │ version = 42    │
-                    └────────┬────────┘
-                             │
-    Request ──► Build Key ───┴──► "v42:video:sample.mp4:w=1280"
-                                        │
-                    ┌───────────────────┴───────────────────┐
-                    │                                       │
-                    ▼                                       ▼
-              KV Lookup                              Cache Miss
-              for v42 key                            (v41 keys exist
-                    │                                 but ignored)
-                    ▼                                       │
-               Return if                                    ▼
-               exists                               Fetch & store
-                                                    with v42 key
-
-To invalidate: increment version to 43
-- All v42 keys become orphaned (expire via TTL)
-- No need to list/delete individual keys
-- Atomic invalidation across all colos
-```
-
-#### Request coalescing
-
-Prevent duplicate origin fetches when multiple requests arrive for the same uncached content:
-
-```
-Request Coalescing
-==================
-
-Time ──────────────────────────────────────────────────────►
-
-Req A ──► Cache Miss ──► Add to in-flight map ──► Fetch Origin ──► Store ──► Return
-                              │                        │              │
-Req B ──► Cache Miss ──► In-flight? YES ──► Wait ──────┴──────────────┼──► Clone & Return
-                                                                      │
-Req C ──► Cache Miss ──► In-flight? YES ──► Wait ─────────────────────┴──► Clone & Return
-
-
-Implementation:
-┌──────────────────────────────────────────────┐
-│  const inFlight = new Map<string,            │
-│    Promise<Response>>();                     │
-│                                              │
-│  if (inFlight.has(cacheKey)) {               │
-│    return (await inFlight.get(cacheKey))!    │
-│      .clone();                               │
-│  }                                           │
-│                                              │
-│  const promise = fetchAndCache(url);         │
-│  inFlight.set(cacheKey, promise);            │
-│  const response = await promise;             │
-│  inFlight.delete(cacheKey);                  │
-│  return response;                            │
-└──────────────────────────────────────────────┘
-```
-
-#### Chunking for large files
-
-Files > 25 MB must be split across multiple KV keys:
-
-```
-KV Chunking Pattern
-===================
-
-Store (100 MB file):
-                                        ┌─────────────────────┐
-                                        │ Manifest Key        │
-    100 MB ──► Split into ──►           │ "video:large.mp4"   │
-              20 MB chunks              │                     │
-                    │                   │ {                   │
-                    │                   │   totalSize: 100MB, │
-                    ├──► Chunk 0 ──►    │   chunkSize: 20MB,  │
-                    │    (20 MB)        │   chunks: [         │
-                    │                   │     "...chunk:0",   │
-                    ├──► Chunk 1 ──►    │     "...chunk:1",   │
-                    │    (20 MB)        │     "...chunk:2",   │
-                    │                   │     "...chunk:3",   │
-                    ├──► Chunk 2 ──►    │     "...chunk:4"    │
-                    │    (20 MB)        │   ],                │
-                    │                   │   contentType: ...  │
-                    ├──► Chunk 3 ──►    │ }                   │
-                    │    (20 MB)        └─────────────────────┘
-                    │
-                    └──► Chunk 4 ──►
-                         (20 MB)
-
-Retrieve (Range: bytes=45000000-50000000):
-                                        
-    Range Request ──► Read Manifest ──► Calculate: chunks 2-3 needed
-                                              │
-                                              ├──► Fetch chunk 2
-                                              │
-                                              └──► Fetch chunk 3
-                                                        │
-                                                        ▼
-                                              Slice & stream to client
-```
-
-For production implementations of these patterns, see:
-- [video-resizer](https://github.com/erfianugrah/video-resizer) - Full implementation with all patterns above
-- [Media Transformation Architecture](/reference/media-transformation-architecture/) - Detailed documentation
-- [cache-kv-purger](https://github.com/erfianugrah/cache-kv-purger) - CLI for purging by tags/metadata
 
 #### Basic implementation
 
@@ -448,52 +380,70 @@ async function refreshTTL(env: Env, key: string, metadata: object): Promise<void
 KV writes can take time to propagate. Using `ctx.waitUntil()` ensures the write completes without blocking the response. You can also import `waitUntil` directly from `cloudflare:workers` to avoid passing `ctx` through your code.
 </Aside>
 
-<Aside type="caution" title="KV is a commitment">
-Choosing KV over Cache API means taking on cache infrastructure responsibilities. For simple caching needs where per-colo consistency is acceptable, Cache API is significantly simpler.
-</Aside>
+#### What you're building
 
-## Memory limits and cloning
+KV caching requires implementing what Cache API gives you automatically:
 
-Workers have a **128 MB memory limit per isolate**. When using `response.clone()` for caching, the entire response body is buffered into memory. For large responses, this can exceed the limit and cause the Worker to fail.
+1. **Cache key generation** - Deterministic keys from request params (e.g., `video:sample.mp4:w=1280:h=720`)
+2. **Metadata storage** - Headers, content-type, timestamps alongside value (KV metadata limited to 1KB)
+3. **TTL management** - `expirationTtl` on write, tracking `cachedAt` for refresh decisions
+4. **Chunking** - Splitting files > 25 MB across multiple keys, reassembling on read
+5. **Invalidation** - By exact key, prefix/pattern (requires listing), or metadata tags
 
-### Mitigations
+#### Advanced patterns
 
-**Use `tee()` instead of `clone()`** for large responses. `ReadableStream.tee()` creates two streams from one without immediately buffering the entire body:
+<details>
+<summary>**Cache versioning** - Atomic invalidation without listing keys</summary>
+
+Instead of purging individual keys, increment a version number:
+
+```
+Version Store (KV or config): version = 42
+
+Request ──► Build Key ──► "v42:video:sample.mp4:w=1280"
+                                    │
+                    ┌───────────────┴───────────────┐
+                    ▼                               ▼
+              KV Lookup                       Cache Miss
+              for v42 key                     (v41 keys ignored)
+                    │                               │
+                    ▼                               ▼
+               Return                        Fetch & store
+                                             with v42 key
+
+To invalidate: increment version to 43
+- All v42 keys become orphaned (expire via TTL)
+- No need to list/delete individual keys
+- Atomic invalidation across all colos
+```
+</details>
+
+<details>
+<summary>**Request coalescing** - Prevent duplicate origin fetches</summary>
+
+When multiple requests arrive for the same uncached content:
 
 ```typescript
-async function fetchLargeWithCache(originUrl: string, ctx: ExecutionContext): Promise<Response> {
-  const cache = caches.default;
-  const cacheKey = new Request(originUrl, { method: 'GET' });
-  
-  const cached = await cache.match(cacheKey);
-  if (cached) return cached;
-  
-  const originResp = await fetch(originUrl);
-  if (!originResp.ok || !originResp.body) return originResp;
-  
-  // tee() creates two streams from one - avoids buffering entire body
-  const [stream1, stream2] = originResp.body.tee();
-  
-  const headers = new Headers(originResp.headers);
-  headers.delete('Set-Cookie');
-  if (!headers.has('Cache-Control')) {
-    headers.set('Cache-Control', 'public, max-age=3600');
+const inFlight = new Map<string, Promise<Response>>();
+
+async function fetchWithCoalescing(cacheKey: string, url: string): Promise<Response> {
+  if (inFlight.has(cacheKey)) {
+    return (await inFlight.get(cacheKey))!.clone();
   }
   
-  const responseToCache = new Response(stream1, { status: originResp.status, headers });
-  ctx.waitUntil(cache.put(cacheKey, responseToCache));
-  
-  return new Response(stream2, { status: originResp.status, headers });
+  const promise = fetchAndCache(url);
+  inFlight.set(cacheKey, promise);
+  const response = await promise;
+  inFlight.delete(cacheKey);
+  return response;
 }
 ```
+</details>
 
-<Aside type="caution" title="tee() still buffers under load">
-If one stream is consumed faster than the other, the slower stream's data will be buffered. For very large responses with slow consumers, consider whether caching is the right approach.
-</Aside>
+<details>
+<summary>**Chunking** - Files > 25 MB across multiple keys</summary>
 
-### KV value limits and chunking
-
-KV has a **25 MB value limit**. For larger payloads, use a manifest pattern - store chunks separately and reference them:
+KV has a **25 MB value limit**. Split larger files into chunks with a manifest:
 
 ```typescript
 interface ChunkManifest {
@@ -525,7 +475,19 @@ async function storeLargeFile(key: string, data: ArrayBuffer, env: Env, ctx: Exe
 }
 ```
 
-For a complete implementation of this pattern, see [Media Transformation Architecture](/reference/media-transformation-architecture/).
+For retrieval with range request support, see [Media Transformation Architecture](/reference/media-transformation-architecture/).
+</details>
+
+For production implementations of all patterns, see:
+- [video-resizer](https://github.com/erfianugrah/video-resizer) - Full implementation with versioning, coalescing, chunking
+- [Media Transformation Architecture](/reference/media-transformation-architecture/) - Detailed documentation
+- [cache-kv-purger](https://github.com/erfianugrah/cache-kv-purger) - CLI for purging by tags/metadata
+
+<Aside type="caution" title="KV is a commitment">
+Choosing KV over Cache API means taking on cache infrastructure responsibilities. For simple caching needs where per-colo consistency is acceptable, Cache API is the better choice.
+</Aside>
+
+---
 
 ## Microservices architecture
 
@@ -594,7 +556,7 @@ ttl:3600          ttl:60
 |------|------|
 | Each service owns its strategy | Inconsistent behavior |
 | No single point of failure | Harder to debug system-wide |
-| Independent deployments | Complex invalidation |
+| Independent deployments | Harder invalidation |
 | Better separation of concerns | Duplicate logic |
 
 ### Recommendation
