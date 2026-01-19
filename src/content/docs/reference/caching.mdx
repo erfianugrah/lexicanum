@@ -184,9 +184,164 @@ KV caching requires building infrastructure that Cache API provides automaticall
 3. **Purge mechanisms** - Finding and deleting related items
 4. **Chunking for large files** - Splitting files > 25 MB across multiple keys
 
-For a production implementation, see [video-resizer](https://github.com/erfianugrah/video-resizer) which implements KV caching with chunking, TTL refresh, cache versioning, and request coalescing. The [Media Transformation Architecture](/reference/media-transformation-architecture/) documents this approach in detail.
+#### KV caching architecture
 
-For purging KV-cached content by tags or metadata, see [cache-kv-purger](https://github.com/erfianugrah/cache-kv-purger).
+When building a KV-based cache, you need these components:
+
+```
+Request Flow with KV Cache
+==========================
+
+Request ──► Cache Key ──► KV Lookup ──┬──► HIT ──► TTL Check ──┬──► Fresh ──► Return
+            Generation     (+ metadata) │                       │
+                                        │                       └──► Stale ──► Background
+                                        │                                       Refresh
+                                        │
+                                        └──► MISS ──► Origin Fetch ──► Transform ──► KV Store ──► Return
+
+
+Components needed:
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                 │
+│  1. Cache Key Generation                                                        │
+│     └─► Deterministic keys from request params                                  │
+│         e.g., "video:sample.mp4:w=1280:h=720:q=high"                           │
+│                                                                                 │
+│  2. Metadata Storage                                                            │
+│     └─► Store headers, content-type, timestamps alongside value                 │
+│         KV metadata field (limited to 1KB)                                      │
+│                                                                                 │
+│  3. TTL Management                                                              │
+│     └─► expirationTtl on write                                                  │
+│     └─► Track cachedAt for refresh decisions                                    │
+│     └─► Background refresh to avoid blocking                                    │
+│                                                                                 │
+│  4. Chunking (for values > 25 MB)                                               │
+│     └─► Split into chunks with manifest                                         │
+│     └─► Reassemble on read                                                      │
+│                                                                                 │
+│  5. Invalidation / Purging                                                      │
+│     └─► By exact key                                                            │
+│     └─► By prefix/pattern (requires key listing)                                │
+│     └─► By metadata tags (requires search)                                      │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Cache versioning for invalidation
+
+Instead of purging individual keys, increment a version number to invalidate all cached content:
+
+```
+Cache Versioning
+================
+
+                    ┌─────────────────┐
+                    │ Version Store   │
+                    │ (KV or config)  │
+                    │ version = 42    │
+                    └────────┬────────┘
+                             │
+    Request ──► Build Key ───┴──► "v42:video:sample.mp4:w=1280"
+                                        │
+                    ┌───────────────────┴───────────────────┐
+                    │                                       │
+                    ▼                                       ▼
+              KV Lookup                              Cache Miss
+              for v42 key                            (v41 keys exist
+                    │                                 but ignored)
+                    ▼                                       │
+               Return if                                    ▼
+               exists                               Fetch & store
+                                                    with v42 key
+
+To invalidate: increment version to 43
+- All v42 keys become orphaned (expire via TTL)
+- No need to list/delete individual keys
+- Atomic invalidation across all colos
+```
+
+#### Request coalescing
+
+Prevent duplicate origin fetches when multiple requests arrive for the same uncached content:
+
+```
+Request Coalescing
+==================
+
+Time ──────────────────────────────────────────────────────►
+
+Req A ──► Cache Miss ──► Add to in-flight map ──► Fetch Origin ──► Store ──► Return
+                              │                        │              │
+Req B ──► Cache Miss ──► In-flight? YES ──► Wait ──────┴──────────────┼──► Clone & Return
+                                                                      │
+Req C ──► Cache Miss ──► In-flight? YES ──► Wait ─────────────────────┴──► Clone & Return
+
+
+Implementation:
+┌────────────────────────────────────────┐
+│  const inFlight = new Map<string,      │
+│    Promise<Response>>();               │
+│                                        │
+│  if (inFlight.has(cacheKey)) {         │
+│    return (await inFlight.get(key))    │
+│      .clone();                         │
+│  }                                     │
+│                                        │
+│  const promise = fetchAndCache(url);   │
+│  inFlight.set(cacheKey, promise);      │
+│  const response = await promise;       │
+│  inFlight.delete(cacheKey);            │
+│  return response;                      │
+└────────────────────────────────────────┘
+```
+
+#### Chunking for large files
+
+Files > 25 MB must be split across multiple KV keys:
+
+```
+KV Chunking Pattern
+===================
+
+Store (100 MB file):
+                                        ┌─────────────────────┐
+                                        │ Manifest Key        │
+    100 MB ──► Split into ──►           │ "video:large.mp4"   │
+              20 MB chunks              │                     │
+                    │                   │ {                   │
+                    │                   │   totalSize: 100MB, │
+                    ├──► Chunk 0 ──►    │   chunkSize: 20MB,  │
+                    │    (20 MB)        │   chunks: [         │
+                    │                   │     "...chunk:0",   │
+                    ├──► Chunk 1 ──►    │     "...chunk:1",   │
+                    │    (20 MB)        │     "...chunk:2",   │
+                    │                   │     "...chunk:3",   │
+                    ├──► Chunk 2 ──►    │     "...chunk:4"    │
+                    │    (20 MB)        │   ],                │
+                    │                   │   contentType: ...  │
+                    ├──► Chunk 3 ──►    │ }                   │
+                    │    (20 MB)        └─────────────────────┘
+                    │
+                    └──► Chunk 4 ──►
+                         (20 MB)
+
+Retrieve (Range: bytes=45000000-50000000):
+                                        
+    Range Request ──► Read Manifest ──► Calculate: chunks 2-3 needed
+                                              │
+                                              ├──► Fetch chunk 2
+                                              │
+                                              └──► Fetch chunk 3
+                                                        │
+                                                        ▼
+                                              Slice & stream to client
+```
+
+For production implementations of these patterns, see:
+- [video-resizer](https://github.com/erfianugrah/video-resizer) - Full implementation with all patterns above
+- [Media Transformation Architecture](/reference/media-transformation-architecture/) - Detailed documentation
+- [cache-kv-purger](https://github.com/erfianugrah/cache-kv-purger) - CLI for purging by tags/metadata
 
 #### Basic implementation
 
