@@ -1,13 +1,12 @@
-# Diagram Fullscreen Components
+# D2 Diagram Fullscreen Component
 
-Interactive fullscreen modal functionality for Mermaid and D2 diagrams in Starlight documentation.
+Interactive fullscreen modal functionality for D2 diagrams in Starlight documentation.
 
-## Components
+## Component
 
-- **MermaidFullscreen.astro** - Handles Mermaid diagrams (`svg[id^="mermaid-"]`)
 - **D2Fullscreen.astro** - Handles D2 diagrams (`img[src*="/d2/"]`)
 
-Both components are loaded via `Head.astro` and automatically enhance all diagrams on every page.
+Loaded via `Head.astro` and automatically enhances all D2 diagrams on every page.
 
 ## Features
 
@@ -21,12 +20,6 @@ Both components are loaded via `Head.astro` and automatically enhance all diagra
 
 ## How It Works
 
-### Mermaid Diagrams
-1. Detects all `svg[id^="mermaid-"]` elements
-2. Wraps them in a container with expand button
-3. Clones SVG into modal for interactive viewing
-
-### D2 Diagrams
 1. Detects all `img[src*="/d2/"]` elements
 2. Wraps them in a container with expand button
 3. Fetches SVG content and injects into modal for interactive viewing
@@ -121,21 +114,18 @@ Override styles in `custom.css`:
 
 ```css
 /* Change expand button position */
-.d2-expand-btn,
-.mermaid-expand-btn {
+.d2-expand-btn {
   top: 0.5rem;
   right: 0.5rem;
 }
 
 /* Change modal background */
-.d2-modal,
-.mermaid-modal {
+.d2-modal {
   background: rgba(0, 0, 0, 0.95);
 }
 
 /* Change wrapper background */
-.d2-diagram-wrapper,
-.mermaid-diagram-wrapper {
+.d2-diagram-wrapper {
   background: var(--sl-color-gray-6);
   padding: 1.5rem;
 }
