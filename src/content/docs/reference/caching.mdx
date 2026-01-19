@@ -156,7 +156,42 @@ Workers have a **128 MB memory limit**. `response.clone()` buffers the entire bo
 
 ### KV for global consistency
 
-For global replication with eventual consistency (up to 60s).
+KV provides global replication with eventual consistency (up to 60s). However, using KV as a cache means **building your own caching layer** - you're responsible for cache key generation, TTL management, invalidation, and purging.
+
+#### Cache API vs KV trade-offs
+
+| Aspect | Cache API | KV |
+|--------|-----------|-----|
+| **Consistency** | Per-colo (different colos may have different content) | Global (eventually consistent across all colos) |
+| **TTL management** | Automatic via `Cache-Control` headers | Manual via `expirationTtl` |
+| **Invalidation** | `cache.delete()` per-colo only | `KV.delete()` propagates globally |
+| **Purge tooling** | Built-in via Cloudflare dashboard/API | Roll your own or use [cache-kv-purger](https://github.com/erfianugrah/cache-kv-purger) |
+| **Value size limit** | 512 MB | 25 MB (chunking required for larger) |
+| **Cost** | Free | $0.50/M reads, $5.00/M writes |
+| **Tiered caching** | No | N/A (KV is not CDN cache) |
+
+#### When to use KV over Cache API
+
+- **Global cache coherence required** - All users should see the same cached content regardless of colo
+- **Programmatic invalidation** - Need to purge specific items globally (not just per-colo)
+- **Cross-Worker sharing** - Multiple Workers need to share cached data
+- **Metadata-driven purging** - Need to find and purge items by tags/metadata
+
+#### The hidden complexity
+
+KV caching requires building infrastructure that Cache API provides automatically:
+
+1. **Cache key generation** - Consistent keys across requests
+2. **TTL refresh** - Extending TTL on cache hits without rewriting the value
+3. **Purge mechanisms** - Finding and deleting related items
+4. **Chunking for large files** - Splitting files > 25 MB across multiple keys
+
+For production implementations, see:
+- [video-resizer](https://github.com/erfianugrah/video-resizer) - KV caching with chunking, TTL refresh, and cache versioning
+- [cache-kv-purger](https://github.com/erfianugrah/cache-kv-purger) - CLI for purging KV cache by tags/metadata
+- [Media Transformation Architecture](/reference/media-transformation-architecture/) - Complete architecture with manifest pattern
+
+#### Basic implementation
 
 ```typescript
 async function fetchWithKV(originUrl: string, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -166,9 +201,15 @@ async function fetchWithKV(originUrl: string, env: Env, ctx: ExecutionContext): 
   const { value, metadata } = await env.CACHE_KV.getWithMetadata<{
     contentType: string;
     status: number;
+    cachedAt: number;
   }>(cacheKey, 'arrayBuffer');
   
   if (value && metadata) {
+    // Optional: refresh TTL on hit without rewriting value
+    const age = Date.now() - metadata.cachedAt;
+    if (age > 1800000) { // 30 min
+      ctx.waitUntil(refreshTTL(env, cacheKey, metadata));
+    }
     return new Response(value, {
       status: metadata.status,
       headers: { 'Content-Type': metadata.contentType },
@@ -186,11 +227,11 @@ async function fetchWithKV(originUrl: string, env: Env, ctx: ExecutionContext): 
   const body = await response.arrayBuffer();
   const contentType = response.headers.get('Content-Type') || 'application/octet-stream';
   
-  // Use waitUntil for non-blocking write - critical for KV!
+  // Use waitUntil for non-blocking write
   ctx.waitUntil(
     env.CACHE_KV.put(cacheKey, body, { 
       expirationTtl: 3600,
-      metadata: { contentType, status: response.status },
+      metadata: { contentType, status: response.status, cachedAt: Date.now() },
     })
   );
   
@@ -199,14 +240,25 @@ async function fetchWithKV(originUrl: string, env: Env, ctx: ExecutionContext): 
     headers: { 'Content-Type': contentType },
   });
 }
+
+async function refreshTTL(env: Env, key: string, metadata: object): Promise<void> {
+  // KV doesn't support TTL refresh without rewriting - must read and write
+  const { value } = await env.CACHE_KV.getWithMetadata(key, 'arrayBuffer');
+  if (value) {
+    await env.CACHE_KV.put(key, value, {
+      expirationTtl: 3600,
+      metadata: { ...metadata, cachedAt: Date.now() },
+    });
+  }
+}
 ```
 
 <Aside type="tip" title="Always use waitUntil for KV writes">
 KV writes can take time to propagate. Using `ctx.waitUntil()` ensures the write completes without blocking the response. You can also import `waitUntil` directly from `cloudflare:workers` to avoid passing `ctx` through your code.
 </Aside>
 
-<Aside type="caution" title="Don't mix Cache API and KV">
-Choose one caching strategy per data type. Mixing them creates complexity and potential inconsistency.
+<Aside type="caution" title="KV is a commitment">
+Choosing KV over Cache API means taking on cache infrastructure responsibilities. For simple caching needs where per-colo consistency is acceptable, Cache API is significantly simpler.
 </Aside>
 
 ## Decision tree
