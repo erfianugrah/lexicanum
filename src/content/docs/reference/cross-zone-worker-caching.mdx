@@ -93,25 +93,36 @@ async function fetchWithCache(originUrl: string): Promise<Response> {
   const cache = caches.default;
   const cacheKey = new Request(originUrl, { method: 'GET' });
   
+  // Check cache first
   const cached = await cache.match(cacheKey);
   if (cached) {
-    const response = new Response(cached.body, cached);
-    response.headers.set('X-Cache', 'HIT');
-    return response;
+    return cached;
   }
   
+  // Fetch from origin
   const originResp = await fetch(originUrl);
+  
+  // Don't cache error responses
+  if (!originResp.ok) {
+    return originResp;
+  }
+  
+  // Prepare response for caching
   const headers = new Headers(originResp.headers);
-  headers.delete('Set-Cookie'); // Required - cache.put() rejects Set-Cookie
+  headers.delete('Set-Cookie'); // Cache API won't store responses with Set-Cookie
   
   if (!headers.has('Cache-Control')) {
     headers.set('Cache-Control', 'public, max-age=3600');
   }
   
-  const response = new Response(originResp.body, { status: originResp.status, headers });
-  response.headers.set('X-Cache', 'MISS');
+  const response = new Response(originResp.body, {
+    status: originResp.status,
+    headers,
+  });
   
-  await cache.put(cacheKey, response.clone());
+  // Store in cache (non-blocking)
+  // Note: cache.put() is best-effort, no need to await
+  cache.put(cacheKey, response.clone());
   
   return response;
 }
@@ -122,23 +133,45 @@ async function fetchWithCache(originUrl: string): Promise<Response> {
 Use KV when you need cached data replicated globally (eventual consistency, up to 60s).
 
 ```typescript
+interface CachedResponse {
+  body: string;  // Base64 encoded
+  contentType: string;
+  status: number;
+}
+
 async function fetchWithKV(originUrl: string, env: Env): Promise<Response> {
   const cacheKey = new URL(originUrl).pathname;
   
-  const cached = await env.CACHE_KV.get(cacheKey, 'arrayBuffer');
+  // Check KV first
+  const cached = await env.CACHE_KV.get<CachedResponse>(cacheKey, 'json');
   if (cached) {
-    return new Response(cached, {
-      headers: { 'X-Cache': 'HIT', 'Content-Type': 'application/octet-stream' }
+    return new Response(Uint8Array.from(atob(cached.body), c => c.charCodeAt(0)), {
+      status: cached.status,
+      headers: { 'Content-Type': cached.contentType },
     });
   }
   
+  // Fetch from origin
   const response = await fetch(originUrl);
-  const body = await response.arrayBuffer();
   
-  await env.CACHE_KV.put(cacheKey, body, { expirationTtl: 3600 });
+  if (!response.ok) {
+    return response;
+  }
+  
+  // Store in KV with metadata
+  const body = await response.arrayBuffer();
+  const toCache: CachedResponse = {
+    body: btoa(String.fromCharCode(...new Uint8Array(body))),
+    contentType: response.headers.get('Content-Type') || 'application/octet-stream',
+    status: response.status,
+  };
+  
+  // Non-blocking write
+  env.CACHE_KV.put(cacheKey, JSON.stringify(toCache), { expirationTtl: 3600 });
   
   return new Response(body, {
-    headers: { 'X-Cache': 'MISS', 'Content-Type': response.headers.get('Content-Type') || '' }
+    status: response.status,
+    headers: { 'Content-Type': toCache.contentType },
   });
 }
 ```
@@ -297,37 +330,36 @@ This works because:
 
 ### Origin-side caching
 
-Since `cf` options work within the same zone, origin Workers can fully control their own caching behavior:
+Origin Workers can cache upstream responses using `cf` options (within the same zone), and signal cacheability to downstream consumers via headers:
 
 ```typescript
-// Origin Worker - controls its own caching
+// Origin Worker - fetches from upstream API and caches at origin's edge
 export default {
   async fetch(request: Request): Promise<Response> {
-    const data = await getExpensiveData();
-    
-    // Fetch from upstream with cf options (same zone = works)
-    const upstream = await fetch('https://api.same-zone.com/data', {
+    // Fetch from upstream with cf options (same zone or non-CF = works)
+    const upstream = await fetch('https://api.example.com/data', {
       cf: {
         cacheTtl: 3600,
-        cacheEverything: true, // Required for JSON - not a default cacheable type
-        cacheTags: ['api-data', 'v1'],
+        cacheEverything: true, // Required - JSON is not cached by default
       },
     });
     
-    // Cache-Control header is for downstream consumers (router, browser)
-    // This doesn't cache at CDN level - Worker responses bypass CDN cache
-    return new Response(JSON.stringify(data), {
+    // Worker-generated responses bypass CDN cache
+    // Cache-Control tells downstream (router, browser) how long to cache
+    return new Response(upstream.body, {
+      status: upstream.status,
       headers: {
         'Content-Type': 'application/json',
         'Cache-Control': 'public, max-age=3600',
-        'Cache-Tag': 'api-response',
       },
     });
   },
 };
 ```
 
-**Important:** Worker-generated responses don't go through the CDN cache. The `Cache-Control` header here tells downstream consumers (like a router Worker using Cache API, or the browser) how long they can cache it.
+**Two levels of caching here:**
+1. **CDN cache** (via `cf` options) - caches the upstream API response at this zone's edge
+2. **Downstream cache** (via `Cache-Control` header) - tells the calling Worker/browser how long to cache this response
 
 For details on how `Cache-Control` headers interact with Cloudflare, see [Origin Cache Control](https://developers.cloudflare.com/cache/concepts/cache-control/).
 
