@@ -1,0 +1,286 @@
+---
+title: "Caching with Cloudflare Workers: When to Use What"
+description: Which caching mechanism to use when Workers fetch from different origin types, and architectural patterns for multi-Worker systems
+author: Erfi Anugrah
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+How caching behaves when a Cloudflare Worker makes `fetch()` requests to origins proxied through Cloudflare (orange-clouded) on different zones.
+
+**Key insight:** The `cf` caching options (`cacheTtl`, `cacheEverything`, `cacheTtlByStatus`) are ignored for all cross-zone orange-clouded origins. Transformation options like `cf.image` still work.
+
+## Why this happens
+
+From [How the Cache works](https://developers.cloudflare.com/workers/reference/how-the-cache-works/#fetch):
+
+> "First, `fetch` checks to see if the URL matches a different zone. If it does, it reads through that zone's cache (or Worker). Otherwise, it reads through its own zone's cache, even if the URL is for a non-Cloudflare site."
+
+This means requests to cross-zone orange-clouded origins are routed to that zone's edge, not your zone's cache.
+
+From [Cache using fetch](https://developers.cloudflare.com/workers/examples/cache-using-fetch/):
+
+> "Workers operating on behalf of different zones cannot affect each other's cache. You can only override cache keys when making requests within your own zone... or requests to hosts that are not on Cloudflare. When making a request to another Cloudflare zone (for example, belonging to a different Cloudflare customer), that zone fully controls how its own content is cached within Cloudflare; you cannot override it."
+
+This is an intentional security boundary - one zone cannot manipulate another zone's cache behavior.
+
+## cf options compatibility
+
+| cf Option | Non-CF / Same Zone | Cross-Zone |
+|-----------|-------------------|------------|
+| `cacheTtl`, `cacheEverything`, `cacheTtlByStatus` | Yes | **No** |
+| `image` | Yes | **Yes** |
+| `polish`, `minify`, `mirage` | Yes | **No** (uses origin zone) |
+
+## Workarounds
+
+### Cache API
+
+The Cache API stores responses in the calling Worker's zone cache, bypassing cross-zone restrictions entirely.
+
+```typescript
+async function fetchWithCache(originUrl: string): Promise<Response> {
+  const cache = caches.default;
+  const cacheKey = new Request(originUrl, { method: 'GET' });
+  
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    const response = new Response(cached.body, cached);
+    response.headers.set('X-Cache', 'HIT');
+    return response;
+  }
+  
+  const originResp = await fetch(originUrl);
+  const headers = new Headers(originResp.headers);
+  headers.delete('Set-Cookie'); // Required - cache.put() rejects Set-Cookie
+  
+  if (!headers.has('Cache-Control')) {
+    headers.set('Cache-Control', 'public, max-age=3600');
+  }
+  
+  const response = new Response(originResp.body, { status: originResp.status, headers });
+  response.headers.set('X-Cache', 'MISS');
+  
+  await cache.put(cacheKey, response.clone());
+  
+  return response;
+}
+```
+
+### KV for global consistency
+
+Use KV when you need cached data replicated globally (eventual consistency, up to 60s).
+
+```typescript
+async function fetchWithKV(originUrl: string, env: Env): Promise<Response> {
+  const cacheKey = new URL(originUrl).pathname;
+  
+  const cached = await env.CACHE_KV.get(cacheKey, 'arrayBuffer');
+  if (cached) {
+    return new Response(cached, {
+      headers: { 'X-Cache': 'HIT', 'Content-Type': 'application/octet-stream' }
+    });
+  }
+  
+  const response = await fetch(originUrl);
+  const body = await response.arrayBuffer();
+  
+  await env.CACHE_KV.put(cacheKey, body, { expirationTtl: 3600 });
+  
+  return new Response(body, {
+    headers: { 'X-Cache': 'MISS', 'Content-Type': response.headers.get('Content-Type') || '' }
+  });
+}
+```
+
+<Aside type="caution" title="Don't mix Cache API and KV">
+Choose one caching strategy per data type. Mixing them creates complexity and potential inconsistency.
+</Aside>
+
+## Decision tree
+
+When to use which caching approach:
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'arial, sans-serif', 'lineColor': '#64748b' }, 'flowchart': { 'wrappingWidth': 200 }}}%%
+flowchart TD
+    Start(["`**Need to cache responses?**`"]) --> OriginType
+
+    OriginType{"`**What is the origin type?**`"}
+    OriginType -- Non-CF origin --> FetchCF
+    OriginType -- Same zone --> FetchCF
+    OriginType -- Cross-zone orange-clouded --> CrossZone
+
+    FetchCF["`**fetch with cf options**
+    cacheTtl, cacheEverything,
+    cacheTtlByStatus all work`"]
+
+    CrossZone{"`**Need global consistency?**`"}
+    CrossZone -- No, per-colo OK --> CacheAPI
+    CrossZone -- Yes, global --> Writes
+
+    CacheAPI["`**Cache API**
+    Fast, free, per data center
+    No tiered caching support`"]
+
+    Writes{"`**Concurrent writes?**`"}
+    Writes -- No or rare --> KV["`**KV**
+    Global replication
+    Eventual consistency up to 60s
+    Last-write-wins`"]
+    Writes -- Yes, need coordination --> DO["`**Durable Objects + KV**
+    DO coordinates writes
+    KV for read distribution`"]
+
+    classDef decision fill:#fbbf24,stroke:#b45309,color:#1c1917
+    classDef cfOptions fill:#4ade80,stroke:#15803d,color:#1c1917
+    classDef cacheApi fill:#60a5fa,stroke:#1d4ed8,color:#1c1917
+    classDef kvStorage fill:#c084fc,stroke:#7c3aed,color:#1c1917
+    classDef doStorage fill:#fb923c,stroke:#ea580c,color:#1c1917
+    classDef startEnd fill:#94a3b8,stroke:#475569,color:#1c1917
+
+    class Start startEnd
+    class OriginType,CrossZone,Writes decision
+    class FetchCF cfOptions
+    class CacheAPI cacheApi
+    class KV kvStorage
+    class DO doStorage
+```
+
+| Option | Use when | Latency | Consistency | Notes |
+|--------|----------|---------|-------------|-------|
+| `fetch()` + `cf` | Non-CF or same zone | ~0ms | Per-colo | [Docs](https://developers.cloudflare.com/workers/examples/cache-using-fetch/) |
+| Cache API | Cross-zone, per-colo OK | ~0ms | Per-colo | [No tiered caching](https://developers.cloudflare.com/workers/runtime-apis/cache/) |
+| KV | Cross-zone, global | ~0ms cached | Eventual 60s | [Docs](https://developers.cloudflare.com/kv/concepts/how-kv-works/) |
+
+<Aside type="note" title="Coordinating KV writes">
+KV uses last-write-wins semantics. Use [Durable Objects](https://developers.cloudflare.com/durable-objects/) to coordinate writes and prevent race conditions.
+</Aside>
+
+## Microservices architecture
+
+In multi-Worker systems (router → origin services), there are two caching approaches:
+
+### Centralized caching (router handles all)
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'arial, sans-serif', 'lineColor': '#64748b', 'primaryTextColor': '#1e293b', 'secondaryTextColor': '#1e293b', 'tertiaryTextColor': '#1e293b' }}}%%
+flowchart TD
+    Client([Client]) --> Router[Router Worker<br/>Handles caching]
+    Router <--> Cache[(Cache Layer)]
+    Cache -.->|miss| Origins
+    subgraph Origins
+        OriginA[Origin A]
+        OriginB[Origin B]
+        OriginC[Origin C]
+    end
+
+    classDef client fill:#94a3b8,stroke:#475569,color:#1c1917
+    classDef router fill:#60a5fa,stroke:#1d4ed8,color:#1c1917
+    classDef cache fill:#c084fc,stroke:#7c3aed,color:#1c1917
+    classDef origin fill:#cbd5e1,stroke:#64748b,color:#1c1917
+
+    class Client client
+    class Router router
+    class Cache cache
+    class OriginA,OriginB,OriginC origin
+```
+
+**Which caching mechanism to use in the router:**
+
+| Origin Type | Caching Mechanism | Why |
+|-------------|-------------------|-----|
+| Grey-clouded (DNS only) | `fetch()` with `cf` options | Not proxied through CF, so `cf` options work |
+| Orange-clouded (same zone) | `fetch()` with `cf` options | Same zone, `cf` options work |
+| Orange-clouded (cross-zone) | Cache API or KV | `cf` options ignored, must cache explicitly |
+
+| Pros | Cons |
+|------|------|
+| Single cache management point | Router becomes bottleneck |
+| Consistent behavior | Extra hop latency |
+| Easier debugging | Tight coupling to origins |
+| Centralized circuit breakers | Router must know all origin semantics |
+
+### Distributed caching (origins decide)
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'arial, sans-serif', 'lineColor': '#64748b', 'primaryTextColor': '#1e293b', 'secondaryTextColor': '#1e293b', 'tertiaryTextColor': '#1e293b' }}}%%
+flowchart TD
+    Client([Client]) --> Router[Router Worker<br/>Routing only]
+    Router --> OriginA[Origin A<br/>max-age=3600]
+    Router --> OriginB[Origin B<br/>no-store]
+    Router --> OriginC[Origin C<br/>max-age=60]
+    
+    OriginA -.-> CacheA[(Cache)]
+    OriginC -.-> CacheC[(Cache)]
+
+    classDef client fill:#94a3b8,stroke:#475569,color:#1c1917
+    classDef router fill:#4ade80,stroke:#15803d,color:#1c1917
+    classDef origin fill:#60a5fa,stroke:#1d4ed8,color:#1c1917
+    classDef cache fill:#c084fc,stroke:#7c3aed,color:#1c1917
+
+    class Client client
+    class Router router
+    class OriginA,OriginB,OriginC origin
+    class CacheA,CacheC cache
+```
+
+| Pros | Cons |
+|------|------|
+| Each service owns its strategy | Inconsistent behavior |
+| No single point of failure | Harder to debug system-wide |
+| Independent deployments | Complex invalidation |
+| Better separation of concerns | Duplicate logic |
+
+### Recommendation
+
+**Prefer distributed caching for cross-zone Worker architectures:**
+
+1. **Router stays stateless** - routing logic only
+2. **Origins control their own caching** - using `cf` options, Cache Rules, or `Cache-Control` headers
+3. **If edge caching needed**, router uses Cache API (since `cf` options are ignored anyway)
+
+This works because:
+- `cf` caching options are ignored for cross-zone origins anyway
+- Origins understand their own caching needs
+- Simpler router = fewer failure modes
+
+### Origin-side caching
+
+Since `cf` options work within the same zone, origin Workers can fully control their own caching behavior:
+
+```typescript
+// Origin Worker - controls its own caching
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const data = await getExpensiveData();
+    
+    // Fetch from upstream with cf options (same zone = works)
+    const upstream = await fetch('https://api.same-zone.com/data', {
+      cf: {
+        cacheTtl: 3600,
+        cacheEverything: true,
+        cacheTags: ['api-data', 'v1'],
+      },
+    });
+    
+    // Set Cache-Control for downstream consumers
+    return new Response(JSON.stringify(data), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'public, max-age=3600',
+        'Cache-Tag': 'api-response',
+      },
+    });
+  },
+};
+```
+
+Origins can also use [Cache Rules](https://developers.cloudflare.com/cache/how-to/cache-rules/) at the zone level for declarative caching without code changes.
+
+<Aside type="tip" title="When to centralize">
+Use centralized caching when you need:
+- Consistent cache invalidation across services
+- Single audit point for cached data
+- Rate limiting or circuit breakers at the edge
+</Aside>
