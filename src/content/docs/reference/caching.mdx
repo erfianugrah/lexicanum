@@ -90,12 +90,16 @@ This means if you want caching, the **origin zone** must configure it via:
 
 ### Cache API
 
-Stores responses in the calling Worker's zone cache, bypassing cross-zone restrictions.
+The Cache API works for cross-zone fetches because **you explicitly store fetched responses in the local data center's cache** after the fetch completes. The cross-zone fetch still occurs on a cache miss, but once cached, subsequent requests in that colo are served from the local cache.
+
+<Aside type="caution" title="Cache API is per-colo">
+Cache API stores data in the data center handling the request. The same URL may have different cached content in different data centers. It does NOT "bypass cross-zone restrictions" - it simply stores the response locally after fetching.
+</Aside>
 
 **TTL control:** To honor origin's TTL, preserve the `Cache-Control` header. To override, set your own.
 
 ```typescript
-async function fetchWithCache(request: Request, originUrl: string): Promise<Response> {
+async function fetchWithCache(request: Request, originUrl: string, ctx: ExecutionContext): Promise<Response> {
   const cache = caches.default;
   const cacheKey = new Request(originUrl, { method: 'GET' });
   
@@ -139,20 +143,23 @@ async function fetchWithCache(request: Request, originUrl: string): Promise<Resp
     headers,
   });
   
-  // Store in cache (non-blocking)
-  // Note: cache.put() is best-effort, no need to await
-  cache.put(cacheKey, response.clone());
+  // Store in cache using waitUntil (non-blocking, doesn't delay response)
+  ctx.waitUntil(cache.put(cacheKey, response.clone()));
   
   return response;
 }
 ```
+
+<Aside type="caution" title="Memory limits with clone()">
+Workers have a **128 MB memory limit**. `response.clone()` buffers the entire body into memory. For large responses, use `body.tee()` instead to stream without full buffering. See [Memory limits](#memory-limits-and-cloning) below.
+</Aside>
 
 ### KV for global consistency
 
 For global replication with eventual consistency (up to 60s).
 
 ```typescript
-async function fetchWithKV(originUrl: string, env: Env): Promise<Response> {
+async function fetchWithKV(originUrl: string, env: Env, ctx: ExecutionContext): Promise<Response> {
   const cacheKey = new URL(originUrl).pathname;
   
   // Check KV first - store body as arrayBuffer, metadata separately
@@ -179,11 +186,13 @@ async function fetchWithKV(originUrl: string, env: Env): Promise<Response> {
   const body = await response.arrayBuffer();
   const contentType = response.headers.get('Content-Type') || 'application/octet-stream';
   
-  // Non-blocking write
-  env.CACHE_KV.put(cacheKey, body, { 
-    expirationTtl: 3600,
-    metadata: { contentType, status: response.status },
-  });
+  // Use waitUntil for non-blocking write - critical for KV!
+  ctx.waitUntil(
+    env.CACHE_KV.put(cacheKey, body, { 
+      expirationTtl: 3600,
+      metadata: { contentType, status: response.status },
+    })
+  );
   
   return new Response(body, {
     status: response.status,
@@ -191,6 +200,10 @@ async function fetchWithKV(originUrl: string, env: Env): Promise<Response> {
   });
 }
 ```
+
+<Aside type="tip" title="Always use waitUntil for KV writes">
+KV writes can take time to propagate. Using `ctx.waitUntil()` ensures the write completes without blocking the response. You can also import `waitUntil` directly from `cloudflare:workers` to avoid passing `ctx` through your code.
+</Aside>
 
 <Aside type="caution" title="Don't mix Cache API and KV">
 Choose one caching strategy per data type. Mixing them creates complexity and potential inconsistency.
@@ -200,60 +213,83 @@ Choose one caching strategy per data type. Mixing them creates complexity and po
 
 When to use which caching approach:
 
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'arial, sans-serif', 'lineColor': '#64748b' }, 'flowchart': { 'wrappingWidth': 200 }}}%%
-flowchart TD
-    Start(["`**Need to cache responses?**`"]) --> OriginType
-
-    OriginType{"`**What is the origin type?**`"}
-    OriginType -- Non-CF origin --> FetchCF
-    OriginType -- Same zone --> FetchCF
-    OriginType -- Cross-zone orange-clouded --> CrossZone
-
-    FetchCF["`**fetch with cf options**
-    cacheTtl, cacheEverything,
-    cacheTtlByStatus all work`"]
-
-    CrossZone{"`**Need global consistency?**`"}
-    CrossZone -- No, per-colo OK --> CacheAPI
-    CrossZone -- Yes, global --> Writes
-
-    CacheAPI["`**Cache API**
-    Fast, free, per data center
-    No tiered caching support`"]
-
-    Writes{"`**Concurrent writes?**`"}
-    Writes -- No or rare --> KV["`**KV**
-    Global replication
-    Eventual consistency up to 60s
-    Last-write-wins`"]
-    Writes -- Yes, need coordination --> DO["`**Durable Objects + KV**
-    DO coordinates writes
-    KV for read distribution`"]
-
-    classDef decision fill:#fbbf24,stroke:#b45309,color:#1c1917
-    classDef cfOptions fill:#4ade80,stroke:#15803d,color:#1c1917
-    classDef cacheApi fill:#60a5fa,stroke:#1d4ed8,color:#1c1917
-    classDef kvStorage fill:#c084fc,stroke:#7c3aed,color:#1c1917
-    classDef doStorage fill:#fb923c,stroke:#ea580c,color:#1c1917
-    classDef startEnd fill:#94a3b8,stroke:#475569,color:#1c1917
-
-    class Start startEnd
-    class OriginType,CrossZone,Writes decision
-    class FetchCF cfOptions
-    class CacheAPI cacheApi
-    class KV kvStorage
-    class DO doStorage
+```
+What's the origin type?
+│
+├─► Non-CF origin ──────────► fetch() with cf options
+│                              • cacheTtl
+├─► Same zone ─────────────►   • cacheEverything
+│                              • cacheTtlByStatus
+│
+└─► Cross-zone (orange-clouded)
+    │
+    └─► cf options are IGNORED, choose:
+        │
+        ├─► Per-colo OK? ────► Cache API
+        │                      • Fast, free
+        │                      • No tiered caching
+        │                      • Different colos = different caches
+        │
+        └─► Need global? ────► KV
+                               • Eventual consistency (~60s)
+                               • 25 MB value limit
+                               │
+                               └─► Concurrent writes? ──► Add Durable Objects
+                                                          • DO coordinates writes
+                                                          • KV for read distribution
 ```
 
 | Option | Use when | Latency | Consistency | Notes |
 |--------|----------|---------|-------------|-------|
 | `fetch()` + `cf` | Non-CF or same zone | ~0ms | Per-colo | [Docs](https://developers.cloudflare.com/workers/examples/cache-using-fetch/) |
 | Cache API | Cross-zone, per-colo OK | ~0ms | Per-colo | [No tiered caching](https://developers.cloudflare.com/workers/runtime-apis/cache/) |
-| KV | Cross-zone, global | ~0ms cached | Eventual 60s | [Docs](https://developers.cloudflare.com/kv/concepts/how-kv-works/) |
+| KV | Cross-zone, global needed | ~0ms cached | Eventual 60s | [Docs](https://developers.cloudflare.com/kv/concepts/how-kv-works/) |
+| DO + KV | Concurrent writes | ~20-50ms | Strong (per-object) | [Docs](https://developers.cloudflare.com/durable-objects/) |
 
 <Aside type="note" title="Coordinating KV writes">
 KV uses last-write-wins semantics. Use [Durable Objects](https://developers.cloudflare.com/durable-objects/) to coordinate writes and prevent race conditions.
+</Aside>
+
+## Memory limits and cloning
+
+Workers have a **128 MB memory limit per isolate**. When using `response.clone()` for caching, the entire response body is buffered into memory. For large responses, this can exceed the limit and cause the Worker to fail.
+
+### Best practices
+
+1. **Avoid cloning large responses** - If the response exceeds ~50 MB, consider whether caching is appropriate
+2. **Use streaming with `tee()`** - `ReadableStream.tee()` creates two streams from one without full buffering
+3. **KV has a 25 MB value limit** - Large responses won't fit in KV anyway
+
+```typescript
+// For large responses, use tee() instead of clone()
+async function fetchLargeWithCache(originUrl: string, ctx: ExecutionContext): Promise<Response> {
+  const cache = caches.default;
+  const cacheKey = new Request(originUrl, { method: 'GET' });
+  
+  const cached = await cache.match(cacheKey);
+  if (cached) return cached;
+  
+  const originResp = await fetch(originUrl);
+  if (!originResp.ok || !originResp.body) return originResp;
+  
+  // tee() creates two streams from one - avoids buffering entire body
+  const [stream1, stream2] = originResp.body.tee();
+  
+  const headers = new Headers(originResp.headers);
+  headers.delete('Set-Cookie');
+  if (!headers.has('Cache-Control')) {
+    headers.set('Cache-Control', 'public, max-age=3600');
+  }
+  
+  const responseToCache = new Response(stream1, { status: originResp.status, headers });
+  ctx.waitUntil(cache.put(cacheKey, responseToCache));
+  
+  return new Response(stream2, { status: originResp.status, headers });
+}
+```
+
+<Aside type="caution" title="tee() still buffers under load">
+While `tee()` avoids immediate full buffering, if one stream is consumed faster than the other, the slower stream's data will be buffered. For very large responses with slow consumers, consider whether caching is the right approach.
 </Aside>
 
 ## Microservices architecture
@@ -262,27 +298,25 @@ In multi-Worker systems (router → origin services), there are two caching appr
 
 ### Centralized caching (router handles all)
 
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'arial, sans-serif', 'lineColor': '#64748b', 'primaryTextColor': '#1e293b', 'secondaryTextColor': '#1e293b', 'tertiaryTextColor': '#1e293b' }}}%%
-flowchart TD
-    Client([Client]) --> Router[Router Worker<br/>Handles caching]
-    Router <--> Cache[(Cache Layer)]
-    Cache -.->|miss| Origins
-    subgraph Origins
-        OriginA[Origin A]
-        OriginB[Origin B]
-        OriginC[Origin C]
-    end
-
-    classDef client fill:#94a3b8,stroke:#475569,color:#1c1917
-    classDef router fill:#60a5fa,stroke:#1d4ed8,color:#1c1917
-    classDef cache fill:#c084fc,stroke:#7c3aed,color:#1c1917
-    classDef origin fill:#cbd5e1,stroke:#64748b,color:#1c1917
-
-    class Client client
-    class Router router
-    class Cache cache
-    class OriginA,OriginB,OriginC origin
+```
+Client
+  │
+  ▼
+┌─────────────────────────┐
+│  Router Worker          │
+│  (handles all caching)  │
+└────────────┬────────────┘
+             │
+       ┌─────┴─────┐
+       ▼           │
+   [Cache]         │ hit
+       │           │
+  miss │           │
+       ▼           │
+   ┌───────┐       │
+   │Origins│───────┘
+   │ A B C │
+   └───────┘
 ```
 
 **Which caching mechanism to use in the router:**
@@ -302,26 +336,23 @@ flowchart TD
 
 ### Distributed caching (origins decide)
 
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': { 'fontFamily': 'arial, sans-serif', 'lineColor': '#64748b', 'primaryTextColor': '#1e293b', 'secondaryTextColor': '#1e293b', 'tertiaryTextColor': '#1e293b' }}}%%
-flowchart TD
-    Client([Client]) --> Router[Router Worker<br/>Routing only]
-    Router --> OriginA[Origin A<br/>cacheTtl: 3600]
-    Router --> OriginB[Origin B<br/>no caching]
-    Router --> OriginC[Origin C<br/>cacheTtl: 60]
-    
-    OriginA -.-> CacheA[(Cache)]
-    OriginC -.-> CacheC[(Cache)]
-
-    classDef client fill:#94a3b8,stroke:#475569,color:#1c1917
-    classDef router fill:#4ade80,stroke:#15803d,color:#1c1917
-    classDef origin fill:#60a5fa,stroke:#1d4ed8,color:#1c1917
-    classDef cache fill:#c084fc,stroke:#7c3aed,color:#1c1917
-
-    class Client client
-    class Router router
-    class OriginA,OriginB,OriginC origin
-    class CacheA,CacheC cache
+```
+Client
+  │
+  ▼
+┌───────────────────────┐
+│  Router Worker        │
+│  (routing only)       │
+└───────────┬───────────┘
+            │
+    ┌───────┼───────┐
+    ▼       ▼       ▼
+ Origin   Origin   Origin
+   A        B        C
+   │                 │
+   ▼                 ▼
+[Cache]           [Cache]
+ttl:3600          ttl:60
 ```
 
 | Pros | Cons |
