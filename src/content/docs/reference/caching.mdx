@@ -526,6 +526,277 @@ For production implementations of all patterns, see:
 Choosing KV means building and maintaining cache infrastructure. Start with Cache API unless you specifically need global consistency.
 </Aside>
 
+### Content-addressable storage with instant invalidation
+
+KV's [eventual consistency](https://developers.cloudflare.com/kv/concepts/how-kv-works/#consistency) (up to 60 seconds) makes cache invalidation challenging. Content-addressable storage sidesteps this: instead of updating content at existing keys, write new content to new keys (derived from content hashes) and update a version pointer.
+
+This is how [Workers Static Assets](https://developers.cloudflare.com/workers/static-assets/) works internally - assets are stored by content hash in KV, and a manifest maps paths to hashes. The manifest is deployed atomically with the Worker, so there's no propagation delay.
+
+For centralized KV stores where you can't redeploy Workers on every content change, use a Durable Object as the version pointer with Cache API to stay under the [1000 RPS limit](https://developers.cloudflare.com/durable-objects/platform/limits/).
+
+```d2
+direction: down
+
+title: Content-Addressable KV with DO Version Pointer {
+  shape: text
+  near: top-center
+}
+
+read-path: Read Path {
+  worker: Worker
+  cache-api: Cache API\n(5-10s TTL) {
+    shape: cylinder
+  }
+  do: Durable Object\n(version pointer) {
+    shape: hexagon
+  }
+  memory: In-Memory\n(per-isolate)
+  kv-manifest: KV\nmanifest:v43 {
+    shape: cylinder
+  }
+  kv-content: KV\ncontent:{hash} {
+    shape: cylinder
+  }
+
+  worker -> cache-api: 1. get version
+  cache-api -> do: miss
+  do -> cache-api: "v43"
+  worker -> memory: 2. get manifest
+  memory -> kv-manifest: miss/stale
+  worker -> kv-content: 3. get content
+}
+
+write-path: Write Path {
+  publisher: Publisher
+  kv-content-w: KV\ncontent:{hash} {
+    shape: cylinder
+  }
+  kv-manifest-w: KV\nmanifest:v44 {
+    shape: cylinder
+  }
+  do-w: Durable Object {
+    shape: hexagon
+  }
+
+  publisher -> kv-content-w: 1. write content
+  publisher -> kv-manifest-w: 2. write manifest
+  publisher -> do-w: 3. wait ~5s, flip version
+}
+```
+
+| Layer | Strategy | Why |
+|-------|----------|-----|
+| Version pointer | DO + Cache API (5-10s TTL) | Strong consistency, cached to stay under 1000 RPS |
+| Manifest | KV with versioned key + in-memory | Immutable per version, safe to cache forever |
+| Content | KV with content-hash key | Immutable, deduplicated, 1 year cache |
+
+**RPS math:** With Cache API caching the version for 5 seconds across ~300 colos, you get ~60 RPS to the DO - well under the 1000 limit.
+
+<details>
+<summary>**Durable Object** - Version pointer only</summary>
+
+```typescript
+import { DurableObject } from 'cloudflare:workers';
+
+export class ManifestVersion extends DurableObject {
+  private version: string | undefined;
+
+  async getVersion(): Promise<string> {
+    if (this.version === undefined) {
+      this.version = (await this.ctx.storage.get<string>('version')) ?? 'v0';
+    }
+    return this.version;
+  }
+
+  async setVersion(newVersion: string): Promise<string> {
+    this.version = newVersion;
+    await this.ctx.storage.put('version', newVersion);
+    return this.version;
+  }
+}
+```
+</details>
+
+<details>
+<summary>**Reader Worker** - Cache version in Cache API, manifest in memory</summary>
+
+```typescript
+interface Manifest {
+  assets: Record<string, string>;  // path -> content hash
+  createdAt: number;
+}
+
+interface Env {
+  MANIFEST_VERSION: DurableObjectNamespace<ManifestVersion>;
+  CACHE_KV: KVNamespace;
+}
+
+// Per-isolate cache (survives across requests in same isolate)
+let manifestCache: { version: string; data: Manifest } | null = null;
+
+async function getCurrentVersion(env: Env, ctx: ExecutionContext): Promise<string> {
+  const cache = caches.default;
+  const cacheKey = new Request('https://internal/manifest-version');
+
+  // Check Cache API (per-colo, short TTL)
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    return await cached.text();
+  }
+
+  // Miss - fetch from DO (strong consistency)
+  const stub = env.MANIFEST_VERSION.getByName('global');
+  const version = await stub.getVersion();
+
+  // Cache for 5s - balances freshness vs DO RPS
+  ctx.waitUntil(
+    cache.put(cacheKey, new Response(version, {
+      headers: { 'Cache-Control': 'max-age=5' }
+    }))
+  );
+
+  return version;
+}
+
+async function getManifest(env: Env, ctx: ExecutionContext): Promise<Manifest> {
+  const version = await getCurrentVersion(env, ctx);
+
+  // Check per-isolate cache (fastest)
+  if (manifestCache?.version === version) {
+    return manifestCache.data;
+  }
+
+  // Fetch from KV (versioned key = immutable, cache 1 year)
+  const manifest = await env.CACHE_KV.get<Manifest>(`manifest:${version}`, {
+    type: 'json',
+    cacheTtl: 31536000,
+  });
+
+  if (!manifest) {
+    throw new Error(`Manifest ${version} not found`);
+  }
+
+  manifestCache = { version, data: manifest };
+  return manifest;
+}
+
+async function getAsset(
+  path: string,
+  env: Env,
+  ctx: ExecutionContext
+): Promise<{ body: ArrayBuffer; contentType: string } | null> {
+  const manifest = await getManifest(env, ctx);
+  const contentHash = manifest.assets[path];
+
+  if (!contentHash) return null;
+
+  // Content-addressed = immutable, cache 1 year
+  const { value, metadata } = await env.CACHE_KV.getWithMetadata<{ contentType: string }>(
+    `content:${contentHash}`,
+    { type: 'arrayBuffer', cacheTtl: 31536000 }
+  );
+
+  if (!value) return null;
+
+  return {
+    body: value,
+    contentType: metadata?.contentType ?? 'application/octet-stream'
+  };
+}
+```
+</details>
+
+<details>
+<summary>**Publisher** - Write content, then manifest, then flip version</summary>
+
+```typescript
+async function publish(
+  assets: Map<string, { content: ArrayBuffer; contentType: string }>,
+  env: Env
+): Promise<string> {
+  const newVersion = `v${Date.now()}`;
+  const manifest: Manifest = { assets: {}, createdAt: Date.now() };
+
+  // 1. Hash all content and build manifest
+  const hashes = await Promise.all(
+    [...assets.entries()].map(async ([path, { content }]) => ({
+      path,
+      hash: await sha256(content),
+    }))
+  );
+
+  for (const { path, hash } of hashes) {
+    manifest.assets[path] = hash;
+  }
+
+  // 2. Check which content already exists (deduplication)
+  const existenceChecks = await Promise.all(
+    hashes.map(async ({ hash }) => ({
+      hash,
+      exists: (await env.CACHE_KV.get(`content:${hash}`, { type: 'arrayBuffer' })) !== null,
+    }))
+  );
+
+  const newHashes = new Set(
+    existenceChecks.filter(({ exists }) => !exists).map(({ hash }) => hash)
+  );
+
+  // 3. Write new content and manifest in parallel
+  const writes: Promise<void>[] = [];
+
+  for (const [path, { content, contentType }] of assets) {
+    const hash = manifest.assets[path];
+    if (newHashes.has(hash)) {
+      writes.push(
+        env.CACHE_KV.put(`content:${hash}`, content, {
+          metadata: { contentType },
+          expirationTtl: 86400 * 30,
+        })
+      );
+    }
+  }
+
+  writes.push(
+    env.CACHE_KV.put(`manifest:${newVersion}`, JSON.stringify(manifest), {
+      expirationTtl: 86400 * 30,
+    })
+  );
+
+  await Promise.all(writes);
+
+  // 4. Wait for KV propagation before flipping version
+  await new Promise(r => setTimeout(r, 5000));
+
+  // 5. Flip version pointer (instant, strongly consistent)
+  const stub = env.MANIFEST_VERSION.getByName('global');
+  await stub.setVersion(newVersion);
+
+  return newVersion;
+}
+
+async function sha256(data: ArrayBuffer): Promise<string> {
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return [...new Uint8Array(hash)]
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+```
+</details>
+
+**Consistency guarantees:**
+
+| Event | Latency |
+|-------|---------|
+| Version flipped in DO | Instant (strongly consistent) |
+| Worker sees new version | ≤5-10s (Cache API TTL) |
+| Worker reads new manifest/content | Instant (versioned/hashed keys are immutable) |
+
+**Effective end-to-end latency:** 5-10 seconds after publish completes. The 5s wait ensures KV has propagated the new manifest before the DO points to it.
+
+<Aside type="tip" title="Garbage collection">
+Old manifests and orphaned content hashes will accumulate. Set `expirationTtl` on all writes so old versions auto-expire, or implement active cleanup by tracking version history in the DO.
+</Aside>
+
 ---
 
 ## Microservices architecture
