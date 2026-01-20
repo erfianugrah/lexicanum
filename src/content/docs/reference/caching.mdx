@@ -521,69 +521,88 @@ For production implementations of all patterns, see:
 - [Media Transformation Architecture](/reference/media-transformation-architecture/) - Detailed documentation
 - [cache-kv-purger](https://github.com/erfianugrah/cache-kv-purger) - CLI for purging by tags/metadata
 
-<Aside type="caution" title="KV is a commitment">
-Choosing KV means building and maintaining cache infrastructure. Start with Cache API unless you specifically need global consistency.
-</Aside>
-
-### Content-addressable storage with instant invalidation
+#### Content-addressable storage with instant invalidation
 
 KV's [eventual consistency](https://developers.cloudflare.com/kv/concepts/how-kv-works/#consistency) (up to 60 seconds) makes cache invalidation challenging. Content-addressable storage sidesteps this: instead of updating content at existing keys, write new content to new keys (derived from content hashes) and update a version pointer.
+
+**Why this works:** The key insight is that content-addressed keys are *immutable* - the same hash always returns the same content. You never update a key; you write to a new one. This means:
+
+- **No stale reads** - if a key exists, its content is correct by definition
+- **No invalidation needed** - old keys simply become orphaned, not stale
+- **Eventual consistency becomes irrelevant** - you're not waiting for updates to propagate, you're waiting for new keys to appear (and the version pointer tells you when they're ready)
 
 This is how [Workers Static Assets](https://developers.cloudflare.com/workers/static-assets/) works internally - assets are stored by content hash in KV, and a manifest maps paths to hashes. The manifest is deployed atomically with the Worker, so there's no propagation delay.
 
 For centralized KV stores where you can't redeploy Workers on every content change, use a Durable Object as the version pointer with Cache API to stay under the [1000 RPS limit](https://developers.cloudflare.com/durable-objects/platform/limits/).
 
-#### Architecture
+**Trade-off:** You're trading storage space for consistency. Old content accumulates until TTL expiration or explicit cleanup.
+
+##### Read and write flows
+
+**Read flow:** Worker looks up the current version, then fetches the manifest for that version, then fetches content by hash.
 
 ```d2
-direction: down
+direction: right
 
-title: Content-Addressable KV with DO Version Pointer {
-  shape: text
-  near: top-center
+request: Request {
+  shape: person
 }
 
-read-path: Read Path {
-  worker: Worker
-  cache-api: Cache API\n(5-10s TTL) {
-    shape: cylinder
-  }
-  do: Durable Object\n(version pointer) {
-    shape: hexagon
-  }
-  memory: In-Memory\n(per-isolate)
-  kv-manifest: KV\nmanifest:v43 {
-    shape: cylinder
-  }
-  kv-content: KV\ncontent:{hash} {
-    shape: cylinder
-  }
+worker: Worker
 
-  worker -> cache-api: 1. get version
-  cache-api -> do: miss
-  do -> cache-api: "v43"
-  worker -> memory: 2. get manifest
-  memory -> kv-manifest: miss/stale
-  worker -> kv-content: 3. get content
+version-cache: Cache API\n(5s TTL) {
+  shape: cylinder
 }
 
-write-path: Write Path {
-  publisher: Publisher
-  kv-content-w: KV\ncontent:{hash} {
-    shape: cylinder
-  }
-  kv-manifest-w: KV\nmanifest:v44 {
-    shape: cylinder
-  }
-  do-w: Durable Object {
-    shape: hexagon
-  }
+do: Durable Object\nversion = v43 {
+  shape: hexagon
+}
 
-  publisher -> kv-content-w: 1. write content
-  publisher -> kv-manifest-w: 2. write manifest
-  publisher -> do-w: 3. wait ~5s, flip version
+manifest-cache: In-Memory\nmanifest cache
+
+kv: KV Store {
+  manifest-v43: "manifest:v43\n/app.js → a1b2c3"
+  content-a1b2c3: "content:a1b2c3\n(file bytes)"
+}
+
+request -> worker: GET /app.js
+worker -> version-cache: 1. get version
+version-cache -> worker: v43 or miss
+worker -> manifest-cache: 2. lookup path
+manifest-cache -> worker: "hash: a1b2c3"
+worker -> kv.content-a1b2c3: 3. get content
+kv.content-a1b2c3 -> worker: bytes
+worker -> request: Response
+
+version-cache -> do: miss {
+  style.stroke-dash: 3
 }
 ```
+
+**Write flow:** Publisher writes new content and manifest to KV, waits for propagation, then atomically flips the version pointer.
+
+```d2
+direction: right
+
+publisher: Publisher
+
+kv: KV Store {
+  content-new: "content:d4e5f6\n(new bytes)"
+  manifest-v44: "manifest:v44\n/app.js → d4e5f6"
+}
+
+do: Durable Object {
+  shape: hexagon
+}
+
+publisher -> kv.content-new: 1. write content\n(new hash)
+publisher -> kv.manifest-v44: 2. write manifest\n(new version)
+publisher -> do: 3. wait ~5s\nthen flip to v44
+```
+
+The 5-second wait before flipping ensures the new manifest has propagated to most KV edge locations. Without this, some colos might see the new version pointer but fail to find `manifest:v44`.
+
+##### Caching strategy
 
 | Layer | Strategy | Why |
 |-------|----------|-----|
@@ -593,7 +612,7 @@ write-path: Write Path {
 
 **RPS math:** With Cache API caching the version for 5 seconds across ~300 colos, you get ~60 RPS to the DO - well under the 1000 limit.
 
-#### Implementation
+##### Implementation
 
 <details>
 <summary>**Durable Object** - Version pointer only</summary>
@@ -786,7 +805,7 @@ async function sha256(data: ArrayBuffer): Promise<string> {
 ```
 </details>
 
-#### Consistency guarantees
+##### Consistency guarantees
 
 | Event | Latency |
 |-------|---------|
@@ -804,7 +823,9 @@ Old manifests and orphaned content hashes will accumulate. Set `expirationTtl` o
 
 ## Microservices architecture
 
-In multi-Worker systems (router → origin services), there are two caching approaches:
+When building multi-Worker systems where a router Worker dispatches requests to origin Workers (often on different zones), you need to decide *where* caching happens. This affects latency, consistency, and operational complexity.
+
+The key question: should the **router** cache responses from origins, or should each **origin** manage its own caching?
 
 ### Centralized caching (router handles all)
 
