@@ -1,0 +1,1509 @@
+---
+title: "Self-Hosting Matrix + Element Call on k3s with Cloudflare and VyOS"
+description: Complete guide to deploying Synapse, Element Web, Jitsi, LiveKit SFU, and Element Call on an ARM64 k3s homelab cluster behind Cloudflare Tunnel and Spectrum with VyOS routing
+author: "Erfi Anugrah"
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+A complete, from-scratch guide to self-hosting the full Matrix communication stack on a k3s homelab cluster. This covers Synapse (homeserver), Element Web (client), Jitsi (legacy video conferencing), and LiveKit + Element Call (native MatrixRTC group calls) -- all behind Cloudflare with VyOS as the edge router.
+
+The guide is structured as a linear build-up: cluster infrastructure first, then Matrix core, then video calling (Jitsi and LiveKit). Each section includes the actual manifests, Terraform config, and router commands used in production.
+
+:::tip[What this covers]
+
+1. **Cluster infrastructure**: k3s, MetalLB, Traefik, Cloudflare Tunnel (OpenTofu)
+2. **Matrix core**: Synapse homeserver, PostgreSQL, Element Web, Synapse Admin
+3. **Jitsi video conferencing**: Prosody, Jicofo, JVB, with Spectrum for media UDP
+4. **LiveKit + Element Call**: LiveKit SFU, lk-jwt-service, TURN, cert-manager, Spectrum
+5. **VyOS routing**: NAT, firewall chains, Cloudflare IP source restrictions
+6. **Security hardening**: SOPS encryption, firewall source groups, path isolation
+   :::
+
+---
+
+## Architecture Overview
+
+The cluster runs on 4x ARM64 Rock boards (`rock1`-`rock4`) on a `10.0.71.x` LAN behind a VyOS router with a PPPoE WAN link. All HTTP traffic enters via Cloudflare Tunnel; all non-HTTP media traffic enters via Cloudflare Spectrum direct-to-IP.
+
+```d2
+direction: right
+
+internet: Internet {
+  clients: Element Web/X\nMobile Clients
+}
+
+cloudflare: Cloudflare Edge {
+  proxy: "CF Proxy\n(HTTPS)"
+  tunnel: "cfd Tunnel\n(HTTP/2)"
+  spectrum: "Spectrum\n(L4 TCP/UDP)"
+}
+
+vyos: VyOS Router {
+  pppoe0: "pppoe0\n(WAN)"
+  nat: "DNAT Rules\n40-45"
+  fw: "EXTERNAL-IN\n(default: drop)"
+  eth1: "eth1\n(LAN 10.0.71.x)"
+}
+
+k3s: "k3s Cluster (4x ARM64 Rock)" {
+  traefik: "Traefik LB\n10.0.71.100\n:443 :80 :10000/udp"
+  metallb: "MetalLB LB\n10.0.71.102\n(LiveKit media+TURN)"
+
+  matrix: "matrix namespace" {
+    synapse: "Synapse\n:8008"
+    postgres: "PostgreSQL\n:5432"
+    element: "Element Web\n:80"
+    admin: "Synapse Admin\n:8080"
+  }
+
+  jitsi: "jitsi namespace" {
+    prosody: "Prosody XMPP\n:5222/:5280"
+    jicofo: "Jicofo"
+    jvb: "JVB\n:10000/udp"
+    web: "Jitsi Web\n:80"
+  }
+
+  livekit_ns: "livekit namespace" {
+    livekit: "LiveKit Server\n:7880/:7882/:5349"
+    jwt: "lk-jwt-service\n:8080"
+    redis: "Redis\n:6379"
+  }
+}
+
+internet.clients -> cloudflare.proxy: HTTPS
+internet.clients -> cloudflare.spectrum: "UDP/TCP\nmedia" {style.stroke: "#e74c3c"}
+
+cloudflare.proxy -> cloudflare.tunnel
+cloudflare.tunnel -> vyos.pppoe0: "HTTP/2\nencapsulated"
+cloudflare.spectrum -> vyos.pppoe0: "direct-to-IP" {style.stroke: "#e74c3c"}
+
+vyos.pppoe0 -> vyos.nat
+vyos.nat -> vyos.fw
+vyos.fw -> vyos.eth1
+
+vyos.eth1 -> k3s.traefik: "HTTPS + JVB UDP"
+vyos.eth1 -> k3s.metallb: "7882, 7881\n5349, 3478\n49160-49200" {style.stroke: "#e74c3c"}
+
+k3s.traefik -> k3s.matrix.synapse: "matrix.example.com"
+k3s.traefik -> k3s.matrix.element: "chat.example.com"
+k3s.traefik -> k3s.matrix.admin: "admin.matrix.example.com"
+k3s.traefik -> k3s.jitsi.web: "jitsi.example.com"
+k3s.traefik -> k3s.livekit_ns.jwt: "matrix-rtc.example.com\n/livekit/jwt"
+k3s.traefik -> k3s.livekit_ns.livekit: "matrix-rtc.example.com\n/livekit/sfu"
+
+k3s.metallb -> k3s.livekit_ns.livekit: "media+TURN" {style.stroke: "#e74c3c"}
+
+k3s.matrix.synapse -> k3s.matrix.postgres
+k3s.livekit_ns.jwt -> k3s.matrix.synapse: "OpenID\nvalidation"
+k3s.livekit_ns.livekit -> k3s.livekit_ns.redis
+k3s.jitsi.jicofo -> k3s.jitsi.prosody
+k3s.jitsi.jvb -> k3s.jitsi.prosody
+```
+
+### DNS and hostname map
+
+| Hostname                   | Type  | Managed By            | Routes To                               |
+| :------------------------- | :---- | :-------------------- | :-------------------------------------- |
+| `matrix.example.com`       | CNAME | Terraform records.tf  | Synapse (API + federation + well-known) |
+| `chat.example.com`         | CNAME | Terraform records.tf  | Element Web                             |
+| `admin.matrix.example.com` | CNAME | Terraform records.tf  | Synapse Admin                           |
+| `jitsi.example.com`        | CNAME | Terraform records.tf  | Jitsi Web                               |
+| `matrix-rtc.example.com`   | CNAME | Terraform records.tf  | lk-jwt-service + LiveKit WS signaling   |
+| `livekit.example.com`      | CNAME | Spectrum auto-created | LiveKit media (ICE candidate IP)        |
+| `turn.example.com`         | CNAME | Spectrum auto-created | LiveKit built-in TURN                   |
+
+---
+
+## Part 1: Cluster Infrastructure
+
+### MetalLB
+
+MetalLB provides LoadBalancer IPs on the bare-metal LAN. Traefik gets `10.0.71.100` (first in pool), LiveKit media gets `10.0.71.102`:
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: default-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 10.0.71.100-10.0.71.120
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: default
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - default-pool
+```
+
+### Traefik
+
+Traefik runs as a Deployment (not DaemonSet) with a LoadBalancer Service. Key entrypoints:
+
+| Entrypoint  | Port        | Protocol | Purpose                  |
+| :---------- | :---------- | :------- | :----------------------- |
+| `web`       | 8000 (→80)  | TCP      | HTTP (redirect to HTTPS) |
+| `websecure` | 8443 (→443) | TCP      | HTTPS + HTTP/3           |
+| `jvb-udp`   | 10000       | UDP      | Jitsi Video Bridge media |
+| `metrics`   | 8082        | TCP      | Prometheus metrics       |
+
+Traefik uses Cloudflare DNS01 for TLS certificates and trusts `X-Forwarded-*` headers only from Cloudflare IP ranges:
+
+```yaml
+# Key args from the Traefik deployment
+args:
+  - "--entrypoints.websecure.address=:8443/tcp"
+  - "--entrypoints.websecure.http.tls=true"
+  - "--entrypoints.websecure.http.tls.certResolver=cloudflare"
+  - "--entrypoints.websecure.http3=true"
+  - "--entrypoints.jvb-udp.address=:10000/udp"
+  - "--certificatesresolvers.cloudflare.acme.dnschallenge.provider=cloudflare"
+  - "--certificatesresolvers.cloudflare.acme.storage=/ssl-certs-2/acme-cloudflare.json"
+  - "--entrypoints.websecure.forwardedHeaders.trustedIPs=173.245.48.0/20,..."
+  - "--providers.kubernetescrd"
+```
+
+The LoadBalancer Service exposes websecure (443/TCP+UDP for HTTP/3) and jvb-udp (10000/UDP) on MetalLB `10.0.71.100`.
+
+### Cloudflare Tunnel (OpenTofu)
+
+The tunnel connects the cluster to Cloudflare's edge without exposing any ports publicly. All configuration is managed with OpenTofu (Cloudflare provider `~> 4.0`).
+
+```hcl
+# tunnel.tf
+resource "cloudflare_zero_trust_tunnel_cloudflared" "k3s" {
+  account_id = var.cloudflare_account_id
+  name       = "k3s"
+  secret     = base64encode(random_string.tunnel_secret.result)
+  config_src = "cloudflare"
+}
+```
+
+The tunnel runs as a Kubernetes Deployment with KEDA autoscaling (1-8 replicas):
+
+```hcl
+# k3s-tunnel-deployment.tf (key section)
+container {
+  image   = "cloudflare/cloudflared:2026.2.0"
+  command = [
+    "cloudflared", "tunnel", "--no-autoupdate",
+    "--logfile", "/etc/cloudflared/log",
+    "--metrics", "0.0.0.0:50000",
+    "run"
+  ]
+  env {
+    name = "TUNNEL_TOKEN"
+    value_from {
+      secret_key_ref {
+        name = "cloudflared-credentials"
+        key  = "token"
+      }
+    }
+  }
+}
+```
+
+Each service gets an ingress rule in the tunnel config. All point to `https://traefik.traefik.svc.cluster.local` with `http2_origin: true`:
+
+```hcl
+# tunnel_config.tf -- each hostname is an ingress_rule
+ingress_rule {
+  hostname = "matrix.${var.secondary_domain_name}"
+  service  = "https://traefik.traefik.svc.cluster.local"
+  origin_request {
+    origin_server_name = "matrix.${var.secondary_domain_name}"
+    http2_origin       = true
+    no_tls_verify      = true
+  }
+}
+# Repeated for: chat, admin.matrix, jitsi, matrix-rtc, traefik-dashboard, etc.
+# Final catch-all:
+ingress_rule {
+  service = "http_status:404"
+}
+```
+
+DNS records are CNAMEs pointing to the tunnel:
+
+```hcl
+# records.tf
+resource "cloudflare_record" "matrix" {
+  zone_id = var.cloudflare_secondary_zone_id
+  name    = "matrix"
+  type    = "CNAME"
+  content = cloudflare_zero_trust_tunnel_cloudflared.k3s.cname
+  proxied = true
+  tags    = ["k3s", "matrix"]
+}
+# Repeated for: chat, admin.matrix, jitsi, matrix-rtc, etc.
+```
+
+WARP routing is enabled for direct access to cluster service IPs (`10.43.0.0/16`):
+
+```hcl
+# tunnel_route.tf
+resource "cloudflare_zero_trust_tunnel_route" "k3s" {
+  account_id         = var.cloudflare_account_id
+  tunnel_id          = cloudflare_zero_trust_tunnel_cloudflared.k3s.id
+  network            = "10.43.0.0/16"
+  virtual_network_id = cloudflare_zero_trust_tunnel_virtual_network.k3s.id
+}
+```
+
+### Secrets management
+
+All sensitive Terraform variables live in `secrets.tfvars` (SOPS-encrypted at rest). The state file is also SOPS-encrypted. Kubernetes Secrets use SOPS with an age public key.
+
+Workflow:
+
+```bash
+# Decrypt before tofu operations
+sops -d secrets.tfvars > /tmp/secrets.tfvars
+tofu plan -var-file=/tmp/secrets.tfvars
+tofu apply -var-file=/tmp/secrets.tfvars
+rm /tmp/secrets.tfvars
+
+# Encrypt k8s secrets
+sops --encrypt --age age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+  --encrypted-regex '^(data|stringData)$' \
+  --in-place services/matrix/secrets.yaml
+```
+
+---
+
+## Part 2: Matrix Core (Synapse + Element Web)
+
+### Namespace and secrets
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: matrix
+  labels:
+    app.kubernetes.io/name: matrix
+```
+
+The matrix-secrets Secret contains (all SOPS-encrypted):
+
+| Key                          | Purpose                      |
+| :--------------------------- | :--------------------------- |
+| `POSTGRES_USER`              | PostgreSQL username          |
+| `POSTGRES_PASSWORD`          | PostgreSQL password          |
+| `POSTGRES_DB`                | Database name                |
+| `REGISTRATION_SHARED_SECRET` | Synapse registration secret  |
+| `MACAROON_SECRET_KEY`        | Synapse macaroon signing     |
+| `FORM_SECRET`                | Synapse form protection      |
+| `OIDC_CLIENT_ID`             | Authentik OIDC client ID     |
+| `OIDC_CLIENT_SECRET`         | Authentik OIDC client secret |
+
+### PostgreSQL
+
+Synapse uses PostgreSQL 16 as its database backend, deployed as a StatefulSet with NFS-backed persistent storage:
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: matrix
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: matrix-secrets
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: matrix-secrets
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: matrix-secrets
+                  key: POSTGRES_DB
+            - name: POSTGRES_INITDB_ARGS
+              value: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+          args:
+            - "postgres"
+            - "-c"
+            - "shared_buffers=256MB"
+            - "-c"
+            - "effective_cache_size=512MB"
+            - "-c"
+            - "work_mem=16MB"
+            - "-c"
+            - "maintenance_work_mem=64MB"
+            - "-c"
+            - "max_connections=50"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: nfs-client
+        resources:
+          requests:
+            storage: 10Gi
+```
+
+:::note
+The `--lc-collate=C --lc-ctype=C` initdb args are required by Synapse for correct Unicode sorting behavior.
+:::
+
+### Synapse homeserver
+
+Synapse uses an init container pattern to inject secrets into the config file at startup. The ConfigMap holds the template with `${VARIABLE}` placeholders, and an `alpine` init container runs `envsubst` to produce the final config:
+
+```yaml
+initContainers:
+  - name: config-init
+    image: alpine:3.21
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        apk add --no-cache gettext
+        envsubst < /config-template/homeserver.yaml > /config/homeserver.yaml
+        cp /config-template/log.config /config/log.config
+    env:
+      - name: POSTGRES_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: matrix-secrets
+            key: POSTGRES_PASSWORD
+      # ... all other secret env vars
+    volumeMounts:
+      - name: config-template
+        mountPath: /config-template
+      - name: config
+        mountPath: /config
+```
+
+Key Synapse configuration sections:
+
+```yaml
+# homeserver.yaml (ConfigMap template)
+server_name: "matrix.example.com"
+public_baseurl: "https://matrix.example.com/"
+
+listeners:
+  - port: 8008
+    tls: false
+    type: http
+    x_forwarded: true
+    resources:
+      - names: [client, federation]
+
+database:
+  name: psycopg2
+  args:
+    host: "postgres.matrix.svc.cluster.local"
+    port: 5432
+
+# Federation via well-known (no port 8448 needed)
+serve_server_wellknown: true
+allow_public_rooms_over_federation: true
+
+# OIDC via Authentik
+oidc_providers:
+  - idp_id: authentik
+    idp_name: "Authentik"
+    issuer: "https://authentik.example.com/application/o/matrix/"
+    client_id: "${OIDC_CLIENT_ID}"
+    client_secret: "${OIDC_CLIENT_SECRET}"
+    scopes: ["openid", "profile", "email"]
+    user_mapping_provider:
+      config:
+        localpart_template: "{{ user.preferred_username }}"
+
+# Well-known additions for Jitsi + LiveKit
+extra_well_known_client_content:
+  "im.vector.riot.jitsi":
+    preferredDomain: "jitsi.example.com"
+  "org.matrix.msc4143.rtc_foci":
+    - type: "livekit"
+      livekit_service_url: "https://matrix-rtc.example.com/livekit/jwt"
+
+# MatrixRTC experimental features
+experimental_features:
+  msc3266_enabled: true # Room Summary API
+  msc4222_enabled: true # state_after in sync v2
+
+max_event_delay_duration: 24h # MSC4140: Delayed Events
+
+# Rate limiting tuned for MatrixRTC signaling
+rc_message:
+  per_second: 0.5
+  burst_count: 30
+rc_delayed_event_mgmt:
+  per_second: 1
+  burst_count: 20
+```
+
+<Aside type="caution" title="serve_server_wellknown">
+  With `serve_server_wellknown: true`, Synapse serves
+  `/.well-known/matrix/server` on port 8008. This means federation works without
+  a separate port 8448 listener -- other homeservers discover yours via the
+  well-known response on port 443 (through Traefik/Cloudflare). No separate
+  federation port needed.
+</Aside>
+
+### Element Web
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: element-web
+  namespace: matrix
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: element-web
+  template:
+    spec:
+      containers:
+        - name: element-web
+          image: vectorim/element-web:v1.12.10
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.json
+              subPath: config.json
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+      volumes:
+        - name: config
+          configMap:
+            name: element-config
+```
+
+The Element config enables both Jitsi and Element Call:
+
+```json
+{
+  "default_server_config": {
+    "m.homeserver": {
+      "base_url": "https://matrix.example.com",
+      "server_name": "matrix.example.com"
+    }
+  },
+  "features": {
+    "feature_group_calls": true,
+    "feature_video_rooms": true,
+    "feature_element_call_video_rooms": true
+  },
+  "element_call": {
+    "use_exclusively": true
+  },
+  "jitsi": {
+    "preferredDomain": "jitsi.example.com",
+    "externalApiUrl": "https://jitsi.example.com/external_api.js"
+  }
+}
+```
+
+**Element Call feature flags** -- all three are required:
+
+| Flag                               | Required      | Effect                                                                               |
+| :--------------------------------- | :------------ | :----------------------------------------------------------------------------------- |
+| `feature_group_calls`              | **Mandatory** | Gates ALL Element Call functionality. Without this, `use_exclusively` has no effect. |
+| `feature_video_rooms`              | Yes           | Enables persistent video rooms.                                                      |
+| `feature_element_call_video_rooms` | Yes           | Video rooms use Element Call instead of Jitsi.                                       |
+
+With `use_exclusively: true`, Element Call replaces both Jitsi and legacy 1:1 calling entirely.
+
+:::caution
+`use_element_call_v2` does **not** exist in the Element Web codebase -- it is a fabricated key. Do not use it.
+:::
+
+### Synapse Admin
+
+Synapse Admin is deployed alongside Element Web (in `element.yaml`) using `ghcr.io/etkecc/synapse-admin:latest` on port 8080, exposed at `admin.matrix.example.com`.
+
+### Traefik IngressRoute (Matrix)
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: matrix
+  namespace: matrix
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`chat.example.com`)
+      services:
+        - name: element
+          port: 80
+    - kind: Rule
+      match: Host(`admin.matrix.example.com`)
+      services:
+        - name: synapse-admin
+          port: 80
+    - kind: Rule
+      match: Host(`matrix.example.com`)
+      services:
+        - name: synapse
+          port: 8008
+```
+
+Synapse handles all paths on `matrix.example.com` -- client API (`/_matrix/client/`), federation (`/_matrix/federation/`), well-known (`/.well-known/matrix/`), and media (`/_matrix/media/`).
+
+---
+
+## Part 3: Jitsi Video Conferencing
+
+Jitsi provides widget-based video calls in Element Web. It has four components:
+
+| Component | Image                       | Purpose                            |
+| :-------- | :-------------------------- | :--------------------------------- |
+| Prosody   | `jitsi/prosody:stable-9823` | XMPP server (signaling)            |
+| Jicofo    | `jitsi/jicofo:stable-9823`  | Conference focus (room management) |
+| JVB       | `jitsi/jvb:stable-9823`     | Video Bridge (media relay)         |
+| Web       | `jitsi/web:stable-9823`     | Frontend (nginx + JS)              |
+
+### Jitsi configuration
+
+All components share a ConfigMap and Secret via `envFrom`:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jitsi-config
+  namespace: jitsi
+data:
+  PUBLIC_URL: "https://jitsi.example.com"
+  XMPP_DOMAIN: "meet.jitsi"
+  XMPP_SERVER: "prosody.jitsi.svc.cluster.local"
+  XMPP_BOSH_URL_BASE: "http://prosody.jitsi.svc.cluster.local:5280"
+  XMPP_AUTH_DOMAIN: "auth.meet.jitsi"
+  XMPP_MUC_DOMAIN: "muc.meet.jitsi"
+  XMPP_INTERNAL_MUC_DOMAIN: "internal-muc.meet.jitsi"
+  JVB_BREWERY_MUC: "jvbbrewery"
+  JVB_PORT: "10000"
+  ENABLE_AUTH: "0"
+  ENABLE_GUESTS: "1"
+  ENABLE_P2P: "false"
+```
+
+`ENABLE_P2P: "false"` forces all traffic through JVB, ensuring consistent behavior through Cloudflare Spectrum.
+
+### JVB (Video Bridge)
+
+JVB is the media component -- it receives WebRTC UDP from clients and relays between participants. Like LiveKit, it needs to advertise the correct public IP:
+
+```yaml
+env:
+  # Spectrum edge IP for jitsi-udp.example.com
+  - name: JVB_ADVERTISE_IPS
+    value: "198.51.100.20"
+  # Disable STUN to prevent wrong IP discovery
+  - name: JVB_STUN_SERVERS
+    value: "127.0.0.1:1"
+  - name: OICE4J_MAPPING_STUN_ENABLED
+    value: "false"
+```
+
+JVB's UDP 10000 is exposed through Traefik's `jvb-udp` entrypoint using an `IngressRouteUDP`:
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteUDP
+metadata:
+  name: jitsi-jvb-udp
+  namespace: jitsi
+spec:
+  entryPoints:
+    - jvb-udp
+  routes:
+    - services:
+        - name: jvb-udp
+          port: 10000
+```
+
+This is different from LiveKit's approach (which uses MetalLB directly). JVB goes through Traefik because it only needs one UDP port, while LiveKit needs many (media + TURN + relay range).
+
+---
+
+## Part 4: LiveKit + Element Call
+
+### The call flow
+
+```d2
+direction: down
+
+client: Element Web
+synapse: Synapse\n(matrix.example.com)
+jwt: lk-jwt-service\n(matrix-rtc.example.com)
+livekit: LiveKit Server
+spectrum: Spectrum Edge
+
+client -> synapse: "1. Get OpenID token" {style.stroke-dash: 3}
+client -> jwt: "2. POST /livekit/jwt/get_token\nwith OpenID token" {style.stroke-dash: 3}
+jwt -> synapse: "3. Validate token\nvia federation endpoint" {style.stroke-dash: 3}
+jwt -> client: "4. Return LiveKit JWT\n+ WSS URL" {style.stroke-dash: 3}
+client -> livekit: "5. WebSocket signaling\n(via Tunnel → Traefik)" {style.stroke-dash: 3}
+client -> spectrum: "6. WebRTC media\n(UDP 7882)" {style.stroke: "#e74c3c"}
+spectrum -> livekit: "Spectrum → VyOS\n→ MetalLB → pod" {style.stroke: "#e74c3c"}
+```
+
+Element Call is embedded as a widget in Element Web -- no separate SPA deployment needed for in-app calling. Clients discover the LiveKit focus via `.well-known/matrix/client` (the `org.matrix.msc4143.rtc_foci` key) or via `GET /_matrix/client/unstable/org.matrix.msc4143/rtc/transports` (Synapse 1.140+).
+
+### Step 1: Namespace, secrets, and Cloudflare credentials
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: livekit
+  labels:
+    app.kubernetes.io/name: livekit
+```
+
+Generate LiveKit API credentials:
+
+```bash
+LIVEKIT_API_KEY=$(openssl rand -base64 12 | tr -d '=+/')
+LIVEKIT_API_SECRET=$(openssl rand -base64 36 | tr -d '=+/')
+```
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: livekit-secrets
+  namespace: livekit
+type: Opaque
+stringData:
+  LIVEKIT_API_KEY: "<generated-key>"
+  LIVEKIT_API_SECRET: "<generated-secret>"
+```
+
+A copy of the Cloudflare API token is needed for cert-manager DNS01 challenges. The key **must** be named `api-token` (cert-manager's Cloudflare solver requires this):
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cloudflare-credentials
+  namespace: livekit
+type: Opaque
+stringData:
+  api-token: "<cloudflare-api-token>"
+```
+
+:::danger
+Both secret files **must** be SOPS-encrypted before committing to git:
+
+```bash
+sops --encrypt --age age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+  --encrypted-regex '^(data|stringData)$' \
+  --in-place services/livekit/secrets.yaml
+sops --encrypt --age age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+  --encrypted-regex '^(data|stringData)$' \
+  --in-place services/livekit/cloudflare-credentials.yaml
+```
+
+:::
+
+### Step 2: TLS certificates with cert-manager
+
+LiveKit's built-in TURN server handles TLS termination on port 5349. It needs cert/key files mounted into the pod. cert-manager with Cloudflare DNS01 issues and auto-renews the certificate:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: cloudflare-dns01
+  namespace: livekit
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: your-email@example.com
+    privateKeySecretRef:
+      name: letsencrypt-account-key
+    solvers:
+      - dns01:
+          cloudflare:
+            apiTokenSecretRef:
+              name: cloudflare-credentials
+              key: api-token
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: turn-tls
+  namespace: livekit
+spec:
+  secretName: turn-tls
+  issuerRef:
+    name: cloudflare-dns01
+    kind: Issuer
+  dnsNames:
+    - turn.example.com
+  duration: 2160h # 90 days
+  renewBefore: 360h # 15 days
+```
+
+<Aside type="caution" title="ACME URL">
+  The ACME URL is `acme-v02.api.letsencrypt.org` (with a **zero**). `acme-v2`
+  (no zero) gives NXDOMAIN.
+</Aside>
+
+### Step 3: Redis
+
+Dedicated Redis instance for LiveKit room state:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: livekit
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.4.2-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+```
+
+ClusterIP only -- no external exposure.
+
+### Step 4: LiveKit server configuration
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: livekit-config
+  namespace: livekit
+data:
+  livekit.yaml: |
+    port: 7880
+    log_level: info
+
+    rtc:
+      tcp_port: 7881
+      udp_port: 7882
+      use_external_ip: false
+      node_ip: "198.51.100.10"
+
+    redis:
+      address: redis.livekit.svc.cluster.local:6379
+
+    room:
+      auto_create: false
+
+    turn:
+      enabled: true
+      domain: turn.example.com
+      tls_port: 5349
+      udp_port: 3478
+      relay_range_start: 49160
+      relay_range_end: 49200
+      cert_file: /etc/lkcert/tls.crt
+      key_file: /etc/lkcert/tls.key
+```
+
+**Critical configuration details:**
+
+| Setting                   | Value             | Why                                                                          |
+| :------------------------ | :---------------- | :--------------------------------------------------------------------------- |
+| `use_external_ip: false`  | **Must be false** | When `true`, STUN discovery **overwrites** `node_ip` with the wrong address. |
+| `node_ip`                 | Spectrum edge IP  | Advertised in ICE candidates. Get it with `dig +short livekit.example.com`.  |
+| `room.auto_create: false` | Security          | lk-jwt-service controls room creation.                                       |
+| `turn.external_tls`       | Not set           | Only for L4 LB TLS termination. We mount certs directly.                     |
+
+**`LIVEKIT_KEYS` env var format**: LiveKit reads API keys as `"key: secret"` (YAML format, space after colon). The deployment uses Kubernetes `$(...)` substitution:
+
+```yaml
+env:
+  - name: LIVEKIT_KEYS
+    value: "$(LIVEKIT_API_KEY): $(LIVEKIT_API_SECRET)"
+envFrom:
+  - secretRef:
+      name: livekit-secrets
+```
+
+### Step 5: LiveKit server deployment
+
+The deployment mounts both the config and the TLS cert:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: livekit-server
+  namespace: livekit
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: livekit-server
+  template:
+    spec:
+      containers:
+        - name: livekit-server
+          image: livekit/livekit-server:v1.9.11
+          args:
+            - --config=/etc/livekit/livekit.yaml
+          ports:
+            - containerPort: 7880
+              protocol: TCP
+            - containerPort: 7882
+              protocol: UDP
+            - containerPort: 7881
+              protocol: TCP
+            - containerPort: 5349
+              protocol: TCP
+            - containerPort: 3478
+              protocol: UDP
+            - containerPort: 3478
+              protocol: TCP
+          env:
+            - name: LIVEKIT_KEYS
+              value: "$(LIVEKIT_API_KEY): $(LIVEKIT_API_SECRET)"
+          envFrom:
+            - secretRef:
+                name: livekit-secrets
+          volumeMounts:
+            - name: config
+              mountPath: /etc/livekit
+              readOnly: true
+            - name: turn-tls
+              mountPath: /etc/lkcert
+              readOnly: true
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "2000m"
+              memory: "1Gi"
+      volumes:
+        - name: config
+          configMap:
+            name: livekit-config
+        - name: turn-tls
+          secret:
+            secretName: turn-tls
+```
+
+**Two Services** -- one for signaling (Traefik), one for media (MetalLB):
+
+```yaml
+# ClusterIP for signaling
+apiVersion: v1
+kind: Service
+metadata:
+  name: livekit-server
+  namespace: livekit
+spec:
+  selector:
+    app: livekit-server
+  ports:
+    - name: signaling
+      port: 7880
+      targetPort: 7880
+---
+# LoadBalancer for media + TURN
+apiVersion: v1
+kind: Service
+metadata:
+  name: livekit-media
+  namespace: livekit
+  annotations:
+    metallb.universe.tf/loadBalancerIPs: "10.0.71.102"
+spec:
+  type: LoadBalancer
+  selector:
+    app: livekit-server
+  ports:
+    - name: media-udp
+      port: 7882
+      targetPort: 7882
+      protocol: UDP
+    - name: media-tcp
+      port: 7881
+      targetPort: 7881
+      protocol: TCP
+    - name: turns
+      port: 5349
+      targetPort: 5349
+      protocol: TCP
+    - name: turn-udp
+      port: 3478
+      targetPort: 3478
+      protocol: UDP
+    - name: turn-tcp
+      port: 3478
+      targetPort: 3478
+      protocol: TCP
+    # Relay ports 49160-49200 (one per port, k8s doesn't support ranges)
+    - name: relay-49160
+      port: 49160
+      targetPort: 49160
+      protocol: UDP
+    # ... 49161 through 49199 ...
+    - name: relay-49200
+      port: 49200
+      targetPort: 49200
+      protocol: UDP
+```
+
+### Step 6: lk-jwt-service
+
+Bridges Matrix OpenID tokens to LiveKit JWTs:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lk-jwt-service
+  namespace: livekit
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lk-jwt-service
+  template:
+    spec:
+      containers:
+        - name: lk-jwt-service
+          # No semver tags on GHCR -- pin by digest
+          image: ghcr.io/element-hq/lk-jwt-service:latest-ci@sha256:c08ab563037dadced09f3017e2182a23a6cb3a1241bfae6aca041d6b3249372f
+          ports:
+            - containerPort: 8080
+          env:
+            - name: LIVEKIT_URL
+              value: "wss://matrix-rtc.example.com/livekit/sfu"
+            - name: LIVEKIT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: livekit-secrets
+                  key: LIVEKIT_API_KEY
+            - name: LIVEKIT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: livekit-secrets
+                  key: LIVEKIT_API_SECRET
+            - name: LIVEKIT_FULL_ACCESS_HOMESERVERS
+              value: "matrix.example.com"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+```
+
+**Gotchas:**
+
+| Setting                               | Detail                                                                                               |
+| :------------------------------------ | :--------------------------------------------------------------------------------------------------- |
+| **Env var names**                     | `LIVEKIT_KEY` / `LIVEKIT_SECRET` -- **not** `LIVEKIT_API_KEY`/`LIVEKIT_API_SECRET`.                  |
+| **`LIVEKIT_URL`**                     | Dual-purpose: server-side RoomService API calls AND returned to clients. Must be the public WSS URL. |
+| **`LIVEKIT_FULL_ACCESS_HOMESERVERS`** | Defaults to `*` if unset. Always restrict to your homeserver domain.                                 |
+| **Image pinning**                     | No semver tags exist. Pin by SHA256 digest on `latest-ci`.                                           |
+
+### Step 7: Traefik IngressRoute with path stripping
+
+lk-jwt-service registers exact paths (`/get_token`, `/sfu/get`, `/healthz`). Traefik `StripPrefix` middlewares must remove the URL prefix before forwarding:
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: strip-livekit-jwt
+  namespace: livekit
+spec:
+  stripPrefix:
+    prefixes:
+      - /livekit/jwt
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: strip-livekit-sfu
+  namespace: livekit
+spec:
+  stripPrefix:
+    prefixes:
+      - /livekit/sfu
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: livekit
+  namespace: livekit
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`matrix-rtc.example.com`) && PathPrefix(`/livekit/jwt`)
+      middlewares:
+        - name: strip-livekit-jwt
+      services:
+        - name: lk-jwt-service
+          port: 8080
+    - kind: Rule
+      match: Host(`matrix-rtc.example.com`) && PathPrefix(`/livekit/sfu`)
+      middlewares:
+        - name: strip-livekit-sfu
+      services:
+        - name: livekit-server
+          port: 7880
+```
+
+| Client request           | After StripPrefix | Backend              |
+| :----------------------- | :---------------- | :------------------- |
+| `/livekit/jwt/get_token` | `/get_token`      | lk-jwt-service       |
+| `/livekit/jwt/healthz`   | `/healthz`        | lk-jwt-service       |
+| `/livekit/sfu/rtc`       | `/rtc`            | livekit-server (WS)  |
+| `/livekit/sfu/twirp/...` | `/twirp/...`      | livekit-server (API) |
+
+:::caution
+If path stripping is missing, lk-jwt-service returns 404 for every request. The service has no concept of path prefixes.
+:::
+
+### Step 8: Cloudflare Spectrum
+
+Six Spectrum applications handle all non-HTTP LiveKit traffic:
+
+```hcl
+# spectrum.tf
+
+# Media: UDP 7882 (single mux)
+resource "cloudflare_spectrum_application" "livekit-media-udp" {
+  zone_id      = var.cloudflare_secondary_zone_id
+  protocol     = "udp/7882"
+  traffic_type = "direct"
+  dns {
+    type = "CNAME"
+    name = "livekit.${var.secondary_domain_name}"
+  }
+  origin_direct = ["udp://${var.nl_ip}:7882"]
+  origin_port   = 7882
+  edge_ips {
+    type         = "dynamic"
+    connectivity = "all"
+  }
+}
+
+# Media: TCP 7881 (ICE/TCP fallback)
+resource "cloudflare_spectrum_application" "livekit-media-tcp" {
+  zone_id      = var.cloudflare_secondary_zone_id
+  protocol     = "tcp/7881"
+  traffic_type = "direct"
+  dns {
+    type = "CNAME"
+    name = "livekit.${var.secondary_domain_name}"
+  }
+  origin_direct = ["tcp://${var.nl_ip}:7881"]
+  origin_port   = 7881
+  edge_ips {
+    type         = "dynamic"
+    connectivity = "all"
+  }
+}
+
+# TURN: TCP 5349, UDP 3478, TCP 3478 (same pattern)
+# ...
+
+# TURN relay: UDP 49160-49200
+resource "cloudflare_spectrum_application" "turn-relay" {
+  zone_id      = var.cloudflare_secondary_zone_id
+  protocol     = "udp/49160-49200"
+  traffic_type = "direct"
+  dns {
+    type = "CNAME"
+    name = "turn.${var.secondary_domain_name}"
+  }
+  origin_direct = ["udp://${var.nl_ip}:49160-49200"]
+  origin_port_range {
+    start = 49160
+    end   = 49200
+  }
+  edge_ips {
+    type         = "dynamic"
+    connectivity = "all"
+  }
+}
+```
+
+:::note
+Spectrum auto-creates DNS records for `livekit.example.com` and `turn.example.com`. Do not create these manually in `records.tf` or they'll conflict. Only `matrix-rtc.example.com` needs a manual CNAME.
+:::
+
+After applying, get the Spectrum edge IP for LiveKit's `node_ip`:
+
+```bash
+dig +short livekit.example.com
+# e.g., 198.51.100.10
+```
+
+---
+
+## Part 5: VyOS NAT and Firewall
+
+### NAT rules
+
+DNAT rules translate Spectrum traffic arriving on pppoe0 to the MetalLB IP:
+
+```txt
+configure
+
+# Existing (TURN ports, from coturn era)
+set nat destination rule 40 description 'coturn-udp'
+set nat destination rule 40 destination port '3478'
+set nat destination rule 40 inbound-interface name 'pppoe0'
+set nat destination rule 40 protocol 'udp'
+set nat destination rule 40 translation address '10.0.71.102'
+
+set nat destination rule 41 description 'coturn-tcp'
+set nat destination rule 41 destination port '3478'
+set nat destination rule 41 inbound-interface name 'pppoe0'
+set nat destination rule 41 protocol 'tcp'
+set nat destination rule 41 translation address '10.0.71.102'
+
+set nat destination rule 42 description 'coturn-turns'
+set nat destination rule 42 destination port '5349'
+set nat destination rule 42 inbound-interface name 'pppoe0'
+set nat destination rule 42 protocol 'tcp'
+set nat destination rule 42 translation address '10.0.71.102'
+
+set nat destination rule 43 description 'coturn-relay'
+set nat destination rule 43 destination port '49160-49200'
+set nat destination rule 43 inbound-interface name 'pppoe0'
+set nat destination rule 43 protocol 'udp'
+set nat destination rule 43 translation address '10.0.71.102'
+
+# New (LiveKit media ports)
+set nat destination rule 44 description 'livekit-media-udp'
+set nat destination rule 44 destination port '7882'
+set nat destination rule 44 inbound-interface name 'pppoe0'
+set nat destination rule 44 protocol 'udp'
+set nat destination rule 44 translation address '10.0.71.102'
+
+set nat destination rule 45 description 'livekit-media-tcp'
+set nat destination rule 45 destination port '7881'
+set nat destination rule 45 inbound-interface name 'pppoe0'
+set nat destination rule 45 protocol 'tcp'
+set nat destination rule 45 translation address '10.0.71.102'
+
+commit
+save
+```
+
+### Firewall rules
+
+:::danger
+**Critical: rules must be in `EXTERNAL-IN`, not `forward filter`.** VyOS's `forward filter` has `default-action drop` and jumps to `EXTERNAL-IN` for pppoe0 traffic. `EXTERNAL-IN` also has `default-action drop`. If you put rules in `forward filter` instead of `EXTERNAL-IN`, they are **never evaluated** because the jump target's default action terminates processing first.
+
+This was the root cause of our ICE connectivity failure -- media UDP was silently dropped for hours before we traced it with tcpdump.
+:::
+
+The VyOS network path for Matrix/LiveKit traffic:
+
+```d2
+direction: right
+
+wan: "pppoe0 (WAN)" {
+  spectrum: "Spectrum traffic\nUDP/TCP media"
+  tunnel: "Tunnel traffic\nHTTP/2 encap"
+}
+
+prerouting: "DNAT\n(prerouting)" {
+  r40: "40: 3478/udp → .102"
+  r41: "41: 3478/tcp → .102"
+  r42: "42: 5349/tcp → .102"
+  r43: "43: 49160-49200/udp → .102"
+  r44: "44: 7882/udp → .102"
+  r45: "45: 7881/tcp → .102"
+}
+
+forward: "forward filter\n(default-action: drop)" {
+  r5: "rule 5: pppoe0\njump EXTERNAL-IN"
+  r14: "rule 14: eth1.200\njump TPI"
+}
+
+external_in: "EXTERNAL-IN\n(default-action: drop)" {
+  r70: "70: TURN 3478/udp\nsrc: cf-ipv4"
+  r71: "71: TURN 3478/tcp\nsrc: cf-ipv4"
+  r72: "72: TURNS 5349\nsrc: cf-ipv4"
+  r73: "73: Relay 49160-49200\nsrc: cf-ipv4"
+  r74: "74: LiveKit 7882/udp\nsrc: cf-ipv4" {style.stroke: "#2ecc71"}
+  r75: "75: LiveKit 7881/tcp\nsrc: cf-ipv4" {style.stroke: "#2ecc71"}
+  drop: "default: DROP"
+}
+
+lan: "eth1.200\n(VLAN 200 — 10.0.71.0/24)" {
+  traefik: "Traefik LB\n10.0.71.100\n:443"
+  metallb: "MetalLB LB\n10.0.71.102\nmedia+TURN"
+}
+
+snat: "SNAT rule 20\nmasquerade\n10.0.0.0/8 → pppoe0"
+
+wan.spectrum -> prerouting: "direct-to-IP" {style.stroke: "#e74c3c"}
+wan.tunnel -> lan.traefik: "HTTP/2 → :443" {style.stroke-dash: 3}
+
+prerouting.r44 -> forward: "dst rewritten" {style.stroke: "#e74c3c"}
+prerouting.r45 -> forward: {style.stroke: "#e74c3c"}
+
+forward.r5 -> external_in: "jump" {style.stroke: "#e74c3c"}
+
+external_in.r74 -> lan.metallb: "accept" {style.stroke: "#2ecc71"}
+external_in.r75 -> lan.metallb: "accept" {style.stroke: "#2ecc71"}
+external_in.r70 -> lan.metallb: "accept"
+external_in.drop -> external_in.drop: "all else dropped" {style.stroke: "#e74c3c"; style.stroke-dash: 3}
+
+lan.traefik -> snat: "outbound replies" {style.stroke-dash: 3}
+lan.metallb -> snat: "outbound replies" {style.stroke-dash: 3}
+snat -> wan: {style.stroke-dash: 3}
+```
+
+All rules restrict source to Cloudflare IPs:
+
+```txt
+configure
+
+set firewall ipv4 name EXTERNAL-IN rule 70 action 'accept'
+set firewall ipv4 name EXTERNAL-IN rule 70 description 'coturn-udp'
+set firewall ipv4 name EXTERNAL-IN rule 70 destination address '10.0.71.102'
+set firewall ipv4 name EXTERNAL-IN rule 70 destination port '3478'
+set firewall ipv4 name EXTERNAL-IN rule 70 log
+set firewall ipv4 name EXTERNAL-IN rule 70 protocol 'udp'
+set firewall ipv4 name EXTERNAL-IN rule 70 source group network-group 'cf-ipv4'
+
+# ... rules 71, 72, 73 for other TURN ports (same pattern) ...
+
+set firewall ipv4 name EXTERNAL-IN rule 74 action 'accept'
+set firewall ipv4 name EXTERNAL-IN rule 74 description 'livekit-media-udp'
+set firewall ipv4 name EXTERNAL-IN rule 74 destination address '10.0.71.102'
+set firewall ipv4 name EXTERNAL-IN rule 74 destination port '7882'
+set firewall ipv4 name EXTERNAL-IN rule 74 log
+set firewall ipv4 name EXTERNAL-IN rule 74 protocol 'udp'
+set firewall ipv4 name EXTERNAL-IN rule 74 source group network-group 'cf-ipv4'
+
+set firewall ipv4 name EXTERNAL-IN rule 75 action 'accept'
+set firewall ipv4 name EXTERNAL-IN rule 75 description 'livekit-media-tcp'
+set firewall ipv4 name EXTERNAL-IN rule 75 destination address '10.0.71.102'
+set firewall ipv4 name EXTERNAL-IN rule 75 destination port '7881'
+set firewall ipv4 name EXTERNAL-IN rule 75 log
+set firewall ipv4 name EXTERNAL-IN rule 75 protocol 'tcp'
+set firewall ipv4 name EXTERNAL-IN rule 75 source group network-group 'cf-ipv4'
+
+commit
+save
+```
+
+The `cf-ipv4` network group must contain all [Cloudflare IP ranges](https://www.cloudflare.com/ips-v4):
+
+```txt
+set firewall group network-group cf-ipv4 network '173.245.48.0/20'
+set firewall group network-group cf-ipv4 network '103.21.244.0/22'
+set firewall group network-group cf-ipv4 network '103.22.200.0/22'
+# ... all Cloudflare IPv4 ranges ...
+set firewall group network-group cf-ipv4 network '131.0.72.0/22'
+```
+
+---
+
+## Verification
+
+### Signaling
+
+```bash
+# Well-known
+curl -s https://matrix.example.com/.well-known/matrix/client | python3 -m json.tool
+# Should include org.matrix.msc4143.rtc_foci
+
+# JWT service health
+curl -s https://matrix-rtc.example.com/livekit/jwt/healthz
+# 200
+
+# Token endpoint (auth error = working, 404 = path stripping broken)
+curl -s -X POST https://matrix-rtc.example.com/livekit/jwt/get_token
+# {"errcode":"M_NOT_JSON","error":"Error reading request"}
+
+# RoomService API (must require auth)
+curl -s -X POST https://matrix-rtc.example.com/livekit/sfu/twirp/livekit.RoomService/ListRooms \
+  -H 'Content-Type: application/json' -d '{}'
+# {"code":"unauthenticated","msg":"permissions denied"}
+
+# Unintended paths
+curl -s -o /dev/null -w '%{http_code}' https://matrix-rtc.example.com/
+# 404
+```
+
+### Media path (tcpdump)
+
+Start a call from Element Web, then trace on VyOS:
+
+```bash
+# WAN -- Spectrum traffic arriving?
+sudo tcpdump -i pppoe0 udp port 7882 -n -c 10
+
+# LAN -- reaching MetalLB?
+sudo tcpdump -i any host 10.0.71.102 and udp port 7882 -n -c 10
+```
+
+**Diagnosis flow:**
+
+| tcpdump location   | Packets seen?      | Problem                                                  |
+| :----------------- | :----------------- | :------------------------------------------------------- |
+| pppoe0             | No                 | Spectrum config wrong (check `origin_direct`)            |
+| pppoe0 yes, LAN no | Firewall dropping  | Rules in wrong chain (`forward filter` vs `EXTERNAL-IN`) |
+| LAN yes, pod no    | kube-proxy/MetalLB | Check service endpoints and MetalLB speaker              |
+| Pod yes, no call   | Asymmetric routing | Consider `hostNetwork: true` or policy routing           |
+
+---
+
+## Resource Summary
+
+| Component       | CPU request | Memory request | CPU limit | Memory limit |
+| :-------------- | :---------- | :------------- | :-------- | :----------- |
+| Synapse         | 200m        | 512Mi          | 2000m     | 2Gi          |
+| PostgreSQL      | 100m        | 256Mi          | 1000m     | 1Gi          |
+| Element Web     | 50m         | 64Mi           | 500m      | 256Mi        |
+| Synapse Admin   | 50m         | 64Mi           | 500m      | 256Mi        |
+| Prosody         | 100m        | 256Mi          | 500m      | 512Mi        |
+| Jicofo          | 200m        | 256Mi          | 1000m     | 512Mi        |
+| JVB             | 500m        | 512Mi          | 2000m     | 2Gi          |
+| Jitsi Web       | 100m        | 128Mi          | 500m      | 256Mi        |
+| LiveKit Server  | 500m        | 256Mi          | 2000m     | 1Gi          |
+| lk-jwt-service  | 100m        | 64Mi           | 500m      | 256Mi        |
+| Redis (LiveKit) | 100m        | 64Mi           | 250m      | 128Mi        |
+| Traefik         | 1000m       | 512Mi          | 2000m     | 1Gi          |
+| cloudflared     | 1000m       | 512Mi          | 2000m     | 1Gi          |
+| **Total**       | **4000m**   | **3.4Gi**      | **14.75** | **10.1Gi**   |
+
+---
+
+## Security Checklist
+
+| Check                               | Detail                                                                         |
+| :---------------------------------- | :----------------------------------------------------------------------------- |
+| All k8s Secrets SOPS-encrypted      | `matrix-secrets`, `jitsi-secrets`, `livekit-secrets`, `cloudflare-credentials` |
+| No plaintext secrets in ConfigMaps  | Keys injected via `envFrom`/`secretKeyRef`, not in configmap values            |
+| lk-jwt-service homeserver allowlist | `LIVEKIT_FULL_ACCESS_HOMESERVERS=matrix.example.com` (not `*`)                 |
+| RoomService API requires auth       | Returns `unauthenticated` without LiveKit API key header                       |
+| LiveKit `room.auto_create: false`   | Prevents unauthorized room creation                                            |
+| VyOS firewall source restriction    | All Spectrum-facing rules use `source group network-group 'cf-ipv4'`           |
+| Traefik trusted IPs                 | `forwardedHeaders.trustedIPs` set to Cloudflare ranges only                    |
+| IngressRoute path scoping           | Only specific PathPrefix rules, no wildcards                                   |
+| Redis not externally exposed        | ClusterIP only in livekit namespace                                            |
+| Images pinned                       | All by tag or SHA256 digest, no floating `latest` (except synapse-admin)       |
+| Traefik runs as non-root            | `securityContext.runAsUser: 65532`, `readOnlyRootFilesystem: true`             |
+
+---
+
+## File Structure
+
+```
+services/
+  matrix/
+    namespace.yaml
+    secrets.yaml              # SOPS-encrypted
+    configmap.yaml            # Synapse config + Element config
+    postgres.yaml             # StatefulSet + Service
+    synapse.yaml              # Deployment + Service + PVC
+    element.yaml              # Element Web + Synapse Admin
+    ingress.yaml              # IngressRoute (chat, admin, matrix)
+    kustomization.yaml
+  jitsi/
+    namespace.yaml
+    secrets.yaml              # SOPS-encrypted
+    configmap.yaml            # Shared Jitsi env vars
+    prosody.yaml              # XMPP server
+    jicofo.yaml               # Conference focus
+    jvb.yaml                  # Video Bridge + ClusterIP services
+    web.yaml                  # Jitsi frontend
+    ingress.yaml              # IngressRoute (HTTPS)
+    ingress-udp.yaml          # IngressRouteUDP (JVB media)
+    kustomization.yaml
+  livekit/
+    namespace.yaml
+    secrets.yaml              # SOPS-encrypted
+    cloudflare-credentials.yaml # SOPS-encrypted
+    cert-manager.yaml         # Issuer + Certificate
+    configmap.yaml            # LiveKit server config
+    redis.yaml                # Dedicated Redis
+    livekit-server.yaml       # Deployment + ClusterIP + LoadBalancer
+    lk-jwt-service.yaml       # Deployment + Service
+    ingress.yaml              # StripPrefix + IngressRoute
+    kustomization.yaml
+  metallb.yaml               # IPAddressPool + L2Advertisement
+  traefik.yaml               # Full Traefik deployment
+
+cloudflare-tunnel-tf/
+  provider.tf                # cloudflare ~> 4.0, kubernetes ~> 2.0
+  variables.tf               # zone IDs, account ID, IPs
+  secrets.tfvars             # SOPS-encrypted
+  tunnel.tf                  # Tunnel resource
+  tunnel_secret.tf           # Random tunnel secret
+  tunnel_config.tf           # Ingress rules
+  tunnel_route.tf            # WARP routing
+  tunnel_vnet.tf             # Virtual network
+  records.tf                 # DNS CNAMEs
+  spectrum.tf                # Spectrum apps (LiveKit + TURN)
+  k3s-tunnel-namespace.tf
+  k3s-tunnel-deployment.tf
+  k3s-tunnel-secret.tf
+  k3s-tunnel-service.tf
+  k3s-tunnel-pvc.tf
+  k3s-tunnel-keda.tf         # KEDA autoscaling
+  outputs.tf
+  terraform.tfstate          # SOPS-encrypted at rest
+```
