@@ -1,0 +1,1736 @@
+---
+title: "Full Observability Stack on k3s: Prometheus, Loki, Jaeger, Grafana, and Cloudflare Logpush"
+description: Complete guide to deploying a production-grade LGTM observability stack on an ARM64 k3s homelab cluster with Kustomize manifests, Cloudflare Logpush integration, and 14 Grafana dashboards
+author: "Erfi Anugrah"
+---
+
+A complete guide to building a full observability stack on a 4-node ARM64 k3s homelab cluster. No Helm -- everything is raw Kustomize manifests. The stack covers metrics (Prometheus + Alertmanager), logging (Loki + Alloy), tracing (Jaeger), and visualization (Grafana with 14 dashboards). On top of the standard LGTM stack, Cloudflare Logpush feeds HTTP request logs, firewall events, and Workers traces through a custom Traefik decompression plugin into Loki for security analytics and performance monitoring.
+
+The guide is structured as a linear build-up: Prometheus Operator and core metrics first, then Loki and log collection, then Jaeger tracing, then Grafana with dashboards and SSO, then the Cloudflare Logpush pipeline with its custom Traefik plugin. Each section includes the actual manifests used in production.
+
+:::tip[What this covers]
+
+1. **Prometheus Operator**: CRDs, operator deployment, Prometheus CR, alert rules, ServiceMonitors
+2. **Alertmanager**: Operator-managed, SOPS-encrypted SMTP config
+3. **Loki**: Monolithic mode, TSDB v13, filesystem storage, retention and tuning
+4. **Grafana Alloy**: DaemonSet for pod log collection, OTLP trace forwarding to Jaeger
+5. **Jaeger**: v2 all-in-one with Badger storage, OTel Collector config format
+6. **Grafana**: Authentik SSO, 4 datasources, k8s-sidecar dashboard provisioning
+7. **14 dashboards**: configMapGenerator pattern, Python generators, `add-dashboard.sh`
+8. **Cloudflare Logpush**: Custom Traefik decompress plugin, dataset-agnostic Alloy receiver, 7 Logpush jobs via OpenTofu
+9. **VyOS metrics**: ScrapeConfig for remote node_exporter
+10. **LogQL pitfalls**: 9 specific traps with high-cardinality Loki data
+11. **KEDA autoscaling**: ScaledObjects for Prometheus and Grafana
+:::
+
+---
+
+## Architecture Overview
+
+The cluster runs on 4x ARM64 Rock boards (`rock1`-`rock4`) on a `10.0.71.x` LAN behind a VyOS router with a PPPoE WAN link. All HTTP traffic enters via Cloudflare Tunnel through Traefik. The monitoring stack runs entirely in the `monitoring` namespace.
+
+```d2
+direction: right
+
+nodes: "k3s Cluster (4x ARM64 Rock)" {
+  rock1: "rock1" {
+    alloy1: "Alloy\n(logs+traces)"
+    ne1: "Node Exporter"
+  }
+  rock2: "rock2" {
+    alloy2: "Alloy"
+    ne2: "Node Exporter"
+  }
+  rock3: "rock3" {
+    alloy3: "Alloy"
+    ne3: "Node Exporter"
+  }
+  rock4: "rock4" {
+    alloy4: "Alloy"
+    ne4: "Node Exporter"
+  }
+}
+
+monitoring: "monitoring namespace" {
+  prometheus: "Prometheus v3.9.1\n:9090\nNFS 10Gi\n7d retention"
+  alertmanager: "Alertmanager v0.31.1\n:9093\nNFS 1Gi"
+  loki: "Loki 3.6.5\n:3100\nNFS 20Gi\n31d retention"
+  jaeger: "Jaeger 2.15.1\n:4317 OTLP\n:16686 UI\nBadger 10Gi"
+  grafana: "Grafana 12.3.3\n:3000\n14 dashboards\nAuthentik SSO"
+  alloy_lp: "Alloy Logpush\n(Deployment)\n:3500" {
+    style.stroke: "#e74c3c"
+  }
+  operator: "Prometheus\nOperator v0.89.0"
+  ksm: "kube-state-metrics"
+  blackbox: "Blackbox Exporter"
+}
+
+cf: Cloudflare Edge {
+  logpush: "Logpush\n(7 jobs)"
+  tunnel: "cfd Tunnel"
+}
+
+traefik: "Traefik v3.3.6\n(traefik ns)" {
+  decompress: "Decompress\nPlugin" {style.stroke: "#e74c3c"}
+}
+
+vyos: "VyOS Router" {
+  ne_vyos: "node_exporter\n:9100"
+}
+
+nodes.rock1.alloy1 -> monitoring.loki: "pod logs"
+nodes.rock1.alloy1 -> monitoring.jaeger: "OTLP traces"
+nodes.rock2.alloy2 -> monitoring.loki
+nodes.rock3.alloy3 -> monitoring.loki
+nodes.rock4.alloy4 -> monitoring.loki
+
+monitoring.prometheus -> monitoring.alertmanager: "alerts"
+monitoring.operator -> monitoring.prometheus: "manages"
+monitoring.operator -> monitoring.alertmanager: "manages"
+
+monitoring.prometheus -> monitoring.grafana
+monitoring.loki -> monitoring.grafana
+monitoring.jaeger -> monitoring.grafana
+monitoring.alertmanager -> monitoring.grafana
+
+cf.logpush -> cf.tunnel: "gzip NDJSON"
+cf.tunnel -> traefik
+traefik -> traefik.decompress
+traefik.decompress -> monitoring.alloy_lp: "raw JSON" {style.stroke: "#e74c3c"}
+monitoring.alloy_lp -> monitoring.loki
+
+monitoring.prometheus -> vyos.ne_vyos: "ScrapeConfig" {style.stroke: "#2ecc71"}
+```
+
+### Component versions
+
+| Component | Version | Image |
+| :-------- | :------ | :---- |
+| Prometheus Operator | v0.89.0 | `quay.io/prometheus-operator/prometheus-operator:v0.89.0` |
+| Prometheus | v3.9.1 | `quay.io/prometheus/prometheus:v3.9.1` |
+| Alertmanager | v0.31.1 | `quay.io/prometheus/alertmanager:v0.31.1` |
+| kube-state-metrics | v2.18.0 | `registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.18.0` |
+| Node Exporter | v1.10.2 | `quay.io/prometheus/node-exporter:v1.10.2` |
+| Blackbox Exporter | v0.28.0 | `quay.io/prometheus/blackbox-exporter:v0.28.0` |
+| Grafana | 12.3.3 | `docker.io/grafana/grafana:12.3.3` |
+| k8s-sidecar | 2.5.0 | `quay.io/kiwigrid/k8s-sidecar:2.5.0` |
+| Loki | 3.6.5 | `docker.io/grafana/loki:3.6.5` |
+| Grafana Alloy | v1.13.0 | `docker.io/grafana/alloy:v1.13.0` |
+| Jaeger | 2.15.1 | `docker.io/jaegertracing/jaeger:2.15.1` |
+
+### External access
+
+All monitoring UIs are exposed via Cloudflare Tunnel through Traefik IngressRoutes:
+
+| Service | URL | IngressRoute |
+| :------ | :-- | :----------- |
+| Grafana | `https://grafana-k3s.erfi.io` | `ingressroutes/grafana-ingress.yaml` |
+| Prometheus | `https://prom-k3s.erfi.io` | `ingressroutes/prometheus-ingress.yaml` |
+| Alertmanager | `https://alertmanager-k3s.erfi.io` | `ingressroutes/alertmanager-ingress.yaml` |
+| Jaeger | `https://jaeger-k3s.erfi.io` | `ingressroutes/jaeger-ingress.yaml` |
+
+DNS CNAME records and Cloudflare tunnel ingress rules are managed by OpenTofu in `cloudflare-tunnel-tf/`.
+
+---
+
+## Part 1: Prometheus Operator
+
+### Why raw manifests instead of Helm
+
+The entire stack is deployed as raw Kustomize manifests. No Helm. This gives full visibility into every resource, avoids Helm's template abstraction layer, and makes it straightforward to patch individual fields. The trade-off is manual version bumps, which is acceptable for a homelab.
+
+### Operator CRDs
+
+The Prometheus Operator provides 10 CRDs totaling ~3.7 MB:
+
+```yaml
+# monitoring/operator/kustomization.yaml
+resources:
+  # CRDs (must be applied before operator)
+  - crd-alertmanagerconfigs.yaml
+  - crd-alertmanagers.yaml
+  - crd-podmonitors.yaml
+  - crd-probes.yaml
+  - crd-prometheusagents.yaml
+  - crd-prometheuses.yaml
+  - crd-prometheusrules.yaml
+  - crd-scrapeconfigs.yaml
+  - crd-servicemonitors.yaml
+  - crd-thanosrulers.yaml
+  # Operator RBAC and workload
+  - serviceaccount.yaml
+  - clusterrole.yaml
+  - clusterrolebinding.yaml
+  - deployment.yaml
+  - service.yaml
+  - servicemonitor.yaml
+  - webhook.yaml
+```
+
+:::caution
+The CRDs exceed Kubernetes' 262144-byte annotation limit for client-side apply. You **must** use `kubectl apply --server-side`:
+
+```bash
+kubectl apply -k monitoring/ --server-side --force-conflicts
+```
+
+`--force-conflicts` is needed on first run to take ownership of resources previously applied with client-side apply.
+:::
+
+The webhook cert-gen Jobs must complete before the operator Deployment starts. Kustomize handles ordering if everything is in the same kustomization.
+
+### Prometheus CR
+
+The operator manages Prometheus via a `Prometheus` custom resource. It creates a StatefulSet (`prometheus-prometheus`), a config-reloader sidecar, and handles all ServiceMonitor/PrometheusRule reconciliation:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  version: v3.9.1
+  image: quay.io/prometheus/prometheus:v3.9.1
+  replicas: 1
+  serviceAccountName: prometheus
+
+  retention: 7d
+  retentionSize: 8GB
+
+  storage:
+    volumeClaimTemplate:
+      spec:
+        storageClassName: nfs-client
+        accessModes: [ReadWriteMany]
+        resources:
+          requests:
+            storage: 10Gi
+
+  # Config reloader sidecar resources -- uses strategic merge patch
+  containers:
+    - name: config-reloader
+      resources:
+        requests:
+          cpu: 10m
+          memory: 25Mi
+        limits:
+          cpu: 50m
+          memory: 50Mi
+
+  walCompression: true
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+  # Selectors -- all match `release: prometheus` label
+  serviceMonitorSelector:
+    matchLabels:
+      release: prometheus
+  serviceMonitorNamespaceSelector: {}
+  podMonitorSelector:
+    matchLabels:
+      release: prometheus
+  podMonitorNamespaceSelector: {}
+  probeSelector:
+    matchLabels:
+      release: prometheus
+  probeNamespaceSelector: {}
+  ruleSelector:
+    matchLabels:
+      release: prometheus
+  ruleNamespaceSelector: {}
+  scrapeConfigSelector:
+    matchLabels:
+      release: prometheus
+  scrapeConfigNamespaceSelector: {}
+
+  alerting:
+    alertmanagers:
+      - namespace: monitoring
+        name: alertmanager
+        port: http-web
+        apiVersion: v2
+
+  securityContext:
+    fsGroup: 65534
+    runAsGroup: 65534
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+
+  externalUrl: https://prom-k3s.erfi.io
+```
+
+:::note
+The `configReloaderResources` field does **not** exist in the v0.89.0 CRD. To set config-reloader sidecar resources, use the `spec.containers` strategic merge patch with `name: config-reloader` as shown above. This is needed for KEDA CPU/memory triggers to have a reference point.
+:::
+
+### ServiceMonitors
+
+18 ServiceMonitors scrape targets across the cluster. The `release: prometheus` label is the common selector:
+
+| ServiceMonitor | Namespace | Target |
+| :------------- | :-------- | :----- |
+| prometheus-operator | monitoring | Operator metrics |
+| prometheus | monitoring | Prometheus self-metrics |
+| alertmanager | monitoring | Alertmanager metrics |
+| grafana | monitoring | Grafana metrics |
+| kube-state-metrics | monitoring | kube-state-metrics |
+| node-exporter | monitoring | Node Exporter (all nodes) |
+| blackbox-exporter | monitoring | Blackbox Exporter |
+| loki | monitoring | Loki metrics |
+| alloy | monitoring | Grafana Alloy (DaemonSet) |
+| alloy-logpush | monitoring | Alloy Logpush receiver |
+| jaeger | monitoring | Jaeger metrics |
+| traefik | traefik | Traefik ingress controller |
+| cloudflared | cloudflared | Cloudflare tunnel daemon |
+| authentik-metrics | authentik | Authentik server |
+| revista | revista | Revista app |
+| kubelet | kube-system | Kubelet + cAdvisor |
+| coredns | kube-system | CoreDNS |
+| apiserver | default | Kubernetes API server |
+
+Cross-namespace ServiceMonitors (traefik, cloudflared, authentik, revista, kubelet, coredns, apiserver) live in `monitoring/servicemonitors/` and use `namespaceSelector.matchNames` to reach across namespaces.
+
+The kubelet ServiceMonitor scrapes three endpoints from the same port: `/metrics` (kubelet), `/metrics/cadvisor` (container metrics), and `/metrics/probes` (probe metrics). All use bearer token auth against the k8s API server CA.
+
+### Alert rules
+
+Six PrometheusRule CRs provide alerting and recording rules:
+
+| Rule file | Coverage |
+| :-------- | :------- |
+| `general-rules.yaml` | Watchdog, InfoInhibitor, TargetDown |
+| `kubernetes-apps.yaml` | Pod CrashLoopBackOff, container restarts, Deployment/StatefulSet failures |
+| `kubernetes-resources.yaml` | CPU/memory quota overcommit, namespace resource limits |
+| `node-rules.yaml` | Node filesystem, memory, CPU, network, clock skew |
+| `k8s-recording-rules.yaml` | Pre-computed recording rules for dashboards |
+| `traefik-rules.yaml` | Traefik-specific alerting rules |
+
+### KEDA autoscaling
+
+Prometheus and Grafana use KEDA ScaledObjects for autoscaling:
+
+```yaml
+# Prometheus: targets the operator-created StatefulSet
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: prometheus-keda
+  namespace: monitoring
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: prometheus-prometheus
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  triggers:
+    - type: cpu
+      metadata:
+        type: Utilization
+        value: "50"
+    - type: memory
+      metadata:
+        type: Utilization
+        value: "50"
+```
+
+:::caution
+KEDA must target `kind: StatefulSet` for Prometheus -- the operator creates `statefulset/prometheus-prometheus`, not a Deployment.
+
+For Grafana, `maxReplicaCount` is capped at **1** because Grafana uses SQLite. SQLite over NFS does not support concurrent writers. Multiple replicas cause `"database is locked"` errors, user sync failures on OAuth login, and dashboard provisioning failures. Do not increase this without first migrating Grafana to PostgreSQL.
+:::
+
+---
+
+## Part 2: Alertmanager
+
+Managed by the Prometheus Operator via the `Alertmanager` CR:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: Alertmanager
+metadata:
+  name: alertmanager
+  namespace: monitoring
+spec:
+  version: v0.31.1
+  image: quay.io/prometheus/alertmanager:v0.31.1
+  replicas: 1
+  serviceAccountName: prometheus
+
+  storage:
+    volumeClaimTemplate:
+      spec:
+        storageClassName: nfs-client
+        accessModes: [ReadWriteMany]
+        resources:
+          requests:
+            storage: 1Gi
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  securityContext:
+    fsGroup: 65534
+    runAsGroup: 65534
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+
+  externalUrl: https://alertmanager-k3s.erfi.io
+```
+
+The Alertmanager config (routing rules, SMTP credentials) lives in `alertmanager/secret.yaml` and **must be SOPS-encrypted** before committing:
+
+```bash
+encrypt_k3s_secret monitoring/alertmanager/secret.yaml
+```
+
+---
+
+## Part 3: Loki
+
+Loki runs in monolithic mode (`-target=all`) as a single-replica StatefulSet with filesystem storage on NFS.
+
+### Configuration
+
+```yaml
+# monitoring/loki/configmap.yaml
+data:
+  loki.yaml: |
+    target: all
+    auth_enabled: false
+    server:
+      http_listen_port: 3100
+      grpc_listen_port: 9095
+      log_level: info
+    common:
+      path_prefix: /loki
+      ring:
+        instance_addr: 0.0.0.0
+        kvstore:
+          store: inmemory
+      replication_factor: 1
+    schema_config:
+      configs:
+        - from: "2024-01-01"
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: index_
+            period: 24h
+    storage_config:
+      filesystem:
+        directory: /loki/chunks
+      tsdb_shipper:
+        active_index_directory: /loki/index
+        cache_location: /loki/index_cache
+    compactor:
+      working_directory: /loki/compactor
+      compaction_interval: 5m
+      retention_enabled: true
+      delete_request_store: filesystem
+      retention_delete_delay: 2h
+      retention_delete_worker_count: 150
+    limits_config:
+      retention_period: 744h           # 31 days
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h # 7 days
+      ingestion_rate_mb: 10
+      ingestion_burst_size_mb: 20
+      max_query_parallelism: 2
+      max_query_series: 5000
+      allow_structured_metadata: true
+      volume_enabled: true
+```
+
+Key settings:
+
+| Setting | Value | Why |
+| :------ | :---- | :-- |
+| `schema: v13` | TSDB | Latest Loki schema, required for structured metadata |
+| `retention_period: 744h` | 31 days | Matches Cloudflare's Logpush retention |
+| `max_query_series: 5000` | High | Required for `topk` queries on high-cardinality Logpush data (see Part 8) |
+| `ingestion_rate_mb: 10` | 10 MB/s | Logpush batches can be large; default was too low |
+| `max_query_parallelism: 2` | Conservative | ARM64 nodes have limited resources |
+| `delete_request_store: filesystem` | Required | Must be set when `retention_enabled: true`, otherwise Loki fails to start |
+
+### StatefulSet
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: loki
+  namespace: monitoring
+spec:
+  replicas: 1
+  serviceName: loki-headless
+  template:
+    spec:
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        runAsNonRoot: true
+      containers:
+        - name: loki
+          image: docker.io/grafana/loki:3.6.5
+          args:
+            - -config.file=/etc/loki/loki.yaml
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/loki
+            - name: data
+              mountPath: /loki
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        storageClassName: nfs-client
+        accessModes: [ReadWriteMany]
+        resources:
+          requests:
+            storage: 20Gi
+```
+
+:::note
+Loki ConfigMap changes do **not** trigger a StatefulSet rollout. After editing the config:
+
+```bash
+kubectl rollout restart statefulset/loki -n monitoring
+```
+:::
+
+---
+
+## Part 4: Grafana Alloy
+
+Grafana Alloy serves two roles in this stack:
+
+1. **DaemonSet** (`alloy/`) -- runs on every node, collects pod logs and forwards OTLP traces
+2. **Deployment** (`alloy-logpush/`) -- single instance, receives Cloudflare Logpush data (covered in Part 7)
+
+### DaemonSet configuration
+
+The DaemonSet Alloy discovers pods on its node, tails their log files, and forwards to Loki. It also receives OTLP traces and batches them to Jaeger:
+
+```hcl
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// Pod discovery and log collection
+discovery.kubernetes "pods" {
+  role = "pod"
+  selectors {
+    role  = "pod"
+    field = "spec.nodeName=" + coalesce(env("HOSTNAME"), "")
+  }
+}
+
+discovery.relabel "pod_logs" {
+  targets = discovery.kubernetes.pods.targets
+
+  rule {
+    source_labels = ["__meta_kubernetes_pod_phase"]
+    regex         = "Pending|Succeeded|Failed|Unknown"
+    action        = "drop"
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_namespace"]
+    target_label  = "namespace"
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_pod_name"]
+    target_label  = "pod"
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_pod_container_name"]
+    target_label  = "container"
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_pod_uid",
+                     "__meta_kubernetes_pod_container_name"]
+    separator     = "/"
+    target_label  = "__path__"
+    replacement   = "/var/log/pods/*$1/*.log"
+  }
+}
+
+local.file_match "pod_logs" {
+  path_targets = discovery.relabel.pod_logs.output
+}
+
+loki.source.file "pod_logs" {
+  targets    = local.file_match.pod_logs.targets
+  forward_to = [loki.process.pod_logs.receiver]
+}
+
+loki.process "pod_logs" {
+  stage.cri {}
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push"
+  }
+}
+
+// OTLP trace receiver -> Jaeger
+otelcol.receiver.otlp "default" {
+  grpc { endpoint = "0.0.0.0:4317" }
+  http { endpoint = "0.0.0.0:4318" }
+  output { traces = [otelcol.processor.batch.default.input] }
+}
+
+otelcol.processor.batch "default" {
+  output { traces = [otelcol.exporter.otlp.jaeger.input] }
+}
+
+otelcol.exporter.otlp "jaeger" {
+  client {
+    endpoint = "jaeger-collector.monitoring.svc.cluster.local:4317"
+    tls { insecure = true }
+  }
+}
+```
+
+The pipeline:
+
+1. **`discovery.kubernetes`** discovers pods on the current node (filtered by `HOSTNAME` env var)
+2. **`discovery.relabel`** extracts namespace/pod/container labels and constructs the log file path
+3. **`loki.source.file`** tails the CRI log files under `/var/log/pods/`
+4. **`loki.process`** applies the `stage.cri {}` pipeline to parse CRI-format log lines
+5. **`loki.write`** pushes to Loki
+6. **`otelcol.receiver.otlp`** receives traces from applications on gRPC 4317 / HTTP 4318
+7. **`otelcol.processor.batch`** batches traces for efficiency
+8. **`otelcol.exporter.otlp`** forwards to Jaeger's collector
+
+---
+
+## Part 5: Jaeger
+
+Jaeger v2 uses the OpenTelemetry Collector config format. It runs as an all-in-one Deployment with Badger embedded storage on an NFS PVC (10Gi).
+
+### Configuration
+
+```yaml
+# monitoring/jaeger/configmap.yaml
+data:
+  config.yaml: |
+    service:
+      extensions:
+        - jaeger_storage
+        - jaeger_query
+        - healthcheckv2
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [jaeger_storage_exporter]
+      telemetry:
+        resource:
+          service.name: jaeger
+        metrics:
+          level: detailed
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    host: 0.0.0.0
+                    port: 8888
+        logs:
+          level: info
+
+    extensions:
+      healthcheckv2:
+        use_v2: true
+        http:
+          endpoint: 0.0.0.0:13133
+      jaeger_query:
+        storage:
+          traces: badger_main
+      jaeger_storage:
+        backends:
+          badger_main:
+            badger:
+              directories:
+                keys: /badger/data/keys
+                values: /badger/data/values
+              ephemeral: false
+              ttl:
+                spans: 168h
+
+    receivers:
+      otlp:
+        protocols:
+          grpc: { endpoint: 0.0.0.0:4317 }
+          http: { endpoint: 0.0.0.0:4318 }
+
+    processors:
+      batch:
+        send_batch_size: 10000
+        timeout: 5s
+
+    exporters:
+      jaeger_storage_exporter:
+        trace_storage: badger_main
+```
+
+:::note
+Jaeger v2.15.1 requires the **nested** telemetry config structure with `pull.exporter.prometheus.host`/`port`. The flat `address: "0.0.0.0:8888"` format does not work and fails silently.
+:::
+
+The Deployment uses `strategy: Recreate` since Badger uses file locking and cannot run multiple instances:
+
+```yaml
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    spec:
+      containers:
+        - name: jaeger
+          image: docker.io/jaegertracing/jaeger:2.15.1
+          args: [--config, /etc/jaeger/config.yaml]
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: query-http
+              containerPort: 16686
+            - name: metrics
+              containerPort: 8888
+            - name: health
+              containerPort: 13133
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+```
+
+### Log-to-trace correlation
+
+Loki's datasource config includes `derivedFields` that extract trace IDs from log lines and link them to Jaeger:
+
+```yaml
+# In grafana/datasources.yaml
+- name: Loki
+  type: loki
+  uid: loki
+  url: http://loki.monitoring.svc:3100
+  jsonData:
+    derivedFields:
+      - datasourceUid: jaeger
+        matcherRegex: '"traceID":"(\w+)"'
+        name: traceID
+        url: "$${__value.raw}"
+```
+
+When a log line contains a `traceID` field, Grafana renders it as a clickable link that opens the trace in Jaeger.
+
+---
+
+## Part 6: Grafana
+
+### Authentication with Authentik SSO
+
+Grafana uses Authentik as an OAuth2/OIDC provider:
+
+```ini
+# grafana.ini
+[auth]
+oauth_allow_insecure_email_lookup = true
+
+[auth.generic_oauth]
+enabled = true
+name = Authentik
+allow_sign_up = true
+auto_login = false
+scopes = openid email profile
+auth_url = https://authentik.erfi.io/application/o/authorize/
+token_url = https://authentik.erfi.io/application/o/token/
+api_url = https://authentik.erfi.io/application/o/userinfo/
+signout_redirect_url = https://authentik.erfi.io/application/o/grafana/end-session/
+role_attribute_path = contains(groups, 'Grafana Admins') && 'Admin' || contains(groups, 'Grafana Editors') && 'Editor' || 'Viewer'
+groups_attribute_path = groups
+login_attribute_path = preferred_username
+name_attribute_path = name
+email_attribute_path = email
+use_pkce = true
+use_refresh_token = true
+```
+
+**Role mapping** via Authentik groups:
+
+| Authentik Group | Grafana Role |
+| :-------------- | :----------- |
+| `Grafana Admins` | Admin |
+| `Grafana Editors` | Editor |
+| (everyone else) | Viewer |
+
+Credentials (`oauth-client-id`, `oauth-client-secret`) are stored in `grafana-secret` and injected as env vars. The secret must be SOPS-encrypted.
+
+:::caution
+**OAuth user sync gotcha**: When Authentik returns `email_verified: false`, Grafana 12 fails to create or link OAuth users. You need `oauth_allow_insecure_email_lookup = true` in `[auth]`. Additionally, the bootstrap admin user has `email: admin@localhost` which won't match the OAuth email -- either update the admin email via the Grafana API before first SSO login, or mark the email as verified in Authentik.
+:::
+
+### Datasources
+
+Four datasources are provisioned via a directly-mounted ConfigMap (not the sidecar):
+
+```yaml
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    url: http://prometheus.monitoring.svc:9090
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 30s
+
+  - name: Alertmanager
+    type: alertmanager
+    uid: alertmanager
+    url: http://alertmanager.monitoring.svc:9093
+    jsonData:
+      implementation: prometheus
+
+  - name: Loki
+    type: loki
+    uid: loki
+    url: http://loki.monitoring.svc:3100
+    jsonData:
+      derivedFields:
+        - datasourceUid: jaeger
+          matcherRegex: '"traceID":"(\w+)"'
+          name: traceID
+          url: "$${__value.raw}"
+
+  - name: Jaeger
+    type: jaeger
+    uid: jaeger
+    url: http://jaeger-query.monitoring.svc:16686
+```
+
+:::tip[Why direct mount instead of sidecar]
+The k8s-sidecar in LIST mode runs once and exits silently. If Grafana starts before the sidecar writes the datasource file, provisioning fails with no error message and no logs. Mounting the datasource ConfigMap directly as a volume avoids this race condition entirely. The sidecar is only used for dashboard provisioning (WATCH mode), where it continuously monitors for changes.
+:::
+
+### Deployment
+
+The Grafana Deployment has two containers: the k8s-sidecar for dashboard provisioning and Grafana itself:
+
+```yaml
+containers:
+  - name: grafana-sc-dashboard
+    image: quay.io/kiwigrid/k8s-sidecar:2.5.0
+    env:
+      - name: LABEL
+        value: grafana_dashboard
+      - name: LABEL_VALUE
+        value: "1"
+      - name: METHOD
+        value: WATCH
+      - name: FOLDER
+        value: /tmp/dashboards
+      - name: NAMESPACE
+        value: ALL
+      - name: RESOURCE
+        value: configmap
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+
+  - name: grafana
+    image: docker.io/grafana/grafana:12.3.3
+    env:
+      - name: GF_SECURITY_ADMIN_USER
+        valueFrom:
+          secretKeyRef:
+            name: grafana-secret
+            key: admin-user
+      - name: GF_SECURITY_ADMIN_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: grafana-secret
+            key: admin-password
+      - name: GF_AUTH_GENERIC_OAUTH_CLIENT_ID
+        valueFrom:
+          secretKeyRef:
+            name: grafana-secret
+            key: oauth-client-id
+      - name: GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET
+        valueFrom:
+          secretKeyRef:
+            name: grafana-secret
+            key: oauth-client-secret
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+```
+
+The sidecar in WATCH mode detects ConfigMaps with `grafana_dashboard: "1"` across all namespaces and writes them to `/tmp/dashboards`. Grafana's dashboard provider reads from that directory.
+
+### Dashboard management
+
+All 14 dashboards are standalone `.json` files managed by kustomize `configMapGenerator`:
+
+```yaml
+# monitoring/grafana/dashboards/kustomization.yaml
+generatorOptions:
+  disableNameSuffixHash: true
+  labels:
+    grafana_dashboard: "1"
+
+configMapGenerator:
+  - name: alertmanager-dashboard
+    files:
+      - alertmanager.json
+  - name: cloudflare-logpush-dashboard
+    files:
+      - cloudflare-logpush.json
+  # ... 12 more entries
+```
+
+This replaced the previous approach of inlining dashboard JSON inside YAML ConfigMaps. The benefits:
+
+- JSON files get proper syntax highlighting in editors
+- No YAML escaping issues with special characters in JSON
+- Files can be imported/exported directly from Grafana's UI
+- Easy to diff and review in git
+
+| Dashboard | Source | Panels |
+| :-------- | :----- | :----- |
+| Alertmanager | grafana.com | ~6 |
+| Alloy | grafana.com | ~30 |
+| Authentik | grafana.com | ~20 |
+| Blackbox Exporter | grafana.com | ~12 |
+| **Cloudflare Logpush** | **custom gen script** | **85** |
+| **Cloudflare Tunnel** | **custom gen script** | **41** |
+| CoreDNS | grafana.com | ~15 |
+| Grafana Stats | grafana.com | ~8 |
+| Jaeger | grafana.com | ~20 |
+| K8s Cluster | grafana.com | ~15 |
+| Loki | grafana.com | ~40 |
+| Node Exporter | grafana.com | ~40 |
+| Prometheus | grafana.com | ~35 |
+| Traefik | grafana.com | ~25 |
+
+**Adding upstream dashboards** from grafana.com:
+
+```bash
+cd monitoring/grafana/dashboards/
+./add-dashboard.sh <gnet-id> <name> [revision]
+
+# Example:
+./add-dashboard.sh 1860 node-exporter 37
+```
+
+The script downloads the JSON, replaces all datasource template variables with hardcoded UIDs (`prometheus`, `loki`), strips `__inputs`/`__requires`, fixes deprecated panel types (`grafana-piechart-panel` -> `piechart`), writes a standalone `.json` file, and adds a `configMapGenerator` entry.
+
+**Regenerating custom dashboards:**
+
+```bash
+python3 gen-cloudflare-logpush.py   # 85 panels
+python3 gen-cloudflared.py          # 41 panels
+```
+
+:::note
+The Node Exporter Full dashboard (gnetId 1860) is ~472KB as JSON. As a ConfigMap, it exceeds the 262144-byte annotation limit and requires `--server-side` apply.
+:::
+
+### Python dashboard generators
+
+Custom dashboards are generated by Python scripts rather than hand-edited JSON. An 85-panel dashboard is ~5000 lines of JSON but only ~500 lines of Python with reusable helper functions:
+
+```python
+#!/usr/bin/env python3
+"""Generate the Cloudflare Logpush Grafana dashboard JSON."""
+import json
+
+DS = {"type": "loki", "uid": "loki"}
+
+def stat_panel(id, title, expr, legend, x, y, w=6, unit="short",
+               thresholds=None, instant=True):
+    """Stat panel with threshold colors."""
+    # ... returns panel dict
+
+def ts_panel(id, title, targets, x, y, w=12, h=8, unit="short",
+             stack=True, overrides=None, fill=20):
+    """Time series panel with stacking."""
+    # ... returns panel dict
+
+def table_panel(id, title, expr, legend, x, y, w=8, h=8):
+    """Table panel for topk queries."""
+    # ... returns panel dict
+
+def pie_panel(id, title, expr, legend, x, y, w=6, h=8):
+    """Pie chart with donut style and right legend."""
+    # ... returns panel dict
+
+# Shared query fragments with template variable filters
+HTTP = ('{job="cloudflare-logpush", dataset="http_requests"} | json'
+       ' | ClientRequestHost =~ "$host" | ClientCountry =~ "$country"')
+FW = ('{job="cloudflare-logpush", dataset="firewall_events"} | json'
+      ' | ClientRequestHost =~ "$host"')
+WK = '{job="cloudflare-logpush", dataset="workers_trace_events"} | json'
+```
+
+The `gen-cloudflared.py` script follows the same pattern but uses `DS = {"type": "prometheus", "uid": "prometheus"}` since cloudflared exports Prometheus metrics natively.
+
+---
+
+## Part 7: Cloudflare Logpush Pipeline
+
+This is the most complex part of the stack. Cloudflare Logpush pushes HTTP request logs, firewall events, and Workers trace events as gzip-compressed NDJSON to an HTTPS endpoint on the cluster. The challenge: Alloy's `/loki/api/v1/raw` endpoint does not handle gzip, and Traefik has no built-in request body decompression.
+
+### The compression problem
+
+When Cloudflare Logpush sends data to an HTTP destination:
+
+1. **Logpush always gzip-compresses HTTP payloads** -- no way to disable this
+2. **Alloy's `loki.source.api` `/loki/api/v1/raw` does not handle `Content-Encoding: gzip`** -- confirmed by reading Alloy source. Only `/loki/api/v1/push` (protobuf/JSON) handles gzip
+3. **Traefik's `compress` middleware** only handles response compression, not request body decompression
+
+This means a decompression layer is needed between Cloudflare and Alloy.
+
+### The Traefik decompress plugin
+
+I wrote a Traefik Yaegi (Go interpreter) local plugin that intercepts `Content-Encoding: gzip` requests, decompresses the body, and passes through to the next handler:
+
+```go
+package decompress
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+)
+
+type Config struct{}
+
+func CreateConfig() *Config { return &Config{} }
+
+type Decompress struct {
+	next http.Handler
+	name string
+}
+
+func New(ctx context.Context, next http.Handler, config *Config,
+    name string) (http.Handler, error) {
+	return &Decompress{next: next, name: name}, nil
+}
+
+func (d *Decompress) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	encoding := strings.ToLower(req.Header.Get("Content-Encoding"))
+	if encoding != "gzip" {
+		d.next.ServeHTTP(rw, req)
+		return
+	}
+
+	gzReader, err := gzip.NewReader(req.Body)
+	if err != nil {
+		http.Error(rw, fmt.Sprintf("failed to create gzip reader: %v", err),
+			http.StatusBadRequest)
+		return
+	}
+	defer gzReader.Close()
+
+	decompressed, err := io.ReadAll(gzReader)
+	if err != nil {
+		http.Error(rw, fmt.Sprintf("failed to decompress body: %v", err),
+			http.StatusBadRequest)
+		return
+	}
+
+	req.Body = io.NopCloser(bytes.NewReader(decompressed))
+	req.ContentLength = int64(len(decompressed))
+	req.Header.Set("Content-Length", strconv.Itoa(len(decompressed)))
+	req.Header.Del("Content-Encoding")
+
+	d.next.ServeHTTP(rw, req)
+}
+```
+
+Published at [github.com/erfianugrah/decompress](https://github.com/erfianugrah/decompress), tagged v0.1.0.
+
+### Deploying the plugin on k3s
+
+Traefik loads local plugins from `/plugins-local/src/<moduleName>/`. Since Traefik runs with `readOnlyRootFilesystem: true`, the plugin files are packaged as a ConfigMap and mounted:
+
+**Step 1**: ConfigMap in `traefik` namespace containing `decompress.go`, `go.mod`, `.traefik.yml`:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traefik-plugin-decompress
+  namespace: traefik
+data:
+  decompress.go: |
+    package decompress
+    // ... (full Go source)
+  go.mod: |
+    module github.com/erfianugrah/decompress
+    go 1.22
+  .traefik.yml: |
+    displayName: Decompress Request Body
+    type: middleware
+    import: github.com/erfianugrah/decompress
+    summary: Decompresses gzip-encoded request bodies for upstream services.
+    testData: {}
+```
+
+**Step 2**: Volume mount in Traefik Deployment:
+
+```yaml
+volumeMounts:
+  - name: plugin-decompress
+    mountPath: /plugins-local/src/github.com/erfianugrah/decompress
+    readOnly: true
+volumes:
+  - name: plugin-decompress
+    configMap:
+      name: traefik-plugin-decompress
+```
+
+**Step 3**: Traefik arg to enable the plugin:
+
+```yaml
+args:
+  - "--experimental.localPlugins.decompress.moduleName=github.com/erfianugrah/decompress"
+```
+
+**Step 4**: Middleware CRD (must be in same namespace as IngressRoute):
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: decompress
+  namespace: monitoring
+spec:
+  plugin:
+    decompress: {}
+```
+
+:::note
+The `import` field in `.traefik.yml` must match the Go module name in `go.mod` exactly. The mount path under `/plugins-local/src/` must also match. And the Middleware CRD must be in the same namespace as the IngressRoute, OR `allowCrossNamespace` must be enabled in Traefik.
+:::
+
+### Dataset-agnostic Alloy receiver
+
+The Alloy Logpush receiver runs as a separate Deployment. The key design: it knows nothing about individual Logpush datasets. Each job injects a `_dataset` field via `output_options.record_prefix`, and Alloy extracts only that as a label:
+
+```hcl
+loki.source.api "cloudflare" {
+  http {
+    listen_address = "0.0.0.0"
+    listen_port    = 3500
+  }
+  labels = {
+    job = "cloudflare-logpush",
+  }
+  forward_to = [loki.process.cloudflare.receiver]
+}
+
+loki.process "cloudflare" {
+  stage.json {
+    expressions = { dataset = "_dataset" }
+  }
+  stage.labels {
+    values = { dataset = "dataset" }
+  }
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push"
+  }
+}
+```
+
+Adding a new Logpush dataset requires zero Alloy changes -- just create the job with the right `record_prefix` and data flows automatically.
+
+### DNS and tunnel routing
+
+The Logpush endpoint needs a public HTTPS URL. This is provided by the Cloudflare Tunnel:
+
+```hcl
+# cloudflare-tunnel-tf/records.tf
+resource "cloudflare_record" "logpush-k3s" {
+  zone_id = var.cloudflare_secondary_zone_id
+  name    = "logpush-k3s"
+  type    = "CNAME"
+  content = cloudflare_zero_trust_tunnel_cloudflared.k3s.cname
+  proxied = true
+  tags    = ["k3s", "monitoring"]
+}
+
+# cloudflare-tunnel-tf/tunnel_config.tf
+ingress_rule {
+  hostname = "logpush-k3s.${var.secondary_domain_name}"
+  service  = "https://traefik.traefik.svc.cluster.local"
+  origin_request {
+    origin_server_name = "logpush-k3s.${var.secondary_domain_name}"
+    http2_origin       = true
+    no_tls_verify      = true
+  }
+}
+```
+
+The IngressRoute ties hostname, middleware, and backend together:
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: alloy-logpush
+  namespace: monitoring
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`logpush-k3s.erfi.io`)
+      middlewares:
+        - name: decompress
+          namespace: monitoring
+      services:
+        - kind: Service
+          name: alloy-logpush
+          port: 3500
+```
+
+### OpenTofu Logpush jobs
+
+Seven Logpush jobs are managed in OpenTofu. Shared config uses locals:
+
+```hcl
+# erfianugrah-cf-tf/main_zone/locals.tf
+logpush_loki_dest = "https://logpush-k3s.erfi.io/loki/api/v1/raw?header_Content-Type=application%2Fjson&header_X-Logpush-Secret=${var.logpush_secret}"
+
+zone_ids = {
+  erfianugrah_com = var.cloudflare_zone_id
+  erfi_dev        = var.secondary_cloudflare_zone_id
+  erfi_io         = var.thirdary_cloudflare_zone_id
+}
+```
+
+The destination URL uses Logpush's `header_` query parameter syntax to inject `Content-Type` and a shared secret header.
+
+**HTTP requests** (one per zone, using `for_each`):
+
+```hcl
+resource "cloudflare_logpush_job" "http_loki" {
+  for_each = local.zone_ids
+
+  dataset                     = "http_requests"
+  destination_conf            = local.logpush_loki_dest
+  enabled                     = true
+  max_upload_interval_seconds = 30
+
+  output_options {
+    output_type      = "ndjson"
+    record_prefix    = "{\"_dataset\":\"http_requests\","
+    field_names      = local.http_requests_fields
+    timestamp_format = "rfc3339"
+    cve20214428      = false
+  }
+
+  zone_id = each.value
+}
+```
+
+**Firewall events** (same pattern, `for_each` over zones):
+
+```hcl
+resource "cloudflare_logpush_job" "firewall_loki" {
+  for_each = local.zone_ids
+
+  dataset          = "firewall_events"
+  destination_conf = local.logpush_loki_dest
+  enabled          = true
+
+  output_options {
+    output_type   = "ndjson"
+    record_prefix = "{\"_dataset\":\"firewall_events\","
+    field_names   = local.firewall_events_fields
+  }
+
+  zone_id = each.value
+}
+```
+
+**Workers trace events** (account-scoped, single job):
+
+```hcl
+resource "cloudflare_logpush_job" "workers_loki" {
+  dataset          = "workers_trace_events"
+  destination_conf = local.logpush_loki_dest
+  enabled          = true
+
+  output_options {
+    output_type   = "ndjson"
+    record_prefix = "{\"_dataset\":\"workers_trace_events\","
+    field_names   = local.workers_trace_events_fields
+  }
+
+  account_id = var.cloudflare_account_id
+}
+```
+
+The `record_prefix` trick prepends `{"_dataset":"http_requests",` to every JSON line, producing:
+
+```json
+{"_dataset":"http_requests","ClientIP":"1.2.3.4","RayID":"abc123",...}
+```
+
+Alloy extracts `_dataset` as a label; everything else stays in the log line for LogQL `| json`.
+
+| Dataset | Scope | Jobs | Zones |
+| :------ | :---- | :--- | :---- |
+| `http_requests` | Zone | 3 | erfianugrah.com, erfi.dev, erfi.io |
+| `firewall_events` | Zone | 3 | erfianugrah.com, erfi.dev, erfi.io |
+| `workers_trace_events` | Account | 1 | (all Workers) |
+| **Total** | | **7** | |
+
+:::tip[Adding new datasets]
+To add a new dataset (e.g., `spectrum_events`):
+1. Define the field list in `locals.tf`
+2. Create a `cloudflare_logpush_job` with `record_prefix = "{\"_dataset\":\"spectrum_events\","`
+3. `tofu apply -var-file=secrets.tfvars`
+
+No Alloy or cluster changes needed. Data immediately appears as `{dataset="spectrum_events"}`.
+:::
+
+### Cloudflare Logpush dashboard
+
+The custom dashboard has 85 panels across 11 sections:
+
+| Section | Panels | Key visualizations |
+| :------ | :----- | :----------------- |
+| Overview | 8 stats | Request count, 5xx error rate, cache hit ratio, WAF attacks, bot traffic %, leaked credentials |
+| HTTP Requests | 8 | By host/status/method, top paths, suspicious user agents (BotScore<30) |
+| Performance | 10 | Edge TTFB (avg/p95/p99), origin timing breakdown (DNS/TCP/TLS stacked area) |
+| Cache | 9 | Cache status, hit ratio trend, tiered fill, compression ratio |
+| Security & Firewall | 5 | Firewall events by action/source/host, top rules |
+| WAF Attack Analysis | 6 | Attack score buckets, SQLi/XSS/RCE breakdown, unmitigated attacks |
+| Threat Intelligence | 9 | Leaked credentials, IP classification, geo anomaly on sensitive paths |
+| Bot Analysis | 6 | Bot score distribution, JA4/JA3 fingerprints, verified bot categories |
+| Geography | 4 | Top countries, edge colos, ASNs, device types |
+| SSL/TLS | 4 | Client SSL versions/ciphers, mTLS status, origin SSL |
+| Workers | 6 | CPU/wall time by script, outcomes, subrequest count |
+
+Template variables are `textbox` type with `.*` default (matches everything). Grafana's `label_values()` only works for indexed Loki labels, not JSON-extracted fields -- since all fields are in the JSON body, textbox is the only practical option.
+
+### Cloudflared tunnel dashboard
+
+Expanded from 18 to 41 panels using `gen-cloudflared.py`:
+
+| Section | Key panels |
+| :------ | :--------- |
+| Tunnel Overview | Requests/sec, errors/sec, active connections, uptime |
+| Response Status | Status code distribution, error rate by origin |
+| Latency | Request/response duration (avg/p95/p99) |
+| Throughput | Bytes sent/received, request body size percentiles |
+| Edge Locations | Top colo codes, request distribution by edge |
+| RPC Operations | Register, unregister, reconnect calls |
+| Process Resources | CPU, memory, goroutines, open FDs |
+
+---
+
+## Part 8: LogQL Pitfalls
+
+Working with high-cardinality Cloudflare Logpush data in Loki exposed nine specific traps. These cost real debugging time -- the error messages are often unhelpful.
+
+### 1. `count_over_time` without `sum()` explodes series
+
+```logql
+# BAD: one series per unique log line
+count_over_time({job="cloudflare-logpush"} | json [5m])
+
+# GOOD: single aggregated count
+sum(count_over_time({job="cloudflare-logpush"} | json [5m]))
+```
+
+After `| json`, every extracted field becomes a potential label. Without `sum()`, `count_over_time` returns one series per unique label combination -- easily hitting `max_query_series`.
+
+### 2. `unwrap` aggregations don't support `by ()`
+
+```logql
+# BAD: parse error
+avg_over_time(... | unwrap EdgeTimeToFirstByteMs [5m]) by (Host)
+
+# GOOD: outer aggregation for grouping
+sum by (Host) (avg_over_time(... | unwrap EdgeTimeToFirstByteMs [5m]))
+```
+
+### 3. Stat panels need `instant: true`
+
+Without `instant: true`, Loki returns a range result. The stat panel picks `lastNotNull` which may not reflect the full window. Set `"queryType": "instant", "instant": true` on stat panel targets.
+
+### 4. `$__auto` vs fixed intervals
+
+- **Time series panels**: `[$__auto]` -- adapts to the visible time range
+- **Table panels**: `[5m]` fixed -- `$__auto` creates too many evaluation windows
+- **Stat panels**: `[5m]` with `instant: true`
+
+### 5. Cannot compare two extracted fields
+
+```logql
+# IMPOSSIBLE: compare two extracted fields
+{...} | json | OriginResponseStatus != EdgeResponseStatus
+```
+
+LogQL can only compare extracted fields to literal values. Use two queries or dashboard transformations.
+
+### 6. `unwrap` produces one series per stream
+
+Always wrap `unwrap` aggregations in an outer `sum()` or `avg by ()`:
+
+```logql
+# BAD: one series per label combination
+avg_over_time(... | unwrap EdgeTimeToFirstByteMs [$__auto])
+
+# GOOD: collapsed
+sum(avg_over_time(... | unwrap EdgeTimeToFirstByteMs [$__auto]))
+```
+
+### 7. `max_query_series` applies to inner cardinality
+
+```logql
+topk(10, sum by (Path) (count_over_time(... | json [5m])))
+```
+
+Loki evaluates `sum by (Path)` first. If there are thousands of unique paths (bots/scanners), it exceeds `max_query_series` before `topk` ever runs. Reducing the time window does not help -- the cardinality is inherent in the data.
+
+### 8. High-cardinality `topk` requires high `max_query_series`
+
+Even a 1-second scan window can have 1500+ unique paths due to bots. Raised `max_query_series` to 5000:
+
+```yaml
+limits_config:
+  max_query_series: 5000
+```
+
+The memory impact on single-instance homelab Loki is negligible for instant queries.
+
+### 9. Table panels with `[$__auto]` hit series limits
+
+Combines pitfalls 4, 7, and 8. Over a 24h range, `$__auto` might resolve to 15-second intervals, creating many evaluation windows. Use `[5m]` fixed for all table instant queries.
+
+---
+
+## Part 9: VyOS Metrics
+
+### Probe vs ScrapeConfig
+
+The VyOS router runs `node_exporter` on port 9100 (HTTPS, self-signed cert). Initially we used the Prometheus `Probe` CRD, but it routes through blackbox exporter, producing only `probe_*` metrics -- not the actual `node_*` metrics. VyOS never appeared in the Node Exporter dashboard.
+
+The fix: `ScrapeConfig` CRD for direct scraping:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: vyos-nl
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  metricsPath: /metrics
+  scheme: HTTPS
+  tlsConfig:
+    insecureSkipVerify: true
+  staticConfigs:
+    - targets:
+        - prom-vyos-nl.erfianugrah.com
+      labels:
+        job: node-exporter
+        instance: prom-vyos-nl.erfianugrah.com
+  scrapeInterval: 30s
+```
+
+| Aspect | Probe CRD | ScrapeConfig CRD |
+| :----- | :-------- | :--------------- |
+| Path | Prometheus -> blackbox -> target | Prometheus -> target (direct) |
+| Metrics | `probe_*` only | All target metrics |
+| Use case | Endpoint availability | Actual metric scraping |
+
+With `job: node-exporter`, VyOS appears in the Node Exporter dashboard alongside cluster nodes.
+
+---
+
+## Secrets Management
+
+Two Secret files require SOPS encryption before committing:
+
+| File | Contents |
+| :--- | :------- |
+| `monitoring/grafana/secret.yaml` | admin-user, admin-password, oauth-client-id, oauth-client-secret |
+| `monitoring/alertmanager/secret.yaml` | Alertmanager config with SMTP credentials |
+
+```bash
+encrypt_k3s_secret monitoring/grafana/secret.yaml
+encrypt_k3s_secret monitoring/alertmanager/secret.yaml
+```
+
+OpenTofu secrets (`logpush_secret`, zone IDs, API tokens) live in SOPS-encrypted `secrets.tfvars`:
+
+```bash
+sops -d secrets.tfvars > /tmp/secrets.tfvars
+tofu plan -var-file=/tmp/secrets.tfvars
+tofu apply -var-file=/tmp/secrets.tfvars
+rm /tmp/secrets.tfvars
+```
+
+---
+
+## Deployment
+
+### Full stack deploy
+
+```bash
+# 1. Deploy the entire monitoring stack (includes all components)
+kubectl apply -k monitoring/ --server-side --force-conflicts
+
+# 2. Deploy decompress plugin + middleware (separate from monitoring kustomization)
+kubectl apply -f middleware/decompress-configmap.yaml
+kubectl apply -f middleware/decompress-middleware.yaml
+
+# 3. Deploy updated Traefik with plugin enabled
+kubectl apply -f services/traefik.yaml
+
+# 4. Deploy ingress routes
+kubectl apply -f ingressroutes/grafana-ingress.yaml
+kubectl apply -f ingressroutes/prometheus-ingress.yaml
+kubectl apply -f ingressroutes/alertmanager-ingress.yaml
+kubectl apply -f ingressroutes/jaeger-ingress.yaml
+kubectl apply -f ingressroutes/alloy-logpush-ingress.yaml
+
+# 5. Deploy KEDA autoscaling
+kubectl apply -f hpa/grafana-keda-autoscaling.yaml
+kubectl apply -f hpa/prom-keda-autoscaling.yaml
+
+# 6. Apply OpenTofu for DNS + tunnel config
+cd cloudflare-tunnel-tf/ && tofu apply
+
+# 7. Apply OpenTofu for Logpush jobs
+cd ../erfianugrah-cf-tf/main_zone/
+tofu apply -var-file=secrets.tfvars
+```
+
+`--server-side` is required because the Prometheus Operator CRDs and Node Exporter dashboard exceed the 262144-byte annotation limit. IngressRoutes and KEDA ScaledObjects are outside the `monitoring/` kustomization directory because Kustomize cannot reference files outside its root.
+
+### Verification
+
+```bash
+# All pods running
+kubectl get pods -n monitoring
+
+# Prometheus targets
+kubectl port-forward svc/prometheus 9090 -n monitoring
+# Visit http://localhost:9090/targets -- all should be UP
+
+# Loki receiving data
+kubectl logs deploy/alloy-logpush -n monitoring --tail=20
+
+# Logpush data flowing
+# In Grafana Explore with Loki:
+#   {job="cloudflare-logpush"} | json
+
+# Dashboard ConfigMaps
+kubectl get cm -n monitoring -l grafana_dashboard=1
+# Should show 14 ConfigMaps
+```
+
+---
+
+## Resource Budget
+
+| Component | Instances | CPU Req | Mem Req | Storage |
+| :-------- | :-------- | :------ | :------ | :------ |
+| Prometheus Operator | 1 | 100m | 128Mi | -- |
+| Prometheus | 1 | 200m | 512Mi | 10Gi NFS |
+| Alertmanager | 1 | 50m | 64Mi | 1Gi NFS |
+| Grafana | 1 | 100m | 128Mi | 1Gi NFS |
+| kube-state-metrics | 1 | 50m | 64Mi | -- |
+| Node Exporter | 4 (DaemonSet) | 50m x4 | 32Mi x4 | -- |
+| Blackbox Exporter | 1 | 25m | 32Mi | -- |
+| Loki | 1 | 250m | 512Mi | 20Gi NFS |
+| Grafana Alloy | 4 (DaemonSet) | 100m x4 | 128Mi x4 | -- |
+| Alloy Logpush | 1 | 50m | 64Mi | -- |
+| Jaeger | 1 | 250m | 512Mi | 10Gi NFS |
+| **Total** | | **~1.68 cores** | **~2.59Gi** | **~42Gi** |
+
+---
+
+## File Reference
+
+```txt
+monitoring/
+  kustomization.yaml              # Top-level: composes all components
+  namespace.yaml
+
+  operator/                       # Prometheus Operator v0.89.0
+    kustomization.yaml
+    crd-*.yaml                    # 10 CRDs (~3.7 MB)
+    serviceaccount.yaml
+    clusterrole.yaml / clusterrolebinding.yaml
+    deployment.yaml / service.yaml / servicemonitor.yaml
+    webhook.yaml                  # Cert-gen Jobs + webhook configs
+
+  prometheus/                     # Prometheus v3.9.1 (operator-managed)
+    kustomization.yaml
+    prometheus.yaml               # Prometheus CR
+    serviceaccount.yaml / clusterrole.yaml / clusterrolebinding.yaml
+    service.yaml / servicemonitor.yaml
+    rules/
+      general-rules.yaml          # Watchdog, TargetDown
+      kubernetes-apps.yaml        # CrashLoopBackOff, restarts
+      kubernetes-resources.yaml   # CPU/memory quota
+      node-rules.yaml             # Filesystem, memory, CPU
+      k8s-recording-rules.yaml   # Pre-computed recording rules
+      traefik-rules.yaml          # Traefik alerts
+
+  alertmanager/                   # Alertmanager v0.31.1
+    alertmanager.yaml             # Alertmanager CR
+    secret.yaml                   # SOPS-encrypted SMTP config
+
+  grafana/                        # Grafana 12.3.3
+    configmap.yaml                # grafana.ini + dashboard provider
+    datasources.yaml              # Prometheus, Loki, Jaeger, Alertmanager
+    deployment.yaml               # Grafana + k8s-sidecar
+    secret.yaml                   # SOPS-encrypted credentials
+    dashboards/
+      kustomization.yaml          # configMapGenerator
+      add-dashboard.sh            # Download from grafana.com
+      gen-cloudflare-logpush.py   # 85-panel dashboard generator
+      gen-cloudflared.py          # 41-panel dashboard generator
+      *.json                      # 14 dashboard files
+
+  loki/                           # Loki 3.6.5 (monolithic)
+    configmap.yaml / statefulset.yaml / service.yaml / servicemonitor.yaml
+
+  alloy/                          # Grafana Alloy v1.13.0 (DaemonSet)
+    configmap.yaml / daemonset.yaml / service.yaml / servicemonitor.yaml
+
+  alloy-logpush/                  # Alloy Logpush receiver (Deployment)
+    configmap.yaml / deployment.yaml / service.yaml / servicemonitor.yaml
+
+  jaeger/                         # Jaeger 2.15.1 (all-in-one)
+    configmap.yaml / deployment.yaml / service.yaml / servicemonitor.yaml
+
+  kube-state-metrics/             # v2.18.0
+  node-exporter/                  # v1.10.2 (DaemonSet)
+  blackbox-exporter/              # v0.28.0
+
+  servicemonitors/                # Cross-namespace ServiceMonitors
+    apiserver.yaml / authentik.yaml / cloudflared.yaml
+    coredns.yaml / kubelet.yaml / revista.yaml / traefik.yaml
+
+  probes/
+    vyos-scrape.yaml              # ScrapeConfig for VyOS node_exporter
+
+middleware/                       # Traefik decompress plugin
+  decompress-plugin/
+    decompress.go / go.mod / .traefik.yml
+  decompress-configmap.yaml       # ConfigMap for k8s
+  decompress-middleware.yaml      # Middleware CRD
+
+ingressroutes/
+  grafana-ingress.yaml / prometheus-ingress.yaml
+  alertmanager-ingress.yaml / jaeger-ingress.yaml
+  alloy-logpush-ingress.yaml
+
+hpa/
+  grafana-keda-autoscaling.yaml   # maxReplicas: 1 (SQLite limitation)
+  prom-keda-autoscaling.yaml      # maxReplicas: 8
+
+cloudflare-tunnel-tf/             # OpenTofu: DNS + tunnel ingress rules
+  records.tf / tunnel_config.tf
+
+erfianugrah-cf-tf/main_zone/      # OpenTofu: Logpush jobs
+  zone_logpush_job.tf / locals.tf / variables.tf
+```
+
+---
+
+## Lessons Learned
+
+1. **Server-side apply is mandatory.** Prometheus Operator CRDs (~3.7 MB) and the Node Exporter dashboard (~472KB) exceed the 262144-byte annotation limit. Use `kubectl apply --server-side` for everything.
+
+2. **Prometheus v2 -> v3 is a major breaking change.** Removed flags (`--storage.tsdb.retention`, `--alertmanager.timeout`), removed feature flags (now default), PromQL renames (`holt_winters` -> `double_exponential_smoothing`), regex `.` now matches newlines.
+
+3. **Grafana 10 -> 12 removed Angular.** `grafana-piechart-panel` is now the built-in `piechart` type. The `add-dashboard.sh` script handles this automatically.
+
+4. **SQLite + NFS + multiple replicas = data corruption.** Keep Grafana at 1 replica or migrate to PostgreSQL.
+
+5. **Mount datasources directly, not via sidecar.** The k8s-sidecar in LIST mode has a startup race condition. Direct ConfigMap mount is reliable.
+
+6. **Jaeger v2 telemetry config is nested.** `pull.exporter.prometheus.host`/`port`, not flat `address`.
+
+7. **Loki requires `delete_request_store: filesystem` when retention is enabled.** Without it, Loki fails to start.
+
+8. **`configMapGenerator` with `disableNameSuffixHash: true` is the right dashboard pattern.** Without `disableNameSuffixHash`, every edit creates a new ConfigMap name and orphans the old one.
+
+9. **Cloudflare Logpush always gzip-compresses HTTP payloads.** No option to disable. Alloy's `/loki/api/v1/raw` doesn't handle gzip. Traefik has no built-in request decompression. Requires a custom plugin.
+
+10. **`record_prefix` enables dataset-agnostic ingestion.** By prepending `{"_dataset":"<name>",` to every line, Alloy extracts a label without knowing the dataset schema. Zero cluster changes for new datasets.
+
+11. **LogQL `unwrap` aggregations always need an outer `sum()`.** Without it, one series per unique label combination hits `max_query_series`.
+
+12. **`topk()` does not reduce inner cardinality.** Loki evaluates the inner aggregation fully before applying `topk`. Raise `max_query_series` instead.
+
+13. **Grafana template variables with Loki only work for indexed labels.** JSON-extracted fields cannot use `label_values()`. Use `textbox` or `custom` type with `.*` default.
+
+14. **Prometheus `Probe` CRD routes through blackbox exporter.** It only returns `probe_*` metrics, not the target's actual metrics. Use `ScrapeConfig` for real metric scraping.
+
+15. **Python generators >> hand-editing dashboard JSON.** 85 panels = ~5000 lines of JSON, but only ~500 lines of Python with reusable helpers.
+
+16. **Grafana admin password with special characters gets mangled.** `$`, `&`, and other shell metacharacters in `GF_SECURITY_ADMIN_PASSWORD` are unreliable through env vars. Use alphanumeric passwords.
+
+17. **Grafana OAuth email matching.** Bootstrap admin has `email: admin@localhost`. Update it via the API before first SSO login, or set `email_verified: true` in Authentik.
+
+18. **Pie charts with many slices need `legend.placement: "right"`.** Bottom placement shrinks the chart to nothing when there are 10+ slices.
