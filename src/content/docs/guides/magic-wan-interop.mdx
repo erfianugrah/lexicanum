@@ -1062,3 +1062,259 @@ mtr 10.68.73.102
 ```
 
 and vice versa to see the traffic reach the WARP connector CGNAT IP before reaching the other machine.
+
+#### Spectrum / Load Balancer to Private Origins (Magic WAN)
+
+[Private Network Load Balancing](https://developers.cloudflare.com/load-balancing/private-network/) with Magic WAN off-ramps traffic to private IPs behind your IPsec/GRE tunnels. For HTTP, a proxied LB pointing to private origins on the default VNET is sufficient. For TCP/UDP, you need [Spectrum](https://developers.cloudflare.com/spectrum/) in front of the LB since raw L4 traffic can't go through the HTTP proxy, refer to the [Spectrum LB docs](https://developers.cloudflare.com/load-balancing/additional-options/spectrum/) for more.
+
+The pool origins need to be on the **default VNET** -- this is the account-level VNET where Magic WAN tunnels live, not a Cloudflare Tunnel VNET.
+
+```d2
+direction: right
+
+# On-ramps
+Users: {
+  HTTP: HTTP Client
+  L4: TCP/UDP Client
+}
+
+# Cloudflare
+Cloudflare: {
+  Proxy: Cloudflare Proxy
+  Spectrum: Spectrum
+  LB1: Load Balancer
+  LB2: Load Balancer
+}
+
+# Magic WAN
+MagicWAN: {
+  MW: Static Route
+  Tunnel: IPsec / GRE Tunnel
+}
+
+# Origin
+Origin: {
+  Router: On-prem Router
+  HTTPSvc: HTTP Service
+  L4Svc: TCP/UDP Service
+}
+
+# HTTP path
+Users.HTTP -> Cloudflare.Proxy: HTTPS
+Cloudflare.Proxy -> Cloudflare.LB1
+Cloudflare.LB1 -> MagicWAN.MW: private IP (default VNET)
+MagicWAN.MW -> MagicWAN.Tunnel: nexthop
+MagicWAN.Tunnel -> Origin.Router: GRE or IPsec
+Origin.Router -> Origin.HTTPSvc
+
+# TCP/UDP path
+Users.L4 -> Cloudflare.Spectrum: TCP or UDP
+Cloudflare.Spectrum -> Cloudflare.LB2: origin_dns
+Cloudflare.LB2 -> MagicWAN.MW: private IP (default VNET)
+MagicWAN.Tunnel -> Origin.Router
+Origin.Router -> Origin.L4Svc
+```
+
+:::danger
+**Spectrum LB caveats**
+
+- Spectrum LBs are always proxied regardless of what you set on the LB itself
+- No session affinity support (except hash endpoint steering), no Custom Rules
+- The LB hostname and the Spectrum application DNS name must be different or you'll get DNS resolution conflicts
+- For UDP origins, use `icmp_ping` monitors -- HTTP monitors won't work against a UDP service
+- For HTTP origins over private networks, use `http` (not `https`) monitors unless the origin terminates TLS
+:::
+
+##### HTTP: LB to Magic WAN
+
+For HTTP, the LB is just a standard proxied LB with pool origins pointing at private IPs on the default VNET. The traffic gets off-ramped via the Magic WAN static route to the IPsec/GRE tunnel, same as any other Magic WAN traffic.
+
+##### Gitops/IaC
+
+###### LB Monitor HCL
+
+```terraform
+resource "cloudflare_load_balancer_monitor" "httpbun_erfipie" {
+  account_id       = var.cloudflare_account_id
+  allow_insecure   = false
+  consecutive_down = 5
+  consecutive_up   = 0
+  description      = "httpbun_erfipie"
+  expected_codes   = "200"
+  follow_redirects = false
+  interval         = 300
+  method           = "GET"
+  path             = "/"
+  port             = 9000
+  retries          = 5
+  timeout          = 5
+  type             = "http"
+}
+```
+
+###### LB Pool HCL
+
+```terraform
+resource "cloudflare_load_balancer_pool" "httpbun_ipsec_erfipie_nl" {
+  account_id      = var.cloudflare_account_id
+  check_regions   = ["ALL_REGIONS"]
+  enabled         = true
+  minimum_origins = 1
+  monitor         = cloudflare_load_balancer_monitor.httpbun_erfipie.id
+  name            = "httpbun_ipsec_erfipie_nl"
+  origins {
+    address = "10.0.69.7"
+    enabled = true
+    header {
+      header = "Host"
+      values = ["httpbun-pie.${var.thirdary_domain_name}"]
+    }
+    virtual_network_id = var.default_vnet_id  # default VNET (Magic WAN)
+    name               = "httpbun_ipsec_erfipie_nl"
+    weight             = 1
+  }
+}
+```
+
+###### Load Balancer HCL
+
+```terraform
+resource "cloudflare_load_balancer" "httpbun_ipsec_erfipie" {
+  default_pool_ids = [cloudflare_load_balancer_pool.httpbun_ipsec_erfipie_nl.id]
+  enabled          = true
+  fallback_pool_id = cloudflare_load_balancer_pool.httpbun_ipsec_erfipie_nl.id
+  name             = "httpbun-pie.${var.thirdary_domain_name}"
+  proxied          = true
+  session_affinity = "none"
+  steering_policy  = "geo"
+  zone_id          = var.thirdary_cloudflare_zone_id
+  pop_pools {
+    pop      = "AMS"
+    pool_ids = [cloudflare_load_balancer_pool.httpbun_ipsec_erfipie_nl.id]
+  }
+  adaptive_routing {
+    failover_across_pools = true
+  }
+  location_strategy {
+    mode       = "pop"
+    prefer_ecs = "proximity"
+  }
+  random_steering {
+    default_weight = 1
+  }
+  session_affinity_attributes {
+    samesite               = "Auto"
+    secure                 = "Auto"
+    zero_downtime_failover = "temporary"
+  }
+}
+```
+
+##### TCP/UDP: Spectrum to LB to Magic WAN
+
+For TCP/UDP, you first create the LB and pool the same way as the HTTP case, then create a Spectrum application that uses `origin_dns` to point at the LB hostname. The Spectrum app handles the L4 on-ramp, the LB steers to the pool, and Magic WAN off-ramps to your tunnel.
+
+The LB hostname and Spectrum DNS name need to be different -- in my case, `jitsi-lb.example.com` for the LB and `jitsi-udp.example.com` for the Spectrum entry point.
+
+##### Gitops/IaC
+
+###### LB Monitor HCL
+
+Since the origin is a UDP service (Jitsi JVB), I'm using `icmp_ping` instead of an HTTP health check:
+
+```terraform
+resource "cloudflare_load_balancer_monitor" "jitsi" {
+  account_id       = var.cloudflare_account_id
+  consecutive_down = 5
+  consecutive_up   = 0
+  description      = "jitsi_jvb_udp"
+  interval         = 60
+  retries          = 2
+  timeout          = 3
+  type             = "icmp_ping"
+}
+```
+
+:::note
+For TCP origins, you can use a `tcp` monitor instead of `icmp_ping`.
+:::
+
+###### LB Pool HCL
+
+```terraform
+resource "cloudflare_load_balancer_pool" "jitsi_ipsec_k3s_nl" {
+  account_id      = var.cloudflare_account_id
+  check_regions   = ["ALL_REGIONS"]
+  enabled         = true
+  minimum_origins = 1
+  monitor         = cloudflare_load_balancer_monitor.jitsi.id
+  name            = "jitsi_ipsec_k3s_NL"
+  origins {
+    address = "10.0.71.100"
+    enabled = true
+    header {
+      header = "Host"
+      values = ["jitsi.${var.thirdary_domain_name}"]
+    }
+    virtual_network_id = var.default_vnet_id  # default VNET (Magic WAN)
+    name               = "jitsi_ipsec_k3s_nl"
+    weight             = 1
+  }
+}
+```
+
+###### Load Balancer HCL
+
+```terraform
+resource "cloudflare_load_balancer" "jitsi" {
+  enabled          = true
+  proxied          = true
+  zone_id          = var.thirdary_cloudflare_zone_id
+  default_pool_ids = [cloudflare_load_balancer_pool.jitsi_ipsec_k3s_nl.id]
+  fallback_pool_id = cloudflare_load_balancer_pool.jitsi_ipsec_k3s_nl.id
+  name             = "jitsi-lb.${var.thirdary_domain_name}"
+  session_affinity = "none"
+  steering_policy  = "dynamic_latency"
+  adaptive_routing {
+    failover_across_pools = true
+  }
+  location_strategy {
+    mode       = "pop"
+    prefer_ecs = "proximity"
+  }
+  random_steering {
+    default_weight = 1
+  }
+  session_affinity_attributes {
+    samesite               = "Auto"
+    secure                 = "Auto"
+    zero_downtime_failover = "temporary"
+  }
+}
+```
+
+###### Spectrum Application HCL
+
+The Spectrum application uses `origin_dns` (not `origin_direct`) to reference the LB hostname, `traffic_type` is `direct` for raw L4 passthrough:
+
+```terraform
+resource "cloudflare_spectrum_application" "jitsi_jvb_udp" {
+  origin_dns {
+    name = "jitsi-lb.${var.thirdary_domain_name}"
+  }
+  origin_port    = 10000
+  protocol       = "udp/10000"
+  proxy_protocol = "off"
+  tls            = "off"
+  traffic_type   = "direct"
+  zone_id        = var.thirdary_cloudflare_zone_id
+  dns {
+    name = "jitsi-udp.${var.thirdary_domain_name}"
+    type = "CNAME"
+  }
+  edge_ips {
+    connectivity = "ipv4"
+    type         = "dynamic"
+  }
+}
+```
