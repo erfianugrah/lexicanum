@@ -318,7 +318,7 @@ The dynamic listener cert is stored in three places: a Kubernetes Secret (`k3s-s
 The critical point: **`systemctl restart k3s-agent` does not fix this.** The agent reloads the same stale CA certs from disk. You must delete the cached CA files so the agent re-fetches them from the server's `/cacerts` endpoint.
 
 :::danger
-If the CA itself was rotated (e.g. after a manual `k3s` reinstall on the server), simply deleting the cached CA certs is **not enough**. The agent will re-bootstrap using the old token and old private keys, and get certs signed by the old CA again. In this case you need a full agent reinstall -- see [Part 12: Token and CA Rotation](#part-12-token-and-ca-rotation).
+If the CA itself was rotated (e.g. after a manual `k3s` reinstall on the server), simply deleting the cached CA certs is **not enough**. The agent will re-bootstrap using the old token and old private keys, and get certs signed by the old CA again. In this case you need a full agent reinstall -- see [Part 11: Token and CA Rotation](#part-11-token-and-ca-rotation).
 :::
 
 ### Recovery procedure (stale cert cache)
@@ -764,162 +764,7 @@ When power cycling the whole board, always start the server (slot 1) first and w
 
 ---
 
-## Part 8: CrowdSec Operations
-
-CrowdSec runs as a DaemonSet in the cluster and feeds into a Traefik bouncer middleware. It can unexpectedly ban legitimate IPs.
-
-### Security Dashboard (web UI)
-
-A dedicated Go+htmx web application at `security-k3s.example.com` provides a browser-based alternative to `cscli` for most CrowdSec operations. Protected by Authentik forward-auth.
-
-| Feature | Dashboard | `cscli` |
-| :------ | :-------- | :------ |
-| View decisions (paginated, sortable) | Yes | Yes |
-| View alerts with expandable detail | Yes | Yes |
-| Remove individual decisions | Yes | Yes |
-| Create decisions (CF-style rule builder) | Yes | Yes (`cscli decisions add`) |
-| Export/import decisions as JSON | Yes | No |
-| GeoIP + ASN enrichment (country flags, org) | Yes | No |
-| IP lookup (decisions + alerts + allowlist check) | Yes | Partial |
-| View sentinel/rate-limit config | Yes | No |
-| Manage allowlists (read-only + CLI hints) | Yes (read) | Yes (read+write) |
-| Scenario breakdown with bar charts | Yes | Yes (`cscli metrics`) |
-
-Source: `services/security-dashboard/`. Deploy: `docker build` → `docker push erfianugrah/security-dashboard:latest` → `kubectl rollout restart`. See `security-stack.md` for full details.
-
-### Checking if an IP is banned
-
-```bash
-# Via the Security Dashboard:
-# Navigate to the IP Lookup page and search
-
-# Or exec into the CrowdSec LAPI pod:
-kubectl exec -n crowdsec deploy/crowdsec-lapi -- cscli decisions list
-
-# Check a specific IP:
-kubectl exec -n crowdsec deploy/crowdsec-lapi -- cscli decisions list -i <your_ip>
-```
-
-### Removing a ban
-
-If your own IP gets banned:
-
-```bash
-# Via the Security Dashboard:
-# Click "Remove" on the decision in the Decisions or Policy page
-
-# Or via cscli:
-kubectl exec -n crowdsec deploy/crowdsec-lapi -- cscli decisions delete -i <your_ip>
-```
-
-:::caution
-`cscli decisions add --type allow` does **not** override an existing `ban` decision. Both coexist and the bouncer checks bans first. To prevent re-banning, use a parser-level whitelist (see below) rather than a decision-level allow.
-:::
-
-### Dashboard false positives (parser-level whitelist)
-
-Dashboard UIs like Headlamp and Grafana generate 404s by requesting plugin locale files (e.g. `/static-plugins/prometheus/locales/en/translation.json`). The `crowdsecurity/http-probing` scenario has a capacity of 10 with 10-second leak speed, so 11+ unique 404 paths in a burst will trigger a ban. The `.json` extension is not in CrowdSec's `static_ressource` list, so these are treated as probing.
-
-The fix is a parser-level whitelist that runs in the `s02-enrich` stage. Create `dashboard-whitelist.yaml`:
-
-```yaml
-# dashboard-whitelist.yaml — placed in /etc/crowdsec/parsers/s02-enrich/
-name: custom/dashboard-whitelist
-description: "Whitelist known dashboard UI false positives"
-whitelist:
-  reason: "known dashboard UI request patterns"
-  expression:
-    - >-
-      evt.Meta.service == 'http'
-      && evt.Meta.http_path startsWith '/static-plugins/'
-    - >-
-      evt.Meta.service == 'http'
-      && evt.Meta.http_path startsWith '/plugins/'
-    - >-
-      evt.Meta.service == 'http'
-      && evt.Meta.http_path matches '^/api/v[0-9]+/namespaces'
-      && evt.Meta.http_status == '404'
-```
-
-To deploy it in a DaemonSet-based CrowdSec agent, embed the file in the agent ConfigMap and copy it with an init container:
-
-```yaml
-# In the agent ConfigMap, add the file as a data key:
-data:
-  dashboard-whitelist.yaml: |
-    name: custom/dashboard-whitelist
-    ...
-
-# In the agent DaemonSet, add an init container:
-initContainers:
-  - name: init-config
-    image: busybox:1.36
-    command: ["sh", "-c"]
-    args:
-      - |
-        cp /config-custom/dashboard-whitelist.yaml \
-          /etc/crowdsec/parsers/s02-enrich/dashboard-whitelist.yaml
-    volumeMounts:
-      - name: crowdsec-config
-        mountPath: /etc/crowdsec
-      - name: agent-config
-        mountPath: /config-custom
-```
-
-After deploying, verify the parser loaded and test with `cscli explain`:
-
-```bash
-# Verify parser is listed:
-kubectl exec -n crowdsec <agent-pod> -- cscli parsers list | grep dashboard
-
-# Test with a simulated log line:
-kubectl exec -n crowdsec <agent-pod> -- cscli explain \
-  --type traefik \
-  --log '1.2.3.4 - - [18/Feb/2026:15:30:00 +0000] "GET /static-plugins/prometheus/locales/en/translation.json HTTP/1.1" 404 19 "-" "Mozilla/5.0" 1 "app@docker" "https://10.0.0.1:443" 5ms'
-# Expected output should show:
-#   custom/dashboard-whitelist (~2 [whitelisted])
-#   parser success, ignored by whitelist (known dashboard UI request patterns)
-
-# Check whitelist metrics over time:
-kubectl exec -n crowdsec <agent-pod> -- cscli metrics show whitelists
-```
-
-### Allowlists (CrowdSec v1.7+)
-
-CrowdSec v1.7 introduced allowlists — persistent IP/CIDR whitelists that prevent matching IPs from being banned. Unlike parser-level whitelists (which prevent log events from being processed), allowlists operate at the decision level and can be managed dynamically.
-
-```bash
-# Create an allowlist:
-kubectl exec -n crowdsec deploy/crowdsec-lapi -- \
-  cscli allowlists create trusted-ips -d "Trusted IP addresses"
-
-# Add entries:
-kubectl exec -n crowdsec deploy/crowdsec-lapi -- \
-  cscli allowlists add trusted-ips 10.0.0.0/8 -d "Internal network"
-
-# Remove entries:
-kubectl exec -n crowdsec deploy/crowdsec-lapi -- \
-  cscli allowlists remove trusted-ips 10.0.0.0/8
-
-# View allowlists:
-kubectl exec -n crowdsec deploy/crowdsec-lapi -- cscli allowlists list
-```
-
-The Security Dashboard shows all allowlists in a read-only view with items, country flags, and expiry dates. Write operations require `cscli` (the LAPI allowlist endpoints are read-only via machine auth).
-
-### Debugging 403 errors
-
-If services behind Traefik return 403 Forbidden unexpectedly, check in this order:
-
-1. **CrowdSec decisions** -- is the client IP banned?
-2. **Sentinel plugin** -- is it flagging the request as a bot? Check the `X-Sentinel-Bot-Score` header
-3. **Cloudflare WAF** -- check the Cloudflare dashboard for firewall events
-
-The global middleware chain on the `websecure` entrypoint is: `sentinel` -> `crowdsec-bouncer` -> `security-headers`. A 403 from CrowdSec will be intercepted by the Sentinel plugin's response interceptor and rendered as a styled HTML error page showing the block source, reason, trace ID, and client IP.
-
----
-
-## Part 9: Prometheus Resource Tuning
+## Part 8: Prometheus Resource Tuning
 
 On a cluster with ~265k active series, 59 scrape targets, and a 30s scrape interval, Prometheus uses approximately 1 GB of memory at steady state.
 
@@ -957,7 +802,7 @@ rate(prometheus_tsdb_head_samples_appended_total[5m])
 
 ---
 
-## Part 10: Stale Pod Cleanup
+## Part 9: Stale Pod Cleanup
 
 After node reboots, agent restarts, or operator reconciliation conflicts, pods can be left in `Error` or `Completed` state. These consume API server resources and clutter `kubectl get pods` output.
 
@@ -984,7 +829,7 @@ kubectl delete pods -A --field-selector=status.phase=Succeeded
 
 ---
 
-## Part 11: KEDA and Prometheus Conflicts
+## Part 10: KEDA and Prometheus Conflicts
 
 KEDA's ScaledObjects can conflict with Kubernetes operators that manage the same workloads.
 
@@ -1008,7 +853,7 @@ triggers:
 
 ---
 
-## Part 12: Token and CA Rotation
+## Part 11: Token and CA Rotation
 
 ### The K10 token format
 
@@ -1114,8 +959,8 @@ The `k3s-agent-uninstall.sh` script removes everything under `/var/lib/rancher/k
 | Symptom | Likely cause | Fix |
 | :---- | :---- | :---- |
 | Agent: `x509: certificate signed by unknown authority` | Stale cached CA after server reboot | Stop agent, `rm` CA certs, start agent ([Part 3](#part-3-k3s-tls-certificate-recovery)) |
-| Agent: `x509` persists after clearing certs | CA was rotated (server reinstall); token has old CA hash | Full agent reinstall with stripped token ([Part 12](#part-12-token-and-ca-rotation)) |
-| Agent: `Unauthorized` on API calls | Stale client certs signed by old CA | Clear certs and restart; if it persists, full reinstall ([Part 12](#part-12-token-and-ca-rotation)) |
+| Agent: `x509` persists after clearing certs | CA was rotated (server reinstall); token has old CA hash | Full agent reinstall with stripped token ([Part 11](#part-11-token-and-ca-rotation)) |
+| Agent: `Unauthorized` on API calls | Stale client certs signed by old CA | Clear certs and restart; if it persists, full reinstall ([Part 11](#part-11-token-and-ca-rotation)) |
 | Watchdog creating a restart death loop | No cooldown + narrow TLS detection | Deploy updated watchdog with cooldown and server gate ([Part 4](#part-4-health-watchdog)) |
 | Missing kube-proxy iptables rules | Power loss wiped in-memory iptables | Delete KUBE-PROXY-CANARY chains, or restart agent |
 | `InvalidDiskCapacity` warning | Containerd v2.1 + k3s 1.34 cosmetic bug | Ignore (resolves with k3s upgrade) |
@@ -1123,8 +968,8 @@ The `k3s-agent-uninstall.sh` script removes everything under `/var/lib/rancher/k
 | `CgroupV1` warning on kubelet start | Node still on cgroup v1 | Run the cgroup v2 migration ([Part 2](#part-2-cgroup-v2-migration)) |
 | Node won't boot after config change | Corrupted `ubuntuEnv.txt` | BMC serial console recovery ([Part 7](#part-7-bmc-serial-console-recovery)) |
 | Disk pressure on agent nodes | Journal/containerd logs filling SD card | Vacuum journals, clean rotated logs ([Part 5](#part-5-disk-maintenance)) |
-| CrowdSec banning your IP for `http-probing` | Dashboard UI 404s exceeding scenario threshold | Parser-level whitelist ([Part 8](#part-8-crowdsec-operations)) |
-| Need to check/manage CrowdSec without `cscli` | N/A | Use the Security Dashboard at `security-k3s.example.com` ([Part 8](#part-8-crowdsec-operations)) |
+| CrowdSec banning your IP for `http-probing` | Dashboard UI 404s exceeding scenario threshold | Parser-level whitelist (see [Traefik guide](/guides/k3s-traefik/#dashboard-false-positives-parser-level-whitelist)) |
+| Need to check/manage CrowdSec without `cscli` | N/A | Use the Security Dashboard at `security-k3s.example.com` (see [Traefik guide](/guides/k3s-traefik/#security-dashboard-web-ui)) |
 | Prometheus pods crash-looping | KEDA vs Prometheus Operator replica conflict | Delete the KEDA ScaledObject for Prometheus |
 
 ## File Reference
@@ -1150,19 +995,6 @@ ansible-playbooks/my-playbooks/
     ├── server-ca.crt                # Cached server CA (delete to refresh)
     ├── client-ca.crt                # Cached client CA (delete to refresh)
     └── kubelet.kubeconfig           # Kubelet credentials
-
-services/crowdsec/
-├── agent-configmap.yaml             # Agent config + custom parsers
-├── agent-daemonset.yaml             # Agent DaemonSet (init container copies parsers)
-├── lapi-deployment.yaml             # LAPI server deployment
-├── lapi-configmap.yaml              # LAPI configuration
-└── scenarios-configmap.yaml         # Custom detection scenarios
-
-services/security-dashboard/
-├── main.go                          # Go+htmx dashboard (~2300 lines, zero deps)
-├── manifests.yaml                   # SOPS-encrypted (ns, SA, RBAC, secret, deploy, svc, ingress)
-├── Dockerfile                       # Multi-stage ARM64 build
-└── ui/                              # Templates + static assets (go:embed)
 
 /usr/local/bin/k3s-health-check      # Watchdog script (deployed by Ansible)
 /etc/systemd/system/
