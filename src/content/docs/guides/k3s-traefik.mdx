@@ -1,0 +1,1058 @@
+---
+title: "Traefik on k3s: Custom Deployment, Plugins, Middlewares, and Cloudflare Tunnel"
+description: Complete guide to running a custom Traefik v3 deployment on k3s with local Go plugins for bot detection and request decompression, per-route rate limiting, CrowdSec integration, Authentik forward auth, TLS via ACME DNS challenge, Cloudflare Tunnel ingress, KEDA autoscaling, and full observability via Prometheus, Loki, and Jaeger
+author: "Erfi Anugrah"
+---
+
+A complete guide to replacing k3s's built-in Traefik with a fully custom deployment on a 4-node ARM64 homelab cluster. The built-in Traefik is fine for simple setups, but it doesn't support local plugins, has limited middleware configuration, and doesn't expose the level of control needed for things like bot detection, request body decompression, or per-route rate limiting.
+
+This guide covers the full setup: disabling the built-in Traefik, deploying a custom one as a raw Deployment manifest, writing and packaging Traefik Go plugins as ConfigMaps, configuring the middleware chain, managing TLS certificates via Cloudflare DNS challenge, routing traffic through Cloudflare Tunnel, autoscaling with KEDA, and piping access logs + traces into the monitoring stack.
+
+:::tip[What this covers]
+
+1. **Disabling k3s built-in Traefik**: Ansible playbook, config.yaml cleanup
+2. **Custom Traefik Deployment**: Raw manifest with 5 entrypoints, 2 replicas, pod anti-affinity, PDB
+3. **CRD installation**: Traefik CRDs and RBAC for KubernetesCRD provider
+4. **Custom local plugins**: Sentinel (bot detection + IP resolution) and Decompress (gzip request body) -- how to write, package as ConfigMap, mount into Traefik
+5. **Remote plugins**: CrowdSec Bouncer v1.5.0
+6. **Global middlewares**: Sentinel, CrowdSec Bouncer, security headers -- applied to all `websecure` requests
+7. **Per-route middlewares**: Rate limits, inflight-req, retry, decompress, Authentik forward auth
+8. **TLS configuration**: TLSOption CRD, ACME DNS challenge via Cloudflare, strong cipher suite
+9. **All IngressRoutes**: 20+ routes with their middleware assignments
+10. **Cloudflare Tunnel integration**: OpenTofu-managed tunnel config, DNS records, ingress rules
+11. **KEDA autoscaling**: 5-trigger ScaledObject (CPU, memory, open connections, p95 latency, request rate)
+12. **Observability**: Access logs (JSON → Alloy → Loki with structured metadata), tracing (OTLP → Alloy → Jaeger), metrics (Prometheus with router labels)
+:::
+
+---
+
+## Architecture Overview
+
+All HTTP traffic enters through Cloudflare's edge network, passes through a Cloudflare Tunnel (`cloudflared` running in the cluster), and hits the custom Traefik deployment in the `traefik` namespace. Traefik terminates TLS (ACME certs via Cloudflare DNS challenge), runs the global middleware chain (sentinel → crowdsec-bouncer → security-headers), then routes to per-route middlewares and backend services.
+
+```d2
+direction: right
+
+cf: "Cloudflare Edge" {
+  tunnel: "cfd Tunnel\n(cloudflared ns)"
+}
+
+traefik: "Traefik v3.6.8\n(traefik ns, 2 replicas)" {
+  global: "Global Middlewares" {
+    sentinel: "Sentinel\n(IP + bot score)"
+    crowdsec: "CrowdSec Bouncer\n(IP reputation)"
+    headers: "Security Headers\n(HSTS, nosniff)"
+  }
+  perroute: "Per-route Middlewares" {
+    rl: "rl-*\n(per-service rate limit)"
+    inflight: "inflight-req\n(100 concurrent/IP)"
+    retry: "retry\n(3 attempts)"
+    decompress: "decompress\n(gzip body)"
+    auth: "authentik-forward-auth"
+  }
+}
+
+services: "Backend Services" {
+  grafana: "Grafana\n(monitoring)"
+  prometheus: "Prometheus\n(monitoring)"
+  authentik: "Authentik\n(authentik)"
+  revista: "Revista\n(revista)"
+  matrix: "Matrix stack\n(matrix)"
+  jitsi: "Jitsi\n(jitsi)"
+  others: "..."
+}
+
+monitoring: "Observability" {
+  alloy: "Alloy DaemonSet"
+  loki: "Loki"
+  jaeger: "Jaeger"
+  prom: "Prometheus"
+}
+
+cf.tunnel -> traefik: "HTTPS\n(h2, SNI)"
+traefik.global.sentinel -> traefik.global.crowdsec -> traefik.global.headers
+traefik.perroute -> services
+traefik -> monitoring.alloy: "access logs\n(JSON stdout)"
+traefik -> monitoring.alloy: "OTLP traces"
+traefik -> monitoring.prom: "metrics\n(:8082)"
+monitoring.alloy -> monitoring.loki: "structured\nmetadata"
+monitoring.alloy -> monitoring.jaeger: "traces"
+```
+
+### Component versions
+
+| Component | Version | Image |
+| :-------- | :------ | :---- |
+| Traefik | v3.6.8 | `traefik:v3.6.8` |
+| CrowdSec Bouncer plugin | v1.5.0 | (remote, fetched by Traefik) |
+| cloudflared | 2026.2.0 | `cloudflare/cloudflared:2026.2.0` |
+| KEDA | (cluster-wide) | (already deployed) |
+
+---
+
+## Part 1: Disabling the Built-in Traefik
+
+k3s ships with Traefik as a bundled Helm chart. It auto-deploys on the server node and manages its own CRDs. To run a custom Traefik, the built-in one must be fully disabled -- otherwise you get two Traefik instances fighting over the same IngressRoutes.
+
+### Ansible playbook
+
+```yaml
+# ansible-playbooks/my-playbooks/disable-builtin-traefik.yml
+---
+- name: Disable k3s built-in Traefik and ServiceLB on server
+  hosts: server
+  become: yes
+  tasks:
+    - name: Add disable directives to k3s config.yaml
+      ansible.builtin.blockinfile:
+        path: /etc/rancher/k3s/config.yaml
+        marker: "# {mark} ANSIBLE MANAGED - disable built-in addons"
+        block: |
+          disable:
+            - traefik
+            - servicelb
+        create: no
+      register: config_changed
+
+    - name: Remove k3s bundled traefik manifest files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/rancher/k3s/server/manifests/traefik.yaml
+        - /var/lib/rancher/k3s/server/static/charts/traefik-crd-38.0.201+up38.0.2.tgz
+        - /var/lib/rancher/k3s/server/static/charts/traefik-38.0.201+up38.0.2.tgz
+      register: manifests_removed
+
+    - name: Restart k3s to pick up config change
+      ansible.builtin.systemd:
+        name: k3s
+        state: restarted
+        daemon_reload: yes
+      when: config_changed.changed
+
+    - name: Wait for k3s API to be ready after restart
+      ansible.builtin.wait_for:
+        port: 6443
+        host: "{{ ansible_host }}"
+        delay: 10
+        timeout: 120
+      when: config_changed.changed
+```
+
+Run it:
+
+```bash
+ansible-playbook -i inventory.yml \
+  ansible-playbooks/my-playbooks/disable-builtin-traefik.yml \
+  --become --ask-become-pass
+```
+
+Safe to re-run (idempotent). The playbook also removes stale chart tarballs from k3s's static manifests directory -- without this, k3s may re-deploy the built-in Traefik on restart even with `disable` set.
+
+:::caution
+ServiceLB (`servicelb`) is also disabled because we use MetalLB for LoadBalancer services. If you're not running MetalLB or another LB solution, keep ServiceLB enabled or your Traefik Service won't get an external IP.
+:::
+
+---
+
+## Part 2: CRDs and RBAC
+
+Traefik's Kubernetes CRD provider needs its own CRD definitions (IngressRoute, Middleware, TLSOption, etc.) and RBAC permissions. These are separate from the Traefik Deployment itself and must be applied first.
+
+```bash
+# Apply Traefik CRDs (one-time, or on Traefik version upgrades)
+kubectl apply -f crds/kubernetes-crd-definition-v1.yml --server-side
+kubectl apply -f crds/kubernetes-crd-rbac.yml
+```
+
+The CRD file is large (~3.5 MB) and requires `--server-side` due to the annotation size limit. RBAC grants the Traefik ServiceAccount read access to IngressRoutes, Middlewares, TLSOptions, Services, Secrets, EndpointSlices, and related resources across both `traefik.io` and the legacy `traefik.containo.us` API groups.
+
+---
+
+## Part 3: The Traefik Deployment
+
+The entire Traefik deployment lives in a single manifest: `services/traefik.yaml`. It contains a ServiceAccount, ClusterRole, ClusterRoleBinding, LoadBalancer Service, Deployment, IngressClass, and PodDisruptionBudget.
+
+### Entrypoints
+
+Five entrypoints handle different traffic types:
+
+| Entrypoint | Address | Protocol | Purpose |
+| :--------- | :------ | :------- | :------ |
+| `web` | `:8000/tcp` | HTTP | Redirect to HTTPS (unused behind tunnel) |
+| `websecure` | `:8443` | HTTPS + HTTP/3 + QUIC | All production traffic |
+| `metrics` | `:8082/tcp` | HTTP | Prometheus metrics scrape endpoint |
+| `traefik` | `:9000/tcp` | HTTP | Dashboard API + health checks (`/ping`) |
+| `jvb-udp` | `:10000/udp` | UDP | Jitsi Videobridge media |
+
+The `websecure` entrypoint is the workhorse. Key settings:
+
+```yaml
+args:
+  - "--entrypoints.websecure.address=:8443"
+  - "--entrypoints.websecure.http.tls=true"
+  - "--entrypoints.websecure.http.tls.certResolver=cloudflare"
+  - "--entrypoints.websecure.http3=true"
+  - "--entrypoints.websecure.http3.advertisedport=443"
+  - "--entrypoints.websecure.http2.maxConcurrentStreams=512"
+  # Global middlewares applied to ALL websecure requests
+  - "--entrypoints.websecure.http.middlewares=traefik-sentinel@kubernetescrd,traefik-crowdsec-bouncer@kubernetescrd,traefik-security-headers@kubernetescrd"
+```
+
+HTTP/3 is enabled with `advertisedport=443` because the container listens on 8443 but the LoadBalancer Service maps port 443 → 8443. Without the advertised port, clients would try QUIC on port 8443 and fail.
+
+### Timeouts
+
+```yaml
+args:
+  - "--entrypoints.websecure.transport.respondingTimeouts.readTimeout=60s"
+  - "--entrypoints.websecure.transport.respondingTimeouts.writeTimeout=0s"
+  - "--entrypoints.websecure.transport.respondingTimeouts.idleTimeout=180s"
+  - "--entrypoints.websecure.transport.lifeCycle.graceTimeOut=30s"
+  - "--entrypoints.websecure.transport.lifeCycle.requestAcceptGraceTimeout=5s"
+```
+
+`writeTimeout=0s` (disabled) is intentional. Matrix (Synapse), Jitsi, and LiveKit all use long-lived WebSocket connections. A non-zero write timeout would kill WebSocket connections that don't send data within the timeout window. The tradeoff is that slowloris-style attacks against WebSocket endpoints aren't mitigated at the Traefik layer -- but CrowdSec and Cloudflare's DDoS protection handle that upstream.
+
+### Forwarded headers
+
+```yaml
+args:
+  - "--entrypoints.websecure.forwardedHeaders.trustedIPs=173.245.48.0/20,103.21.244.0/22,..."
+```
+
+All Cloudflare IPv4 and IPv6 ranges are listed as trusted IPs. This tells Traefik to trust `X-Forwarded-For` headers from these IPs, which is necessary because Cloudflare Tunnel connects from Cloudflare edge IPs. Without this, `X-Forwarded-For` would be stripped and the sentinel plugin would see the cloudflared pod IP instead of the real client IP.
+
+### Go runtime tuning
+
+```yaml
+env:
+  - name: GOMAXPROCS
+    value: "2"
+  - name: GOMEMLIMIT
+    value: "900MiB"
+```
+
+On ARM64 homelab nodes with 4 cores, limiting `GOMAXPROCS` to 2 prevents Traefik from consuming all CPU cores. `GOMEMLIMIT` at 900MiB (with a 1024Mi limit) gives the Go GC a soft target to aim for, reducing OOM kills from GC pressure spikes.
+
+### Security context
+
+```yaml
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+  readOnlyRootFilesystem: true
+```
+
+The root filesystem is read-only. Writable paths are provided via volume mounts: `/ssl-certs-2` (PVC for ACME certs), `/tmp` (emptyDir), `/plugins-local/` (ConfigMap mounts for plugins), `/plugins-storage` (emptyDir for remote plugin cache).
+
+### Pod anti-affinity and PDB
+
+```yaml
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: traefik
+        topologyKey: kubernetes.io/hostname
+```
+
+With 2 replicas, the anti-affinity preference spreads them across different nodes. It's `preferred` not `required` because on a 4-node cluster with other workloads, there might not always be two nodes available.
+
+The PDB ensures at least 1 replica is always available during voluntary disruptions (node drains, rolling updates):
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: traefik-pdb
+  namespace: traefik
+spec:
+  minAvailable: 1
+```
+
+### Graceful shutdown
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command: ["sh", "-c", "sleep 10"]
+```
+
+The 10-second pre-stop sleep gives the Service endpoints time to de-register from kube-proxy before the pod starts shutting down. Without this, in-flight requests can hit a pod that's already draining.
+
+---
+
+## Part 4: Custom Local Plugins
+
+Traefik supports two types of plugins: remote (fetched from GitHub on startup) and local (mounted from the filesystem). Local plugins use Traefik's Yaegi Go interpreter -- you write standard Go code, and Traefik interprets it at runtime. No compilation step needed.
+
+### How local plugins work
+
+1. Plugin source goes into `/plugins-local/src/<moduleName>/` inside the Traefik container
+2. The module must have `go.mod`, `.traefik.yml`, and the Go source file
+3. Traefik is told about the plugin via `--experimental.localPlugins.<name>.moduleName=<moduleName>`
+4. A Middleware CRD references the plugin by name under `spec.plugin.<name>`
+
+Since Traefik runs with `readOnlyRootFilesystem: true`, the plugin files are packaged as ConfigMaps and mounted as volumes.
+
+### Plugin 1: Sentinel (bot detection + IP resolution)
+
+Sentinel is a custom plugin that replaces the standalone `realclientip` plugin. It does two things: resolves the real client IP from trusted headers (Cloudflare's `Cf-Connecting-Ip` or `X-Forwarded-For` with proxy skipping), and runs heuristic bot detection that scores each request.
+
+**Request flow:**
+
+1. Resolve real client IP from trusted headers (`Cf-Connecting-Ip` > XFF right-to-left > RemoteAddr)
+2. Set `X-Real-Client-Ip` header (used by rate limiters and Loki analytics)
+3. Score request using 9 heuristic signals
+4. Set `X-Bot-Score` header (always, regardless of score -- this feeds the Grafana security dashboard via Loki)
+5. If score >= `blockThreshold` (100): return 403 Forbidden
+6. Otherwise: pass to next middleware
+
+**Scoring signals:**
+
+| Signal | Score | Rationale |
+| :----- | :---- | :-------- |
+| Scanner UA substring match | +100 | sqlmap, nikto, nuclei, zgrab, etc. -- one match is enough to block |
+| Honeypot path match | +100 | `/.env`, `/.git/HEAD`, `/wp-login.php`, etc. -- no legitimate client requests these |
+| Empty User-Agent | +40 | Most real browsers always send UA |
+| Missing `Accept` header | +30 | Browsers always send Accept |
+| HTTP/1.0 protocol | +25 | Almost no modern client uses HTTP/1.0 |
+| Missing `Accept-Language` | +20 | Browsers send this; most bots don't |
+| Missing `Accept-Encoding` | +15 | Browsers send this |
+| `Connection: close` with HTTP/1.1 | +10 | Unusual for real clients |
+| Per-IP rate exceeded (>30 req/s) | +30 | Sliding window rate tracker per IP |
+
+A request with a known scanner UA (+100) gets blocked immediately. A request with no UA (+40), no Accept (+30), and no Accept-Language (+20) also gets blocked (90 total, but add missing Accept-Encoding at +15 = 105 >= 100). The per-IP rate tracker uses a sliding window with background cleanup to prevent memory leaks.
+
+**Packaging as ConfigMap:**
+
+The plugin source, `go.mod`, and `.traefik.yml` are inlined in a ConfigMap:
+
+```yaml
+# middleware/sentinel-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traefik-plugin-sentinel
+  namespace: traefik
+data:
+  sentinel.go: |
+    package sentinel
+    // ... (full Go source, ~435 lines)
+  go.mod: |
+    module github.com/erfianugrah/sentinel
+    go 1.22
+  .traefik.yml: |
+    displayName: Sentinel
+    type: middleware
+    import: github.com/erfianugrah/sentinel
+    summary: Real client IP resolution + heuristic bot detection with scoring.
+    testData:
+      trustedHeaders:
+        - Cf-Connecting-Ip
+        - X-Forwarded-For
+      # ...
+```
+
+Mounted in the Deployment:
+
+```yaml
+volumeMounts:
+  - name: plugin-sentinel
+    mountPath: /plugins-local/src/github.com/erfianugrah/sentinel
+    readOnly: true
+volumes:
+  - name: plugin-sentinel
+    configMap:
+      name: traefik-plugin-sentinel
+```
+
+Enabled via args:
+
+```yaml
+args:
+  - "--experimental.localPlugins.sentinel.moduleName=github.com/erfianugrah/sentinel"
+```
+
+**Middleware CRD** (applied as a global middleware on the `websecure` entrypoint):
+
+```yaml
+# middleware/sentinel-middleware.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: sentinel
+  namespace: traefik
+spec:
+  plugin:
+    sentinel:
+      trustedHeaders:
+        - Cf-Connecting-Ip
+        - X-Forwarded-For
+      trustedProxies:
+        - "10.42.0.0/16"    # k3s pod CIDR
+        - "10.43.0.0/16"    # k3s service CIDR
+        - "173.245.48.0/20" # Cloudflare IPv4
+        # ... all CF ranges
+      enabled: true
+      blockThreshold: 100
+      tagThreshold: 60
+      scannerUAs: "sqlmap,nikto,dirbuster,masscan,zgrab,nuclei,httpx,gobuster,ffuf,nmap,whatweb,wpscan,joomla,drupal"
+      honeypotPaths: "/.env,/.git/HEAD,/.git/config,/wp-login.php,/wp-config.php,/wp-admin,/.aws/credentials,/actuator/env,/actuator/health,/xmlrpc.php,/.DS_Store,/config.json,/package.json,/.htaccess,/server-status,/debug/pprof"
+      rateLimitPerSecond: 30
+      rateLimitWindowSeconds: 10
+```
+
+:::note
+The `import` field in `.traefik.yml` must match the Go module name in `go.mod` exactly. The mount path under `/plugins-local/src/` must also match. And the Middleware CRD `spec.plugin.<name>` must use the short plugin name from `--experimental.localPlugins.<name>`, not the full module path.
+:::
+
+### Plugin 2: Decompress (gzip request body)
+
+The decompress plugin exists for one reason: Cloudflare Logpush always gzip-compresses HTTP payloads, and Alloy's `/loki/api/v1/raw` endpoint doesn't handle `Content-Encoding: gzip`. Traefik's built-in `compress` middleware only handles *response* compression, not *request* body decompression.
+
+The plugin is simple -- 71 lines of Go:
+
+```go
+func (d *Decompress) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+    encoding := strings.ToLower(req.Header.Get("Content-Encoding"))
+    if encoding != "gzip" {
+        d.next.ServeHTTP(rw, req)
+        return
+    }
+
+    gzReader, err := gzip.NewReader(req.Body)
+    if err != nil {
+        http.Error(rw, fmt.Sprintf("failed to create gzip reader: %v", err), http.StatusBadRequest)
+        return
+    }
+    defer gzReader.Close()
+
+    decompressed, err := io.ReadAll(gzReader)
+    if err != nil {
+        http.Error(rw, fmt.Sprintf("failed to decompress body: %v", err), http.StatusBadRequest)
+        return
+    }
+
+    req.Body = io.NopCloser(bytes.NewReader(decompressed))
+    req.ContentLength = int64(len(decompressed))
+    req.Header.Set("Content-Length", strconv.Itoa(len(decompressed)))
+    req.Header.Del("Content-Encoding")
+
+    d.next.ServeHTTP(rw, req)
+}
+```
+
+Same ConfigMap packaging pattern as sentinel. The decompress middleware CRD lives in the `monitoring` namespace (same as the Alloy Logpush IngressRoute that uses it):
+
+```yaml
+# middleware/decompress-middleware.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: decompress
+  namespace: monitoring
+spec:
+  plugin:
+    decompress: {}
+```
+
+Published at [github.com/erfianugrah/decompress](https://github.com/erfianugrah/decompress).
+
+---
+
+## Part 5: Remote Plugins
+
+### CrowdSec Bouncer
+
+The [CrowdSec Bouncer Traefik plugin](https://github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin) checks each request's IP against CrowdSec's community threat intelligence via the LAPI (Local API). Blocked IPs get a 403.
+
+Remote plugins are fetched by Traefik on startup from GitHub. No ConfigMap needed -- just the plugin declaration in args:
+
+```yaml
+args:
+  - "--experimental.plugins.bouncer.modulename=github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin"
+  - "--experimental.plugins.bouncer.version=v1.5.0"
+```
+
+The Middleware CRD contains the LAPI connection details and must be **SOPS-encrypted** because it includes the bouncer API key:
+
+```yaml
+# middleware/crowdsec-bouncer.yaml (structure -- values are SOPS-encrypted)
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: crowdsec-bouncer
+  namespace: traefik
+spec:
+  plugin:
+    bouncer:
+      enabled: true
+      crowdsecMode: stream
+      updateIntervalSeconds: 60
+      defaultDecisionSeconds: 300
+      crowdsecLapiScheme: https
+      crowdsecLapiHost: <your-crowdsec-lapi-endpoint>
+      crowdsecLapiKey: <your-bouncer-api-key>
+      forwardedHeadersTrustedIPs:
+        - "10.42.0.0/16"
+        - "10.43.0.0/16"
+      clientTrustedIPs: []
+      forwardedHeadersCustomName: X-Real-Client-Ip
+```
+
+`forwardedHeadersCustomName: X-Real-Client-Ip` tells the bouncer to read the real client IP from the header set by sentinel, not from `X-Forwarded-For` (which might have multiple IPs).
+
+:::note
+Remote plugins require the `/plugins-storage` emptyDir volume mount. Traefik downloads and caches the plugin source there. Without it, plugin download fails because the root filesystem is read-only.
+:::
+
+---
+
+## Part 6: Global Middlewares
+
+Three middlewares are applied globally to every request on the `websecure` entrypoint via the `--entrypoints.websecure.http.middlewares` flag:
+
+```yaml
+- "--entrypoints.websecure.http.middlewares=traefik-sentinel@kubernetescrd,traefik-crowdsec-bouncer@kubernetescrd,traefik-security-headers@kubernetescrd"
+```
+
+The format is `<namespace>-<name>@kubernetescrd`. Order matters -- sentinel runs first (sets IP + bot score), then crowdsec-bouncer (checks IP reputation), then security-headers.
+
+### Security headers
+
+```yaml
+# middleware/security-headers.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: security-headers
+  namespace: traefik
+spec:
+  headers:
+    stsSeconds: 63072000          # HSTS 2 years
+    stsIncludeSubdomains: true
+    stsPreload: true
+    contentTypeNosniff: true
+    referrerPolicy: "strict-origin-when-cross-origin"
+    permissionsPolicy: "camera=(), microphone=(), geolocation=(), payment=()"
+    customResponseHeaders:
+      Server: ""                   # Strip server identity
+      X-Powered-By: ""
+```
+
+`frameDeny`, `browserXssFilter`, and CSP are intentionally omitted from the global middleware. These are app-specific -- Authentik needs its own CSP, Grafana needs iframe support for embedding, etc. Apply those per-route where needed.
+
+---
+
+## Part 7: TLS Configuration
+
+### TLSOption
+
+```yaml
+# middleware/tls-options.yaml
+apiVersion: traefik.io/v1alpha1
+kind: TLSOption
+metadata:
+  name: default
+  namespace: default
+spec:
+  minVersion: VersionTLS12
+  maxVersion: VersionTLS13
+  cipherSuites:
+    # TLS 1.2 only -- TLS 1.3 ciphers are not configurable in Go (all safe by default)
+    - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+    - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+    - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+    - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+    - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+  curvePreferences:
+    - X25519
+    - CurveP256
+  sniStrict: true
+  alpnProtocols:
+    - h2
+    - http/1.1
+```
+
+The TLSOption must be named `default` in the `default` namespace for Traefik to pick it up as the default TLS configuration. All cipher suites are AEAD-only (GCM or ChaCha20-Poly1305) -- no CBC mode. `sniStrict: true` rejects connections that don't present a valid SNI hostname matching a known route.
+
+### ACME via Cloudflare DNS challenge
+
+```yaml
+args:
+  - "--certificatesresolvers.cloudflare.acme.dnschallenge.provider=cloudflare"
+  - "--certificatesresolvers.cloudflare.acme.email=erfi.anugrah@gmail.com"
+  - "--certificatesresolvers.cloudflare.acme.dnschallenge.resolvers=1.1.1.1"
+  - "--certificatesresolvers.cloudflare.acme.storage=/ssl-certs-2/acme-cloudflare.json"
+```
+
+The `CF_DNS_API_TOKEN` env var is pulled from a Kubernetes Secret (`cloudflare-credentials`). The ACME cert storage lives on an NFS PVC (`traefik-ssl-2`, 2Gi, RWX) so certs survive pod restarts and don't trigger Let's Encrypt rate limits on every rollout.
+
+```yaml
+# pvc-claims/traefik-ssl-pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: traefik-ssl-2
+  namespace: traefik
+spec:
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: nfs-client
+```
+
+:::caution
+DNS challenge takes 60-120 seconds to propagate. The first request to a new hostname will hang until the cert is issued. Pre-warm by hitting the hostname after adding a new IngressRoute.
+:::
+
+---
+
+## Part 8: Per-Route Middlewares
+
+### Rate limiting (per-route isolation)
+
+Each service gets its own rate limit middleware to prevent cross-service token bucket interference. The problem this solves: when multiple services share a single `rate-limit-api` middleware, Traefik maintains one token bucket per source IP per middleware *instance*. All routes sharing that middleware share the same bucket. Authentik OAuth flows generate 35+ requests in bursts (redirects, consent, callback, static assets), which would exceed a shared 10 req/s bucket and return 429s.
+
+All per-route rate limit middlewares live in a single file:
+
+```yaml
+# middleware/rate-limits.yaml (pattern -- 22 middlewares total)
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: rl-authentik
+  namespace: traefik
+spec:
+  rateLimit:
+    average: 100
+    period: 1s
+    burst: 500
+    sourceCriterion:
+      requestHeaderName: X-Real-Client-Ip
+```
+
+`sourceCriterion.requestHeaderName: X-Real-Client-Ip` uses the header set by the sentinel plugin for per-IP bucketing. Without this, Traefik would use the connection source IP, which behind Cloudflare Tunnel is always the cloudflared pod IP -- meaning all users would share one bucket.
+
+Rate limits for monitoring/query services (Grafana, Prometheus, Alertmanager, Jaeger, Logpush, Traefik Dashboard, Traefik Prometheus) are currently **commented out** in their IngressRoutes. These services generate heavy internal query traffic (Grafana fires dozens of parallel Loki queries when loading dashboards), and rate limiting them causes query timeouts.
+
+### In-flight request limiting
+
+```yaml
+# middleware/inflight-req.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: inflight-req
+  namespace: traefik
+spec:
+  inFlightReq:
+    amount: 100
+    sourceCriterion:
+      requestHeaderName: X-Real-Client-Ip
+```
+
+Limits concurrent connections per source IP to 100. Unlike rate limiting (which controls request *rate*), this controls *concurrency*. A single IP can't monopolize all backend connections. Shared across all routes -- this is fine because the limit is per-IP, not per-route.
+
+### Retry
+
+```yaml
+# middleware/retry.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: retry
+  namespace: traefik
+spec:
+  retry:
+    attempts: 3
+    initialInterval: 100ms
+```
+
+3 attempts total (1 initial + 2 retries) with exponential backoff starting at 100ms. Only retries on connection errors, NOT on non-2xx status codes. Also shared across all routes.
+
+### Authentik forward auth
+
+```yaml
+# middleware/authentik-forward-auth.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: authentik-forward-auth
+  namespace: authentik
+spec:
+  forwardAuth:
+    address: http://authentik-server.authentik.svc.cluster.local/outpost.goauthentik.io/auth/traefik
+    trustForwardHeader: true
+    authResponseHeaders:
+      - X-authentik-username
+      - X-authentik-groups
+      - X-authentik-entitlements
+      - X-authentik-email
+      - X-authentik-name
+      - X-authentik-uid
+      - X-authentik-jwt
+      - X-authentik-meta-jwks
+      - X-authentik-meta-outpost
+      - X-authentik-meta-provider
+      - X-authentik-meta-app
+      - X-authentik-meta-version
+```
+
+Applied per-route to services that need SSO protection (Jaeger UI, etc.). Traefik forwards a sub-request to Authentik's embedded outpost; if Authentik returns 200, the original request proceeds with the `X-authentik-*` headers injected. If 401/403, the user is redirected to the Authentik login flow.
+
+---
+
+## Part 9: IngressRoutes
+
+20+ IngressRoutes route traffic from hostnames to backend services. Each IngressRoute specifies its middleware chain. The middleware execution order is: global middlewares first (sentinel → crowdsec → security-headers), then per-route middlewares in the order listed.
+
+### Middleware assignments
+
+| Route | Host | Middlewares | Namespace |
+| :---- | :--- | :---------- | :-------- |
+| Grafana | `grafana-k3s.erfi.io` | ~~rl-grafana~~, inflight-req, retry | monitoring |
+| Prometheus | `prom-k3s.erfi.io` | ~~rl-prometheus~~, inflight-req, retry | monitoring |
+| Alertmanager | `alertmanager-k3s.erfi.io` | ~~rl-alertmanager~~, inflight-req, retry | monitoring |
+| Jaeger | `jaeger-k3s.erfi.io` | ~~rl-jaeger~~, inflight-req, authentik-forward-auth, retry | monitoring |
+| Logpush | `logpush-k3s.erfi.io` | ~~rl-logpush~~, inflight-req, decompress, retry | monitoring |
+| Traefik Dashboard | `traefik-dashboard.erfi.io` | ~~rl-traefik-dashboard~~, inflight-req, retry | traefik |
+| Traefik Prometheus | `traefik-prometheus.erfi.io` | ~~rl-traefik-prometheus~~, inflight-req, retry | traefik |
+| Authentik | `authentik.erfi.io` | ~~rl-authentik~~, inflight-req, authentik-csp, retry | authentik |
+| Revista | `erfianugrah.com` | rl-revista, inflight-req, retry | revista |
+| ArgoCD (HTTP) | `argocd.erfi.io` | rl-argocd, inflight-req, retry | argocd |
+| ArgoCD (gRPC) | `argocd.erfi.io` + gRPC header | rl-argocd, inflight-req, retry | argocd |
+| Dendrite | `dendrite.erfi.io` | rl-dendrite, inflight-req, retry | dendrite |
+| httpbun | `httpbun-k3s.erfi.io` | rl-httpbun, inflight-req, retry | httpbun |
+| Jitsi (from Element) | `jitsi.erfi.io` + Referer match | rl-jitsi, inflight-req, retry | jitsi |
+| Jitsi (direct) | `jitsi.erfi.io` | rl-jitsi, inflight-req, retry | jitsi |
+| LiveKit JWT | `matrix-rtc.erfi.io/livekit/jwt` | rl-livekit, inflight-req, strip-livekit-jwt, retry | livekit |
+| LiveKit SFU | `matrix-rtc.erfi.io/livekit/sfu` | rl-livekit, inflight-req, strip-livekit-sfu, retry | livekit |
+| Element (chat) | `chat.erfi.io` | rl-matrix-element, inflight-req, retry | matrix |
+| Synapse Admin | `admin.matrix.erfi.io` | rl-matrix-admin, inflight-req, retry | matrix |
+| Synapse | `matrix.erfi.io` | rl-matrix-synapse, inflight-req, retry | matrix |
+| Maubot | `maubot.erfi.io` | rl-maubot, inflight-req, retry | maubot |
+| Headlamp | `headlamp-k3s.erfi.io` | rl-headlamp, inflight-req, retry | headlamp |
+| Longhorn | `longhorn.erfi.io` | rl-longhorn, inflight-req, retry | longhorn-system |
+| Portainer | `portainer-k3s.erfi.io` | rl-portainer, inflight-req, retry | portainer |
+| Portainer Agent | `port-agent-k3s.erfi.io` | rl-portainer-agent, inflight-req, retry | portainer |
+
+Strikethrough (`~~`) indicates rate limits that are currently commented out.
+
+:::note
+`allowCrossNamespace=true` is enabled on the KubernetesCRD provider. This lets IngressRoutes in any namespace reference middlewares in the `traefik` namespace (where the shared middlewares live). Without this, each namespace would need its own copy of every middleware.
+:::
+
+---
+
+## Part 10: Cloudflare Tunnel Integration
+
+All external traffic enters the cluster through a Cloudflare Tunnel. The tunnel connects from a `cloudflared` Deployment inside the cluster to Cloudflare's edge network via outbound QUIC connections -- no inbound ports or public IPs needed.
+
+### How it works
+
+1. `cloudflared` runs in the `cloudflared` namespace, maintains 4 HA connections to Cloudflare edge
+2. DNS CNAME records point each hostname to the tunnel's `.cfargotunnel.com` address
+3. Cloudflare edge receives the request, looks up the tunnel config, and forwards to `cloudflared`
+4. `cloudflared` routes to the Traefik Service based on hostname matching in the tunnel ingress rules
+5. Traefik handles TLS termination, middleware, and routing to the backend
+
+### Tunnel ingress rules (OpenTofu)
+
+Each hostname maps to the Traefik Service's cluster-internal HTTPS endpoint:
+
+```hcl
+# cloudflare-tunnel-tf/tunnel_config.tf
+ingress_rule {
+  hostname = "grafana-k3s.${var.secondary_domain_name}"
+  service  = "https://traefik.traefik.svc.cluster.local"
+  origin_request {
+    origin_server_name = "grafana-k3s.${var.secondary_domain_name}"
+    http2_origin       = true
+  }
+}
+```
+
+`origin_server_name` is set to the actual hostname so cloudflared presents the correct SNI to Traefik. `http2_origin = true` enables HTTP/2 between cloudflared and Traefik, which is needed for gRPC (ArgoCD) and improves multiplexing.
+
+The catch-all rule at the bottom returns 404 for unrecognized hostnames:
+
+```hcl
+ingress_rule {
+  service = "http_status:404"
+}
+```
+
+### DNS records (OpenTofu)
+
+Each service gets a CNAME record pointing to the tunnel:
+
+```hcl
+# cloudflare-tunnel-tf/records.tf
+resource "cloudflare_record" "grafana-k3s" {
+  zone_id = var.cloudflare_secondary_zone_id
+  name    = "grafana-k3s"
+  type    = "CNAME"
+  content = cloudflare_zero_trust_tunnel_cloudflared.k3s.cname
+  proxied = true
+  tags    = ["k3s", "monitoring"]
+}
+```
+
+`proxied = true` routes traffic through Cloudflare's edge (DDoS protection, WAF, caching). The CNAME target is the tunnel's unique `.cfargotunnel.com` address, auto-generated by the `cloudflare_zero_trust_tunnel_cloudflared` resource.
+
+---
+
+## Part 11: KEDA Autoscaling
+
+Traefik uses a KEDA ScaledObject with 5 triggers for intelligent autoscaling between 1 and 8 replicas:
+
+```yaml
+# hpa/traefik-keda-autoscaling.yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: traefik-keda
+  namespace: traefik
+spec:
+  scaleTargetRef:
+    name: traefik
+  pollingInterval: 5
+  cooldownPeriod: 10
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  triggers:
+    - type: cpu
+      metadata:
+        type: Utilization
+        value: "50"
+    - type: memory
+      metadata:
+        type: Utilization
+        value: "75"
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+        metricName: traefik_open_connections
+        threshold: "1000"
+        query: sum(traefik_open_connections{entrypoint="websecure"})
+    - type: prometheus
+      metadata:
+        metricName: traefik_request_duration
+        threshold: "0.5"
+        query: histogram_quantile(0.95, sum(rate(traefik_entrypoint_request_duration_seconds_bucket{entrypoint="websecure"}[1m])) by (le))
+    - type: prometheus
+      metadata:
+        metricName: traefik_requests_total
+        threshold: "1000"
+        query: sum(rate(traefik_entrypoint_requests_total{entrypoint="websecure"}[1m]))
+```
+
+The Prometheus triggers query Traefik's own metrics: open connection count, p95 request duration, and request rate. Any single trigger exceeding its threshold causes a scale-up. The 5-second polling interval and 10-second cooldown make it responsive without flapping.
+
+---
+
+## Part 12: Observability
+
+### Access logs → Loki (with structured metadata)
+
+Traefik writes JSON-formatted access logs to stdout:
+
+```yaml
+args:
+  - "--accesslog=true"
+  - "--accesslog.format=json"
+  - "--accesslog.bufferingsize=100"
+  - "--accesslog.fields.defaultmode=keep"
+  - "--accesslog.fields.headers.defaultmode=keep"
+```
+
+The `bufferingsize=100` buffers up to 100 log lines before flushing, reducing I/O pressure. `fields.defaultmode=keep` and `fields.headers.defaultmode=keep` include all fields and request/response headers in the JSON output -- this is what enables the sentinel bot score and other custom headers to appear in the access logs.
+
+The Alloy DaemonSet picks up these logs from the Traefik container's stdout (via `/var/log/pods/`), parses the JSON, and sends them to Loki with structured metadata. See the [monitoring stack guide](/guides/k3s-monitoring-stack/#traefik-access-log-enrichment) for the full Alloy config and the label/metadata split.
+
+### Tracing → Jaeger (via Alloy)
+
+```yaml
+args:
+  - "--tracing.otlp=true"
+  - "--tracing.otlp.grpc=true"
+  - "--tracing.otlp.grpc.endpoint=alloy.monitoring.svc.cluster.local:4317"
+  - "--tracing.otlp.grpc.insecure=true"
+  - "--tracing.serviceName=traefik"
+  - "--tracing.sampleRate=1.0"
+```
+
+Traefik sends OTLP traces to the Alloy DaemonSet on each node, which batches and forwards them to Jaeger. 100% sample rate is fine for a homelab -- in production you'd want to sample down.
+
+### Metrics → Prometheus
+
+```yaml
+args:
+  - "--metrics.prometheus=true"
+  - "--metrics.prometheus.entrypoint=metrics"
+  - "--metrics.prometheus.addrouterslabels=true"
+```
+
+`addrouterslabels=true` adds a `router` label to all metrics, enabling per-IngressRoute dashboards and alerting. The metrics endpoint is scraped by a ServiceMonitor in the monitoring stack.
+
+---
+
+## Deployment
+
+### Full deploy sequence
+
+```bash
+# 1. Disable built-in Traefik (one-time)
+ansible-playbook -i inventory.yml \
+  ansible-playbooks/my-playbooks/disable-builtin-traefik.yml \
+  --become --ask-become-pass
+
+# 2. Apply CRDs
+kubectl apply -f crds/kubernetes-crd-definition-v1.yml --server-side
+kubectl apply -f crds/kubernetes-crd-rbac.yml
+
+# 3. Apply TLS options
+kubectl apply -f middleware/tls-options.yaml
+
+# 4. Deploy plugin ConfigMaps
+kubectl apply -f middleware/decompress-configmap.yaml
+kubectl apply -f middleware/sentinel-configmap.yaml
+
+# 5. Deploy middleware CRDs
+kubectl apply -f middleware/sentinel-middleware.yaml
+kubectl apply -f middleware/security-headers.yaml
+kubectl apply -f middleware/crowdsec-bouncer.yaml
+kubectl apply -f middleware/decompress-middleware.yaml
+kubectl apply -f middleware/authentik-forward-auth.yaml
+kubectl apply -f middleware/inflight-req.yaml
+kubectl apply -f middleware/retry.yaml
+kubectl apply -f middleware/rate-limits.yaml
+
+# 6. Deploy Traefik (includes SA, ClusterRole, Service, Deployment, IngressClass, PDB)
+kubectl apply -f services/traefik.yaml
+
+# 7. Deploy IngressRoutes
+kubectl apply -f ingressroutes/
+
+# 8. Deploy KEDA autoscaling
+kubectl apply -f hpa/traefik-keda-autoscaling.yaml
+
+# 9. Apply DNS + tunnel config (OpenTofu)
+cd cloudflare-tunnel-tf/ && tofu apply
+```
+
+### Verification
+
+```bash
+# Traefik pods running on different nodes
+kubectl get pods -n traefik -o wide
+
+# All middlewares loaded
+kubectl get middlewares.traefik.io -n traefik
+
+# TLS option active
+kubectl get tlsoptions.traefik.io -A
+
+# IngressRoutes across all namespaces
+kubectl get ingressroutes.traefik.io -A
+
+# KEDA ScaledObject active
+kubectl get scaledobject -n traefik
+
+# Test bot detection (should return 403)
+curl -s -o /dev/null -w "%{http_code}" -H "User-Agent: sqlmap/1.0" https://httpbun-k3s.erfi.io/
+
+# Test honeypot path (should return 403)
+curl -s -o /dev/null -w "%{http_code}" https://httpbun-k3s.erfi.io/.env
+```
+
+---
+
+## File Reference
+
+```txt
+services/
+  traefik.yaml                    # SA, ClusterRole, Service, Deployment, IngressClass, PDB
+
+crds/
+  kubernetes-crd-definition-v1.yml  # Traefik CRDs (~3.5 MB)
+  kubernetes-crd-rbac.yml           # ClusterRole for CRD provider
+
+middleware/
+  # Local plugins (source + ConfigMap + Middleware CRD)
+  sentinel-plugin/
+    sentinel.go                   # 435-line Go source
+    go.mod / .traefik.yml
+  sentinel-configmap.yaml         # ConfigMap packaging for k8s
+  sentinel-middleware.yaml        # Middleware CRD with config
+
+  decompress-plugin/
+    decompress.go                 # 71-line Go source
+    go.mod / .traefik.yml
+  decompress-configmap.yaml       # ConfigMap packaging for k8s
+  decompress-middleware.yaml      # Middleware CRD (in monitoring ns)
+
+  # Remote plugin
+  crowdsec-bouncer.yaml           # SOPS-encrypted Middleware CRD
+
+  # Global middlewares
+  security-headers.yaml           # HSTS, nosniff, permissions policy
+  tls-options.yaml                # TLSOption (min TLS 1.2, AEAD ciphers, sniStrict)
+
+  # Shared per-route middlewares
+  rate-limits.yaml                # 22 per-route rate limit middlewares (rl-*)
+  inflight-req.yaml               # 100 concurrent req/IP
+  retry.yaml                      # 3 attempts, 100ms backoff
+
+  # Auth
+  authentik-forward-auth.yaml     # Forward auth to Authentik (in authentik ns)
+
+ingressroutes/
+  alertmanager-ingress.yaml       # monitoring
+  alloy-logpush-ingress.yaml      # monitoring (+ decompress middleware)
+  argocd-ingress.yaml             # argocd (2 routes: HTTP + gRPC)
+  authentik-ingress.yaml          # authentik
+  dendrite-ingress.yaml           # dendrite
+  grafana-ingress.yaml            # monitoring
+  httpbun-ingress.yaml            # httpbun
+  jaeger-ingress.yaml             # monitoring (+ authentik-forward-auth)
+  longhorn-ingress.yaml           # longhorn-system
+  portainer-agent-ingress.yaml    # portainer
+  portainer-ingress.yaml          # portainer
+  prometheus-ingress.yaml         # monitoring
+  revista-ingress.yaml            # revista
+  traefik-dashboard-ingress.yaml  # traefik (api@internal)
+  traefik-prometheus-ingress.yaml # traefik (prometheus@internal)
+
+services/*/ingress.yaml           # Service-embedded IngressRoutes
+  headlamp/ingressroute.yaml
+  jitsi/ingress.yaml              # 2 routes: Referer-gated + direct
+  livekit/ingress.yaml            # 2 routes + stripPrefix middlewares
+  matrix/ingress.yaml             # 3 routes: Element, Synapse Admin, Synapse
+  maubot/ingress.yaml
+
+hpa/
+  traefik-keda-autoscaling.yaml   # 5-trigger ScaledObject (1-8 replicas)
+
+pvc-claims/
+  traefik-ssl-pvc.yaml            # 2Gi NFS PVC for ACME cert storage
+
+cloudflare-tunnel-tf/
+  tunnel_config.tf                # Tunnel ingress rules (hostname → Traefik)
+  records.tf                      # DNS CNAME records → tunnel
+
+ansible-playbooks/my-playbooks/
+  disable-builtin-traefik.yml     # Disables k3s built-in Traefik + ServiceLB
+```
