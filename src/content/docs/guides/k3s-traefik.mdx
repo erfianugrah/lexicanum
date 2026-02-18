@@ -994,6 +994,161 @@ curl -s -o /dev/null -w "%{http_code}" https://httpbun-k3s.example.com/.env
 
 ---
 
+## Part 13: CrowdSec Operations
+
+CrowdSec runs as a DaemonSet in the cluster and feeds into the bouncer middleware documented in [Part 5](#part-5-remote-plugins). It can unexpectedly ban legitimate IPs.
+
+### Security Dashboard (web UI)
+
+A dedicated Go+htmx web application at `security-k3s.example.com` provides a browser-based alternative to `cscli` for most CrowdSec operations. Protected by Authentik forward-auth.
+
+| Feature | Dashboard | `cscli` |
+| :------ | :-------- | :------ |
+| View decisions (paginated, sortable) | Yes | Yes |
+| View alerts with expandable detail | Yes | Yes |
+| Remove individual decisions | Yes | Yes |
+| Create decisions (CF-style rule builder) | Yes | Yes (`cscli decisions add`) |
+| Export/import decisions as JSON | Yes | No |
+| GeoIP + ASN enrichment (country flags, org) | Yes | No |
+| IP lookup (decisions + alerts + allowlist check) | Yes | Partial |
+| View sentinel/rate-limit config | Yes | No |
+| Manage allowlists (read-only + CLI hints) | Yes (read) | Yes (read+write) |
+| Scenario breakdown with bar charts | Yes | Yes (`cscli metrics`) |
+
+Source: `services/security-dashboard/`. Deploy: `docker build` → `docker push erfianugrah/security-dashboard:latest` → `kubectl rollout restart`. See `security-stack.md` for full details.
+
+### Checking if an IP is banned
+
+```bash
+# Via the Security Dashboard:
+# Navigate to the IP Lookup page and search
+
+# Or exec into the CrowdSec LAPI pod:
+kubectl exec -n crowdsec deploy/crowdsec-lapi -- cscli decisions list
+
+# Check a specific IP:
+kubectl exec -n crowdsec deploy/crowdsec-lapi -- cscli decisions list -i <your_ip>
+```
+
+### Removing a ban
+
+If your own IP gets banned:
+
+```bash
+# Via the Security Dashboard:
+# Click "Remove" on the decision in the Decisions or Policy page
+
+# Or via cscli:
+kubectl exec -n crowdsec deploy/crowdsec-lapi -- cscli decisions delete -i <your_ip>
+```
+
+:::caution
+`cscli decisions add --type allow` does **not** override an existing `ban` decision. Both coexist and the bouncer checks bans first. To prevent re-banning, use a parser-level whitelist (see below) rather than a decision-level allow.
+:::
+
+### Dashboard false positives (parser-level whitelist)
+
+Dashboard UIs like Headlamp and Grafana generate 404s by requesting plugin locale files (e.g. `/static-plugins/prometheus/locales/en/translation.json`). The `crowdsecurity/http-probing` scenario has a capacity of 10 with 10-second leak speed, so 11+ unique 404 paths in a burst will trigger a ban. The `.json` extension is not in CrowdSec's `static_ressource` list, so these are treated as probing.
+
+The fix is a parser-level whitelist that runs in the `s02-enrich` stage. Create `dashboard-whitelist.yaml`:
+
+```yaml
+# dashboard-whitelist.yaml — placed in /etc/crowdsec/parsers/s02-enrich/
+name: custom/dashboard-whitelist
+description: "Whitelist known dashboard UI false positives"
+whitelist:
+  reason: "known dashboard UI request patterns"
+  expression:
+    - >-
+      evt.Meta.service == 'http'
+      && evt.Meta.http_path startsWith '/static-plugins/'
+    - >-
+      evt.Meta.service == 'http'
+      && evt.Meta.http_path startsWith '/plugins/'
+    - >-
+      evt.Meta.service == 'http'
+      && evt.Meta.http_path matches '^/api/v[0-9]+/namespaces'
+      && evt.Meta.http_status == '404'
+```
+
+To deploy it in a DaemonSet-based CrowdSec agent, embed the file in the agent ConfigMap and copy it with an init container:
+
+```yaml
+# In the agent ConfigMap, add the file as a data key:
+data:
+  dashboard-whitelist.yaml: |
+    name: custom/dashboard-whitelist
+    ...
+
+# In the agent DaemonSet, add an init container:
+initContainers:
+  - name: init-config
+    image: busybox:1.36
+    command: ["sh", "-c"]
+    args:
+      - |
+        cp /config-custom/dashboard-whitelist.yaml \
+          /etc/crowdsec/parsers/s02-enrich/dashboard-whitelist.yaml
+    volumeMounts:
+      - name: crowdsec-config
+        mountPath: /etc/crowdsec
+      - name: agent-config
+        mountPath: /config-custom
+```
+
+After deploying, verify the parser loaded and test with `cscli explain`:
+
+```bash
+# Verify parser is listed:
+kubectl exec -n crowdsec <agent-pod> -- cscli parsers list | grep dashboard
+
+# Test with a simulated log line:
+kubectl exec -n crowdsec <agent-pod> -- cscli explain \
+  --type traefik \
+  --log '1.2.3.4 - - [18/Feb/2026:15:30:00 +0000] "GET /static-plugins/prometheus/locales/en/translation.json HTTP/1.1" 404 19 "-" "Mozilla/5.0" 1 "app@docker" "https://10.0.0.1:443" 5ms'
+# Expected output should show:
+#   custom/dashboard-whitelist (~2 [whitelisted])
+#   parser success, ignored by whitelist (known dashboard UI request patterns)
+
+# Check whitelist metrics over time:
+kubectl exec -n crowdsec <agent-pod> -- cscli metrics show whitelists
+```
+
+### Allowlists (CrowdSec v1.7+)
+
+CrowdSec v1.7 introduced allowlists — persistent IP/CIDR whitelists that prevent matching IPs from being banned. Unlike parser-level whitelists (which prevent log events from being processed), allowlists operate at the decision level and can be managed dynamically.
+
+```bash
+# Create an allowlist:
+kubectl exec -n crowdsec deploy/crowdsec-lapi -- \
+  cscli allowlists create trusted-ips -d "Trusted IP addresses"
+
+# Add entries:
+kubectl exec -n crowdsec deploy/crowdsec-lapi -- \
+  cscli allowlists add trusted-ips 10.0.0.0/8 -d "Internal network"
+
+# Remove entries:
+kubectl exec -n crowdsec deploy/crowdsec-lapi -- \
+  cscli allowlists remove trusted-ips 10.0.0.0/8
+
+# View allowlists:
+kubectl exec -n crowdsec deploy/crowdsec-lapi -- cscli allowlists list
+```
+
+The Security Dashboard shows all allowlists in a read-only view with items, country flags, and expiry dates. Write operations require `cscli` (the LAPI allowlist endpoints are read-only via machine auth).
+
+### Debugging 403 errors
+
+If services behind Traefik return 403 Forbidden unexpectedly, check in this order:
+
+1. **CrowdSec decisions** -- is the client IP banned?
+2. **Sentinel plugin** -- is it flagging the request as a bot? Check the `X-Sentinel-Bot-Score` header
+3. **Cloudflare WAF** -- check the Cloudflare dashboard for firewall events
+
+The global middleware chain on the `websecure` entrypoint is: `sentinel` -> `crowdsec-bouncer` -> `security-headers`. A 403 from CrowdSec will be intercepted by the Sentinel plugin's response interceptor and rendered as a styled HTML error page showing the block source, reason, trace ID, and client IP.
+
+---
+
 ## File Reference
 
 ```txt
@@ -1057,6 +1212,19 @@ services/*/ingress.yaml           # Service-embedded IngressRoutes
   livekit/ingress.yaml            # 2 routes + stripPrefix middlewares
   matrix/ingress.yaml             # 3 routes: Element, Synapse Admin, Synapse
   maubot/ingress.yaml
+
+services/crowdsec/
+  agent-configmap.yaml             # Agent config + custom parsers
+  agent-daemonset.yaml             # Agent DaemonSet (init container copies parsers)
+  lapi-deployment.yaml             # LAPI server deployment
+  lapi-configmap.yaml              # LAPI configuration
+  scenarios-configmap.yaml         # Custom detection scenarios
+
+services/security-dashboard/
+  main.go                          # Go+htmx dashboard (~2300 lines, zero deps)
+  manifests.yaml                   # SOPS-encrypted (ns, SA, RBAC, secret, deploy, svc, ingress)
+  Dockerfile                       # Multi-stage ARM64 build
+  ui/                              # Templates + static assets (go:embed)
 
 hpa/
   traefik-keda-autoscaling.yaml   # 5-trigger ScaledObject (1-8 replicas)
