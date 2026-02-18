@@ -1,0 +1,1116 @@
+---
+title: "ARM64 k3s Cluster Operations: Turing Pi, Node Management, and Recovery"
+description: Operations guide for a 4-node ARM64 k3s cluster on Turing RK1 modules covering boot configuration, cgroup v2 migration, TLS certificate recovery, health watchdogs, disk maintenance, and BMC serial console recovery
+author: "Erfi Anugrah"
+---
+
+An operations guide for running a 4-node ARM64 k3s cluster on Turing RK1 compute modules in a Turing Pi 2 board. This covers the non-obvious parts of keeping a bare-metal homelab cluster healthy: boot configuration quirks on Rockchip BSP kernels, the cgroup v1 to v2 migration, k3s's dynamic TLS certificate system and how it breaks agents after server reboots, kube-proxy iptables recovery after power loss, disk pressure from uncontrolled logs, and recovering bricked nodes through the BMC serial console.
+
+Everything here was learned the hard way through actual cluster failures. Each section includes the root cause analysis, the fix, and the gotchas encountered along the way.
+
+:::tip[What this covers]
+
+1. **Hardware and cluster layout**: Turing Pi 2 board, 4x RK1 modules, NFS storage, network topology
+2. **Boot configuration**: U-Boot, `ubuntuEnv.txt`, kernel cmdline -- and a regex gotcha that can brick a node
+3. **Cgroup v2 migration**: Rolling migration from cgroup v1 with Ansible, swap removal, verification
+4. **k3s TLS certificate recovery**: Why agents break after server reboots, the dynamic listener cert system, and how to fix it
+5. **Health watchdog**: Systemd timer that detects stale iptables, auth failures, and TLS cert errors
+6. **Disk maintenance**: Journal size limits, containerd log rotation, NFS storage for Loki TSDB
+7. **BMC serial console recovery**: Using `tpi` CLI to recover a node that won't boot
+8. **Power management**: Using `tpi` for power cycling individual slots or the whole board
+:::
+
+---
+
+## Cluster Layout
+
+| Node | IP | k3s Role | Turing Pi Slot | Notes |
+| :---- | :---- | :---- | :---- | :---- |
+| node1 | 10.0.0.9 | control-plane (server) | 1 | API server, etcd, scheduler |
+| node2 | 10.0.0.10 | agent | 2 | |
+| node3 | 10.0.0.11 | agent | 3 | NFS server (~460 GB at `/data`) |
+| node4 | 10.0.0.12 | agent | 4 | |
+
+All nodes: Turing RK1 (Rockchip RK3588, 8 GB RAM, 29 GB SD card), Ubuntu 22.04, kernel 5.10.160-rockchip (BSP), k3s v1.34.3+k3s3, containerd v2.1.5.
+
+```d2
+direction: right
+
+tpi: "Turing Pi 2 Board\n(BMC: 10.0.0.8)" {
+  slot1: "Slot 1\nnode1 (10.0.0.9)\nk3s server" {
+    style.stroke: "#e74c3c"
+  }
+  slot2: "Slot 2\nnode2 (10.0.0.10)\nk3s agent"
+  slot3: "Slot 3\nnode3 (10.0.0.11)\nk3s agent + NFS"
+  slot4: "Slot 4\nnode4 (10.0.0.12)\nk3s agent"
+}
+
+vyos: "VyOS Router\n10.0.0.1" {
+  wan: "PPPoE WAN"
+  lan: "LAN 10.0.0.0/24"
+}
+
+cf: "Cloudflare\nTunnel"
+
+vyos.lan -> tpi: "1 Gbps"
+cf -> vyos.wan -> vyos.lan: "kubectl.example.com\n(CF Access + OIDC)"
+```
+
+### Component Versions
+
+| Component | Version |
+| :---- | :---- |
+| k3s | v1.34.3+k3s3 |
+| Containerd | v2.1.5-k3s1 |
+| Kernel | 5.10.160-rockchip (BSP) |
+| Ubuntu | 22.04 LTS (Jammy) |
+| U-Boot | Rockchip (vendor) |
+| Turing Pi BMC | (accessible at BMC IP on the LAN) |
+| `tpi` CLI | Latest from Turing Pi |
+
+### Ansible Inventory
+
+```yaml
+# inventory.yml
+k3s_cluster:
+  children:
+    server:
+      hosts:
+        10.0.0.9:
+    agent:
+      hosts:
+        10.0.0.10:
+        10.0.0.11:
+        10.0.0.12:
+  vars:
+    ansible_port: 22
+    ansible_user: your_user
+    ansible_python_interpreter: /usr/bin/python3
+    k3s_version: v1.34.3+k3s3
+    extra_server_args: --disable traefik --disable servicelb
+```
+
+The server has `--disable traefik --disable servicelb` because both are replaced with custom deployments (see the Traefik and monitoring guides).
+
+---
+
+## Part 1: Boot Configuration
+
+The Turing RK1 modules run a Rockchip BSP U-Boot that loads its configuration from `/boot/firmware/`. The key files:
+
+| File | Purpose |
+| :---- | :---- |
+| `/boot/firmware/ubuntuEnv.txt` | Kernel cmdline (`bootargs=`), DTB file, overlays |
+| `/boot/firmware/boot.cmd` | U-Boot script source (human-readable) |
+| `/boot/firmware/boot.scr` | Compiled U-Boot script (binary, loaded by U-Boot) |
+
+To change kernel boot parameters, edit `ubuntuEnv.txt`. You do **not** need to recompile `boot.scr` -- U-Boot reads `ubuntuEnv.txt` at boot and substitutes the variables into the boot script.
+
+### ubuntuEnv.txt format
+
+```txt
+bootargs=root=UUID=<uuid> rootfstype=ext4 rootwait rw console=ttyS9,115200 console=ttyS2,1500000 console=tty1 systemd.unified_cgroup_hierarchy=1
+fdtfile=rk3588-turing-rk1.dtb
+overlay_prefix=rk3588
+overlays=
+```
+
+:::danger
+**Regex gotcha**: If you use Ansible's `replace` module with a regex that ends in `\s*`, it will consume the trailing newline and merge the current line with the next one. For example:
+
+```yaml
+# BAD — \s* eats the newline, merging bootargs with fdtfile
+replace:
+  regexp: 'old_flags\s*'
+  replace: "new_flags "
+```
+
+This merges `bootargs=...` and `fdtfile=...` into a single line. U-Boot can't find the DTB file and the node fails to boot. Use a literal space match instead:
+
+```yaml
+# GOOD — only matches spaces, preserves newlines
+replace:
+  regexp: 'old_flags *'
+  replace: "new_flags "
+```
+
+If this happens, see [Part 7: BMC Serial Console Recovery](#part-7-bmc-serial-console-recovery) to fix the node without physical access.
+:::
+
+---
+
+## Part 2: Cgroup v2 Migration
+
+The RK1 modules ship with cgroup v1 enabled explicitly in the kernel cmdline. Kubernetes and containerd have deprecated cgroup v1 support and the kernel 5.10 Rockchip BSP supports cgroup v2 with the systemd unified hierarchy.
+
+### What needs to change
+
+The original bootargs contain these cgroup v1 flags:
+
+```txt
+cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory swapaccount=1 systemd.unified_cgroup_hierarchy=0
+```
+
+These need to be replaced with:
+
+```txt
+systemd.unified_cgroup_hierarchy=1
+```
+
+Swap also needs to be disabled -- k3s on cgroup v2 with swap enabled produces `tmpfs-noswap` warnings and kubelet considers memory-backed volumes (secrets, emptyDirs) insecure because they could be swapped to disk.
+
+### Migration playbook
+
+The playbook processes agents first (one at a time, rolling), then the server last. Each node is drained, rebooted, verified, and uncordoned before moving to the next.
+
+```yaml
+# cgroup-v2-swap-off.yml
+- name: Disable swap and enable cgroup v2 on agent nodes
+  hosts: agent
+  become: yes
+  serial: 1
+  tasks:
+    - name: Disable swap immediately
+      ansible.builtin.command: swapoff -a
+      changed_when: true
+
+    - name: Remove swap entry from fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^\s*/swapfile\s'
+        state: absent
+
+    - name: Delete swapfile
+      ansible.builtin.file:
+        path: /swapfile
+        state: absent
+
+    - name: Update bootargs — remove cgroup v1 flags and enable cgroup v2
+      ansible.builtin.replace:
+        path: /boot/firmware/ubuntuEnv.txt
+        # NOTE: Use literal ' *' at end, NOT '\s*' — see Boot Configuration section
+        regexp: 'cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory swapaccount=1 systemd\.unified_cgroup_hierarchy=0 *'
+        replace: "systemd.unified_cgroup_hierarchy=1 "
+
+    - name: Drain node before reboot
+      delegate_to: localhost
+      become: no
+      ansible.builtin.command: >
+        kubectl drain {{ ansible_hostname }}
+        --ignore-daemonsets --delete-emptydir-data --timeout=120s --force
+
+    - name: Reboot into cgroup v2
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+        msg: "Rebooting for cgroup v2 + swap off"
+        pre_reboot_delay: 5
+        post_reboot_delay: 30
+
+    - name: Restart k3s-agent to refresh certificates
+      ansible.builtin.systemd:
+        name: k3s-agent
+        state: restarted
+
+    - name: Wait for k3s-agent to be active
+      ansible.builtin.shell: systemctl is-active k3s-agent
+      register: k3s_status
+      until: k3s_status.rc == 0
+      retries: 18
+      delay: 10
+      changed_when: false
+
+    - name: Uncordon node
+      delegate_to: localhost
+      become: no
+      ansible.builtin.command: kubectl uncordon {{ ansible_hostname }}
+
+    - name: Wait for node to be Ready
+      delegate_to: localhost
+      become: no
+      ansible.builtin.shell: >
+        kubectl get node {{ ansible_hostname }}
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: node_ready
+      until: node_ready.stdout == "True"
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Verify cgroup v2 is active
+      ansible.builtin.shell: stat -f --format=%T /sys/fs/cgroup
+      register: cgroupfs
+      changed_when: false
+      failed_when: cgroupfs.stdout != "cgroup2fs"
+
+    - name: Verify swap is off
+      ansible.builtin.command: swapon --show
+      register: swap_check
+      changed_when: false
+      failed_when: swap_check.stdout | length > 0
+
+- name: Disable swap and enable cgroup v2 on server node
+  hosts: server
+  become: yes
+  tasks:
+    # Same tasks as above, but:
+    # - service name is 'k3s' not 'k3s-agent'
+    # - post_reboot_delay is 60 (server takes longer — etcd bootstrap)
+    # - server is done last to avoid cascading agent failures
+```
+
+### Post-migration: agent TLS cert refresh
+
+After the server reboots, its dynamic listener TLS cert may change. Agents that booted before or concurrently with the server will cache the old CA and fail with `x509: certificate signed by unknown authority`. The playbook includes a `Restart k3s-agent to refresh certificates` step to handle this, but it's not always sufficient. See [Part 3](#part-3-k3s-tls-certificate-recovery) for the full explanation and fix.
+
+### Verification
+
+```bash
+# On each node:
+stat -f --format=%T /sys/fs/cgroup
+# Expected: cgroup2fs
+
+swapon --show
+# Expected: (empty output)
+
+free -h | grep Swap
+# Expected: Swap: 0B 0B 0B
+```
+
+### Known cosmetic issue
+
+After migration, containerd v2.1 on k3s 1.34 produces an `InvalidDiskCapacity` warning on every kubelet start:
+
+```
+Warning  InvalidDiskCapacity  kubelet  invalid capacity 0 on image filesystem
+```
+
+This is caused by `disable_snapshot_annotations = true` in the auto-generated containerd config. It's cosmetic -- disk capacity reporting works fine. It will resolve with a future k3s upgrade.
+
+---
+
+## Part 3: k3s TLS Certificate Recovery
+
+This is the single most disruptive issue on this cluster. After a server reboot (or power cycle), agents frequently get stuck with:
+
+```
+tls: failed to verify certificate: x509: certificate signed by unknown authority
+```
+
+### Why it happens
+
+k3s has two separate CA systems and a dynamic TLS certificate:
+
+| Component | Path (server) | Purpose |
+| :---- | :---- | :---- |
+| Server CA | `/var/lib/rancher/k3s/server/tls/server-ca.crt` | Signs the API server's serving certificate |
+| Client CA | `/var/lib/rancher/k3s/server/tls/client-ca.crt` | Signs kubelet/kube-proxy client certs |
+| Dynamic listener cert | `/var/lib/rancher/k3s/server/tls/dynamic-cert.json` | The actual TLS cert presented on port 6443, managed by `rancher/dynamiclistener` |
+
+Agents cache the server CA and client CA locally:
+
+| Component | Path (agent) |
+| :---- | :---- |
+| Cached server CA | `/var/lib/rancher/k3s/agent/server-ca.crt` |
+| Cached client CA | `/var/lib/rancher/k3s/agent/client-ca.crt` |
+
+The dynamic listener cert is stored in three places: a Kubernetes Secret (`k3s-serving` in `kube-system`), a local file cache, and in memory. On server startup, before etcd is available, the dynamic listener uses the file cache. If this cert doesn't match what agents expect (because the cert was regenerated, or the agent has a stale CA from a previous boot), agents can't verify the server and enter a TLS error loop.
+
+The critical point: **`systemctl restart k3s-agent` does not fix this.** The agent reloads the same stale CA certs from disk. You must delete the cached CA files so the agent re-fetches them from the server's `/cacerts` endpoint.
+
+:::danger
+If the CA itself was rotated (e.g. after a manual `k3s` reinstall on the server), simply deleting the cached CA certs is **not enough**. The agent will re-bootstrap using the old token and old private keys, and get certs signed by the old CA again. In this case you need a full agent reinstall -- see [Part 12: Token and CA Rotation](#part-12-token-and-ca-rotation).
+:::
+
+### Recovery procedure (stale cert cache)
+
+This procedure fixes the common case where the server CA has NOT changed but agents have stale cached copies (e.g. after a server reboot or power cycle).
+
+:::caution
+The server must be fully ready before restarting agents. If agents reconnect while the server is still bootstrapping etcd, they may download an intermediate CA that doesn't match the final dynamic listener cert.
+:::
+
+**Step 1**: Verify the server is up and the API is working:
+
+```bash
+# From the server node itself:
+kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml
+
+# Or via ansible:
+ansible server -i inventory.yml -m shell \
+  -a "kubectl get nodes --kubeconfig /etc/rancher/k3s/k3s.yaml" \
+  -b -e "ansible_become_pass=<pass>"
+```
+
+**Step 2**: On each broken agent, stop the agent, delete cached certs, start:
+
+```bash
+# Via ansible (one node at a time):
+ansible <agent_ip> -i inventory.yml -m shell \
+  -a "systemctl stop k3s-agent; \
+      sleep 2; \
+      rm -f /var/lib/rancher/k3s/agent/server-ca.crt \
+            /var/lib/rancher/k3s/agent/client-ca.crt; \
+      nohup systemctl start k3s-agent &" \
+  -b -e "ansible_become_pass=<pass>"
+```
+
+:::note
+The `nohup systemctl start k3s-agent &` is backgrounded because k3s-agent uses `Type=notify` and won't return until the kubelet is fully ready, which can take 60-90 seconds on these ARM boards. Without backgrounding, ansible will time out.
+:::
+
+**Step 3**: Wait 60-90 seconds, then verify:
+
+```bash
+kubectl get nodes
+```
+
+### Verifying the CA match
+
+If an agent is stuck and you're not sure whether it's a cert issue, compare the CA fingerprints:
+
+```bash
+# On the server — the authoritative CA:
+openssl x509 -in /var/lib/rancher/k3s/server/tls/server-ca.crt \
+  -noout -fingerprint -sha256
+
+# On the agent — what it has cached:
+openssl x509 -in /var/lib/rancher/k3s/agent/server-ca.crt \
+  -noout -fingerprint -sha256
+
+# What the server's /cacerts endpoint returns:
+curl -sk https://<server_ip>:6443/cacerts | \
+  openssl x509 -noout -fingerprint -sha256
+```
+
+If the agent's fingerprint doesn't match the server's, the cert is stale.
+
+### Long-term mitigation
+
+| Approach | Difficulty | Effect |
+| :---- | :---- | :---- |
+| Custom CA certs (pre-created before first server start) | High (requires reinstall) | CA never changes across reboots |
+| `--tls-san` on server config | Low | Reduces dynamic cert regeneration |
+| Health watchdog with TLS detection | Medium | Auto-recovers agents (see Part 4) |
+| Boot order: server first, agents after | Low | Avoids race condition |
+
+---
+
+## Part 4: Health Watchdog
+
+A systemd timer that runs every 5 minutes on each node and detects two failure modes:
+
+1. **Missing kube-proxy iptables rules** (common after power loss) -- attempts a non-disruptive canary chain resync before falling back to a service restart
+2. **Any API failure** (stale certs, unauthorized, connection refused) -- always clears cached CA certs before restarting
+
+Key safety features:
+- **10-minute cooldown**: skips if the agent was restarted recently, preventing a death loop
+- **Server reachability gate**: won't restart the agent if the server API is unreachable (would just get bad certs)
+
+### Agent watchdog script
+
+```bash
+#!/bin/bash
+# k3s agent health watchdog
+
+SERVICE=k3s-agent
+KUBECONFIG=/var/lib/rancher/k3s/agent/kubelet.kubeconfig
+NODENAME=$(hostname)
+SERVER_URL="https://10.0.0.1:6443"  # Replace with your server IP
+COOLDOWN_SECONDS=600  # 10 minutes
+CERT_DIR=/var/lib/rancher/k3s/agent
+
+# ---- Cooldown check ----
+# If the agent was (re)started recently, don't interfere — give it
+# time to stabilize.
+ACTIVE_ENTER=$(systemctl show "$SERVICE" \
+  --property=ActiveEnterTimestamp --value 2>/dev/null)
+if [ -n "$ACTIVE_ENTER" ]; then
+  ENTER_EPOCH=$(date -d "$ACTIVE_ENTER" +%s 2>/dev/null || echo 0)
+  NOW_EPOCH=$(date +%s)
+  AGE=$(( NOW_EPOCH - ENTER_EPOCH ))
+  if [ "$AGE" -lt "$COOLDOWN_SECONDS" ]; then
+    logger -t k3s-watchdog \
+      "Agent started ${AGE}s ago (cooldown ${COOLDOWN_SECONDS}s) — skipping"
+    exit 0
+  fi
+fi
+
+if ! systemctl is-active --quiet "$SERVICE"; then
+  logger -t k3s-watchdog "Agent is not active — skipping"
+  exit 0
+fi
+
+# ---- Check 1: kube-proxy iptables rules ----
+if [ "$(iptables-save 2>/dev/null | grep -c KUBE-SVC)" -eq 0 ]; then
+  logger -t k3s-watchdog "kube-proxy iptables rules missing — deleting canary chains"
+  iptables -t mangle -F KUBE-PROXY-CANARY 2>/dev/null
+  iptables -t mangle -X KUBE-PROXY-CANARY 2>/dev/null
+  iptables -t nat    -F KUBE-PROXY-CANARY 2>/dev/null
+  iptables -t nat    -X KUBE-PROXY-CANARY 2>/dev/null
+  iptables -t filter -F KUBE-PROXY-CANARY 2>/dev/null
+  iptables -t filter -X KUBE-PROXY-CANARY 2>/dev/null
+  sleep 40
+  if [ "$(iptables-save 2>/dev/null | grep -c KUBE-SVC)" -eq 0 ]; then
+    logger -t k3s-watchdog "Canary resync failed — will restart in API check"
+  else
+    logger -t k3s-watchdog "kube-proxy iptables rules restored via canary resync"
+  fi
+fi
+
+# ---- Check 2: API reachability ----
+# Use "get node $NODENAME" not "get nodes" — the kubelet kubeconfig
+# (system:node:<name>) only has RBAC to read its own node object.
+API_ERR=$(kubectl --kubeconfig="$KUBECONFIG" get node "$NODENAME" 2>&1)
+API_RC=$?
+if [ $API_RC -eq 0 ]; then
+  exit 0
+fi
+
+logger -t k3s-watchdog "API check failed for $NODENAME (rc=$API_RC): $API_ERR"
+
+# ---- Server reachability gate ----
+if ! curl -sk --max-time 5 "$SERVER_URL/cacerts" >/dev/null 2>&1; then
+  logger -t k3s-watchdog "Server API not reachable — skipping restart"
+  exit 0
+fi
+
+# ---- Restart with cert cleanup ----
+# Always clear cached CA certs. Stale certs manifest as various errors:
+#   - x509: certificate signed by unknown authority
+#   - connection refused (local proxy can't auth to server)
+#   - 401 Unauthorized (server rejects stale client cert)
+logger -t k3s-watchdog "Clearing cached CA certs and restarting $SERVICE"
+systemctl stop "$SERVICE"
+sleep 2
+rm -f "$CERT_DIR/client-ca.crt" "$CERT_DIR/server-ca.crt"
+systemctl start "$SERVICE"
+logger -t k3s-watchdog "Agent restarted with fresh certs"
+```
+
+:::caution
+**Lessons learned from the original watchdog:**
+
+1. **RBAC**: The kubelet kubeconfig uses `system:node:<name>` which can only read its own node. Using `kubectl get nodes` (plural) returns `Forbidden`, which the watchdog misinterpreted as an auth failure and restarted the agent every 5 minutes.
+
+2. **TLS detection was too narrow**: The original script only cleared certs when it saw `x509` in the error message. But stale certs also cause `connection refused` (local proxy can't authenticate) and `401 Unauthorized`. The non-TLS branch did a plain `systemctl restart` which reloaded the same stale certs, achieving nothing.
+
+3. **No cooldown meant a death loop**: The watchdog fired every 5 minutes. Each time it restarted the agent, the agent hadn't finished bootstrapping before the next watchdog run killed it again. This caused multiple reboots and made the cluster progressively worse.
+:::
+
+### Server watchdog script
+
+The server version only checks kube-proxy iptables. It intentionally does **not** check API auth or restart the k3s server, because restarting the server would invalidate all agent tokens and cause a cascading failure.
+
+```bash
+#!/bin/bash
+# k3s server health watchdog
+
+SERVICE=k3s
+
+if ! systemctl is-active --quiet "$SERVICE"; then
+  exit 0
+fi
+
+if [ "$(iptables-save 2>/dev/null | grep -c KUBE-SVC)" -eq 0 ]; then
+  logger -t k3s-watchdog "kube-proxy iptables rules missing on server"
+  iptables -t mangle -F KUBE-PROXY-CANARY 2>/dev/null
+  iptables -t mangle -X KUBE-PROXY-CANARY 2>/dev/null
+  iptables -t nat    -F KUBE-PROXY-CANARY 2>/dev/null
+  iptables -t nat    -X KUBE-PROXY-CANARY 2>/dev/null
+  iptables -t filter -F KUBE-PROXY-CANARY 2>/dev/null
+  iptables -t filter -X KUBE-PROXY-CANARY 2>/dev/null
+  sleep 40
+  if [ "$(iptables-save 2>/dev/null | grep -c KUBE-SVC)" -eq 0 ]; then
+    logger -t k3s-watchdog "Canary resync failed — restarting $SERVICE as last resort"
+    systemctl restart "$SERVICE"
+  fi
+fi
+```
+
+### Deployment playbook
+
+The watchdog is deployed via Ansible as an inline `copy` task -- the script is embedded directly in the playbook rather than maintained as a separate file:
+
+```yaml
+# k3s-agent-health.yml
+- name: Deploy k3s health watchdog on agent nodes
+  hosts: agent
+  become: yes
+  tasks:
+    - name: Install k3s health check script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/k3s-health-check
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # (full script from above)
+
+    - name: Install systemd timer for health check
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/k3s-health.timer
+        content: |
+          [Unit]
+          Description=k3s health watchdog timer
+
+          [Timer]
+          OnBootSec=3min
+          OnUnitActiveSec=5min
+          AccuracySec=30s
+
+          [Install]
+          WantedBy=timers.target
+
+    - name: Install systemd service for health check
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/k3s-health.service
+        content: |
+          [Unit]
+          Description=k3s health watchdog
+          After=k3s-agent.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/k3s-health-check
+
+    - name: Reload systemd and enable timer
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Enable and start the health check timer
+      ansible.builtin.systemd:
+        name: k3s-health.timer
+        enabled: yes
+        state: started
+```
+
+### Checking watchdog logs
+
+```bash
+# View recent watchdog actions:
+journalctl -t k3s-watchdog --no-pager --since '1 hour ago'
+
+# Check timer status:
+systemctl list-timers k3s-health.timer
+```
+
+---
+
+## Part 5: Disk Maintenance
+
+With 29 GB SD cards, disk space is a constant concern. The main consumers are journal logs, containerd rotated logs, and monitoring data.
+
+### Journal size limits
+
+By default, journald can grow to 2.7-2.8 GB per node. Set a permanent limit:
+
+```bash
+# /etc/systemd/journald.conf.d/size.conf
+[Journal]
+SystemMaxUse=256M
+```
+
+Deploy and apply:
+
+```bash
+ansible all -i inventory.yml -m copy \
+  -a "dest=/etc/systemd/journald.conf.d/size.conf content='[Journal]\nSystemMaxUse=256M\n'" \
+  -b -e "ansible_become_pass=<pass>"
+
+ansible all -i inventory.yml -m shell \
+  -a "journalctl --vacuum-size=256M && systemctl restart systemd-journald" \
+  -b -e "ansible_become_pass=<pass>"
+```
+
+### Containerd log rotation
+
+Containerd creates rotated logs (`*.gz` files) in `/var/lib/rancher/k3s/agent/containerd/`. These accumulate silently. Clean them periodically:
+
+```bash
+ansible all -i inventory.yml -m shell \
+  -a "find /var/lib/rancher/k3s/agent/containerd/ -name '*.gz' -delete" \
+  -b -e "ansible_become_pass=<pass>"
+```
+
+### Syslog rotation
+
+Ubuntu's rsyslog can also accumulate large rotated logs. Configure aggressive rotation:
+
+```bash
+# /etc/logrotate.d/rsyslog-aggressive
+/var/log/syslog /var/log/kern.log /var/log/auth.log {
+    daily
+    rotate 3
+    compress
+    delaycompress
+    missingok
+    notifempty
+    maxsize 50M
+}
+```
+
+### Loki TSDB storage
+
+Loki's TSDB shipper writes index and cache data. If configured with an `emptyDir` volume, this writes to the node's disk and causes disk pressure. Move it to NFS:
+
+```yaml
+# In the Loki configmap, change tsdb_shipper paths:
+schema_config:
+  configs:
+    - from: "2024-09-01"
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+storage_config:
+  tsdb_shipper:
+    active_index_directory: /loki/tsdb-index   # was /local/tsdb-index
+    cache_location: /loki/tsdb-cache            # was /local/tsdb-cache
+  filesystem:
+    directory: /loki/chunks
+```
+
+Remove the `emptyDir` volume from the StatefulSet and make sure `/loki/` is backed by the NFS PVC.
+
+---
+
+## Part 6: Swap Removal
+
+Swap is disabled as part of the cgroup v2 migration (see [Part 2](#part-2-cgroup-v2-migration)), but if you need to do it separately:
+
+```bash
+# Immediate:
+swapoff -a
+
+# Permanent — remove from fstab:
+sed -i '/\/swapfile/d' /etc/fstab
+
+# Reclaim disk space:
+rm -f /swapfile    # Frees ~2 GB per node
+```
+
+The RK1 modules have 8 GB RAM, which is enough for the workloads running on this cluster. With swap enabled on cgroup v2, kubelet produces `tmpfs-noswap` warnings because it can't guarantee that memory-backed volumes (Kubernetes secrets, emptyDirs) stay in RAM.
+
+---
+
+## Part 7: BMC Serial Console Recovery
+
+When a node won't boot (e.g. due to a corrupted `ubuntuEnv.txt` -- see the regex gotcha in [Part 1](#part-1-boot-configuration)), you can recover it through the Turing Pi BMC's serial console without physically accessing the board.
+
+### Prerequisites
+
+The `tpi` CLI tool must be installed and configured to talk to the BMC's IP address on your LAN.
+
+### Accessing the serial console
+
+```bash
+# Read serial output from slot 2 (rock2):
+tpi uart -n 2 get
+
+# Send a command to the serial console:
+tpi uart -n 2 set -c 'ls /boot/firmware/'
+```
+
+### Recovery scenario: corrupted ubuntuEnv.txt
+
+This happened when an Ansible regex consumed a newline, merging `fdtfile=rk3588-turing-rk1.dtb` into the `bootargs=` line. U-Boot couldn't find the DTB and the node dropped to a U-Boot shell.
+
+**Step 1**: Power cycle the node and catch the U-Boot prompt:
+
+```bash
+tpi power -n 2 off
+sleep 2
+tpi power -n 2 on
+# Watch serial output:
+tpi uart -n 2 get
+```
+
+**Step 2**: If the node drops to a U-Boot shell, boot manually:
+
+```bash
+# Load the kernel, DTB, and initrd from the SD card:
+tpi uart -n 2 set -c 'load mmc 1:1 ${kernel_addr_r} /boot/vmlinuz'
+tpi uart -n 2 set -c 'load mmc 1:1 ${fdt_addr_r} /boot/dtbs/5.10.160-rockchip/rockchip/rk3588-turing-rk1.dtb'
+tpi uart -n 2 set -c 'load mmc 1:1 ${ramdisk_addr_r} /boot/initrd.img'
+tpi uart -n 2 set -c 'booti ${kernel_addr_r} ${ramdisk_addr_r} ${fdt_addr_r}'
+```
+
+**Step 3**: Once Linux boots, SSH in and fix `ubuntuEnv.txt`:
+
+```bash
+ssh your_user@10.0.0.10
+sudo vi /boot/firmware/ubuntuEnv.txt
+# Ensure bootargs and fdtfile are on separate lines
+sudo reboot
+```
+
+### Power management
+
+```bash
+# Power cycle a single slot:
+tpi power -n <slot> off && sleep 2 && tpi power -n <slot> on
+
+# Power cycle all slots:
+tpi power -n 1 off && tpi power -n 2 off && tpi power -n 3 off && tpi power -n 4 off
+sleep 2
+tpi power -n 1 on && tpi power -n 2 on && tpi power -n 3 on && tpi power -n 4 on
+```
+
+:::caution
+When power cycling the whole board, always start the server (slot 1) first and wait for k3s to be fully ready before starting agents. Otherwise agents will get stale TLS certs. See [Part 3](#part-3-k3s-tls-certificate-recovery).
+:::
+
+---
+
+## Part 8: CrowdSec Operations
+
+CrowdSec runs as a DaemonSet in the cluster and feeds into a Traefik bouncer middleware. It can unexpectedly ban legitimate IPs.
+
+### Checking if an IP is banned
+
+```bash
+# Exec into the CrowdSec LAPI pod:
+kubectl exec -n crowdsec deploy/crowdsec-lapi -- cscli decisions list
+
+# Check a specific IP:
+kubectl exec -n crowdsec deploy/crowdsec-lapi -- cscli decisions list -i <your_ip>
+```
+
+### Removing a ban
+
+If your own IP gets banned:
+
+```bash
+# Remove the ban:
+kubectl exec -n crowdsec deploy/crowdsec-lapi -- cscli decisions delete -i <your_ip>
+```
+
+:::caution
+`cscli decisions add --type allow` does **not** override an existing `ban` decision. Both coexist and the bouncer checks bans first. To prevent re-banning, use a parser-level whitelist (see below) rather than a decision-level allow.
+:::
+
+### Dashboard false positives (parser-level whitelist)
+
+Dashboard UIs like Headlamp and Grafana generate 404s by requesting plugin locale files (e.g. `/static-plugins/prometheus/locales/en/translation.json`). The `crowdsecurity/http-probing` scenario has a capacity of 10 with 10-second leak speed, so 11+ unique 404 paths in a burst will trigger a ban. The `.json` extension is not in CrowdSec's `static_ressource` list, so these are treated as probing.
+
+The fix is a parser-level whitelist that runs in the `s02-enrich` stage. Create `dashboard-whitelist.yaml`:
+
+```yaml
+# dashboard-whitelist.yaml — placed in /etc/crowdsec/parsers/s02-enrich/
+name: custom/dashboard-whitelist
+description: "Whitelist known dashboard UI false positives"
+whitelist:
+  reason: "known dashboard UI request patterns"
+  expression:
+    - >-
+      evt.Meta.service == 'http'
+      && evt.Meta.http_path startsWith '/static-plugins/'
+    - >-
+      evt.Meta.service == 'http'
+      && evt.Meta.http_path startsWith '/plugins/'
+    - >-
+      evt.Meta.service == 'http'
+      && evt.Meta.http_path matches '^/api/v[0-9]+/namespaces'
+      && evt.Meta.http_status == '404'
+```
+
+To deploy it in a DaemonSet-based CrowdSec agent, embed the file in the agent ConfigMap and copy it with an init container:
+
+```yaml
+# In the agent ConfigMap, add the file as a data key:
+data:
+  dashboard-whitelist.yaml: |
+    name: custom/dashboard-whitelist
+    ...
+
+# In the agent DaemonSet, add an init container:
+initContainers:
+  - name: init-config
+    image: busybox:1.36
+    command: ["sh", "-c"]
+    args:
+      - |
+        cp /config-custom/dashboard-whitelist.yaml \
+          /etc/crowdsec/parsers/s02-enrich/dashboard-whitelist.yaml
+    volumeMounts:
+      - name: crowdsec-config
+        mountPath: /etc/crowdsec
+      - name: agent-config
+        mountPath: /config-custom
+```
+
+After deploying, verify the parser loaded and test with `cscli explain`:
+
+```bash
+# Verify parser is listed:
+kubectl exec -n crowdsec <agent-pod> -- cscli parsers list | grep dashboard
+
+# Test with a simulated log line:
+kubectl exec -n crowdsec <agent-pod> -- cscli explain \
+  --type traefik \
+  --log '1.2.3.4 - - [18/Feb/2026:15:30:00 +0000] "GET /static-plugins/prometheus/locales/en/translation.json HTTP/1.1" 404 19 "-" "Mozilla/5.0" 1 "app@docker" "https://10.0.0.1:443" 5ms'
+# Expected output should show:
+#   custom/dashboard-whitelist (~2 [whitelisted])
+#   parser success, ignored by whitelist (known dashboard UI request patterns)
+
+# Check whitelist metrics over time:
+kubectl exec -n crowdsec <agent-pod> -- cscli metrics show whitelists
+```
+
+### Debugging 403 errors
+
+If services behind Traefik return 403 Forbidden unexpectedly, check in this order:
+
+1. **CrowdSec decisions** -- is the client IP banned?
+2. **Sentinel plugin** -- is it flagging the request as a bot? Check the `X-Sentinel-Bot-Score` header
+3. **Cloudflare WAF** -- check the Cloudflare dashboard for firewall events
+
+The global middleware chain on the `websecure` entrypoint is: `sentinel` -> `crowdsec-bouncer` -> `security-headers`. A 403 from CrowdSec will be intercepted by the Sentinel plugin's response interceptor and rendered as a styled HTML error page showing the block source, reason, trace ID, and client IP.
+
+---
+
+## Part 9: Prometheus Resource Tuning
+
+On a cluster with ~265k active series, 59 scrape targets, and a 30s scrape interval, Prometheus uses approximately 1 GB of memory at steady state.
+
+### Memory request
+
+The default memory request from many Helm charts (512Mi) is too low. Set it to match actual usage to prevent OOM kills and ensure the scheduler places the pod on a node with sufficient capacity:
+
+```yaml
+# In the Prometheus CR or manifest:
+resources:
+  requests:
+    cpu: 200m
+    memory: 1Gi
+  limits:
+    memory: 2Gi
+```
+
+### Monitoring resource usage
+
+To right-size Prometheus, query its own metrics:
+
+```promql
+# Current RSS:
+process_resident_memory_bytes{job="prometheus"}
+
+# Active series count:
+prometheus_tsdb_head_series
+
+# Scrape target count:
+count(up)
+
+# Ingestion rate:
+rate(prometheus_tsdb_head_samples_appended_total[5m])
+```
+
+---
+
+## Part 10: Stale Pod Cleanup
+
+After node reboots, agent restarts, or operator reconciliation conflicts, pods can be left in `Error` or `Completed` state. These consume API server resources and clutter `kubectl get pods` output.
+
+### Cleaning up
+
+```bash
+# Delete all Error pods cluster-wide:
+kubectl get pods -A --field-selector=status.phase=Failed \
+  -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' | \
+  while read ns name; do kubectl delete pod -n "$ns" "$name"; done
+
+# Delete all Completed (Succeeded) pods:
+kubectl get pods -A --field-selector=status.phase=Succeeded \
+  -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' | \
+  while read ns name; do kubectl delete pod -n "$ns" "$name"; done
+```
+
+Or more concisely:
+
+```bash
+kubectl delete pods -A --field-selector=status.phase=Failed
+kubectl delete pods -A --field-selector=status.phase=Succeeded
+```
+
+---
+
+## Part 11: KEDA and Prometheus Conflicts
+
+KEDA's ScaledObjects can conflict with Kubernetes operators that manage the same workloads.
+
+### Prometheus Operator conflict
+
+If a KEDA ScaledObject targets the `prometheus-prometheus` StatefulSet directly, KEDA will scale it (e.g. to 4 replicas), but the Prometheus Operator's `Prometheus` CR has `replicas: 1`. The operator reconciles constantly, trying to scale back down, while KEDA keeps scaling up. This creates crash-looping pods with volume mount failures because the PVCs don't exist for the extra replicas.
+
+**Fix**: Delete the KEDA ScaledObject for Prometheus. Let the Prometheus Operator manage the replica count through its CR. If you need Prometheus autoscaling, do it through the `Prometheus` CR's `replicas` field or use a VPA instead.
+
+### Prometheus service address
+
+KEDA ScaledObjects that use Prometheus as a trigger source need the correct service address. The Prometheus Operator creates a service called `prometheus-operated` (headless) and you typically create a ClusterIP service with a shorter name. Make sure the `serverAddress` in ScaledObject triggers matches your actual service:
+
+```yaml
+triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      # NOT: prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+```
+
+---
+
+## Part 12: Token and CA Rotation
+
+### The K10 token format
+
+When k3s first starts, it generates a node-join token stored at `/var/lib/rancher/k3s/server/token`:
+
+```
+K10<ca_hash>::server:<password>
+```
+
+The `K10` prefix tells the agent to verify the server's CA fingerprint against `<ca_hash>` during bootstrap. The `<password>` is the actual authentication credential.
+
+### What breaks after a server reinstall
+
+If you reinstall or reset the k3s server (e.g. `k3s-uninstall.sh` then fresh install), a **new CA** is generated. But:
+
+1. The `node-token` file may keep the old CA hash
+2. The agent service files (created by Ansible or the installer) still have the old `K10<old_hash>::server:<password>` token
+3. The agent's private keys and client certs (under `/var/lib/rancher/k3s/agent/`) were signed by the old CA
+
+The result is agents that appear to connect intermittently but fail authentication. The error messages vary depending on timing:
+- `x509: certificate signed by unknown authority` (TLS handshake)
+- `401 Unauthorized` (server rejects old client cert)
+- `connection refused` on `127.0.0.1:6443` (local proxy can't authenticate to server)
+
+Simply deleting cached CA certs (`server-ca.crt`, `client-ca.crt`) does **not** fix this because the agent re-bootstraps using the old token and old private keys, getting certs signed by the old CA again.
+
+### Diagnosis
+
+Compare the CA timestamps:
+
+```bash
+# Server's current CA:
+openssl x509 -noout -issuer \
+  < /var/lib/rancher/k3s/server/tls/server-ca.crt
+# e.g. issuer=CN = k3s-server-ca@1755079458
+
+# Agent's cached CA:
+openssl x509 -noout -issuer \
+  < /var/lib/rancher/k3s/agent/server-ca.crt
+# e.g. issuer=CN = k3s-server-ca@1709313234  <-- MISMATCH
+
+# Agent's client cert (who signed it?):
+openssl x509 -noout -issuer \
+  < /var/lib/rancher/k3s/agent/client-kubelet.crt
+# Should match the server's client-ca.crt
+```
+
+If the `@timestamp` values differ, the CA was rotated and agents need a full reinstall.
+
+### Fix: strip the CA pin and reinstall agents
+
+**Step 1**: Update the token in your Ansible inventory to use only the password (no `K10` prefix):
+
+```yaml
+# inventory.yml
+vars:
+  # Do NOT use the K10<hash> form. It pins to a specific CA and
+  # breaks when the server CA rotates.
+  token: "<your_server_password>"
+```
+
+You can find the password portion from the server's token file:
+
+```bash
+# On the server:
+cat /var/lib/rancher/k3s/server/token
+# K10<hash>::server:<password>  <-- use just the <password> part
+```
+
+**Step 2**: Uninstall and reinstall each agent using Ansible (one at a time):
+
+```bash
+# Uninstall:
+ansible-playbook -i inventory.yml reset.yml \
+  --limit <agent_ip> -e "ansible_become_pass=<pass>"
+
+# Reinstall:
+ansible-playbook -i inventory.yml site.yml \
+  --limit <agent_ip> -e "ansible_become_pass=<pass>"
+```
+
+**Step 3**: Verify the agent has the correct CA:
+
+```bash
+ansible <agent_ip> -i inventory.yml -m shell \
+  -a "openssl x509 -noout -issuer \
+      < /var/lib/rancher/k3s/agent/server-ca.crt" \
+  -b -e "ansible_become_pass=<pass>"
+```
+
+:::tip
+Without the `K10` prefix, the agent skips CA pin verification during bootstrap and simply trusts whatever CA the server presents over TLS. This is perfectly safe on a trusted LAN and won't break on future CA rotations.
+:::
+
+:::caution
+The `k3s-agent-uninstall.sh` script removes everything under `/var/lib/rancher/k3s/` but does **not** touch boot configuration (`/boot/firmware/ubuntuEnv.txt`), swap settings (`/etc/fstab`), or custom scripts (`/usr/local/bin/k3s-health-check`). You do not need to re-run cgroup, swap, or watchdog playbooks after an agent reinstall.
+:::
+
+---
+
+## Troubleshooting Quick Reference
+
+| Symptom | Likely cause | Fix |
+| :---- | :---- | :---- |
+| Agent: `x509: certificate signed by unknown authority` | Stale cached CA after server reboot | Stop agent, `rm` CA certs, start agent ([Part 3](#part-3-k3s-tls-certificate-recovery)) |
+| Agent: `x509` persists after clearing certs | CA was rotated (server reinstall); token has old CA hash | Full agent reinstall with stripped token ([Part 12](#part-12-token-and-ca-rotation)) |
+| Agent: `Unauthorized` on API calls | Stale client certs signed by old CA | Clear certs and restart; if it persists, full reinstall ([Part 12](#part-12-token-and-ca-rotation)) |
+| Watchdog creating a restart death loop | No cooldown + narrow TLS detection | Deploy updated watchdog with cooldown and server gate ([Part 4](#part-4-health-watchdog)) |
+| Missing kube-proxy iptables rules | Power loss wiped in-memory iptables | Delete KUBE-PROXY-CANARY chains, or restart agent |
+| `InvalidDiskCapacity` warning | Containerd v2.1 + k3s 1.34 cosmetic bug | Ignore (resolves with k3s upgrade) |
+| `tmpfs-noswap` warning | Swap is enabled on cgroup v2 | `swapoff -a`, remove from fstab |
+| `CgroupV1` warning on kubelet start | Node still on cgroup v1 | Run the cgroup v2 migration ([Part 2](#part-2-cgroup-v2-migration)) |
+| Node won't boot after config change | Corrupted `ubuntuEnv.txt` | BMC serial console recovery ([Part 7](#part-7-bmc-serial-console-recovery)) |
+| Disk pressure on agent nodes | Journal/containerd logs filling SD card | Vacuum journals, clean rotated logs ([Part 5](#part-5-disk-maintenance)) |
+| CrowdSec banning your IP for `http-probing` | Dashboard UI 404s exceeding scenario threshold | Parser-level whitelist ([Part 8](#part-8-crowdsec-operations)) |
+| Prometheus pods crash-looping | KEDA vs Prometheus Operator replica conflict | Delete the KEDA ScaledObject for Prometheus |
+
+## File Reference
+
+```
+ansible-playbooks/my-playbooks/
+├── inventory.yml                    # Cluster inventory (server + 3 agents)
+├── k3s-agent-health.yml             # Health watchdog deployment
+├── cgroup-v2-swap-off.yml           # Cgroup v2 migration + swap removal
+└── site.yml                         # Wrapper that imports playbooks
+
+/boot/firmware/                      # Per-node boot config
+├── ubuntuEnv.txt                    # Kernel cmdline, DTB, overlays
+├── boot.cmd                         # U-Boot script source
+└── boot.scr                         # Compiled U-Boot script
+
+/var/lib/rancher/k3s/
+├── server/tls/                      # Server-side TLS (only on rock1)
+│   ├── server-ca.crt                # Server CA — signs serving certs
+│   ├── client-ca.crt                # Client CA — signs kubelet certs
+│   └── dynamic-cert.json            # Dynamic listener cert (file cache)
+└── agent/                           # Agent-side (rock2-rock4)
+    ├── server-ca.crt                # Cached server CA (delete to refresh)
+    ├── client-ca.crt                # Cached client CA (delete to refresh)
+    └── kubelet.kubeconfig           # Kubelet credentials
+
+services/crowdsec/
+├── agent-configmap.yaml             # Agent config + custom parsers
+├── agent-daemonset.yaml             # Agent DaemonSet (init container copies parsers)
+├── lapi-deployment.yaml             # LAPI server deployment
+├── lapi-configmap.yaml              # LAPI configuration
+└── scenarios-configmap.yaml         # Custom detection scenarios
+
+/usr/local/bin/k3s-health-check      # Watchdog script (deployed by Ansible)
+/etc/systemd/system/
+├── k3s-health.timer                 # 5-minute watchdog timer
+└── k3s-health.service               # Oneshot service for watchdog
+```
