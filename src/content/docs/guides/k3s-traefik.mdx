@@ -1,6 +1,6 @@
 ---
 title: "Traefik on k3s: Custom Deployment, Plugins, Middlewares, and Cloudflare Tunnel"
-description: Complete guide to running a custom Traefik v3 deployment on k3s with local Go plugins for bot detection and request decompression, per-route rate limiting, CrowdSec integration, Authentik forward auth, TLS via ACME DNS challenge, Cloudflare Tunnel ingress, KEDA autoscaling, and full observability via Prometheus, Loki, and Jaeger
+description: Complete guide to running a custom Traefik v3 deployment on k3s with local Go plugins for bot detection, IPsum blocklist enforcement, expression-based firewall rules, request decompression, per-route rate limiting, Authentik forward auth, TLS via ACME DNS challenge, Cloudflare Tunnel ingress, KEDA autoscaling, and full observability via Prometheus, Loki, and Jaeger
 author: "Erfi Anugrah"
 ---
 
@@ -13,22 +13,22 @@ This guide covers the full setup: disabling the built-in Traefik, deploying a cu
 1. **Disabling k3s built-in Traefik**: Ansible playbook, config.yaml cleanup
 2. **Custom Traefik Deployment**: Raw manifest with 5 entrypoints, 2 replicas, pod anti-affinity, PDB
 3. **CRD installation**: Traefik CRDs and RBAC for KubernetesCRD provider
-4. **Custom local plugins**: Sentinel (bot detection + IP resolution) and Decompress (gzip request body) -- how to write, package as ConfigMap, mount into Traefik
-5. **Remote plugins**: CrowdSec Bouncer v1.5.0
-6. **Global middlewares**: Sentinel, CrowdSec Bouncer, security headers -- applied to all `websecure` requests
-7. **Per-route middlewares**: Rate limits, inflight-req, retry, decompress, Authentik forward auth
-8. **TLS configuration**: TLSOption CRD, ACME DNS challenge via Cloudflare, strong cipher suite
-9. **All IngressRoutes**: 20+ routes with their middleware assignments
-10. **Cloudflare Tunnel integration**: OpenTofu-managed tunnel config, DNS records, ingress rules
-11. **KEDA autoscaling**: 5-trigger ScaledObject (CPU, memory, open connections, p95 latency, request rate)
-12. **Observability**: Access logs (JSON → Alloy → Loki with structured metadata), tracing (OTLP → Alloy → Jaeger), metrics (Prometheus with router labels)
+4. **Custom local plugins**: Sentinel (bot detection + IP resolution + IPsum blocklist + expression-based firewall rules) and Decompress (gzip request body) -- how to write, package as ConfigMap, mount into Traefik
+5. **Global middlewares**: Sentinel and security headers -- applied to all `websecure` requests
+6. **Per-route middlewares**: Rate limits, inflight-req, retry, decompress, Authentik forward auth
+7. **TLS configuration**: TLSOption CRD, ACME DNS challenge via Cloudflare, strong cipher suite
+8. **All IngressRoutes**: 20+ routes with their middleware assignments
+9. **Cloudflare Tunnel integration**: OpenTofu-managed tunnel config, DNS records, ingress rules
+10. **KEDA autoscaling**: 5-trigger ScaledObject (CPU, memory, open connections, p95 latency, request rate)
+11. **Observability**: Access logs (JSON → Alloy → Loki with 19 structured metadata fields), tracing (OTLP → Alloy → Jaeger), metrics (Prometheus with router labels + 7 Alloy-generated counters)
+12. **Sentinel operations**: Rule management, debugging 403s, IPsum blocklist, Security Dashboard
 :::
 
 ---
 
 ## Architecture Overview
 
-All HTTP traffic enters through Cloudflare's edge network, passes through a Cloudflare Tunnel (`cloudflared` running in the cluster), and hits the custom Traefik deployment in the `traefik` namespace. Traefik terminates TLS (ACME certs via Cloudflare DNS challenge), runs the global middleware chain (sentinel → crowdsec-bouncer → security-headers), then routes to per-route middlewares and backend services.
+All HTTP traffic enters through Cloudflare's edge network, passes through a Cloudflare Tunnel (`cloudflared` running in the cluster), and hits the custom Traefik deployment in the `traefik` namespace. Traefik terminates TLS (ACME certs via Cloudflare DNS challenge), runs the global middleware chain (sentinel → security-headers), then routes to per-route middlewares and backend services.
 
 ```d2
 direction: right
@@ -39,8 +39,7 @@ cf: "Cloudflare Edge" {
 
 traefik: "Traefik v3.6.8\n(traefik ns, 2 replicas)" {
   global: "Global Middlewares" {
-    sentinel: "Sentinel\n(IP + bot score)"
-    crowdsec: "CrowdSec Bouncer\n(IP reputation)"
+    sentinel: "Sentinel\n(IP + bot + blocklist\n+ rule engine)"
     headers: "Security Headers\n(HSTS, nosniff)"
   }
   perroute: "Per-route Middlewares" {
@@ -70,7 +69,7 @@ monitoring: "Observability" {
 }
 
 cf.tunnel -> traefik: "HTTPS\n(h2, SNI)"
-traefik.global.sentinel -> traefik.global.crowdsec -> traefik.global.headers
+traefik.global.sentinel -> traefik.global.headers
 traefik.perroute -> services
 traefik -> monitoring.alloy: "access logs\n(JSON stdout)"
 traefik -> monitoring.alloy: "OTLP traces"
@@ -84,7 +83,6 @@ monitoring.alloy -> monitoring.jaeger: "traces"
 | Component | Version | Image |
 | :-------- | :------ | :---- |
 | Traefik | v3.6.8 | `traefik:v3.6.8` |
-| CrowdSec Bouncer plugin | v1.5.0 | (remote, fetched by Traefik) |
 | cloudflared | 2026.2.0 | `cloudflare/cloudflared:2026.2.0` |
 | KEDA | (cluster-wide) | (already deployed) |
 
@@ -197,7 +195,7 @@ args:
   - "--entrypoints.websecure.http3.advertisedport=443"
   - "--entrypoints.websecure.http2.maxConcurrentStreams=512"
   # Global middlewares applied to ALL websecure requests
-  - "--entrypoints.websecure.http.middlewares=traefik-sentinel@kubernetescrd,traefik-crowdsec-bouncer@kubernetescrd,traefik-security-headers@kubernetescrd"
+  - "--entrypoints.websecure.http.middlewares=traefik-sentinel@kubernetescrd,traefik-security-headers@kubernetescrd"
 ```
 
 HTTP/3 is enabled with `advertisedport=443` because the container listens on 8443 but the LoadBalancer Service maps port 443 → 8443. Without the advertised port, clients would try QUIC on port 8443 and fail.
@@ -213,7 +211,7 @@ args:
   - "--entrypoints.websecure.transport.lifeCycle.requestAcceptGraceTimeout=5s"
 ```
 
-`writeTimeout=0s` (disabled) is intentional. Matrix (Synapse), Jitsi, and LiveKit all use long-lived WebSocket connections. A non-zero write timeout would kill WebSocket connections that don't send data within the timeout window. The tradeoff is that slowloris-style attacks against WebSocket endpoints aren't mitigated at the Traefik layer -- but CrowdSec and Cloudflare's DDoS protection handle that upstream.
+`writeTimeout=0s` (disabled) is intentional. Matrix (Synapse), Jitsi, and LiveKit all use long-lived WebSocket connections. A non-zero write timeout would kill WebSocket connections that don't send data within the timeout window. The tradeoff is that slowloris-style attacks against WebSocket endpoints aren't mitigated at the Traefik layer -- but Sentinel's tarpit action and Cloudflare's DDoS protection handle that upstream.
 
 ### Forwarded headers
 
@@ -247,7 +245,7 @@ securityContext:
   readOnlyRootFilesystem: true
 ```
 
-The root filesystem is read-only. Writable paths are provided via volume mounts: `/ssl-certs-2` (PVC for ACME certs), `/tmp` (emptyDir), `/plugins-local/` (ConfigMap mounts for plugins), `/plugins-storage` (emptyDir for remote plugin cache).
+The root filesystem is read-only. Writable paths are provided via volume mounts: `/ssl-certs-2` (PVC for ACME certs), `/tmp` (emptyDir), `/plugins-local/` (ConfigMap mounts for plugins), `/plugins-storage` (emptyDir for remote plugin cache), `/blocklists` (ConfigMap for IPsum blocklist).
 
 ### Pod anti-affinity and PDB
 
@@ -303,18 +301,19 @@ Traefik supports two types of plugins: remote (fetched from GitHub on startup) a
 
 Since Traefik runs with `readOnlyRootFilesystem: true`, the plugin files are packaged as ConfigMaps and mounted as volumes.
 
-### Plugin 1: Sentinel (bot detection + IP resolution)
+### Plugin 1: Sentinel (bot detection + IP resolution + IPsum blocklist + rule engine)
 
-Sentinel is a custom plugin that replaces the standalone `realclientip` plugin. It does two things: resolves the real client IP from trusted headers (Cloudflare's `Cf-Connecting-Ip` or `X-Forwarded-For` with proxy skipping), and runs heuristic bot detection that scores each request.
+Sentinel is a ~1843-line Yaegi local plugin that provides the entire inline security layer. It replaces the standalone `realclientip` plugin and the previously-used CrowdSec Bouncer remote plugin, combining IP resolution, heuristic bot detection, IPsum threat intelligence blocklist enforcement, and a Cloudflare WAF-inspired expression-based firewall rule engine into a single middleware.
 
-**Request flow:**
+**7-step request flow:**
 
-1. Resolve real client IP from trusted headers (`Cf-Connecting-Ip` > XFF right-to-left > RemoteAddr)
-2. Set `X-Real-Client-Ip` header (used by rate limiters and Loki analytics)
-3. Score request using 9 heuristic signals
-4. Set `X-Bot-Score` header (always, regardless of score -- this feeds the Grafana security dashboard via Loki)
-5. If score >= `blockThreshold` (100): return 403 Forbidden
-6. Otherwise: pass to next middleware
+1. **IP Resolution**: Resolve real client IP from trusted headers (`Cf-Connecting-Ip` > XFF right-to-left > RemoteAddr), set `X-Real-Client-Ip` header
+2. **Allowlist Check**: If IP in `allowedIPs` config → pass immediately (skip all checks)
+3. **IPsum Blocklist Check**: 19,621+ IPs loaded from `/blocklists/ipsum.txt` (CronJob refreshes daily). If IP matched → 403 Forbidden with `X-Blocked-By: sentinel-blocklist`
+4. **Heuristic Bot Scoring**: 9 signals accumulate a score per request
+5. **Rule Engine**: Expression-based firewall rules evaluated top-to-bottom by priority. First terminating action (allow/block/tarpit) wins; non-terminating actions (score/log/tag) accumulate
+6. **Threshold Check**: If cumulative score >= `blockThreshold` (100) → 403 Forbidden
+7. **Response Intercept**: Wraps upstream responses to style error pages with block info
 
 **Scoring signals:**
 
@@ -332,12 +331,71 @@ Sentinel is a custom plugin that replaces the standalone `realclientip` plugin. 
 
 A request with a known scanner UA (+100) gets blocked immediately. A request with no UA (+40), no Accept (+30), and no Accept-Language (+20) also gets blocked (90 total, but add missing Accept-Encoding at +15 = 105 >= 100). The per-IP rate tracker uses a sliding window with background cleanup to prevent memory leaks.
 
+**Rule engine (expression-based firewall):**
+
+The rule engine uses a concise expression syntax with short field names, a recursive descent parser, and a tokenizer -- all in pure Go stdlib:
+
+```
+path contains "/admin" and country eq "CN"
+(ip in {1.2.3.4 5.6.7.8/24}) or (ua matches "^curl/")
+not ip in {10.0.0.0/8} and score ge 80
+host eq "logpush-k3s.erfi.io" and not header["X-Logpush-Secret"] eq "..."
+```
+
+Available fields (short names preferred, long CF-style names still work for backward compat):
+
+| Field | Long alias | Source |
+| :---- | :--------- | :----- |
+| `ip` | `ip.src` | Resolved client IP |
+| `country` | `ip.src.country` | `Cf-Ipcountry` header (or GeoIP lookup) |
+| `host` | `http.host` | `Host` header |
+| `method` | `http.request.method` | Request method |
+| `path` | `http.request.uri.path` | URI path |
+| `query` | `http.request.uri.query` | Query string |
+| `uri` | `http.request.uri` | Full URI (path + query) |
+| `ua` | `http.user_agent` | User-Agent header |
+| `header["X"]` | `http.request.headers["X"]` | Any header by name |
+| `ssl` | | Boolean (TLS) |
+| `score` | `sentinel.score` | Computed bot score |
+| `proto` | | HTTP protocol version |
+
+Operators: `eq`, `ne`, `contains`, `matches` (regex), `in {set}` (IP/CIDR/string), `gt`, `ge`, `lt`, `le`. Logical: `and`, `or`, `not`, parentheses.
+
+Actions: `allow` (bypass all, terminates), `block` (403, terminates), `tarpit` (slow-drip chunked response, 2s intervals, 5min max, terminates), `score:N` (add N to bot score, continues), `log` (log only, continues), `tag:name` (add header tag, continues).
+
+Rules are stored as a JSON array string in the middleware CRD `rules` field. Example deployed rules:
+
+| ID | Priority | Expression | Action |
+| :- | :------- | :--------- | :----- |
+| r1 | 1 | `ip eq "195.240.81.42"` | `allow` (owner IP bypass) |
+| r6 | 2 | `host eq "logpush-k3s.erfi.io" and not header["X-Logpush-Secret"] eq "..."` | `block` (deny without secret) |
+| r2 | 10 | `path contains "/.git" and not ip eq "195.240.81.42"` | `block` |
+| r3 | 20 | `country in {CN RU}` | `score:30` |
+| r4 | 30 | `ua matches "^curl/" and header["Accept"] eq ""` | `block` |
+| r5 | 100 | `score ge 150` | `tarpit` |
+
+The Security Dashboard provides a **guided expression builder** UI for creating rules: field dropdown, operator dropdown (dynamic per field type), value input, AND/OR combinator, condition chips with remove buttons. The builder auto-generates the expression string and supports bidirectional sync (editing existing rules reverse-parses expressions back into the builder).
+
+**Implementation constraints (Yaegi runtime):**
+
+- Pure Go stdlib only -- no external dependencies, no cgo, no unsafe
+- Cannot use `html/template` -- uses manual string building for HTML error pages
+- **Cannot use Go interfaces for method dispatch** -- Yaegi panics with `reflect: call of reflect.Value.SetBool on interface Value`. The AST uses a single `ExprNode` struct with `exprKind` type tag and standalone `evalExpr()` function instead of an `Expr` interface with concrete types
+- Returns `(string, int, bool, error)` tuple from eval instead of `interface{}` to avoid Yaegi reflection issues
+- Manual JSON parser for rules (no `encoding/json` dependency for Yaegi safety)
+
+**IPsum blocklist:**
+
+IPsum is an open threat intelligence feed aggregating 10+ blocklist sources. A CronJob runs daily, downloads the latest list, and stores it in a ConfigMap mounted into Traefik at `/blocklists/ipsum.txt`. The plugin loads the blocklist into an in-memory map on startup and reloads periodically (configurable via `blocklistReloadSeconds`, default 300s). Currently 19,621+ IPs loaded.
+
+The CronJob resources live in `services/sentinel/ipsum-cronjob.yaml`: ServiceAccount, Role, RoleBinding (ConfigMap write access in traefik namespace), Python script ConfigMap, and the CronJob itself.
+
 **Packaging as ConfigMap:**
 
 The plugin source, `go.mod`, and `.traefik.yml` are inlined in a ConfigMap:
 
 ```yaml
-# middleware/sentinel-configmap.yaml
+# The ConfigMap is generated from middleware/sentinel.go
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -346,7 +404,7 @@ metadata:
 data:
   sentinel.go: |
     package sentinel
-    // ... (full Go source, ~435 lines)
+    // ... (full Go source, ~1843 lines)
   go.mod: |
     module github.com/erfianugrah/sentinel
     go 1.22
@@ -354,7 +412,7 @@ data:
     displayName: Sentinel
     type: middleware
     import: github.com/erfianugrah/sentinel
-    summary: Real client IP resolution + heuristic bot detection with scoring.
+    summary: Real client IP resolution + heuristic bot detection + IPsum blocklist + expression-based firewall rules.
     testData:
       trustedHeaders:
         - Cf-Connecting-Ip
@@ -405,11 +463,21 @@ spec:
       enabled: true
       blockThreshold: 100
       tagThreshold: 60
-      scannerUAs: "sqlmap,nikto,dirbuster,masscan,zgrab,nuclei,httpx,gobuster,ffuf,nmap,whatweb,wpscan,joomla,drupal"
-      honeypotPaths: "/.env,/.git/HEAD,/.git/config,/wp-login.php,/wp-config.php,/wp-admin,/.aws/credentials,/actuator/env,/actuator/health,/xmlrpc.php,/.DS_Store,/config.json,/package.json,/.htaccess,/server-status,/debug/pprof"
       rateLimitPerSecond: 30
       rateLimitWindowSeconds: 10
+      blocklistFile: "/blocklists/ipsum.txt"
+      blocklistReloadSeconds: 300
+      allowedIPs: "195.240.81.42"
+      scannerUAs: "sqlmap,nikto,dirbuster,masscan,zgrab,nuclei,httpx,gobuster,ffuf,nmap,whatweb,wpscan,joomla,drupal"
+      honeypotPaths: "/.env,/.git/HEAD,/.git/config,/wp-login.php,/wp-config.php,/wp-admin,/.aws/credentials,/actuator/env,/actuator/health,/xmlrpc.php,/.DS_Store,/config.json,/package.json,/.htaccess,/server-status,/debug/pprof"
+      rules: |
+        [
+          {"id":"r1","description":"Allow owner IP","expression":"ip.src eq \"195.240.81.42\"","action":"allow","enabled":true,"priority":1},
+          ...
+        ]
 ```
+
+The `rules` field is a JSON array string. Legacy fields (`allowedIPs`, `honeypotPaths`, `scannerUAs`) still work as backward-compatible shortcuts alongside the rule engine.
 
 :::note
 The `import` field in `.traefik.yml` must match the Go module name in `go.mod` exactly. The mount path under `/plugins-local/src/` must also match. And the Middleware CRD `spec.plugin.<name>` must use the short plugin name from `--experimental.localPlugins.<name>`, not the full module path.
@@ -469,63 +537,15 @@ Published at [github.com/erfianugrah/decompress](https://github.com/erfianugrah/
 
 ---
 
-## Part 5: Remote Plugins
+## Part 5: Global Middlewares
 
-### CrowdSec Bouncer
-
-The [CrowdSec Bouncer Traefik plugin](https://github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin) checks each request's IP against CrowdSec's community threat intelligence via the LAPI (Local API). Blocked IPs get a 403.
-
-Remote plugins are fetched by Traefik on startup from GitHub. No ConfigMap needed -- just the plugin declaration in args:
+Two middlewares are applied globally to every request on the `websecure` entrypoint via the `--entrypoints.websecure.http.middlewares` flag:
 
 ```yaml
-args:
-  - "--experimental.plugins.bouncer.modulename=github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin"
-  - "--experimental.plugins.bouncer.version=v1.5.0"
+- "--entrypoints.websecure.http.middlewares=traefik-sentinel@kubernetescrd,traefik-security-headers@kubernetescrd"
 ```
 
-The Middleware CRD contains the LAPI connection details and must be **SOPS-encrypted** because it includes the bouncer API key:
-
-```yaml
-# middleware/crowdsec-bouncer.yaml (structure -- values are SOPS-encrypted)
-apiVersion: traefik.io/v1alpha1
-kind: Middleware
-metadata:
-  name: crowdsec-bouncer
-  namespace: traefik
-spec:
-  plugin:
-    bouncer:
-      enabled: true
-      crowdsecMode: stream
-      updateIntervalSeconds: 60
-      defaultDecisionSeconds: 300
-      crowdsecLapiScheme: https
-      crowdsecLapiHost: <your-crowdsec-lapi-endpoint>
-      crowdsecLapiKey: <your-bouncer-api-key>
-      forwardedHeadersTrustedIPs:
-        - "10.42.0.0/16"
-        - "10.43.0.0/16"
-      clientTrustedIPs: []
-      forwardedHeadersCustomName: X-Real-Client-Ip
-```
-
-`forwardedHeadersCustomName: X-Real-Client-Ip` tells the bouncer to read the real client IP from the header set by sentinel, not from `X-Forwarded-For` (which might have multiple IPs).
-
-:::note
-Remote plugins require the `/plugins-storage` emptyDir volume mount. Traefik downloads and caches the plugin source there. Without it, plugin download fails because the root filesystem is read-only.
-:::
-
----
-
-## Part 6: Global Middlewares
-
-Three middlewares are applied globally to every request on the `websecure` entrypoint via the `--entrypoints.websecure.http.middlewares` flag:
-
-```yaml
-- "--entrypoints.websecure.http.middlewares=traefik-sentinel@kubernetescrd,traefik-crowdsec-bouncer@kubernetescrd,traefik-security-headers@kubernetescrd"
-```
-
-The format is `<namespace>-<name>@kubernetescrd`. Order matters -- sentinel runs first (sets IP + bot score), then crowdsec-bouncer (checks IP reputation), then security-headers.
+The format is `<namespace>-<name>@kubernetescrd`. Order matters -- sentinel runs first (resolves IP, checks blocklist, scores request, evaluates rules), then security-headers adds HSTS and other response headers.
 
 ### Security headers
 
@@ -553,7 +573,7 @@ spec:
 
 ---
 
-## Part 7: TLS Configuration
+## Part 6: TLS Configuration
 
 ### TLSOption
 
@@ -619,7 +639,7 @@ DNS challenge takes 60-120 seconds to propagate. The first request to a new host
 
 ---
 
-## Part 8: Per-Route Middlewares
+## Part 7: Per-Route Middlewares
 
 ### Rate limiting (per-route isolation)
 
@@ -646,6 +666,23 @@ spec:
 `sourceCriterion.requestHeaderName: X-Real-Client-Ip` uses the header set by the sentinel plugin for per-IP bucketing. Without this, Traefik would use the connection source IP, which behind Cloudflare Tunnel is always the cloudflared pod IP -- meaning all users would share one bucket.
 
 Rate limits for monitoring/query services (Grafana, Prometheus, Alertmanager, Jaeger, Logpush, Traefik Dashboard, Traefik Prometheus) are currently **commented out** in their IngressRoutes. These services generate heavy internal query traffic (Grafana fires dozens of parallel Loki queries when loading dashboards), and rate limiting them causes query timeouts.
+
+**Managing rate limits via the Security Dashboard:**
+
+The Security Dashboard's Rate Limits page provides a web UI for managing all 22 `rl-*` middleware CRDs without kubectl:
+
+- **Inline editing**: click any value (average, burst, period) in the table to edit it in-place. Saves are instant via `kubectl patch` (strategic merge patch) on the middleware CRD
+- **Create**: modal form to create a new `rl-{name}` middleware CRD with configurable average, burst, period, and source criterion
+- **Delete**: removes the middleware CRD entirely (with confirmation dialog)
+
+The dashboard's ClusterRole has `get`, `list`, `watch`, `patch`, `update`, `create`, `delete` permissions for `middlewares` in the `traefik.io` API group.
+
+```bash
+# Equivalent kubectl commands for reference
+kubectl get middlewares.traefik.io -n traefik -l app!=sentinel | grep "^rl-"
+kubectl patch middleware rl-grafana -n traefik --type merge \
+  -p '{"spec":{"rateLimit":{"average":200,"burst":1000}}}'
+```
 
 ### In-flight request limiting
 
@@ -714,9 +751,9 @@ Applied per-route to services that need SSO protection (Jaeger UI, etc.). Traefi
 
 ---
 
-## Part 9: IngressRoutes
+## Part 8: IngressRoutes
 
-20+ IngressRoutes route traffic from hostnames to backend services. Each IngressRoute specifies its middleware chain. The middleware execution order is: global middlewares first (sentinel → crowdsec → security-headers), then per-route middlewares in the order listed.
+20+ IngressRoutes route traffic from hostnames to backend services. Each IngressRoute specifies its middleware chain. The middleware execution order is: global middlewares first (sentinel → security-headers), then per-route middlewares in the order listed.
 
 ### Middleware assignments
 
@@ -757,7 +794,7 @@ Strikethrough (`~~`) indicates rate limits that are currently commented out.
 
 ---
 
-## Part 10: Cloudflare Tunnel Integration
+## Part 9: Cloudflare Tunnel Integration
 
 All external traffic enters the cluster through a Cloudflare Tunnel. The tunnel connects from a `cloudflared` Deployment inside the cluster to Cloudflare's edge network via outbound QUIC connections -- no inbound ports or public IPs needed.
 
@@ -828,7 +865,7 @@ resource "cloudflare_record" "grafana-k3s" {
 
 ---
 
-## Part 11: KEDA Autoscaling
+## Part 10: KEDA Autoscaling
 
 Traefik uses a KEDA ScaledObject with 5 triggers for intelligent autoscaling between 1 and 8 replicas:
 
@@ -877,7 +914,7 @@ The Prometheus triggers query Traefik's own metrics: open connection count, p95 
 
 ---
 
-## Part 12: Observability
+## Part 11: Observability
 
 ### Access logs → Loki (with structured metadata)
 
@@ -892,9 +929,51 @@ args:
   - "--accesslog.fields.headers.defaultmode=keep"
 ```
 
-The `bufferingsize=100` buffers up to 100 log lines before flushing, reducing I/O pressure. `fields.defaultmode=keep` and `fields.headers.defaultmode=keep` include all fields and request/response headers in the JSON output -- this is what enables the sentinel bot score and other custom headers to appear in the access logs.
+The `bufferingsize=100` buffers up to 100 log lines before flushing, reducing I/O pressure. `fields.defaultmode=keep` and `fields.headers.defaultmode=keep` include all fields and request/response headers in the JSON output -- this is what enables the sentinel bot score, block reason, and other custom headers to appear in the access logs.
 
-The Alloy DaemonSet picks up these logs from the Traefik container's stdout (via `/var/log/pods/`), parses the JSON, and sends them to Loki with 11 structured metadata fields (`status`, `downstream_status`, `router`, `service`, `client_ip`, `real_client_ip`, `bot_score`, `request_path`, `duration`, `tls_version`, `user_agent`). Dashboards query these SM fields directly instead of using `| json` full-line parsing, which is 5-10x faster. See the [monitoring stack guide](/guides/k3s-monitoring-stack/#traefik-access-log-enrichment) for the full Alloy config and the label/metadata split.
+The Alloy DaemonSet picks up these logs from the Traefik container's stdout (via `/var/log/pods/`), parses the JSON, and sends them to Loki with **19 structured metadata fields**:
+
+| Field | Source | Purpose |
+| :---- | :----- | :------ |
+| `status` | `DownstreamStatus` | HTTP response status code |
+| `downstream_status` | `DownstreamStatus` | Same (for compatibility) |
+| `router` | `RouterName` | Traefik router that handled the request |
+| `service` | `ServiceName` | Backend service |
+| `client_ip` | `ClientHost` | Direct connection source (usually cloudflared pod) |
+| `real_client_ip` | `request_X-Real-Client-Ip` | Actual client IP (set by sentinel) |
+| `bot_score` | `request_X-Bot-Score` | Sentinel bot score |
+| `blocked_by` | `request_X-Blocked-By` | Block source (sentinel-rule, sentinel-blocklist, etc.) |
+| `country` | `request_Cf-Ipcountry` | Client country code |
+| `cf_connecting_ip` | `request_Cf-Connecting-Ip` | Cloudflare's client IP header |
+| `request_host` | `RequestHost` | Host header value |
+| `request_path` | `RequestPath` | URI path |
+| `request_protocol` | `RequestProtocol` | HTTP/1.1, HTTP/2.0, etc. |
+| `duration` | `Duration` | Total request duration |
+| `origin_duration` | `OriginDuration` | Backend response time |
+| `overhead` | `Overhead` | Traefik processing overhead |
+| `downstream_size` | `DownstreamContentSize` | Response body size |
+| `tls_version` | `TLSVersion` | TLS 1.2 or 1.3 |
+| `user_agent` | `request_User-Agent` | Client User-Agent |
+
+Labels (low cardinality): `entrypoint`, `method`, `job="traefik-access-log"`
+
+Dashboards query these structured metadata fields directly instead of using `| json` full-line parsing, which is 5-10x faster (14ms vs 30s+ response times).
+
+Additionally, Alloy generates **7 Prometheus counters** via `stage.metrics`, categorized by Sentinel block type:
+
+| Counter | Match condition |
+| :------ | :-------------- |
+| `loki_process_custom_traefik_access_requests_total` | All requests (`match_all = true`) |
+| `loki_process_custom_traefik_access_sentinel_blocks_total` | `blocked_by = "sentinel"` (bot scoring threshold) |
+| `loki_process_custom_traefik_access_blocklist_blocks_total` | `blocked_by = "sentinel-blocklist"` (IPsum blocklist) |
+| `loki_process_custom_traefik_access_ratelimit_blocks_total` | `blocked_by = "rate-limit"` (per-IP rate limit) |
+| `loki_process_custom_traefik_access_sentinel_rule_blocks_total` | `blocked_by = "sentinel-rule"` (firewall rule engine) |
+| `loki_process_custom_traefik_access_tarpit_blocks_total` | `blocked_by = "sentinel-tarpit"` (tarpit action) |
+| `loki_process_custom_traefik_access_403_total` | `downstream_status = "403"` (all 403s regardless of source) |
+
+The `source` field in `stage.metrics` reads from the extracted data map populated by `stage.json`, matching the `blocked_by` and `downstream_status` JSON keys. These counters power the Security Dashboard's instant-loading aggregate statistics and the Grafana Traefik Access Logs dashboard's security section without querying Loki.
+
+See the [monitoring stack guide](/guides/k3s-monitoring-stack/#traefik-access-log-enrichment) for the full Alloy config and the label/metadata split.
 
 ### Tracing → Jaeger (via Alloy)
 
@@ -947,23 +1026,25 @@ kubectl apply -f middleware/sentinel-configmap.yaml
 # 5. Deploy middleware CRDs
 kubectl apply -f middleware/sentinel-middleware.yaml
 kubectl apply -f middleware/security-headers.yaml
-kubectl apply -f middleware/crowdsec-bouncer.yaml
 kubectl apply -f middleware/decompress-middleware.yaml
 kubectl apply -f middleware/authentik-forward-auth.yaml
 kubectl apply -f middleware/inflight-req.yaml
 kubectl apply -f middleware/retry.yaml
 kubectl apply -f middleware/rate-limits.yaml
 
-# 6. Deploy Traefik (includes SA, ClusterRole, Service, Deployment, IngressClass, PDB)
+# 6. Deploy IPsum blocklist CronJob
+kubectl apply -f services/sentinel/ipsum-cronjob.yaml
+
+# 7. Deploy Traefik (includes SA, ClusterRole, Service, Deployment, IngressClass, PDB)
 kubectl apply -f services/traefik.yaml
 
-# 7. Deploy IngressRoutes
+# 8. Deploy IngressRoutes
 kubectl apply -f ingressroutes/
 
-# 8. Deploy KEDA autoscaling
+# 9. Deploy KEDA autoscaling
 kubectl apply -f hpa/traefik-keda-autoscaling.yaml
 
-# 9. Apply DNS + tunnel config (OpenTofu)
+# 10. Apply DNS + tunnel config (OpenTofu)
 cd cloudflare-tunnel-tf/ && tofu apply
 ```
 
@@ -990,162 +1071,86 @@ curl -s -o /dev/null -w "%{http_code}" -H "User-Agent: sqlmap/1.0" https://httpb
 
 # Test honeypot path (should return 403)
 curl -s -o /dev/null -w "%{http_code}" https://httpbun-k3s.example.com/.env
+
+# Test rule engine - .git block (should return 403 with X-Rule-Match: r2)
+curl -s -D - https://httpbun-k3s.example.com/.git/config 2>&1 | grep -i "x-blocked-by\|x-rule-match\|http/"
+
+# Check IPsum blocklist loaded
+kubectl logs -n traefik -l app.kubernetes.io/name=traefik --tail=50 | grep -i "blocklist\|ipsum"
 ```
 
 ---
 
-## Part 13: CrowdSec Operations
+## Part 12: Sentinel Operations
 
-CrowdSec runs as a DaemonSet in the cluster and feeds into the bouncer middleware documented in [Part 5](#part-5-remote-plugins). It can unexpectedly ban legitimate IPs.
+Sentinel is the sole inline security layer. All blocking, scoring, and rule evaluation happens here.
 
 ### Security Dashboard (web UI)
 
-A dedicated Go+htmx web application at `security-k3s.example.com` provides a browser-based alternative to `cscli` for most CrowdSec operations. Protected by Authentik forward-auth.
+A dedicated Go+htmx web application at `security-k3s.example.com` provides a browser-based interface for managing Sentinel configuration and viewing security analytics. Protected by Authentik forward-auth.
 
-| Feature | Dashboard | `cscli` |
-| :------ | :-------- | :------ |
-| View decisions (paginated, sortable) | Yes | Yes |
-| View alerts with expandable detail | Yes | Yes |
-| Remove individual decisions | Yes | Yes |
-| Create decisions (CF-style rule builder) | Yes | Yes (`cscli decisions add`) |
-| Export/import decisions as JSON | Yes | No |
-| GeoIP + ASN enrichment (country flags, org) | Yes | No |
-| IP lookup (decisions + alerts + allowlist check) | Yes | Partial |
-| View sentinel/rate-limit config | Yes | No |
-| Manage allowlists (read-only + CLI hints) | Yes (read) | Yes (read+write) |
-| Scenario breakdown with bar charts | Yes | Yes (`cscli metrics`) |
+| Feature | Dashboard | Direct config |
+| :------ | :-------- | :------------ |
+| View aggregate stats (requests, blocks, errors) | Yes (Prometheus, instant) | N/A |
+| View recent blocks with details | Yes (background Loki worker) | `kubectl logs` |
+| View bot score distribution | Yes (chart) | N/A |
+| Manage firewall rules (CRUD, reorder) | Yes (modal editor, drag-to-reorder) | Edit middleware YAML |
+| Manage detection rules (honeypots, scanner UAs) | Yes | Edit middleware YAML |
+| Manage allowlist (add/remove IPs) | Yes | Edit middleware YAML |
+| Check IP against blocklist | Yes | N/A |
+| Manage rate limits (CRUD) | Yes (inline edit, create/delete modals) | `kubectl patch/create/delete` |
+| Trigger blocklist reload | Yes | Restart Traefik |
+| IP lookup (all access logs for an IP) | Yes (Loki query) | LogQL |
 
-Source: `services/security-dashboard/`. Deploy: `docker build` → `docker push erfianugrah/security-dashboard:latest` → `kubectl rollout restart`. See `security-stack.md` for full details.
+Source: `services/security-dashboard/`. Deploy: `docker build --platform linux/arm64 -t erfianugrah/security-dashboard:latest .` → `docker push` → `kubectl rollout restart deployment/security-dashboard -n security-dashboard`. See `security-stack.md` for full architecture details.
 
-### Checking if an IP is banned
+### Managing firewall rules
 
-```bash
-# Via the Security Dashboard:
-# Navigate to the IP Lookup page and search
-
-# Or exec into the CrowdSec LAPI pod:
-kubectl exec -n crowdsec deploy/crowdsec-lapi -- cscli decisions list
-
-# Check a specific IP:
-kubectl exec -n crowdsec deploy/crowdsec-lapi -- cscli decisions list -i <your_ip>
-```
-
-### Removing a ban
-
-If your own IP gets banned:
+Rules can be managed via the Security Dashboard's Policy Engine page or by editing the middleware CRD directly:
 
 ```bash
-# Via the Security Dashboard:
-# Click "Remove" on the decision in the Decisions or Policy page
+# View current rules
+kubectl get middleware sentinel -n traefik -o jsonpath='{.spec.plugin.sentinel.rules}' | python3 -m json.tool
 
-# Or via cscli:
-kubectl exec -n crowdsec deploy/crowdsec-lapi -- cscli decisions delete -i <your_ip>
+# Edit rules directly (careful -- JSON in YAML)
+kubectl edit middleware sentinel -n traefik
 ```
 
-:::caution
-`cscli decisions add --type allow` does **not** override an existing `ban` decision. Both coexist and the bouncer checks bans first. To prevent re-banning, use a parser-level whitelist (see below) rather than a decision-level allow.
-:::
-
-### Dashboard false positives (parser-level whitelist)
-
-Dashboard UIs like Headlamp and Grafana generate 404s by requesting plugin locale files (e.g. `/static-plugins/prometheus/locales/en/translation.json`). The `crowdsecurity/http-probing` scenario has a capacity of 10 with 10-second leak speed, so 11+ unique 404 paths in a burst will trigger a ban. The `.json` extension is not in CrowdSec's `static_ressource` list, so these are treated as probing.
-
-The fix is a parser-level whitelist that runs in the `s02-enrich` stage. Create `dashboard-whitelist.yaml`:
-
-```yaml
-# dashboard-whitelist.yaml — placed in /etc/crowdsec/parsers/s02-enrich/
-name: custom/dashboard-whitelist
-description: "Whitelist known dashboard UI false positives"
-whitelist:
-  reason: "known dashboard UI request patterns"
-  expression:
-    - >-
-      evt.Meta.service == 'http'
-      && evt.Meta.http_path startsWith '/static-plugins/'
-    - >-
-      evt.Meta.service == 'http'
-      && evt.Meta.http_path startsWith '/plugins/'
-    - >-
-      evt.Meta.service == 'http'
-      && evt.Meta.http_path matches '^/api/v[0-9]+/namespaces'
-      && evt.Meta.http_status == '404'
-```
-
-To deploy it in a DaemonSet-based CrowdSec agent, embed the file in the agent ConfigMap and copy it with an init container:
-
-```yaml
-# In the agent ConfigMap, add the file as a data key:
-data:
-  dashboard-whitelist.yaml: |
-    name: custom/dashboard-whitelist
-    ...
-
-# In the agent DaemonSet, add an init container:
-initContainers:
-  - name: init-config
-    image: busybox:1.36
-    command: ["sh", "-c"]
-    args:
-      - |
-        cp /config-custom/dashboard-whitelist.yaml \
-          /etc/crowdsec/parsers/s02-enrich/dashboard-whitelist.yaml
-    volumeMounts:
-      - name: crowdsec-config
-        mountPath: /etc/crowdsec
-      - name: agent-config
-        mountPath: /config-custom
-```
-
-After deploying, verify the parser loaded and test with `cscli explain`:
-
-```bash
-# Verify parser is listed:
-kubectl exec -n crowdsec <agent-pod> -- cscli parsers list | grep dashboard
-
-# Test with a simulated log line:
-kubectl exec -n crowdsec <agent-pod> -- cscli explain \
-  --type traefik \
-  --log '1.2.3.4 - - [18/Feb/2026:15:30:00 +0000] "GET /static-plugins/prometheus/locales/en/translation.json HTTP/1.1" 404 19 "-" "Mozilla/5.0" 1 "app@docker" "https://10.0.0.1:443" 5ms'
-# Expected output should show:
-#   custom/dashboard-whitelist (~2 [whitelisted])
-#   parser success, ignored by whitelist (known dashboard UI request patterns)
-
-# Check whitelist metrics over time:
-kubectl exec -n crowdsec <agent-pod> -- cscli metrics show whitelists
-```
-
-### Allowlists (CrowdSec v1.7+)
-
-CrowdSec v1.7 introduced allowlists — persistent IP/CIDR whitelists that prevent matching IPs from being banned. Unlike parser-level whitelists (which prevent log events from being processed), allowlists operate at the decision level and can be managed dynamically.
-
-```bash
-# Create an allowlist:
-kubectl exec -n crowdsec deploy/crowdsec-lapi -- \
-  cscli allowlists create trusted-ips -d "Trusted IP addresses"
-
-# Add entries:
-kubectl exec -n crowdsec deploy/crowdsec-lapi -- \
-  cscli allowlists add trusted-ips 10.0.0.0/8 -d "Internal network"
-
-# Remove entries:
-kubectl exec -n crowdsec deploy/crowdsec-lapi -- \
-  cscli allowlists remove trusted-ips 10.0.0.0/8
-
-# View allowlists:
-kubectl exec -n crowdsec deploy/crowdsec-lapi -- cscli allowlists list
-```
-
-The Security Dashboard shows all allowlists in a read-only view with items, country flags, and expiry dates. Write operations require `cscli` (the LAPI allowlist endpoints are read-only via machine auth).
+The Dashboard's Policy Engine page is preferred -- it provides a modal editor with field reference, expression validation, drag-to-reorder priority, and a Deploy button that applies changes atomically.
 
 ### Debugging 403 errors
 
 If services behind Traefik return 403 Forbidden unexpectedly, check in this order:
 
-1. **CrowdSec decisions** -- is the client IP banned?
-2. **Sentinel plugin** -- is it flagging the request as a bot? Check the `X-Sentinel-Bot-Score` header
-3. **Cloudflare WAF** -- check the Cloudflare dashboard for firewall events
+1. **Sentinel rule engine** -- check response headers `X-Blocked-By` and `X-Rule-Match` to identify which rule blocked the request
+2. **Sentinel bot scoring** -- check `X-Bot-Score` header. Score >= 100 triggers a block. Review heuristic signals
+3. **IPsum blocklist** -- is the client IP in the blocklist? Check via the Security Dashboard's Blocklist page
+4. **Cloudflare WAF** -- check the Cloudflare dashboard for firewall events (these happen before traffic reaches Traefik)
 
-The global middleware chain on the `websecure` entrypoint is: `sentinel` -> `crowdsec-bouncer` -> `security-headers`. A 403 from CrowdSec will be intercepted by the Sentinel plugin's response interceptor and rendered as a styled HTML error page showing the block source, reason, trace ID, and client IP.
+The global middleware chain on the `websecure` entrypoint is: `sentinel` -> `security-headers`. The `X-Blocked-By` header distinguishes block sources:
+
+| `X-Blocked-By` value | Source | Fix |
+| :-------------------- | :----- | :-- |
+| `sentinel-rule` | Rule engine matched (check `X-Rule-Match` for rule ID) | Edit/disable the rule |
+| `sentinel-blocklist` | IP in IPsum blocklist | Add IP to `allowedIPs` or add an `allow` rule |
+| `sentinel-heuristic` | Bot score exceeded threshold | Add IP to `allowedIPs` or add an `allow` rule |
+| `sentinel-rate` | Per-IP rate limit exceeded | Increase `rateLimitPerSecond` or add an `allow` rule |
+
+**Common false positive: Cloudflare Logpush.** Logpush sends requests without browser headers, triggering bot heuristics. Fix: add a rule matching the `X-Logpush-Secret` header with `allow` action (already deployed as rule r6).
+
+### IPsum blocklist management
+
+The blocklist is refreshed daily by a CronJob. To force a reload:
+
+```bash
+# Trigger manual CronJob run
+kubectl create job --from=cronjob/ipsum-update ipsum-manual -n sentinel
+
+# Or restart Traefik (blocklist reloads on startup)
+kubectl rollout restart deployment/traefik -n traefik
+```
+
+The blocklist ConfigMap is in the `traefik` namespace. Sentinel reloads it in-memory every `blocklistReloadSeconds` (default 300s) without requiring a Traefik restart.
 
 ---
 
@@ -1161,20 +1166,14 @@ crds/
 
 middleware/
   # Local plugins (source + ConfigMap + Middleware CRD)
-  sentinel-plugin/
-    sentinel.go                   # 435-line Go source
-    go.mod / .traefik.yml
-  sentinel-configmap.yaml         # ConfigMap packaging for k8s
-  sentinel-middleware.yaml        # Middleware CRD with config
+  sentinel.go                     # ~1843-line Go source (IP + bot + blocklist + rule engine)
+  sentinel-middleware.yaml        # Middleware CRD with config (thresholds, rules, blocklist, allowlist)
 
   decompress-plugin/
     decompress.go                 # 71-line Go source
     go.mod / .traefik.yml
   decompress-configmap.yaml       # ConfigMap packaging for k8s
   decompress-middleware.yaml      # Middleware CRD (in monitoring ns)
-
-  # Remote plugin
-  crowdsec-bouncer.yaml           # SOPS-encrypted Middleware CRD
 
   # Global middlewares
   security-headers.yaml           # HSTS, nosniff, permissions policy
@@ -1187,6 +1186,9 @@ middleware/
 
   # Auth
   authentik-forward-auth.yaml     # Forward auth to Authentik (in authentik ns)
+
+services/sentinel/
+  ipsum-cronjob.yaml              # SA, Role, RoleBinding, Python script ConfigMap, CronJob
 
 ingressroutes/
   alertmanager-ingress.yaml       # monitoring
@@ -1213,18 +1215,17 @@ services/*/ingress.yaml           # Service-embedded IngressRoutes
   matrix/ingress.yaml             # 3 routes: Element, Synapse Admin, Synapse
   maubot/ingress.yaml
 
-services/crowdsec/
-  agent-configmap.yaml             # Agent config + custom parsers
-  agent-daemonset.yaml             # Agent DaemonSet (init container copies parsers)
-  lapi-deployment.yaml             # LAPI server deployment
-  lapi-configmap.yaml              # LAPI configuration
-  scenarios-configmap.yaml         # Custom detection scenarios
-
 services/security-dashboard/
-  main.go                          # Go+htmx dashboard (~2300 lines, zero deps)
+  main.go                          # Go+htmx dashboard (~2700+ lines, zero deps)
   manifests.yaml                   # SOPS-encrypted (ns, SA, RBAC, secret, deploy, svc, ingress)
   Dockerfile                       # Multi-stage ARM64 build
   ui/                              # Templates + static assets (go:embed)
+
+monitoring/
+  alloy/configmap.yaml             # 19 structured metadata fields, 7 Prometheus counters
+  loki/configmap.yaml              # gRPC 16MB max, split_queries 1h
+  grafana/dashboards/
+    traefik-access-logs.json       # 37 panels, Prometheus + Loki, Sentinel security section
 
 hpa/
   traefik-keda-autoscaling.yaml   # 5-trigger ScaledObject (1-8 replicas)
