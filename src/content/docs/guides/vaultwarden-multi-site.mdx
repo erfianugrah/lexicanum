@@ -1,0 +1,1380 @@
+---
+title: "Multi-Site Vaultwarden: PostgreSQL, R2 Sync, and Cloudflare Load Balancer Failover"
+description: Complete guide to running Vaultwarden across two sites (Unraid Docker + k3s) with PostgreSQL backend, Cloudflare R2 backup sync, automated restore, and Cloudflare Load Balancer active/passive failover via tunnel origins
+author: "Author"
+---
+
+A complete guide to migrating a single-site Vaultwarden instance (SQLite on Unraid) to a multi-site active/passive setup with PostgreSQL as the database backend, Cloudflare R2 as the cross-site sync mechanism, and Cloudflare Load Balancer for automatic failover. The primary site runs on an Unraid server ("Servarr") with Docker Compose, and the warm standby runs on a k3s ARM64 homelab cluster in a different country.
+
+The guide is structured as a linear build-up: PostgreSQL migration on the primary site first, then R2 backup automation, then the k3s standby deployment, then the Cloudflare Load Balancer with tunnel-based health checks, and finally the DNS cutover. Each section includes the actual manifests, compose files, and Terraform config used in production.
+
+:::tip[What this covers]
+
+1. **SQLite to PostgreSQL migration**: pgloader on Servarr, schema bootstrap, data-only migration with sequence reset
+2. **Primary site (Servarr)**: Docker Compose with Vaultwarden + PostgreSQL + R2 backup sidecar on Unraid/Dockge
+3. **R2 backup pipeline**: pg_dump every 15 min, timestamped + latest tarballs to Cloudflare R2, 30-day retention
+4. **Standby site (k3s)**: PostgreSQL deployment, Vaultwarden with DATABASE_URL, automated R2 restore CronJob
+5. **K3s backup CronJob**: pg_dump + R2 upload for when k3s becomes primary during failover
+6. **Cloudflare Load Balancer**: Active/passive with tunnel CNAME origins, HTTPS health monitor on `/alive`, cookie session affinity, failover across pools
+7. **Tunnel configuration**: Ingress rules on both tunnels, DNS CNAME removal, LB-owned DNS record
+8. **Secrets management**: SOPS-encrypted Kubernetes secrets with age key
+9. **Gotchas and lessons learned**: Volatile storage flag, WebSocket port removal in v1.31.0, tunnel UUID staleness, pgloader quirks
+:::
+
+---
+
+## Architecture Overview
+
+Servarr (Unraid, Site A) is the primary site -- all user writes go here. The k3s cluster (ARM64, Site B) is a warm standby that restores from R2 every 15 minutes. Cloudflare Load Balancer owns the `vault.example.com` DNS record and routes traffic to Servarr by default. If Servarr's health check fails, the LB fails over to k3s automatically. Both sites connect to Cloudflare via their own tunnels (no VPN between them).
+
+```d2
+direction: right
+
+servarr: "Servarr (Unraid, Site A)" {
+  vw_primary: "Vaultwarden 1.35.3\n(primary, writes)"
+  pg_primary: "PostgreSQL 17\n(172.20.0.4:5432)"
+  backup: "pg_backup_r2\n(every 15 min)"
+  tunnel_sg: "cloudflared\n(servarr tunnel)"
+}
+
+r2: "Cloudflare R2" {
+  bucket: "s3://vault/pg-dumps/\n- timestamped tarballs\n- vaultwarden-pg-latest.tar.gz"
+}
+
+cf: "Cloudflare Edge" {
+  lb: "Load Balancer\nvault.example.com\n(active/passive)"
+  monitor: "HTTPS Monitor\nGET /alive :443\n(every 60s)"
+}
+
+k3s: "k3s Cluster (ARM64, Site B)" {
+  restore: "Restore CronJob\n(every 15 min)"
+  pg_standby: "PostgreSQL 17\n(ClusterIP :5432)"
+  vw_standby: "Vaultwarden 1.35.3\n(standby, read-only)"
+  tunnel_nl: "cloudflared\n(k3s tunnel)"
+  backup_k3s: "Backup CronJob\n(daily, for failover)"
+}
+
+clients: "Bitwarden Clients"
+
+clients -> cf.lb: "HTTPS"
+cf.lb -> servarr.tunnel_sg: "default pool" {style.stroke: "#2ecc71"}
+cf.lb -> k3s.tunnel_nl: "fallback pool" {style.stroke: "#e74c3c"; style.stroke-dash: 3}
+cf.monitor -> servarr.tunnel_sg: "health check"
+cf.monitor -> k3s.tunnel_nl: "health check"
+
+servarr.vw_primary -> servarr.pg_primary: "DATABASE_URL"
+servarr.backup -> servarr.pg_primary: "pg_dump"
+servarr.backup -> r2.bucket: "upload" {style.stroke: "#3498db"}
+
+r2.bucket -> k3s.restore: "download" {style.stroke: "#3498db"}
+k3s.restore -> k3s.pg_standby: "pg_restore"
+k3s.vw_standby -> k3s.pg_standby: "DATABASE_URL"
+k3s.backup_k3s -> k3s.pg_standby: "pg_dump\n(failover mode)"
+k3s.backup_k3s -> r2.bucket: "upload\n(failover mode)" {style.stroke: "#3498db"; style.stroke-dash: 3}
+```
+
+### Why Active/Passive (Not Active/Active)
+
+Both sites have **independent PostgreSQL databases** synced via R2 dump/restore. There is no real-time replication between them. If a user writes to k3s while Servarr is still alive, the next R2 restore will **overwrite that write**. Active/active would require streaming replication or a shared database, neither of which is feasible across two sites without a VPN.
+
+The active/passive model is safe: Servarr handles all writes, k3s stays in sync via periodic restores, and the LB only sends traffic to k3s when Servarr is confirmed down.
+
+### Component Versions
+
+| Component | Version |
+| :---- | :---- |
+| Vaultwarden | 1.35.3 |
+| PostgreSQL | 17 |
+| aws-cli (K8s jobs) | 2.27.31 |
+| Cloudflare Provider (TF) | 4.52.5 |
+| SOPS | 3.11.0 |
+| age | (key: `age1xxxx...xxxx`) |
+
+---
+
+## Part 1: SQLite to PostgreSQL Migration (Servarr)
+
+Vaultwarden ships with SQLite by default. Switching to PostgreSQL requires: (1) bootstrapping the PG schema by letting Vaultwarden start once against an empty PG database, and (2) migrating data from SQLite using pgloader.
+
+### 1.1 Start PostgreSQL
+
+Add a PostgreSQL 17 container to the Vaultwarden Docker Compose stack on Servarr:
+
+```yaml
+# /mnt/user/data/dockge/stacks/vaultwarden/compose.yaml (excerpt)
+postgres_vaultwarden:
+  image: postgres:17
+  container_name: postgres_vaultwarden
+  hostname: postgres_vaultwarden
+  restart: always
+  deploy:
+    resources:
+      limits:
+        cpus: "2"
+        memory: 512M
+  expose:
+    - 5432
+  environment:
+    - POSTGRES_USER=vaultwarden
+    - POSTGRES_PASSWORD=${PG_PASSWORD}
+    - POSTGRES_DB=vaultwarden
+    - TZ=Your/Timezone
+  volumes:
+    - /mnt/user/data/postgres-vaultwarden/data:/var/lib/postgresql/data
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U vaultwarden"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+  networks:
+    warden:
+      ipv4_address: 172.20.0.4
+```
+
+Start it alone first to initialize the data directory:
+
+```bash
+docker compose up -d postgres_vaultwarden
+```
+
+### 1.2 Bootstrap the Vaultwarden Schema
+
+Vaultwarden auto-creates its schema (via Diesel migrations) when it connects to an empty PostgreSQL database. Temporarily point Vaultwarden at PG without mounting `/data`:
+
+:::caution[Volatile storage]
+When starting Vaultwarden without a `/data` volume to bootstrap the schema, you **must** set `I_REALLY_WANT_VOLATILE_STORAGE=true`. Without this, Vaultwarden refuses to start because it detects no persistent storage. This is only needed for the schema bootstrap -- remove it after migration.
+:::
+
+```bash
+docker run --rm \
+  --network vaultwarden_warden \
+  -e DATABASE_URL="postgresql://vaultwarden:${PG_PASSWORD}@postgres_vaultwarden:5432/vaultwarden" \
+  -e I_REALLY_WANT_VOLATILE_STORAGE=true \
+  vaultwarden/server:1.35.3
+```
+
+Wait for the log line `[INFO] Starting Vaultwarden`, then Ctrl+C. The schema is now created in PostgreSQL.
+
+### 1.3 Disable WAL on the SQLite Database
+
+Before migration, disable Write-Ahead Logging on the SQLite database. pgloader can have issues with WAL-enabled databases:
+
+```bash
+sqlite3 /mnt/user/data/vaultwarden/vw-data/db.sqlite3 "PRAGMA journal_mode=delete;"
+```
+
+### 1.4 Migrate Data with pgloader
+
+pgloader handles the SQLite → PostgreSQL data migration. It requires a **load command file** (not CLI flags) for advanced options like table exclusions. Create a file called `vaultwarden.load`:
+
+```
+load database
+     from sqlite:///data/db.sqlite3
+     into postgresql://vaultwarden:YOUR_PG_PASSWORD@postgres_vaultwarden:5432/vaultwarden
+     WITH data only, include no drop, reset sequences
+     EXCLUDING TABLE NAMES LIKE '__diesel_schema_migrations'
+     ALTER SCHEMA 'bitwarden' RENAME TO 'public'
+;
+```
+
+The key options:
+
+- **`data only`** — the schema already exists from step 1.2
+- **`include no drop`** — don't drop tables that Vaultwarden created
+- **`reset sequences`** — fix auto-increment sequences after bulk insert
+- **`EXCLUDING TABLE NAMES LIKE '__diesel_schema_migrations'`** — Vaultwarden already ran its Diesel migrations in step 1.2; re-importing this table would cause duplicate key errors
+- **`ALTER SCHEMA 'bitwarden' RENAME TO 'public'`** — pgloader may create tables in a schema named after the SQLite file; this remaps them to the `public` schema where Vaultwarden expects them
+
+Run pgloader with the load file:
+
+```bash
+docker run --rm \
+  --network vaultwarden_warden \
+  -v /mnt/user/data/vaultwarden/vw-data:/data:ro \
+  -v $(pwd)/vaultwarden.load:/vaultwarden.load:ro \
+  dimitri/pgloader:latest \
+  pgloader /vaultwarden.load
+```
+
+:::tip[Verification]
+After migration, verify the data transferred correctly:
+```bash
+docker exec postgres_vaultwarden psql -U vaultwarden -c "SELECT COUNT(*) FROM ciphers;"
+```
+This should match the number of vault items in your Bitwarden client.
+:::
+
+### 1.5 Switch Vaultwarden to PostgreSQL
+
+Update the Vaultwarden service in `compose.yaml` to use the `DATABASE_URL` environment variable:
+
+```yaml
+vaultwarden:
+  image: vaultwarden/server:1.35.3
+  container_name: vaultwarden
+  hostname: vaultwarden
+  restart: always
+  deploy:
+    resources:
+      limits:
+        cpus: "4"
+        memory: 512M
+  expose:
+    - 80
+  environment:
+    - SIGNUPS_ALLOWED=false
+    - INVITATIONS_ALLOWED=false
+    - DOMAIN=${DOMAIN}
+    - DATABASE_URL=postgresql://vaultwarden:${PG_PASSWORD}@postgres_vaultwarden:5432/vaultwarden
+    - SMTP_HOST=smtp.gmail.com
+    - SMTP_FROM=${GMAIL}
+    - SMTP_PORT=587
+    - SMTP_SECURITY=starttls
+    - SMTP_USERNAME=${GMAIL}
+    - SMTP_PASSWORD=${PASSWORD}
+    - PUID=1000
+    - PGID=100
+    - UMASK=0000
+    - TZ=Your/Timezone
+  volumes:
+    - /mnt/user/data/vaultwarden/vw-data:/data
+  depends_on:
+    postgres_vaultwarden:
+      condition: service_healthy
+  networks:
+    warden:
+      ipv4_address: 172.20.0.2
+```
+
+:::tip[WebSocket port gone since v1.31.0]
+Since v1.29.0, Vaultwarden serves WebSocket notifications natively on the main HTTP port (80). The old `WEBSOCKET_ENABLED` and `WEBSOCKET_PORT` env vars were deprecated in v1.29.0 and port 3012 support was fully removed in v1.31.0. If you had a reverse proxy rule splitting `/notifications/hub` to port 3012, remove it -- everything goes to port 80 now.
+:::
+
+### 1.6 Environment Variables
+
+```bash
+# /mnt/user/data/dockge/stacks/vaultwarden/.env
+GMAIL=you@gmail.com
+PASSWORD=<gmail-app-password>
+DOMAIN=https://vault.example.com
+PG_PASSWORD=<postgres-password>
+R2_ACCESS_KEY_ID=<r2-access-key>
+R2_SECRET_ACCESS_KEY=<r2-secret-key>
+```
+
+---
+
+## Part 2: R2 Backup Pipeline (Servarr → R2)
+
+A sidecar container runs alongside Vaultwarden on Servarr. It dumps PostgreSQL every 15 minutes, packages the dump with RSA keys and attachments into a tarball, and uploads both a timestamped copy and a `latest` copy to Cloudflare R2. Old backups are pruned after 30 days.
+
+### 2.1 pg_backup_r2 Container
+
+```yaml
+# /mnt/user/data/dockge/stacks/vaultwarden/compose.yaml (excerpt)
+pg_backup_r2:
+  image: postgres:17
+  container_name: pg_backup_r2
+  hostname: pg_backup_r2
+  restart: always
+  deploy:
+    resources:
+      limits:
+        cpus: "1"
+        memory: 256M
+  environment:
+    - PGHOST=postgres_vaultwarden
+    - PGUSER=vaultwarden
+    - PGPASSWORD=${PG_PASSWORD}
+    - PGDATABASE=vaultwarden
+    - AWS_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
+    - AWS_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
+    - AWS_DEFAULT_REGION=auto
+    - R2_ENDPOINT=https://<your-account-id>.r2.cloudflarestorage.com
+    - TZ=Your/Timezone
+  entrypoint: ["/bin/bash", "-c"]
+  command:
+    - >
+      set -e
+
+      echo "Installing aws-cli and tar..."
+      apt-get update -qq && apt-get install -y -qq awscli tar gzip > /dev/null 2>&1
+      echo "Starting pg_dump -> R2 backup loop (every 15 minutes)..."
+
+      backup_and_upload() {
+        TIMESTAMP=$$(date +%Y%m%d-%H%M%S)
+        BACKUP_DIR=/tmp/backup-$$TIMESTAMP
+        mkdir -p $$BACKUP_DIR
+
+        echo "[$$TIMESTAMP] Running pg_dump..."
+        pg_dump -Fc --no-owner --no-acl -f $$BACKUP_DIR/vaultwarden.pgdump
+
+        # Copy VW data files (RSA keys, icons, attachments)
+        [ -d /data/attachments ] && cp -r /data/attachments $$BACKUP_DIR/ || true
+        [ -d /data/sends ] && cp -r /data/sends $$BACKUP_DIR/ || true
+        [ -d /data/icon_cache ] && cp -r /data/icon_cache $$BACKUP_DIR/ || true
+        [ -f /data/config.json ] && cp /data/config.json $$BACKUP_DIR/ || true
+        [ -f /data/rsa_key.pem ] && cp /data/rsa_key.pem $$BACKUP_DIR/ || true
+        [ -f /data/rsa_key.pub.pem ] && cp /data/rsa_key.pub.pem $$BACKUP_DIR/ || true
+
+        TARBALL=/tmp/vaultwarden-pg-$$TIMESTAMP.tar.gz
+        tar -czf $$TARBALL -C $$BACKUP_DIR .
+        rm -rf $$BACKUP_DIR
+
+        echo "[$$TIMESTAMP] Uploading to R2..."
+        aws s3 cp $$TARBALL s3://vault/pg-dumps/ --endpoint-url $$R2_ENDPOINT
+        rm -f $$TARBALL
+
+        # Also upload a "latest" copy for easy restore
+        LATEST_DIR=/tmp/latest-backup
+        mkdir -p $$LATEST_DIR
+        pg_dump -Fc --no-owner --no-acl -f $$LATEST_DIR/vaultwarden.pgdump
+        [ -f /data/rsa_key.pem ] && cp /data/rsa_key.pem $$LATEST_DIR/ || true
+        [ -f /data/rsa_key.pub.pem ] && cp /data/rsa_key.pub.pem $$LATEST_DIR/ || true
+        [ -d /data/attachments ] && cp -r /data/attachments $$LATEST_DIR/ || true
+        [ -d /data/sends ] && cp -r /data/sends $$LATEST_DIR/ || true
+        tar -czf /tmp/vaultwarden-pg-latest.tar.gz -C $$LATEST_DIR .
+        aws s3 cp /tmp/vaultwarden-pg-latest.tar.gz \
+          s3://vault/pg-dumps/vaultwarden-pg-latest.tar.gz \
+          --endpoint-url $$R2_ENDPOINT
+        rm -rf $$LATEST_DIR /tmp/vaultwarden-pg-latest.tar.gz
+
+        # Prune R2: keep last 30 days of timestamped backups
+        CUTOFF=$$(date -d '30 days ago' +%Y%m%d)
+        aws s3 ls s3://vault/pg-dumps/ --endpoint-url $$R2_ENDPOINT | while read -r line; do
+          FILE=$$(echo "$$line" | awk '{print $$4}')
+          case "$$FILE" in
+            vaultwarden-pg-2[0-9][0-9][0-9]*)
+              FILE_DATE=$$(echo "$$FILE" | sed 's/vaultwarden-pg-\([0-9]\{8\}\).*/\1/')
+              if [ "$$FILE_DATE" -lt "$$CUTOFF" ] 2>/dev/null; then
+                echo "Pruning old backup: $$FILE"
+                aws s3 rm "s3://vault/pg-dumps/$$FILE" --endpoint-url $$R2_ENDPOINT
+              fi
+              ;;
+          esac
+        done
+
+        echo "[$$TIMESTAMP] Backup complete."
+      }
+
+      # Run immediately on start
+      backup_and_upload
+
+      # Then every 15 minutes
+      while true; do
+        sleep 900
+        backup_and_upload
+      done
+  volumes:
+    - /mnt/user/data/vaultwarden/vw-data:/data:ro
+    - /mnt/user/data/vaultwarden/vaultwarden_backup/backups:/backups
+  depends_on:
+    postgres_vaultwarden:
+      condition: service_healthy
+  networks:
+    warden:
+      ipv4_address: 172.20.0.3
+```
+
+### 2.2 R2 Bucket Structure
+
+After the first run, the R2 bucket looks like:
+
+```
+s3://vault/pg-dumps/
+├── vaultwarden-pg-20260221-080000.tar.gz   # timestamped
+├── vaultwarden-pg-20260221-081500.tar.gz
+├── vaultwarden-pg-20260221-083000.tar.gz
+├── ...
+└── vaultwarden-pg-latest.tar.gz            # always the newest
+```
+
+Each tarball contains:
+
+```
+.
+├── vaultwarden.pgdump    # pg_dump custom format
+├── rsa_key.pem           # Vaultwarden RSA private key
+├── rsa_key.pub.pem       # Vaultwarden RSA public key
+├── attachments/          # file attachments (if any)
+└── sends/                # Bitwarden Send files (if any)
+```
+
+:::caution[RSA keys are critical]
+The RSA key pair is used to encrypt/decrypt vault data in transit. If the standby site doesn't have the same RSA keys as the primary, clients will get decryption errors. The backup tarball includes these keys specifically for cross-site restore.
+:::
+
+### 2.3 Docker Network
+
+The stack uses a dedicated bridge network with static IPs:
+
+```yaml
+networks:
+  warden:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+          gateway: 172.20.0.1
+```
+
+| Container | IP | Port |
+| :---- | :---- | :---- |
+| vaultwarden | 172.20.0.2 | 80 |
+| pg_backup_r2 | 172.20.0.3 | — |
+| postgres_vaultwarden | 172.20.0.4 | 5432 |
+
+---
+
+## Part 3: k3s Standby Deployment
+
+The k3s site runs a full Vaultwarden + PostgreSQL stack that stays in sync with Servarr via R2 restores every 15 minutes. All manifests live in `services/vaultwarden/` and are managed with Kustomize.
+
+### 3.1 Kustomization
+
+```yaml
+# services/vaultwarden/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - secret.yaml
+  - pvc.yaml
+  - postgres-deployment.yaml
+  - postgres-service.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingressroute.yaml
+  - backup-cronjob.yaml
+  - restore-cronjob.yaml
+```
+
+### 3.2 Namespace
+
+```yaml
+# services/vaultwarden/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vaultwarden
+```
+
+### 3.3 SOPS-Encrypted Secret
+
+The secret contains all sensitive values encrypted with SOPS + age:
+
+```yaml
+# services/vaultwarden/secret.yaml (decrypted view)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vaultwarden-secrets
+  namespace: vaultwarden
+type: Opaque
+stringData:
+  DOMAIN: https://vault.example.com
+  SMTP_FROM: you@gmail.com
+  SMTP_USERNAME: you@gmail.com
+  SMTP_PASSWORD: <gmail-app-password>
+  R2_ACCESS_KEY_ID: <r2-access-key>
+  R2_SECRET_ACCESS_KEY: <r2-secret-key>
+  PG_PASSWORD: <postgres-password>
+  DATABASE_URL: postgresql://vaultwarden:<postgres-password>@postgres-vaultwarden:5432/vaultwarden
+```
+
+To encrypt with SOPS:
+
+```bash
+sops --encrypt \
+  --age age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+  --unencrypted-suffix _unencrypted \
+  secret.yaml > secret.enc.yaml
+mv secret.enc.yaml secret.yaml
+```
+
+### 3.4 Persistent Volume Claims
+
+Three PVCs on the `nfs-client` storageClass:
+
+```yaml
+# services/vaultwarden/pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vaultwarden-data
+  namespace: vaultwarden
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: nfs-client
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vaultwarden-backups
+  namespace: vaultwarden
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: nfs-client
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-vaultwarden-data
+  namespace: vaultwarden
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: nfs-client
+  resources:
+    requests:
+      storage: 5Gi
+```
+
+| PVC | Size | Access Mode | Purpose |
+| :---- | :---- | :---- | :---- |
+| `vaultwarden-data` | 5Gi | RWX | VW `/data` (RSA keys, attachments, icons) |
+| `vaultwarden-backups` | 10Gi | RWX | Local backup tarballs |
+| `postgres-vaultwarden-data` | 5Gi | RWO | PostgreSQL data directory |
+
+### 3.5 PostgreSQL Deployment
+
+```yaml
+# services/vaultwarden/postgres-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-vaultwarden
+  namespace: vaultwarden
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: postgres-vaultwarden
+  template:
+    metadata:
+      labels:
+        app: postgres-vaultwarden
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_USER
+              value: vaultwarden
+            - name: POSTGRES_DB
+              value: vaultwarden
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vaultwarden-secrets
+                  key: PG_PASSWORD
+            - name: TZ
+              value: Your/Timezone
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            limits:
+              cpu: "2"
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - vaultwarden
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - vaultwarden
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: postgres-vaultwarden-data
+```
+
+```yaml
+# services/vaultwarden/postgres-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-vaultwarden
+  namespace: vaultwarden
+spec:
+  selector:
+    app: postgres-vaultwarden
+  ports:
+    - port: 5432
+      targetPort: 5432
+      protocol: TCP
+  type: ClusterIP
+```
+
+:::tip[PGDATA subdirectory]
+The `PGDATA` env var is set to `/var/lib/postgresql/data/pgdata` (a subdirectory of the mount). This is required because PostgreSQL refuses to initialize in a directory that already contains files (like the NFS `.` and `..` entries or lost+found). The subdirectory avoids this check.
+:::
+
+### 3.6 Vaultwarden Deployment
+
+```yaml
+# services/vaultwarden/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vaultwarden
+  namespace: vaultwarden
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vaultwarden
+  template:
+    metadata:
+      labels:
+        app: vaultwarden
+    spec:
+      securityContext:
+        fsGroup: 100
+      containers:
+        - name: vaultwarden
+          image: vaultwarden/server:1.35.3
+          ports:
+            - containerPort: 80
+              name: http
+
+          env:
+            - name: SIGNUPS_ALLOWED
+              value: "false"
+            - name: INVITATIONS_ALLOWED
+              value: "false"
+            - name: TZ
+              value: Your/Timezone
+            - name: DOMAIN
+              valueFrom:
+                secretKeyRef:
+                  name: vaultwarden-secrets
+                  key: DOMAIN
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vaultwarden-secrets
+                  key: DATABASE_URL
+            - name: SMTP_HOST
+              value: smtp.gmail.com
+            - name: SMTP_PORT
+              value: "587"
+            - name: SMTP_SECURITY
+              value: starttls
+            - name: SMTP_FROM
+              valueFrom:
+                secretKeyRef:
+                  name: vaultwarden-secrets
+                  key: SMTP_FROM
+            - name: SMTP_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: vaultwarden-secrets
+                  key: SMTP_USERNAME
+            - name: SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vaultwarden-secrets
+                  key: SMTP_PASSWORD
+          resources:
+            limits:
+              cpu: "4"
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /alive
+              port: 80
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /alive
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: vaultwarden-data
+```
+
+The `/alive` endpoint returns HTTP 200 when Vaultwarden is healthy. It also verifies the database connection (the handler takes a `DbConn` parameter), so it will fail if PostgreSQL is unreachable. This is used by both K8s probes and the Cloudflare LB health monitor.
+
+### 3.7 Service and IngressRoute
+
+```yaml
+# services/vaultwarden/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: vaultwarden
+  namespace: vaultwarden
+spec:
+  selector:
+    app: vaultwarden
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 80
+```
+
+```yaml
+# services/vaultwarden/ingressroute.yaml
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: vaultwarden
+  namespace: vaultwarden
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`vault.example.com`)
+      middlewares:
+        - name: inflight-req
+          namespace: traefik
+        - name: retry
+          namespace: traefik
+      services:
+        - kind: Service
+          name: vaultwarden
+          port: 80
+```
+
+The IngressRoute uses the `websecure` entrypoint (port 443 with TLS via ACME DNS challenge). The global sentinel + security-headers middlewares are applied automatically by Traefik's entrypoint config. Per-route middlewares add inflight-req (100 concurrent connections per IP) and retry (3 attempts).
+
+### 3.8 Restore CronJob (R2 → k3s)
+
+This CronJob runs every 15 minutes and is the core of the standby sync:
+
+1. **initContainer** (`amazon/aws-cli`): Downloads `vaultwarden-pg-latest.tar.gz` from R2
+2. **main container** (`postgres:17`): Extracts the tarball, runs `pg_restore --clean --if-exists` into the local PG, and copies RSA keys + attachments to the Vaultwarden data PVC
+
+```yaml
+# services/vaultwarden/restore-cronjob.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vaultwarden-restore
+  namespace: vaultwarden
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: vaultwarden-restore
+        spec:
+          initContainers:
+            - name: download
+              image: amazon/aws-cli:2.27.31
+              command:
+                - sh
+                - -c
+                - |
+                  echo "Downloading latest PG backup from R2..."
+                  aws s3 cp s3://vault/pg-dumps/vaultwarden-pg-latest.tar.gz /restore/vaultwarden-pg-latest.tar.gz \
+                    --endpoint-url https://<your-account-id>.r2.cloudflarestorage.com
+                  echo "Download complete."
+              env:
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: vaultwarden-secrets
+                      key: R2_ACCESS_KEY_ID
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: vaultwarden-secrets
+                      key: R2_SECRET_ACCESS_KEY
+                - name: AWS_DEFAULT_REGION
+                  value: auto
+              resources:
+                limits:
+                  cpu: 500m
+                  memory: 128Mi
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+              volumeMounts:
+                - name: restore-tmp
+                  mountPath: /restore
+          containers:
+            - name: restore
+              image: postgres:17
+              command:
+                - bash
+                - -c
+                - |
+                  set -e
+                  echo "Extracting backup..."
+                  cd /restore
+                  tar -xzf vaultwarden-pg-latest.tar.gz
+
+                  echo "Restoring PG dump..."
+                  # Drop and recreate all tables, then restore
+                  pg_restore --clean --if-exists --no-owner --no-acl \
+                    -d "$DATABASE_URL" \
+                    /restore/vaultwarden.pgdump 2>&1 || true
+
+                  # Copy RSA keys and data files to VW data volume
+                  [ -f /restore/rsa_key.pem ] && cp /restore/rsa_key.pem /data/ && echo "Restored rsa_key.pem"
+                  [ -f /restore/rsa_key.pub.pem ] && cp /restore/rsa_key.pub.pem /data/ && echo "Restored rsa_key.pub.pem"
+                  [ -d /restore/attachments ] && cp -r /restore/attachments /data/ && echo "Restored attachments"
+                  [ -d /restore/sends ] && cp -r /restore/sends /data/ && echo "Restored sends"
+
+                  # Cleanup
+                  rm -rf /restore/*
+
+                  echo "Restore complete at $(date)"
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: vaultwarden-secrets
+                      key: DATABASE_URL
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: 256Mi
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+              volumeMounts:
+                - name: restore-tmp
+                  mountPath: /restore
+                - name: data
+                  mountPath: /data
+          restartPolicy: OnFailure
+          volumes:
+            - name: restore-tmp
+              emptyDir: {}
+            - name: data
+              persistentVolumeClaim:
+                claimName: vaultwarden-data
+```
+
+:::tip[pg_restore `|| true`]
+The `pg_restore ... || true` is intentional. On the first restore into a fresh database, `--clean` will emit errors like "table does not exist" for the DROP statements. These are harmless -- the subsequent CREATE + COPY statements succeed. The `|| true` prevents the job from failing on these expected warnings.
+:::
+
+### 3.9 Backup CronJob (k3s → R2)
+
+This CronJob runs daily and exists for **failover scenarios**: if Servarr goes down and k3s becomes the primary, this ensures k3s writes are backed up to R2.
+
+```yaml
+# services/vaultwarden/backup-cronjob.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vaultwarden-backup
+  namespace: vaultwarden
+spec:
+  schedule: "0 5 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: vaultwarden-backup
+        spec:
+          securityContext:
+            fsGroup: 100
+          initContainers:
+            - name: backup
+              image: postgres:17
+              command:
+                - bash
+                - -c
+                - |
+                  set -e
+                  TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+                  BACKUP_DIR=/tmp/backup
+
+                  mkdir -p ${BACKUP_DIR}
+
+                  echo "Running pg_dump..."
+                  pg_dump -Fc --no-owner --no-acl -f ${BACKUP_DIR}/vaultwarden.pgdump "$DATABASE_URL"
+
+                  # Copy additional data
+                  [ -d /data/attachments ] && cp -r /data/attachments ${BACKUP_DIR}/
+                  [ -d /data/sends ] && cp -r /data/sends ${BACKUP_DIR}/
+                  [ -d /data/icon_cache ] && cp -r /data/icon_cache ${BACKUP_DIR}/
+                  [ -f /data/config.json ] && cp /data/config.json ${BACKUP_DIR}/
+                  [ -f /data/rsa_key.pem ] && cp /data/rsa_key.pem ${BACKUP_DIR}/
+                  [ -f /data/rsa_key.pub.pem ] && cp /data/rsa_key.pub.pem ${BACKUP_DIR}/
+
+                  # Create tarball
+                  tar -czf /backups/vaultwarden-pg-${TIMESTAMP}.tar.gz -C ${BACKUP_DIR} .
+                  rm -rf ${BACKUP_DIR}
+
+                  # Prune local backups older than 30 days
+                  find /backups -name "vaultwarden-pg-*.tar.gz" -mtime +30 -delete
+
+                  echo "Backup created: vaultwarden-pg-${TIMESTAMP}.tar.gz"
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: vaultwarden-secrets
+                      key: DATABASE_URL
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: 256Mi
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+                  readOnly: true
+                - name: backups
+                  mountPath: /backups
+          containers:
+            - name: upload-r2
+              image: amazon/aws-cli:2.27.31
+              command:
+                - sh
+                - -c
+                - |
+                  LATEST=$(ls -t /backups/vaultwarden-pg-*.tar.gz 2>/dev/null | head -1)
+                  if [ -z "$LATEST" ]; then
+                    echo "No backup files found"
+                    exit 1
+                  fi
+                  echo "Uploading $LATEST to R2..."
+                  aws s3 cp "$LATEST" s3://vault/pg-dumps/ \
+                    --endpoint-url https://<your-account-id>.r2.cloudflarestorage.com
+                  echo "Upload complete"
+              env:
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: vaultwarden-secrets
+                      key: R2_ACCESS_KEY_ID
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: vaultwarden-secrets
+                      key: R2_SECRET_ACCESS_KEY
+                - name: AWS_DEFAULT_REGION
+                  value: auto
+                - name: TZ
+                  value: Your/Timezone
+              resources:
+                limits:
+                  cpu: 500m
+                  memory: 128Mi
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                  readOnly: true
+          restartPolicy: OnFailure
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: vaultwarden-data
+            - name: backups
+              persistentVolumeClaim:
+                claimName: vaultwarden-backups
+```
+
+---
+
+## Part 4: Cloudflare Load Balancer
+
+The Cloudflare Load Balancer owns the `vault.example.com` DNS record and routes traffic to the healthy origin. Both origins are Cloudflare Tunnel CNAMEs -- not direct IPs -- because neither site has a stable public IP.
+
+### 4.1 How Tunnel-Based LB Origins Work
+
+When using tunnels as LB origins, the pool origin `address` is the tunnel's CNAME (format: `<UUID>.cfargotunnel.com`). The `Host` header must be set to the application hostname (`vault.example.com`) so the tunnel knows which ingress rule to match. The health monitor also needs this `Host` header.
+
+```
+Client → CF LB (vault.example.com) → CF Tunnel CNAME → cloudflared → Traefik/Docker → Vaultwarden
+```
+
+:::caution[Tunnel CNAMEs don't resolve publicly]
+`<UUID>.cfargotunnel.com` is not a real DNS record you can dig. It's only meaningful to Cloudflare's proxy layer. If you try to curl it directly, it won't work. This is normal.
+:::
+
+### 4.2 Health Monitor
+
+The monitor checks `GET /alive` on port 443 (HTTPS) every 60 seconds. The `Host` header is required because the tunnel origin is a shared CNAME that serves multiple hostnames.
+
+```hcl
+# cloudflare-tf/main_zone/lb_monitor.tf
+resource "cloudflare_load_balancer_monitor" "vaultwarden" {
+  account_id       = var.cloudflare_account_id
+  allow_insecure   = false
+  consecutive_down = 3
+  consecutive_up   = 2
+  description      = "vaultwarden"
+  expected_codes   = "200"
+  follow_redirects = false
+  interval         = 60
+  method           = "GET"
+  path             = "/alive"
+  port             = 443
+  retries          = 2
+  timeout          = 5
+  type             = "https"
+  header {
+    header = "Host"
+    values = ["vault.${var.domain_name}"]
+  }
+}
+```
+
+| Parameter | Value | Why |
+| :---- | :---- | :---- |
+| `interval` | 60s | Password manager -- fast failover matters |
+| `consecutive_down` | 3 | 3 failures (3 min) before marking unhealthy |
+| `consecutive_up` | 2 | 2 successes before marking healthy again |
+| `path` | `/alive` | Vaultwarden's built-in health endpoint |
+| `header.Host` | `vault.example.com` | Required for tunnel origin routing |
+
+### 4.3 Origin Pools
+
+Two pools: Servarr (default) and k3s (fallback).
+
+```hcl
+# cloudflare-tf/main_zone/lb_pool.tf
+resource "cloudflare_load_balancer_pool" "vault_servarr" {
+  account_id      = var.cloudflare_account_id
+  check_regions   = ["ALL_REGIONS"]
+  enabled         = true
+  minimum_origins = 1
+  monitor         = cloudflare_load_balancer_monitor.vaultwarden.id
+  name            = "vault_servarr"
+  origins {
+    address = module.tunnel_servarr.cname
+    enabled = true
+    header {
+      header = "Host"
+      values = ["vault.${var.domain_name}"]
+    }
+    name   = "vault_servarr"
+    weight = 1
+  }
+}
+
+resource "cloudflare_load_balancer_pool" "vault_k3s" {
+  account_id      = var.cloudflare_account_id
+  check_regions   = ["ALL_REGIONS"]
+  enabled         = true
+  minimum_origins = 1
+  monitor         = cloudflare_load_balancer_monitor.vaultwarden.id
+  name            = "vault_k3s"
+  origins {
+    address = var.k3s_tunnel
+    enabled = true
+    header {
+      header = "Host"
+      values = ["vault.${var.domain_name}"]
+    }
+    name   = "vault_k3s"
+    weight = 1
+  }
+}
+```
+
+The `k3s_tunnel` variable must contain the **correct** tunnel CNAME. In this setup it's `aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.cfargotunnel.com`. A stale UUID here will cause the pool to show "Unknown host" / Critical in the Cloudflare dashboard.
+
+### 4.4 Load Balancer Resource
+
+```hcl
+# cloudflare-tf/main_zone/lb.tf
+resource "cloudflare_load_balancer" "vault" {
+  default_pool_ids = [cloudflare_load_balancer_pool.vault_servarr.id]
+  enabled          = true
+  fallback_pool_id = cloudflare_load_balancer_pool.vault_k3s.id
+  name             = "vault.${var.domain_name}"
+  proxied          = true
+  session_affinity = "cookie"
+  steering_policy  = "off"
+  zone_id          = var.cloudflare_zone_id
+  adaptive_routing {
+    failover_across_pools = true
+  }
+  location_strategy {
+    mode       = "pop"
+    prefer_ecs = "proximity"
+  }
+  random_steering {
+    default_weight = 1
+  }
+  session_affinity_attributes {
+    samesite               = "Auto"
+    secure                 = "Auto"
+    zero_downtime_failover = "temporary"
+  }
+}
+```
+
+| Setting | Value | Why |
+| :---- | :---- | :---- |
+| `steering_policy` | `off` | No geographic steering -- always Servarr unless it's down |
+| `session_affinity` | `cookie` | Sticky sessions prevent mid-session failover |
+| `failover_across_pools` | `true` | If Servarr pool is unhealthy, fail over to k3s pool |
+| `zero_downtime_failover` | `temporary` | During failover, temporarily route to fallback without waiting for full health check cycle |
+
+---
+
+## Part 5: Tunnel Configuration
+
+Both sites need a tunnel ingress rule for `vault.example.com`. The DNS CNAME record that previously pointed to a single tunnel must be removed -- the LB now owns that DNS record.
+
+### 5.1 Servarr Tunnel
+
+The Servarr tunnel module in `cloudflare-tf/main_zone/tunnels.tf` includes the `vault.example.com` ingress rule pointing at the Vaultwarden container's Docker IP:
+
+```hcl
+# cloudflare-tf/main_zone/tunnels.tf (excerpt)
+module "tunnel_servarr" {
+  source     = "./modules/tunnel"
+  account_id = var.cloudflare_account_id
+  name       = "servarr"
+  secret     = var.tunnel_secret
+
+  ingress_rules = [
+    # ... other services ...
+    { hostname = "vault.${var.domain_name}", service = "http://172.20.0.2:80" },
+    # ... other services ...
+    { service = "http_status:404" },
+  ]
+
+  vnet_name = "servarr_vnet"
+  route     = { network = "172.20.0.0/16" }
+}
+```
+
+### 5.2 k3s Tunnel
+
+The k3s tunnel in `k3s/cloudflare-tunnel-tf/tunnel_config.tf` routes `vault.example.com` through Traefik:
+
+```hcl
+# k3s/cloudflare-tunnel-tf/tunnel_config.tf (excerpt)
+ingress_rule {
+  hostname = "vault.${var.domain_name}"
+  service  = "https://traefik.traefik.svc.cluster.local"
+  origin_request {
+    origin_server_name = "vault.${var.domain_name}"
+    http2_origin       = true
+  }
+}
+```
+
+### 5.3 DNS CNAME Removal
+
+The `vault` CNAME record in the k3s tunnel TF was commented out because the LB now creates and owns the DNS record:
+
+```hcl
+# k3s/cloudflare-tunnel-tf/records.tf
+# vault.example.com DNS is now managed by Cloudflare Load Balancer in cloudflare-tf/main_zone
+# resource "cloudflare_record" "vault" {
+#   zone_id = var.cloudflare_zone_id
+#   name    = "vault"
+#   type    = "CNAME"
+#   content = cloudflare_zero_trust_tunnel_cloudflared.k3s.cname
+#   proxied = true
+#   tags    = ["k3s", "vaultwarden"]
+# }
+```
+
+:::tip[LB vs CNAME precedence]
+Per [Cloudflare docs](https://developers.cloudflare.com/load-balancing/load-balancers/dns-records/#priority-order), when an LB record and a DNS record (A/AAAA/CNAME) exist for the same hostname, the LB record takes precedence if it is equally or more specific. You don't need to delete the old CNAME first, but removing it keeps the Terraform state clean and avoids confusion when reading DNS config later. Note that if you **disable** the LB, traffic falls back to the existing DNS record.
+:::
+
+### 5.4 Tunnel UUID Fix
+
+The `k3s_tunnel` variable in `secrets.tfvars` was stale -- it referenced an old tunnel UUID instead of the current one. This caused the k3s LB pool to show "Critical / Unknown host" because Cloudflare couldn't route to a nonexistent tunnel.
+
+```hcl
+# Before (broken):
+k3s_tunnel = "11111111-2222-3333-4444-555555555555.cfargotunnel.com"
+
+# After (fixed):
+k3s_tunnel = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.cfargotunnel.com"
+```
+
+To find the correct UUID, check the k3s tunnel TF state or the Cloudflare dashboard under Zero Trust → Networks → Tunnels.
+
+---
+
+## Part 6: Failover Procedure
+
+### 6.1 Automatic Failover (Servarr Down)
+
+When Servarr goes down:
+
+1. LB monitor detects 3 consecutive `/alive` failures (3 min)
+2. Servarr pool marked unhealthy
+3. `failover_across_pools` kicks in, routes to k3s fallback pool
+4. k3s Vaultwarden serves traffic from its last R2 restore (at most 15 min stale)
+5. Bitwarden clients reconnect transparently (cookie session affinity resets)
+
+No manual intervention needed. Data staleness is bounded by the 15-minute restore interval.
+
+### 6.2 Manual Failover (Planned Maintenance)
+
+For planned Servarr maintenance:
+
+1. Trigger one final backup on Servarr: `docker exec pg_backup_r2 bash -c "backup_and_upload"`
+2. Wait for k3s restore CronJob to run (or trigger manually: `kubectl create job --from=cronjob/vaultwarden-restore manual-restore -n vaultwarden`)
+3. Disable the Servarr pool in the LB (set `enabled = false` in TF, or toggle in dashboard)
+4. Verify traffic is flowing through k3s: check Traefik access logs for `vault.example.com` requests
+
+### 6.3 Failback (Servarr Recovery)
+
+When Servarr comes back:
+
+1. If k3s received writes during failover, you need to export from k3s first:
+   - Trigger k3s backup CronJob: `kubectl create job --from=cronjob/vaultwarden-backup manual-backup -n vaultwarden`
+   - On Servarr, restore from the k3s-uploaded backup
+2. Start Servarr containers: `docker compose up -d`
+3. LB monitor detects 2 consecutive successes, re-enables Servarr pool
+4. Traffic automatically returns to Servarr (it's the default pool)
+
+:::caution[Write conflict risk]
+If both sites received writes during a split-brain scenario (e.g., LB flapped), you'll need to manually merge the databases. This is the fundamental limitation of the R2 dump/restore approach -- there's no conflict resolution. For a password manager with a single user, this is unlikely but worth understanding.
+:::
+
+---
+
+## Part 7: Verification
+
+### 7.1 Check R2 Backups
+
+```bash
+# From Servarr (via pg_backup_r2 container)
+docker exec pg_backup_r2 aws s3 ls s3://vault/pg-dumps/ \
+  --endpoint-url https://<your-account-id>.r2.cloudflarestorage.com
+
+# Or from any machine with aws-cli configured
+aws s3 ls s3://vault/pg-dumps/ \
+  --endpoint-url https://<your-account-id>.r2.cloudflarestorage.com
+```
+
+### 7.2 Check k3s Restore
+
+```bash
+# Check recent restore job logs
+kubectl logs -n vaultwarden -l app=vaultwarden-restore --tail=50
+
+# Verify data in k3s PG
+kubectl exec -n vaultwarden deploy/postgres-vaultwarden -- \
+  psql -U vaultwarden -c "SELECT COUNT(*) FROM ciphers;"
+```
+
+### 7.3 Check LB Health
+
+```bash
+# Cloudflare API (or check the dashboard under Traffic → Load Balancing)
+curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
+  "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/load_balancers" | jq '.result[] | select(.name | contains("vault"))'
+```
+
+Both pools should show `healthy: true`. If the k3s pool shows "Unknown host", the tunnel UUID in `secrets.tfvars` is wrong.
+
+### 7.4 Test Failover
+
+Temporarily stop Vaultwarden on Servarr:
+
+```bash
+ssh servarr docker stop vaultwarden
+```
+
+Wait 3-4 minutes for the LB monitor to detect the failure. Then:
+
+```bash
+curl -sI https://vault.example.com/alive
+```
+
+Should return HTTP 200, served by k3s. Restart Servarr after testing:
+
+```bash
+ssh servarr docker start vaultwarden
+```
+
+---
+
+## Gotchas and Lessons Learned
+
+### WebSocket Port 3012 Was Removed in v1.31.0
+
+Prior to v1.29.0, Vaultwarden served WebSocket notifications on a separate port (3012). Reverse proxy configs often had a dedicated route for `/notifications/hub → :3012`. Since v1.29.0, WebSocket notifications are served natively on the main HTTP port (80), and the `WEBSOCKET_ENABLED` / `WEBSOCKET_PORT` env vars were deprecated. In v1.31.0, port 3012 support was fully removed. If you're upgrading from an older version, remove the port 3012 mapping and any separate WebSocket proxy rules.
+
+### `bruceforce/vaultwarden-backup` Is a Daemon, Not a Job
+
+The popular `bruceforce/vaultwarden-backup` Docker image runs cron internally as a long-lived daemon. It's designed for `docker run --restart always`, not as a Kubernetes CronJob or initContainer. Trying to use it as an initContainer will either hang (waiting for the internal cron) or exit before backup completes. Building a custom backup script with `pg_dump` + `aws s3 cp` is more predictable in both Docker and K8s contexts.
+
+### pgloader and `__diesel_schema_migrations`
+
+Vaultwarden uses Diesel ORM for database migrations. The `__diesel_schema_migrations` table tracks which migrations have been applied. When you bootstrap the PG schema by starting Vaultwarden (step 1.2), Diesel writes its migration records. If pgloader then imports the SQLite version of this table, you get duplicate keys and Vaultwarden may refuse to start or re-run migrations incorrectly. Always exclude this table with `--excluding-table-names`.
+
+### `I_REALLY_WANT_VOLATILE_STORAGE`
+
+Vaultwarden checks for a persistent `/data` volume at startup. If it doesn't find one (e.g., no volume mount), it refuses to start to protect against data loss. Setting `I_REALLY_WANT_VOLATILE_STORAGE=true` overrides this check. Only use it for the one-time schema bootstrap -- never in production.
+
+### Tunnel CNAME Staleness
+
+Cloudflare Tunnel UUIDs are assigned at tunnel creation and never change. But if you recreate a tunnel (delete + create), the UUID changes. Any TF variable or config referencing the old UUID will silently break -- the LB pool will show "Critical" because it can't route to a tunnel that no longer exists. Always verify the UUID matches the actual tunnel:
+
+```bash
+# In k3s tunnel TF directory:
+tofu state show cloudflare_zero_trust_tunnel_cloudflared.k3s | grep cname
+```
+
+### LB Monitor Needs Host Header for Tunnel Origins
+
+When the LB pool origin is a tunnel CNAME, the health check request arrives at the tunnel with no `Host` header by default. The tunnel doesn't know which ingress rule to match, so it returns 404. Adding `header { header = "Host" values = ["vault.example.com"] }` to the monitor fixes this.
