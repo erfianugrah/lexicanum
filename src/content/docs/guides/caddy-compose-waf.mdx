@@ -1,0 +1,956 @@
+---
+title: Caddy Reverse Proxy with Coraza WAF and Management Dashboard
+description: Building a hardened Docker Compose stack with Caddy, OWASP CRS WAF, Authelia 2FA, and a custom Go sidecar with React dashboard for WAF management.
+author: "Erfi Anugrah"
+---
+
+A single reverse proxy handling 20+ services needs more than just TLS termination. This guide
+walks through the architecture and implementation of a Docker Compose stack that layers five
+distinct security tiers — Cloudflare edge filtering, IP reputation blocklists, OWASP CRS WAF,
+2FA forward authentication, and per-service rate limiting — behind one Caddy instance, with
+a purpose-built Go sidecar and React dashboard for real-time WAF management.
+
+The stack is designed around a few non-negotiable constraints: zero external Go dependencies
+in the sidecar, read-only root filesystems on all containers, atomic file operations for
+config changes, and a single source of truth for WAF mode that lives in the dashboard rather
+than scattered across config files.
+
+:::tip[What this covers]
+1. Architecture overview and traffic flow through five security layers
+2. Docker Compose layout with hardened container security
+3. Multi-stage Dockerfile with build-time data fetching
+4. Caddyfile structure and the WAF config loading order
+5. The Go sidecar: log parsing, SecRule generation, deploy pipeline
+6. Policy Engine exclusion types and condition fields
+7. IPsum blocklist lifecycle and GeoIP three-tier resolution
+8. WAF dashboard pages and API layer design
+9. Build, test, and deploy workflows
+:::
+
+---
+
+## Architecture Overview
+
+```d2
+direction: right
+
+internet: Internet {
+  shape: cloud
+}
+
+cf: Cloudflare Edge {
+  shape: hexagon
+  style.fill: "#f6821f"
+}
+
+caddy: Caddy (host network) {
+  tls: TLS + ACME DNS
+  ipsum: IPsum Blocklist
+  waf: Coraza WAF + CRS
+  rl: Rate Limiting
+  proxy: Reverse Proxy
+}
+
+authelia: Authelia 2FA {
+  shape: rectangle
+  style.fill: "#1a1a2e"
+}
+
+waf-api: waf-api Sidecar {
+  parser: Log Parser
+  generator: SecRule Generator
+  api: REST API
+}
+
+dashboard: WAF Dashboard {
+  shape: rectangle
+}
+
+backends: Backend Services {
+  shape: rectangle
+}
+
+volumes: Shared Volumes {
+  shape: cylinder
+  logs: "caddy/log (RO)"
+  coraza: "caddy/coraza (RW)"
+  rl: "caddy/rl (RW)"
+}
+
+internet -> cf -> caddy
+caddy -> authelia: forward_auth
+caddy -> backends
+caddy -> volumes.logs: writes
+waf-api -> volumes.logs: reads (tail)
+waf-api -> volumes.coraza: writes configs
+waf-api -> volumes.rl: writes zones
+caddy -> volumes.coraza: reads configs
+caddy -> volumes.rl: reads zones
+dashboard -> waf-api: REST API
+waf-api -> caddy: admin API reload
+```
+
+Traffic flows through five security layers in order:
+
+1. **Cloudflare edge** — DDoS mitigation and bot filtering before traffic reaches the origin
+2. **IPsum blocklist** — known-bad IPs get a 403 before any WAF processing
+3. **Coraza WAF** — OWASP Core Rule Set with custom pre/post rules and Policy Engine exclusions
+4. **Authelia forward auth** — TOTP/WebAuthn 2FA for protected services
+5. **Rate limiting** — per-service zone configuration with dynamic thresholds
+
+The waf-api sidecar sits alongside Caddy, continuously tailing logs and serving a management
+API. The React dashboard is compiled into static files and served directly by Caddy.
+
+---
+
+## Docker Compose Layout
+
+The stack runs three containers with aggressive security hardening:
+
+```yaml
+services:
+  caddy:
+    image: your-registry/caddy:1.x.x-2.x.x
+    network_mode: host
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE, DAC_OVERRIDE]
+    security_opt: [no-new-privileges]
+    deploy:
+      resources:
+        limits:
+          cpus: "8"
+          memory: 2048M
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - coraza_config:/data/coraza
+      - ratelimit_config:/data/rl
+      - caddy_logs:/var/log/caddy
+
+  authelia:
+    image: authelia/authelia:4
+    read_only: true
+    cap_drop: [ALL]
+    user: "1000:1000"
+    security_opt: [no-new-privileges]
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 256M
+    networks:
+      authelia:
+        ipv4_address: 172.20.0.2
+    volumes:
+      - ./authelia:/config:ro
+      - /path/to/secrets:/secrets:ro
+
+  waf-api:
+    image: your-registry/waf-api:0.x.x
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+    networks:
+      waf:
+        ipv4_address: 172.21.0.2
+    extra_hosts:
+      - "caddy:host-gateway"
+    volumes:
+      - coraza_config:/data/coraza
+      - ratelimit_config:/data/rl
+      - caddy_logs:/var/log/caddy:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+
+networks:
+  authelia:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+  waf:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24
+```
+
+Each support service gets its own bridge network with a static IP. Caddy runs on the host
+network and reaches them by address. This prevents cross-container communication except
+through Caddy and makes firewall rules predictable.
+
+Key design choices in the compose file:
+
+- **`read_only: true`** on all containers — writable space is provided only through explicit volume mounts and tmpfs
+- **`cap_drop: [ALL]`** — only Caddy gets `NET_BIND_SERVICE` (port 443) and `DAC_OVERRIDE` back
+- **`user: "1000:1000"`** — Authelia runs as a non-root user with matching host UID/GID
+- **`extra_hosts: caddy:host-gateway`** — lets waf-api reach Caddy's admin API through Docker's host gateway since Caddy is on the host network
+- **Authelia secrets via `_FILE` env vars** — secrets are mounted as individual files with restrictive permissions, never passed as plain environment variables (which would be visible in `docker inspect`)
+
+---
+
+## Multi-Stage Dockerfile
+
+The Caddy image uses a 6-stage build. Five stages produce artifacts for the final image;
+the sixth (`waf-api`) validates the Go sidecar compiles but its binary is **not** baked in —
+waf-api runs as a separate container with its own Dockerfile.
+
+```dockerfile
+ARG VERSION=2.10.2
+
+# Stage 1: Build Caddy with plugins
+FROM caddy:${VERSION}-builder AS builder
+RUN xcaddy build \
+    --with github.com/caddy-dns/cloudflare \
+    --with github.com/mholt/caddy-dynamicdns \
+    --with github.com/mholt/caddy-ratelimit \
+    --with github.com/corazawaf/coraza-caddy/v2
+
+# Stage 2: Fetch IPsum blocklist — inline awk filters by min score,
+# then generates a Caddy client_ip matcher + respond block
+FROM alpine:3.21 AS ipsum
+ARG IPSUM_MIN_SCORE=3
+RUN apk add --no-cache curl \
+    && curl -fsSL --retry 3 --max-time 60 \
+       https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt \
+       | awk -v min="${IPSUM_MIN_SCORE}" '/^#/{next} /^[[:space:]]*$/{next} {if($2+0>=min) printf "%s ",$1}' \
+       > /tmp/ipsum_ips \
+    && { printf '# AUTO-GENERATED at build time\n# Updated: %s\n@ipsum_blocked client_ip %s\n' \
+       "$(date -Iseconds)" "$(cat /tmp/ipsum_ips)"; \
+       printf 'route @ipsum_blocked {\n\trespond 403\n}\n'; \
+    } > /tmp/ipsum_block.caddy
+
+# Stage 3: Fetch Cloudflare IP ranges for trusted_proxies
+FROM alpine:3.21 AS cloudflare-ips
+RUN apk add --no-cache curl \
+    && curl -fsSL --retry 3 https://www.cloudflare.com/ips-v4 > /tmp/cf_ipv4 \
+    && curl -fsSL --retry 3 https://www.cloudflare.com/ips-v6 > /tmp/cf_ipv6 \
+    && { printf 'trusted_proxies static'; \
+         while IFS= read -r cidr; do [ -n "$cidr" ] && printf ' %s' "$cidr"; done < /tmp/cf_ipv4; \
+         while IFS= read -r cidr; do [ -n "$cidr" ] && printf ' %s' "$cidr"; done < /tmp/cf_ipv6; \
+         echo; } > /tmp/cf_trusted_proxies.caddy
+
+# Stage 4: Build the WAF dashboard
+FROM node:22-alpine AS waf-dashboard
+WORKDIR /build
+COPY waf-dashboard/package.json waf-dashboard/package-lock.json ./
+RUN npm ci
+COPY waf-dashboard/ ./
+RUN npm run build
+
+# Stage 5: Build the Go sidecar (validates compilation; binary not used here)
+FROM golang:1.23-alpine AS waf-api
+WORKDIR /build
+COPY waf-api/go.mod ./
+COPY waf-api/*.go ./
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o waf-api .
+
+# Stage 6: Final image — assemble Caddy + baked-in data + dashboard
+FROM caddy:${VERSION}-alpine
+RUN apk add --no-cache curl
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+COPY --from=ipsum /tmp/ipsum_block.caddy /etc/caddy/ipsum_block.caddy
+COPY --from=cloudflare-ips /tmp/cf_trusted_proxies.caddy /etc/caddy/cf_trusted_proxies.caddy
+COPY --from=waf-dashboard /build/dist/ /etc/caddy/waf-ui/
+COPY errors/ /etc/caddy/errors/
+COPY coraza/ /etc/caddy/coraza/
+COPY scripts/update-ipsum.sh /usr/local/bin/update-ipsum.sh
+COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/update-ipsum.sh /usr/local/bin/entrypoint.sh \
+    && echo '0 2 * * * /usr/local/bin/update-ipsum.sh >> /var/log/ipsum-update.log 2>&1' \
+       >> /var/spool/cron/crontabs/root
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+```
+
+Note that the waf-api stage (5) compiles the sidecar binary but the final stage does **not**
+`COPY --from=waf-api` — the sidecar runs as a separate container, defined in `compose.yaml`
+with its own `waf-api/Dockerfile`. This keeps the Caddy image lean and allows independent
+sidecar updates without rebuilding the entire image.
+
+The build-time data fetching (stages 2-3) means the image is never empty on first boot.
+The entrypoint script bridges the gap between build-time and runtime: it seeds the IPsum
+blocklist from the baked-in snapshot if the runtime copy is missing or lacks an `# Updated:`
+header, starts `crond` for daily updates, then execs Caddy as PID 1.
+
+---
+
+## Caddyfile Structure
+
+The Caddyfile is organized around composable snippets that site blocks mix and match:
+
+```caddy
+{
+    admin localhost:2019
+    metrics
+    acme_dns cloudflare {$CF_API_TOKEN}
+    order coraza_waf first
+
+    servers {
+        strict_sni_host on
+        protocols h1 h2 h3
+        import /etc/caddy/cf_trusted_proxies.caddy
+    }
+}
+
+# --- Reusable Snippets ---
+
+(tls_config) {
+    tls {
+        issuer acme {
+            dns cloudflare {$CF_API_TOKEN}
+            propagation_delay 60s
+            propagation_timeout -1
+        }
+    }
+}
+
+(security_headers) {
+    header {
+        Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+        Cross-Origin-Opener-Policy "same-origin"
+        Cross-Origin-Resource-Policy "same-origin"
+        -Server
+        -X-Powered-By
+    }
+}
+
+# WebSocket upgrades are skipped — Coraza mangles the 101 handshake.
+# CRS is loaded from Coraza's embedded copy via @-prefixed paths.
+(waf) {
+    @not_websocket {
+        not header Connection *Upgrade*
+    }
+    route @not_websocket {
+        coraza_waf {
+            load_owasp_crs
+            directives `
+            Include /etc/caddy/coraza/pre-crs.conf
+            Include /data/coraza/custom-pre-crs.conf
+            Include @crs-setup.conf.example
+            Include /data/coraza/custom-waf-settings.conf
+            Include @owasp_crs/*.conf
+            Include /etc/caddy/coraza/post-crs.conf
+            Include /data/coraza/custom-post-crs.conf
+            SecAuditEngine RelevantOnly
+            SecAuditLog /var/log/coraza-audit.log
+            SecAuditLogFormat json
+            SecAuditLogParts ABCFHKZ
+            `
+        }
+    }
+    handle_errors 400 403 429 {
+        root * /etc/caddy/errors
+        templates
+        rewrite * /error.html
+        file_server
+    }
+}
+
+# IPsum blocklist — the snippet file is generated at build time and
+# updated daily by cron. It defines @ipsum_blocked and a route block.
+(ipsum_blocklist) {
+    import /data/coraza/ipsum_block.caddy
+}
+
+(forward_auth) {
+    forward_auth 172.20.0.2:9091 {
+        uri /api/authz/forward-auth
+        copy_headers Remote-User Remote-Groups Remote-Email
+    }
+}
+
+# --- Site Blocks ---
+
+app.example.com {
+    import tls_config
+    import security_headers
+    import ipsum_blocklist
+    import waf
+    import forward_auth
+    # Rate limit zone files are imported per-service via glob
+    import /data/caddy/rl/app*.caddy
+    reverse_proxy backend-host:port
+}
+```
+
+The critical architectural decision here is the **WAF config loading order**. Seven files are
+loaded in a specific sequence that mixes baked-in rules with dynamically generated ones:
+
+1. `pre-crs.conf` — body size limits, JSON body processor, XXE detection (baked in at `/etc/caddy/coraza/`)
+2. `custom-pre-crs.conf` — Policy Engine runtime exclusions (generated by waf-api at `/data/coraza/`)
+3. `@crs-setup.conf.example` — CRS default configuration (embedded in Coraza, `@`-prefixed)
+4. `custom-waf-settings.conf` — `SecRuleEngine`, paranoia level, anomaly thresholds (generated at `/data/coraza/`)
+5. `@owasp_crs/*.conf` — OWASP CRS detection rules (embedded in Coraza via `load_owasp_crs`)
+6. `post-crs.conf` — RCE, CRLF detection, honeypot paths (baked in at `/etc/caddy/coraza/`)
+7. `custom-post-crs.conf` — Policy Engine post-CRS exclusions (generated at `/data/coraza/`)
+
+:::note
+The Caddyfile intentionally does **not** set `SecRuleEngine` directly. That directive is exclusively
+emitted by waf-api's generator into `custom-waf-settings.conf`. This makes the dashboard
+Settings panel the single source of truth for WAF mode, preventing configuration drift.
+:::
+
+---
+
+## The Go Sidecar (waf-api)
+
+The waf-api is a stdlib-only Go HTTP service — zero external dependencies, not even a router
+library. It handles log parsing, SecRule generation, configuration management, and the
+dashboard REST API in roughly 6300 lines of Go (plus 6300 lines of tests).
+
+### File Organization
+
+| File | Responsibility |
+|------|---------------|
+| `main.go` | HTTP server, 30+ route handlers, CORS middleware |
+| `models.go` | All data models (events, config, exclusions, rate limits) |
+| `logparser.go` | Incremental Coraza audit log parser with offset tracking |
+| `rl_analytics.go` | Combined access log parser for 429 events and IPsum blocks |
+| `generator.go` | SecRule generation from Policy Engine exclusions |
+| `deploy.go` | Deploy pipeline, SHA-256 fingerprinting, Caddy admin API reload |
+| `config.go` | WAF settings store (mode, paranoia, thresholds) |
+| `exclusions.go` | Policy Engine exclusion CRUD, validation, atomic file writes |
+| `ratelimit.go` | Rate limit zone config and Caddy snippet generation |
+| `blocklist.go` | IPsum file parser, cached stats, on-demand refresh |
+| `geoip.go` | Pure-Go MMDB reader, three-tier IP resolution |
+| `crs_rules.go` | 152-rule CRS catalog with search/autocomplete |
+
+### Route Registration Pattern
+
+Go 1.22+ method-pattern routing eliminates the need for a third-party router:
+
+```go
+mux := http.NewServeMux()
+
+// Core
+mux.HandleFunc("GET /api/health", handleHealth)
+mux.HandleFunc("GET /api/summary", handleSummary(store, als))
+mux.HandleFunc("GET /api/events", handleEvents(store, als))
+
+// Policy Engine
+mux.HandleFunc("GET /api/exclusions", handleListExclusions(exclusionStore))
+mux.HandleFunc("POST /api/exclusions", handleCreateExclusion(exclusionStore))
+mux.HandleFunc("GET /api/exclusions/{id}", handleGetExclusion(exclusionStore))
+mux.HandleFunc("PUT /api/exclusions/{id}", handleUpdateExclusion(exclusionStore))
+mux.HandleFunc("DELETE /api/exclusions/{id}", handleDeleteExclusion(exclusionStore))
+
+// Config + Deploy
+mux.HandleFunc("GET /api/config", handleGetConfig(configStore))
+mux.HandleFunc("PUT /api/config", handleUpdateConfig(configStore))
+mux.HandleFunc("POST /api/config/deploy", handleDeploy(configStore, exclusionStore, deployCfg))
+```
+
+Handlers use the closure pattern for dependency injection — each handler factory takes the
+stores it needs and returns an `http.HandlerFunc`:
+
+```go
+func handleSummary(store *Store, als *AccessLogStore) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        store.mu.RLock()
+        defer store.mu.RUnlock()
+        // ... build summary from store data
+        writeJSON(w, http.StatusOK, summary)
+    }
+}
+```
+
+### Concurrency Model
+
+Every store wraps its state with `sync.RWMutex`. Reads acquire `RLock`, mutations acquire
+`Lock`. Getters return deep copies to prevent callers from mutating shared state:
+
+```go
+type ConfigStore struct {
+    mu       sync.RWMutex
+    config   WAFConfig
+    filePath string
+}
+
+func (s *ConfigStore) Get() WAFConfig {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    // Return a deep copy
+    cp := s.config
+    cp.Services = make(map[string]WAFServiceSettings, len(s.config.Services))
+    for k, v := range s.config.Services {
+        cp.Services[k] = v
+    }
+    return cp
+}
+```
+
+### Atomic File Operations
+
+All file writes go through an atomic helper that prevents Caddy from reading partially-written
+config during a reload:
+
+```go
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+    dir := filepath.Dir(path)
+    tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp.*")
+    if err != nil {
+        return fmt.Errorf("creating temp file: %w", err)
+    }
+    tmpPath := tmp.Name()
+
+    // Clean up the temp file on any error.
+    success := false
+    defer func() {
+        if !success {
+            tmp.Close()
+            os.Remove(tmpPath)
+        }
+    }()
+
+    if _, err := tmp.Write(data); err != nil {
+        return fmt.Errorf("writing temp file: %w", err)
+    }
+    if err := tmp.Sync(); err != nil {
+        return fmt.Errorf("syncing temp file: %w", err)
+    }
+    if err := tmp.Close(); err != nil {
+        return fmt.Errorf("closing temp file: %w", err)
+    }
+    if err := os.Chmod(tmpPath, perm); err != nil {
+        return fmt.Errorf("chmod temp file: %w", err)
+    }
+    if err := os.Rename(tmpPath, path); err != nil {
+        return fmt.Errorf("renaming temp file: %w", err)
+    }
+    success = true
+    return nil
+}
+```
+
+### The Deploy Pipeline
+
+When a user changes settings or policies in the dashboard, the deploy flow is:
+
+1. **Generate** — translate stored JSON state into SecRule `.conf` files
+2. **Write atomically** — each config file written via the temp+fsync+rename pattern
+3. **Fingerprint** — SHA-256 hash of all generated config files
+4. **Reload** — read the Caddyfile, prepend a fingerprint comment, POST to Caddy's admin API
+
+The fingerprint step solves a subtle problem: when only *included* config files change (not
+the Caddyfile itself), Caddy's `/load` endpoint sees identical Caddyfile text and skips
+reprovisioning. By prepending `# waf-api deploy <timestamp> fingerprint:<sha256>` to the
+in-memory Caddyfile content before POSTing, the admin API always sees a "changed" config.
+The on-disk Caddyfile is never modified.
+
+```go
+// reloadCaddy sends the Caddyfile to Caddy's admin API to trigger a reload.
+// configFiles are the paths whose contents contribute to the fingerprint.
+func reloadCaddy(caddyfilePath, adminURL string, configFiles ...string) error {
+    content, err := os.ReadFile(caddyfilePath)
+    if err != nil {
+        return fmt.Errorf("reading Caddyfile: %w", err)
+    }
+
+    fingerprint := deployFingerprint(configFiles)
+    header := fmt.Sprintf("# waf-api deploy %s fingerprint:%s\n",
+        time.Now().UTC().Format(time.RFC3339), fingerprint)
+    payload := append([]byte(header), content...)
+
+    req, _ := http.NewRequest("POST", adminURL+"/load", bytes.NewReader(payload))
+    req.Header.Set("Content-Type", "text/caddyfile")
+
+    client := &http.Client{Timeout: 90 * time.Second}
+    resp, err := client.Do(req)
+    if err != nil {
+        return fmt.Errorf("Caddy admin API request failed: %w", err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        body, _ := io.ReadAll(resp.Body)
+        return fmt.Errorf("Caddy reload failed (status %d): %s", resp.StatusCode, body)
+    }
+    return nil
+}
+```
+
+### Generate-on-Boot
+
+On startup, `generateOnBoot()` regenerates all config files from stored JSON state. This
+means a full stack restart always picks up the latest generator output without requiring a
+manual deploy action. No Caddy reload is performed — Caddy reads the files fresh on its own
+startup.
+
+---
+
+## Policy Engine and SecRule Generation
+
+The Policy Engine is the heart of the WAF management layer. It translates high-level exclusion
+rules into ModSecurity `SecRule` directives that Coraza understands.
+
+### Exclusion Types
+
+| Type | Generated Action | Use Case |
+|------|-----------------|----------|
+| `allow` | `ctl:ruleEngine=Off` | Full WAF bypass for trusted paths/IPs |
+| `block` | `deny,status:403` | Explicit deny for malicious patterns |
+| `skip_rule` | `ctl:ruleRemoveById` / `ByTag` | Skip specific CRS rules for false positives |
+| `honeypot` | `deny,status:403` (consolidated `@pm`) | Dynamic honeypot paths merged into one rule |
+| `raw` | Verbatim SecRule | Free-form directives for edge cases |
+| `remove_by_id` | Post-CRS `SecRuleRemoveById` | Configure-time rule exclusion |
+| `update_target_by_id` | Post-CRS `SecRuleUpdateTargetById` | Exclude specific variables from a rule |
+
+### Condition Fields
+
+Conditions map to ModSecurity variables with operator support:
+
+| Field | SecRule Variable | Supported Operators |
+|-------|-----------------|---------------------|
+| `ip` | `REMOTE_ADDR` | `eq`, `neq`, `ip_match`, `not_ip_match` |
+| `path` | `REQUEST_URI` | `eq`, `contains`, `begins_with`, `ends_with`, `regex`, `in` |
+| `host` | `SERVER_NAME` | `eq`, `neq`, `contains` |
+| `method` | `REQUEST_METHOD` | `eq`, `neq`, `in` |
+| `user_agent` | `REQUEST_HEADERS:User-Agent` | `eq`, `contains`, `regex` |
+| `country` | `REQUEST_HEADERS:Cf-Ipcountry` | `eq`, `neq`, `in` |
+
+Multiple conditions on a single exclusion combine with `chain` (logical AND). The `in`
+operator generates separate rules for each value (logical OR) — e.g., blocking multiple
+countries produces individual `SecRule` directives rather than one chained rule.
+
+### Honeypot Consolidation
+
+Rather than generating one rule per honeypot path, the generator merges all honeypot-type
+exclusions into a single rule using the `@pm` (phrase match) operator:
+
+```
+SecRule REQUEST_URI "@pm /wp-admin /xmlrpc.php /.env /phpmyadmin" \
+    "id:9100021,phase:1,deny,status:403,log,msg:'Dynamic honeypot match'"
+```
+
+This keeps the rule count low and Coraza's evaluation fast, even with hundreds of honeypot paths.
+
+---
+
+## Incremental Log Parsing
+
+The waf-api parses two log streams simultaneously:
+
+### Coraza Audit Log
+
+The audit log is configured with `SecAuditLogFormat json` and parts `ABCFHKZ` — Coraza outputs
+structured JSON with transaction metadata, request/response headers, and matched rules. The
+parser reads incrementally with offset tracking:
+
+```go
+type Store struct {
+    mu     sync.RWMutex
+    events []Event
+
+    // file tailing state
+    path   string
+    offset int64
+
+    maxAge time.Duration
+    geoIP  *GeoIPStore
+}
+
+// Load reads new lines appended since last offset and parses them.
+func (s *Store) Load() {
+    f, err := os.Open(s.path)
+    if err != nil {
+        if os.IsNotExist(err) {
+            log.Printf("audit log not found at %s, will retry", s.path)
+            return
+        }
+        log.Printf("error opening audit log: %v", err)
+        return
+    }
+    defer f.Close()
+
+    // Detect log rotation: file shrunk since last read
+    info, _ := f.Stat()
+    if info.Size() < s.offset {
+        log.Printf("audit log appears rotated, re-reading from start")
+        s.offset = 0
+        s.mu.Lock()
+        s.events = nil
+        s.mu.Unlock()
+    }
+
+    if info.Size() == s.offset {
+        return // nothing new
+    }
+    // ... seek to offset, parse new entries, update offset
+}
+```
+
+From each JSON audit log entry, the parser extracts:
+- Anomaly scores from evaluation rules `949110` / `959100` / `980170`
+- Matched rule IDs and messages from the `messages` array
+- Request URI, method, headers from the `transaction.request` object
+- Client IP, response status, and interruption details from `transaction`
+
+### Combined Access Log
+
+A second parser tails Caddy's access log (JSON format) looking for:
+- **429 responses** — rate limit events, tagged with the triggering zone
+- **IPsum blocks** — requests matched by the blocklist, identified by a specific handler marker
+
+Both parsers run on configurable intervals (default `5s`) and maintain in-memory event stores
+with configurable maximum age (default `168h` / 7 days).
+
+---
+
+## GeoIP: Three-Tier Resolution
+
+IP geolocation uses a priority chain that degrades gracefully:
+
+```
+Priority 1: Cf-Ipcountry header  (free, zero latency, present behind Cloudflare)
+Priority 2: Local MMDB lookup     (sub-microsecond, offline capable)
+Priority 3: Online API fallback   (configurable, cached)
+```
+
+The MMDB reader is a pure-Go implementation ported from a parallel Kubernetes project — no
+CGO, no `libmaxminddb`, just stdlib `encoding/binary` and `net` packages parsing the MaxMind
+binary tree format directly.
+
+Online API results are cached in a shared in-memory LRU cache (24h TTL, 100k entries). The
+API URL supports both placeholder (`https://api.example.com/%s/json` where `%s` is the IP)
+and path-append styles. An optional API key is sent as a Bearer token.
+
+---
+
+## The WAF Dashboard
+
+The frontend is an Astro 5 + React 19 + TypeScript 5.7 application with file-based routing,
+built into static files and served by Caddy.
+
+### Pages
+
+| Route | Component | Purpose |
+|-------|-----------|---------|
+| `/` | `OverviewDashboard` | Timeline chart, service breakdown, recent events, top clients |
+| `/analytics` | `AnalyticsDashboard` | Top blocked IPs, targeted URIs, country breakdown |
+| `/blocklist` | `BlocklistPanel` | IPsum stats, IP check search, manual refresh |
+| `/events` | `EventsTable` | Paginated event log with expandable detail rows, JSON export |
+| `/policy` | `PolicyEngine` | Three-tab rule builder: Quick Actions, Advanced, Raw Editor |
+| `/rate-limits` | `RateLimitsPanel` | Per-zone rate limit management |
+| `/services` | `ServicesList` | Per-service stats, top URIs, triggered rules |
+| `/settings` | `SettingsPanel` | Global + per-service WAF mode, paranoia, thresholds |
+
+### API Layer
+
+The Go backend returns `snake_case` JSON. The frontend's `api.ts` module maps everything
+to `camelCase` TypeScript interfaces, providing full type safety across the boundary:
+
+```typescript
+const API_BASE = "/api";
+
+export interface WAFEvent {
+  id: string;
+  timestamp: string;
+  clientIp: string;     // mapped from client_ip
+  requestUri: string;   // mapped from request_uri
+  anomalyScore: number; // mapped from anomaly_score
+  matchedRules: MatchedRule[];
+  // ...
+}
+
+export async function fetchEvents(params: EventParams): Promise<WAFEvent[]> {
+  const res = await fetch(`${API_BASE}/events?${buildQuery(params)}`);
+  if (!res.ok) throw new Error(`Events fetch failed: ${res.status}`);
+  const data = await res.json();
+  return data.map(mapEvent);
+}
+```
+
+### Stack
+
+- **shadcn/ui** — 16 primitives (button, card, badge, dialog, tabs, etc.) in `src/components/ui/`
+- **Tailwind CSS 4** — utility-first styling with `cn()` helper (clsx + tailwind-merge)
+- **Recharts** — timeline charts, donut charts, stacked bar charts
+- **CodeMirror 6** — raw SecRule editor with ModSecurity syntax highlighting
+- **Lucide** — icon set
+
+---
+
+## IPsum Blocklist Lifecycle
+
+The IP reputation blocklist has a multi-phase lifecycle ensuring the stack is never unprotected:
+
+**Build time** — the Dockerfile fetches the latest IPsum list, filters by minimum score,
+and generates a Caddy `client_ip` matcher snippet baked into the image.
+
+**First boot** — the entrypoint script checks if the runtime volume has an `ipsum_block.caddy`
+file. If missing, or if the file lacks an `# Updated:` header comment (indicating it came from
+an older build), the baked-in snapshot is copied to the volume.
+
+**Daily cron** — a cron job at 02:00 downloads a fresh list, filters, generates the snippet,
+atomically writes it, and reloads Caddy.
+
+**On-demand refresh** — `POST /api/blocklist/refresh` triggers the same pipeline immediately
+from the dashboard. The Go handler downloads the list, parses it, generates the Caddy snippet,
+atomically writes the file, refreshes the in-memory cache, and reloads Caddy — all in one
+synchronous request.
+
+The `BlocklistStore` parser extracts the update timestamp from a `# Updated: <RFC3339>`
+comment at the top of the file. If the comment is missing (older format), it falls back to
+the file's `mtime`.
+
+---
+
+## Security Hardening Summary
+
+The stack applies defense-in-depth at every layer:
+
+| Layer | Mechanism |
+|-------|-----------|
+| **Container runtime** | `read_only`, `cap_drop: ALL`, `no-new-privileges`, non-root users |
+| **Network isolation** | Separate bridge networks with static IPs, no cross-container communication |
+| **Secrets** | SOPS-encrypted `.env` (age), Authelia secrets as mounted files via `_FILE` vars |
+| **Pre-commit hooks** | Block unencrypted secrets, check for SOPS markers, glob-based exemptions |
+| **File operations** | Atomic writes (temp + fsync + rename) prevent partial reads |
+| **WAF config** | Single source of truth in waf-api, not scattered across Caddyfile |
+| **TLS** | ACME DNS challenge (no exposed port 80), Encrypted Client Hello, strict SNI |
+
+The pre-commit hook deserves special mention. It inspects staged files for unencrypted secrets
+by checking for SOPS `ENC[AES256_GCM,...]` markers in YAML/JSON files and blocking `.env`,
+`.tfvars`, and `.tfstate` files that lack encryption. Projects can opt out per-file via
+`.allow-unencrypted-paths` glob patterns.
+
+---
+
+## Build and Test
+
+```bash
+# Build all images
+make build
+
+# Build only the Caddy image (includes dashboard)
+make build-caddy
+
+# Build only the standalone waf-api image
+make build-waf-api
+
+# Run all tests
+make test
+
+# Go tests only
+make test-go
+
+# Frontend tests only (Vitest)
+make test-frontend
+
+# Single Go test
+cd waf-api && go test -run TestGenerateSecRules -count=1 -timeout 60s ./...
+
+# Single frontend test
+cd waf-dashboard && npx vitest run -t "fetchEvents"
+```
+
+### Go Test Patterns
+
+Tests are whitebox (`package main`) using table-driven subtests:
+
+```go
+func TestWAFModeTransitions(t *testing.T) {
+    tests := []struct {
+        name     string
+        from     string
+        to       string
+        wantErr  bool
+    }{
+        {"enabled to detection", "enabled", "detection_only", false},
+        {"enabled to disabled", "enabled", "disabled", false},
+        {"invalid mode", "enabled", "turbo", true},
+    }
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            store := newTestConfigStore(t, tt.from)
+            _, err := store.Update(WAFConfig{Mode: tt.to})
+            if (err != nil) != tt.wantErr {
+                t.Errorf("got err=%v, wantErr=%v", err, tt.wantErr)
+            }
+        })
+    }
+}
+```
+
+Handler tests use `httptest.NewServer` to mock the Caddy admin API and verify the full
+deploy pipeline end-to-end. Temp file helpers (`writeTempLog`, `newTestConfigStore`) keep
+test setup concise.
+
+### Frontend Test Patterns
+
+Vitest tests mock `fetch` globally and verify the API layer's snake-to-camel mapping:
+
+```typescript
+describe("fetchEvents", () => {
+  it("maps snake_case to camelCase", async () => {
+    vi.fn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify([{
+        client_ip: "1.2.3.4",
+        request_uri: "/test",
+        anomaly_score: 15,
+      }]))
+    );
+    const events = await fetchEvents({});
+    expect(events[0].clientIp).toBe("1.2.3.4");
+    expect(events[0].requestUri).toBe("/test");
+    expect(events[0].anomalyScore).toBe(15);
+  });
+});
+```
+
+---
+
+## Deploy Workflow
+
+The Makefile supports two deployment modes configurable via `.env.mk`:
+
+**Full pipeline** (`make deploy`):
+1. Build both Docker images locally
+2. Push to registry
+3. SCP `Caddyfile` and `compose.yaml` to the remote host
+4. Pull updated images on the remote
+5. Restart the stack
+
+**Partial deploys** for faster iteration:
+- `make deploy-caddy` — rebuild and deploy only the Caddy image (includes dashboard changes)
+- `make deploy-waf-api` — build, push, and restart only the sidecar container
+
+**Config-only changes** require no image rebuild:
+- SCP the Caddyfile, then `docker exec caddy caddy reload`
+- Or change settings through the dashboard, which triggers the sidecar's deploy pipeline
+
+:::tip[Version Sync]
+Image tags must stay in sync across four files: `Makefile`, `compose.yaml`, `README.md`, and
+`test/docker-compose.test.yml`. The Caddy tag format is `<project-version>-<caddy-version>`
+(e.g., `1.15.0-2.10.2`) and waf-api uses simple semver (e.g., `0.10.0`).
+:::
+
+---
+
+## Coraza Rule ID Namespaces
+
+Custom rules follow a strict ID allocation scheme to avoid collisions with the CRS:
+
+| Range | Purpose |
+|-------|---------|
+| `9100001–9100006` | Pre-CRS rules (body settings, XXE, JSON processor) |
+| `9100010–9100019` | Post-CRS custom detection (RCE, CRLF) |
+| `9100020–9100029` | Honeypot rules (static + dynamic Policy Engine) |
+| `9100030–9100039` | Heuristic bot signal rules (scanner UA matching) |
+| `9100050–9100059` | Reserved for GeoIP blocking |
+| `95xxxxx` | Generated Policy Engine exclusion rules |
+| `97xxxxx` | Generated WAF settings overrides |
+| `910000–979999` | OWASP CRS (do not use) |
+
+This namespacing ensures that generated rules from the Policy Engine never collide with
+baked-in custom rules or the CRS itself.
