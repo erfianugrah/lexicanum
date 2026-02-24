@@ -1,0 +1,1279 @@
+---
+title: "Edge-Native Fraud Detection: Multi-Layer Scoring on Cloudflare Workers"
+description: Architecture reference for building a multi-layer form fraud detection system with ML email classification, TLS fingerprinting, and weighted risk scoring on Cloudflare Workers
+author: Erfi Anugrah
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+How [**forminator**](https://github.com/erfianugrah/forminator) and [**markov-mail**](https://github.com/erfianugrah/markov-mail) implement multi-layer fraud detection for form submissions on Cloudflare Workers. Two Workers -- one handling form submissions with 6 detection layers and 10-component risk scoring, the other running Random Forest ML inference on email addresses -- connected via RPC service bindings.
+
+This serves as a reference template for building similar systems. All patterns are derived from production code.
+
+---
+
+## Architecture overview
+
+```d2
+direction: right
+
+Browser -> BL: ""
+Bot -> TV: "" {style.stroke-dash: 3}
+BL -> TR: clean
+TR -> TV: clean
+TV -> TS: validate
+TS -> TV: eph_id
+TV -> Signals: ""
+Signals -> ML: RPC {style.stroke-dash: 3}
+ML -> Score: score {style.stroke-dash: 3}
+Signals -> Score: ""
+Score -> D1: ""
+
+Browser: Browser
+Bot: Bot Mgmt {
+  shape: cloud
+}
+BL: Blacklist {
+  shape: diamond
+}
+TR: Token Replay {
+  shape: diamond
+}
+TV: Turnstile
+TS: Turnstile API
+Signals: Collect Signals
+ML: ML Worker {
+  shape: hexagon
+}
+Score: Score (10w) {
+  shape: hexagon
+}
+D1: D1 {
+  shape: cylinder
+}
+```
+
+| Component | Role | Tech |
+|-----------|------|------|
+| **Form Worker** | Submission intake, multi-layer fraud detection, risk scoring | Hono on Workers, D1, KV |
+| **ML Worker** | Email fraud classification, feature extraction, model inference | Hono on Workers, D1, 3x KV |
+| **Service Binding** | Worker-to-Worker RPC (zero overhead, same-thread execution) | `WorkerEntrypoint` from `cloudflare:workers` |
+| **Turnstile** | CAPTCHA validation, ephemeral device IDs (Enterprise) | Cloudflare Turnstile |
+| **Bot Management** | JA4 fingerprints, bot scores, JS detection (Enterprise) | Cloudflare Bot Management |
+
+<Aside type="caution" title="Enterprise features">
+  Ephemeral IDs from Turnstile and JA4/bot score signals from Bot Management require Enterprise plans. The system works without them -- those layers degrade gracefully and their scoring weight is redistributed to active signals.
+</Aside>
+
+---
+
+## Detection layers
+
+The fraud pipeline runs in four phases. Each layer is independent -- failure in one doesn't block the others.
+
+```d2
+direction: down
+
+BL -> TR: clean
+TR -> TS: clean
+TS -> Write: pass
+Write -> Dup: ""
+Dup -> Signals: unique
+Dup -> Block: 3x+ {style.stroke-dash: 3}
+BL -> Block: hit {style.stroke-dash: 3}
+
+Signals -> Email: ""
+Signals -> Eph: ""
+Signals -> JA4: ""
+Signals -> IPFP: ""
+
+Email -> Score: ""
+Eph -> Score: ""
+JA4 -> Score: ""
+IPFP -> Score: ""
+Score -> Decide: ""
+Decide -> Allow: below
+Decide -> Block: above
+
+BL: Blacklist {shape: diamond}
+TR: Token Replay {shape: diamond}
+TS: Turnstile {shape: diamond}
+Write: Write Record
+Dup: Duplicate? {shape: diamond}
+Signals: Collect Signals
+Email: Email (RPC)
+Eph: Ephemeral ID
+JA4: JA4 Fingerprint
+IPFP: IP + Fingerprint
+Score: Weighted Score {shape: hexagon}
+Decide: Threshold? {shape: diamond}
+Allow: 201
+Block: 429 + Blacklist
+```
+
+### Layer 0: Blacklist fast path
+
+Pre-Turnstile check against a TTL-based blacklist. Matches on email, ephemeral ID, JA4 fingerprint, or IP address (checked in that priority order, most specific first). Returns in single-digit milliseconds and short-circuits the entire pipeline.
+
+```typescript
+// Check order: most specific identifier first
+async function checkPreValidationBlock(
+  ephemeralId: string | null,
+  remoteIp: string,
+  ja4: string | null,
+  email: string | null,
+  db: D1Database,
+): Promise<PreValidationResult> {
+  const identifiers = [
+    { type: "email", value: email },
+    { type: "ephemeral_id", value: ephemeralId },
+    { type: "ja4", value: ja4 },
+    { type: "ip_address", value: remoteIp },
+  ].filter((id) => id.value != null);
+
+  for (const { type, value } of identifiers) {
+    const entry = await db
+      .prepare(
+        `SELECT * FROM fraud_blacklist
+         WHERE identifier_type = ? AND identifier_value = ?
+         AND expires_at > ?`,
+      )
+      .bind(type, value, new Date().toISOString())
+      .first();
+
+    if (entry && ["high", "medium"].includes(entry.confidence)) {
+      return { blocked: true, reason: entry.detection_type, confidence: entry.confidence };
+    }
+  }
+  return { blocked: false };
+}
+```
+
+<Aside type="tip" title="Why a fast path matters">
+  Turnstile validation costs an external API call. If you've already determined an identifier is fraudulent, checking a local D1 table first avoids that cost entirely. In practice, this can eliminate the API call for the majority of repeat offenders.
+</Aside>
+
+### Layer 1: Email fraud via ML (RPC)
+
+The form Worker calls the ML Worker via a service binding. The RPC call has zero overhead per Cloudflare's documentation -- both Workers execute on the same thread of the same server.
+
+```typescript
+// Form Worker: call ML Worker via service binding
+async function checkEmailFraud(
+  email: string,
+  env: Env,
+  request?: Request,
+): Promise<EmailFraudResult | null> {
+  try {
+    // Pass request headers so ML Worker has access to
+    // geo, network, and bot management signals
+    const headers: Record<string, string | null> = {};
+    if (request?.cf) {
+      headers["cf-ipcountry"] = request.headers.get("cf-ipcountry");
+      headers["cf-connecting-ip"] = request.headers.get("cf-connecting-ip");
+      // ... additional cf headers for fingerprinting
+    }
+
+    const result = await env.FRAUD_DETECTOR.validate({
+      email,
+      consumer: "form-worker",
+      flow: "submission",
+      headers,
+    });
+
+    return {
+      riskScore: result.riskScore * 100, // ML returns 0-1, scoring expects 0-100
+      decision: result.decision,
+      signals: result.signals,
+    };
+  } catch {
+    return null; // Fail-open: ML unavailable = 0 risk
+  }
+}
+```
+
+<Aside type="note" title="Fail-open design">
+  Email fraud detection fails open -- if the ML Worker is unavailable, the submission proceeds with a 0 risk score for that component. Its weight is redistributed to the remaining active signals. Token replay and Turnstile validation are the only fail-secure checks.
+</Aside>
+
+### Layer 2: Ephemeral ID behavioral signals
+
+Collects three signals from D1 using Turnstile's ephemeral device ID (Enterprise) to detect volume abuse:
+
+| Signal | Query | Detection |
+|--------|-------|-----------|
+| **Submission count** | Count submissions by ephemeral ID in 24h | Form stuffing from same device |
+| **Validation frequency** | Count Turnstile validations by ephemeral ID in 1h | Rapid-fire CAPTCHA solving |
+| **IP diversity** | Count distinct IPs per ephemeral ID in 24h | VPN/proxy rotation from same device |
+
+```typescript
+async function collectEphemeralIdSignals(
+  ephemeralId: string,
+  db: D1Database,
+  config: FraudDetectionConfig,
+): Promise<EphemeralIdSignals> {
+  try {
+    const [submissions, validations, ips] = await Promise.all([
+      db.prepare(
+        `SELECT COUNT(*) as count FROM submissions
+         WHERE ephemeral_id = ? AND created_at > datetime('now', '-24 hours')`,
+      ).bind(ephemeralId).first<{ count: number }>(),
+
+      db.prepare(
+        `SELECT COUNT(*) as count FROM turnstile_validations
+         WHERE ephemeral_id = ? AND validated_at > datetime('now', '-1 hour')`,
+      ).bind(ephemeralId).first<{ count: number }>(),
+
+      db.prepare(
+        `SELECT COUNT(DISTINCT ip) as count FROM (
+           SELECT ip_address as ip FROM submissions
+           WHERE ephemeral_id = ? AND created_at > datetime('now', '-24 hours')
+           UNION
+           SELECT ip_address as ip FROM turnstile_validations
+           WHERE ephemeral_id = ? AND validated_at > datetime('now', '-24 hours')
+         )`,
+      ).bind(ephemeralId, ephemeralId).first<{ count: number }>(),
+    ]);
+
+    return {
+      submissionCount: submissions?.count ?? 1,
+      validationCount: validations?.count ?? 1,
+      uniqueIPCount: ips?.count ?? 1,
+    };
+  } catch {
+    return { submissionCount: 1, validationCount: 1, uniqueIPCount: 1 }; // Fail-open baseline
+  }
+}
+```
+
+<Aside type="caution" title="Write-before-read">
+  The current request's validation record must be inserted into D1 **before** collecting signals. Otherwise you have a TOCTOU race where the first request from a device always sees count=0. Insert the pending record first, then query.
+</Aside>
+
+### Layer 3: JA4 TLS fingerprint analysis
+
+Uses Bot Management's JA4 fingerprint (Enterprise) to detect session hopping -- multiple distinct devices sharing the same TLS fingerprint, which indicates automated tooling.
+
+Three sub-layers with increasing scope:
+
+| Sub-layer | Scope | Window | Threshold | Catches |
+|-----------|-------|--------|-----------|---------|
+| **4a: IP Clustering** | Same JA4 + same IP/subnet | 1 hour | 2+ ephemeral IDs | Bot farm on single network |
+| **4b: Rapid Global** | Same JA4, any IP | 5 min | 3+ ephemeral IDs | VPN-hopping automation |
+| **4c: Extended Global** | Same JA4, any IP | 1 hour | 5+ ephemeral IDs | Slow distributed attacks |
+
+```typescript
+interface ClusteringAnalysis {
+  ja4: string;
+  ephemeralCount: number;
+  submissionCount: number;
+  timeSpanMinutes: number;
+  avgBotScore: number | null;
+}
+
+function calculateCompositeRiskScore(
+  analysis: ClusteringAnalysis,
+  config: FraudDetectionConfig,
+): number {
+  let rawScore = 0;
+
+  // Signal 1: Clustering (multiple devices sharing JA4)
+  if (analysis.ephemeralCount >= 2) {
+    let clusterScore = 80;
+    // Household mitigation: halve score if bot score indicates human
+    if (analysis.avgBotScore && analysis.avgBotScore >= 50 && !isRapid) {
+      clusterScore = Math.round(clusterScore / 2);
+    }
+    rawScore += clusterScore;
+  }
+
+  // Signal 2: Velocity (submissions too close together)
+  if (analysis.timeSpanMinutes < config.ja4.velocityThreshold) {
+    rawScore += 60;
+  }
+
+  // Signal 3a: Global anomaly (high IP distribution + local clustering)
+  if (ja4Signals?.ips_quantile_1h > config.ja4.ipsQuantileThreshold) {
+    rawScore += 50;
+  }
+
+  // Signal 3b: Bot pattern (high request volume + local clustering)
+  if (ja4Signals?.reqs_quantile_1h > config.ja4.reqsQuantileThreshold) {
+    rawScore += 40;
+  }
+
+  // Max raw = 230, normalized to 0-100 by scoring module
+  return rawScore;
+}
+```
+
+<Aside type="tip" title="IPv6 subnet matching">
+  For IP clustering, compare IPv6 addresses at the /64 prefix level (first 4 groups). Privacy extensions (RFC 8981) rotate the interface identifier but keep the prefix stable, so /64 matching links requests from the same network without relying on a stable full address.
+</Aside>
+
+---
+
+## Risk scoring
+
+All signals feed into a 10-component weighted score. The architecture ensures every decision is auditable -- the full breakdown is stored alongside each submission.
+
+### Score components and weights
+
+| Component | Weight | Source | What it measures |
+|-----------|--------|--------|-----------------|
+| Token Replay | 0.28 | Turnstile | Reused CAPTCHA token (binary: 0 or 100) |
+| Email Fraud | 0.14 | ML Worker RPC | ML-classified email fraud probability |
+| Ephemeral ID | 0.15 | D1 query | Submission volume from same device |
+| Validation Frequency | 0.10 | D1 query | CAPTCHA solve rate from same device |
+| IP Diversity | 0.07 | D1 query | IP rotation from same device |
+| JA4 Session Hopping | 0.06 | D1 query + Bot Mgmt | TLS fingerprint clustering |
+| IP Rate Limit | 0.07 | D1 query | Browser-switching OR email diversity from same IP |
+| Header Fingerprint | 0.07 | Request headers | Header pattern reuse across ephemeral IDs |
+| TLS Anomaly | 0.04 | D1 + Bot Mgmt | Fingerprint baseline deviation |
+| Latency Mismatch | 0.02 | Request timing | Geo vs network latency inconsistency |
+
+Weights must sum to 1.0. The system auto-normalizes after config overrides.
+
+The IP Rate Limit component is a composite of two sub-signals -- submission frequency per IP and email diversity per IP -- combined via `Math.max()`. The email diversity signal detects form spam with unique emails from the same address:
+
+```typescript
+async function collectEmailDiversitySignal(
+  remoteIp: string,
+  db: D1Database,
+  config: FraudDetectionConfig,
+): Promise<{ distinctEmails: number; riskScore: number }> {
+  const result = await db
+    .prepare(
+      `SELECT COUNT(DISTINCT email) as count FROM submissions
+       WHERE remote_ip = ? AND created_at > datetime('now', '-1 hour')`,
+    )
+    .bind(remoteIp)
+    .first<{ count: number }>();
+
+  const distinctEmails = (result?.count ?? 0) + 1; // +1 for current submission
+
+  let riskScore: number;
+  if (distinctEmails <= 1) riskScore = 0;
+  else if (distinctEmails === 2) riskScore = 20;  // Could be household
+  else if (distinctEmails === 3) riskScore = 60;  // Suspicious
+  else riskScore = 100;                           // Definite form spam
+
+  return { distinctEmails, riskScore };
+}
+```
+
+<Aside type="note" title="IP rate limit is never a standalone block trigger">
+  The IP Rate Limit component contributes to the weighted risk score but never independently triggers a block. This prevents false positives from shared IPs (offices, universities, NAT). Blocks only occur when the combined risk from all signals exceeds the threshold.
+</Aside>
+
+### Scoring pipeline
+
+```d2
+direction: right
+
+Raw -> Redist: base
+Redist -> Corr: normalized
+Corr -> Det: adjusted
+Det -> Final: ""
+Final -> Decide: ""
+Decide -> Allow: below
+Decide -> Block: above
+
+Raw: 10 Components
+Redist: Redistribute {shape: diamond}
+Corr: Corroboration {shape: diamond}
+Det: Deterministic {shape: diamond}
+Final: Final 0-100 {shape: hexagon}
+Decide: Threshold? {shape: diamond}
+Allow: Allow
+Block: Block
+```
+
+### Weight redistribution
+
+When signals are inactive (at baseline), their weight is redistributed proportionally to active signals. This prevents the score from being suppressed when some detection layers aren't available (e.g., no Enterprise features, ML Worker down).
+
+```typescript
+// Identify inactive signals (at baseline values)
+const inactiveWeight = components
+  .filter((c) => c.score === 0 || c.score === baselineForComponent(c))
+  .reduce((sum, c) => sum + c.weight, 0);
+
+// Redistribute to active signals
+const normalizationFactor = 1.0 / (1.0 - inactiveWeight);
+
+for (const component of activeComponents) {
+  component.contribution = component.score * component.weight * normalizationFactor;
+}
+```
+
+### Corroboration bonus
+
+When 3+ independent signals score above a threshold (default: 30), a bonus (default: +15 points) is added. This rewards convergent evidence from different detection methods.
+
+### Deterministic block floors
+
+Certain triggers immediately floor the score at the block threshold, regardless of the weighted calculation. Each has qualification requirements to prevent false positives:
+
+| Trigger | Qualification |
+|---------|--------------|
+| `token_replay` | Always qualifies (fail-secure) |
+| `turnstile_failed` | Always qualifies (fail-secure) |
+| `email_fraud` | Self-sufficient (ML confidence) |
+| `ephemeral_id_fraud` | Requires elevated validation frequency OR IP diversity |
+| `ja4_session_hopping` | Requires raw score at least 140 AND IP rate limit score at least 25 |
+| `validation_frequency` | Requires ephemeral ID score above threshold |
+
+### Dual scoring modes
+
+| Mode | Behavior | Use case |
+|------|----------|----------|
+| `defensive` | Deterministic triggers can override weighted score | Production default |
+| `additive` | Purely weighted, no overrides | A/B testing, tuning |
+
+### Decision audit trail
+
+Every score adjustment is recorded:
+
+```typescript
+interface ScoringDecision {
+  baseScore: number;       // Raw weighted sum
+  normalizedScore: number; // After weight redistribution
+  adjustedScore: number;   // After corroboration bonus
+  finalScore: number;      // After deterministic floors
+  weightRedistribution?: {
+    inactiveWeight: number;
+    normalizationFactor: number;
+  };
+  corroborationBonus?: {
+    applied: boolean;
+    bonus: number;
+    corroboratingSignals: string[];
+  };
+  deterministicBlock?: {
+    trigger: string;
+    qualified: boolean;
+  };
+}
+```
+
+### Block trigger priority
+
+When the final score exceeds the block threshold, a `blockTrigger` is assigned based on which signal was the primary cause. The evaluation order matters -- it determines the detection type recorded for forensic analysis and the user-facing error message.
+
+| Priority | Condition | blockTrigger | detectionType |
+|----------|-----------|-------------|---------------|
+| 1 | ML email decision = block | `email_fraud` | `email_fraud_detection` |
+| 2 | Ephemeral submission count exceeds threshold | `ephemeral_id_fraud` | `ephemeral_id_tracking` |
+| 3 | Validation count exceeds frequency threshold | `validation_frequency` | `ephemeral_id_tracking` |
+| 4 | Validation burst (5+ validations, fewer than 2 submissions) | `validation_frequency` | `ephemeral_id_tracking` |
+| 5 | Unique IP count exceeds IP diversity threshold | `ip_diversity` | `ephemeral_id_tracking` |
+| 6 | JA4 clustering detected | `ja4_session_hopping` | `ja4_fingerprinting` |
+| 7 | Fingerprint anomaly triggered | per-signal | `fingerprint_anomaly` |
+
+IP rate limit is intentionally excluded as a block trigger (see note above).
+
+### Duplicate email handling
+
+Duplicate email submissions use a tiered approach that distinguishes user error from automated probing:
+
+| Attempt | Response | Blacklist | Rationale |
+|---------|----------|-----------|-----------|
+| 1st-2nd | `409 Conflict` with friendly message | Low-confidence tracking entry (24h) | Likely user re-submission |
+| 3rd+ | `429 Too Many Requests` with wait time | High-confidence entry with progressive timeout | Automated probing pattern |
+
+The escalation happens because the blacklist tracks duplicate attempts per email+IP combination. On the 3rd attempt, the system calculates a progressive timeout and adds a high-confidence blacklist entry that triggers the Layer 0 fast path for subsequent requests.
+
+---
+
+## Input validation and sanitization
+
+All form inputs pass through Zod schema validation and HTML sanitization before entering the fraud detection pipeline.
+
+**Schema validation** (Zod):
+- Names: 1-50 chars, Unicode-aware pattern (`\p{L}\s'-`)
+- Email: max 100 chars, standard format
+- Phone: optional, normalized to E.164 format (strip non-digits, add `+1` prefix), validated against `^\+[1-9]\d{1,14}$`
+- Address: optional, country required if any address field present
+- Date of birth: optional, `YYYY-MM-DD`, must be 18-120 years old
+
+**HTML sanitization** applied to all text inputs:
+
+```typescript
+function sanitizeString(input: string): string {
+  return input
+    .replace(/<[^>]*>?/g, "")        // Strip HTML tags
+    .replace(/&#?\w+;/g, "")         // Strip HTML entities
+    .replace(/javascript\s*:/gi, "")  // Strip javascript: URIs
+    .replace(/data\s*:/gi, "")        // Strip data: URIs
+    .replace(/on\w+\s*=/gi, "")       // Strip inline event handlers
+    .trim();
+}
+```
+
+<Aside type="tip" title="Sanitize before fraud detection">
+  Run sanitization before the fraud pipeline so detection signals operate on clean input. The Turnstile token is explicitly excluded from sanitization.
+</Aside>
+
+---
+
+## ML email classification
+
+The ML Worker extracts a 45-dimension feature vector from an email address and scores it with a Random Forest classifier. It serves as both a standalone HTTP API and an RPC service.
+
+### Feature vector
+
+Features span seven categories:
+
+| Category | Examples | Count |
+|----------|---------|-------|
+| **Identity** | Local part length, digit ratio, word boundaries, segment count | ~8 |
+| **Linguistic** | Pronounceability, vowel ratio, consonant clusters, bigram entropy | ~7 |
+| **Statistical** | Shannon entropy, character distribution, Benford's Law conformance | ~6 |
+| **N-gram** | Character bigram/trigram naturalness across language models | ~8 |
+| **Structural** | Plus-addressing, sequential patterns, date patterns, pattern family | ~6 |
+| **Domain/MX** | Disposable domain flag, TLD risk, MX provider category | ~5 |
+| **Geo/Network** | Language mismatch, timezone mismatch, name-email similarity | ~5 |
+
+### ML middleware pipeline
+
+```d2
+direction: right
+
+Req -> HasEmail: ""
+HasEmail -> Load: yes
+HasEmail -> Skip: no
+Load -> Feat -> RF -> Cal: ""
+Cal -> OOD -> Heur -> Decide: ""
+Decide -> D1: async
+Decide -> Next: ""
+
+Req: POST /validate
+HasEmail: email? {shape: diamond}
+Skip: pass through
+Load: Load from KV
+Feat: 45 Features
+RF: Random Forest {shape: hexagon}
+Cal: Platt Cal
+OOD: OOD? {shape: diamond}
+Heur: Heuristics
+Decide: Decision {shape: diamond}
+D1: D1 {shape: cylinder}
+Next: Route Handler
+```
+
+### Detectors
+
+The 45 features are produced by specialized detector modules. Each operates independently and returns structured results.
+
+#### Sequential pattern detection
+
+Identifies `user123`, `test001`, `account42` style emails. Two patterns: trailing numbers (`/^(.+?)(\d+)$/`) and middle numbers with separators (`/^(.+?)[._-](\d+)[._-](.+)$/`).
+
+Confidence factors: sequence length (+0.25 to +0.7), leading zeros (+0.3), digit ratio (+0.1 to +0.2), common bot bases (+0.25). Threshold: `confidence >= 0.4` marks as sequential.
+
+**Exemptions** (reduce false positives):
+- **Birth years** (1940-present, ages 13-100): `john1990@` is not sequential
+- **Small memorable numbers** (3 or fewer digits, base 4+ chars, no leading zeros, no common base): `mike42@` is not sequential
+
+Common bot bases: `test`, `user`, `account`, `email`, `temp`, `demo`, `admin`, `guest`, `trial`, `sample`, `hello`, `service`, `team`, `info`, `support`, `member`.
+
+#### Dated pattern detection
+
+Identifies date components in email local parts. Five format patterns checked in priority order (most specific first): full date (`20241031`), month+year (`oct2024`), four-digit year (`2024`), leading year (`2024.username`), two-digit year (`24`).
+
+Age-aware classification is the key insight -- birth years get low risk, recent years get high risk:
+
+| Category | Year Age | Risk | Example |
+|----------|----------|------|---------|
+| `future` | negative (year > current) | 0.95 | `user2027@` |
+| `recent_timestamp` | 0-2 | 0.90 | `user2025@` |
+| `underage` | 3-12 | 0.70 | `user2015@` |
+| `plausible_birth_year` | 13-65 | 0.20 | `john1990@` |
+| `elderly_birth_year` | 66-100 | 0.40 | `user1940@` |
+| `ancient` | >100 | 0.80 | `user1900@` |
+
+#### Linguistic feature extraction
+
+Three feature groups measuring how "natural" an email local part looks:
+
+- **Linguistic**: Pronounceability (composite: vowel ratio, consonant cluster penalties, impossible cluster detection), vowel/consonant ratios, max cluster lengths, syllable estimate. Context-dependent `y`/`w` classification (e.g., `y` is a vowel when not adjacent to vowels).
+- **Structure**: Word boundary detection (`.`, `_`, `-`), segment count and length statistics, segments-without-vowels ratio.
+- **Statistical**: Shannon entropy, bigram entropy (character pair transition randomness -- higher = more suspicious), digit ratio, unique character ratio.
+
+18 allowed consonant clusters (e.g., `sch`, `str`, `thr`, `ght`, `tch`, `nch`). Clusters of 3+ consonants not containing an allowed pattern are counted as "impossible."
+
+#### N-gram naturalness
+
+Bigram and trigram frequency analysis across 7 language models (English, Spanish, French, German, Italian, Portuguese, Romanized). Scores how likely a character sequence is to appear in natural text for each language, taking the best match. Higher naturalness = lower fraud risk.
+
+#### Benford's Law analysis
+
+Checks whether the first-digit distribution of numbers in an email batch follows Benford's Law (`P(d) = log10(1 + 1/d)`). Natural registrations follow this distribution; sequential/automated generation produces uniform distribution.
+
+Method: chi-square goodness-of-fit test (df=8) with critical value at 0.05 significance (15.507). Requires minimum 30 digit samples for statistical validity. Used primarily in batch analysis rather than individual scoring.
+
+#### MX resolution
+
+Resolves the email domain's MX records to classify the provider and detect suspicious hosting:
+
+- **Resolution**: Cloudflare DNS-over-HTTPS (`cloudflare-dns.com/dns-query`) with 500ms timeout via `AbortController`
+- **Caching**: In-memory with 15-minute TTL. Concurrent requests for the same domain are deduplicated via an inflight map.
+- **Provider classification**: Google, Microsoft, iCloud, Yahoo, Zoho, Proton, self-hosted (MX points to own domain), other. Provider is determined by the MX exchange hostname patterns.
+- **Features produced**: `mx_has_records`, `mx_record_count`, and one-hot encoded `mx_provider_*` flags (7 providers)
+
+<Aside type="note" title="Well-known provider fast path">
+  Common domains (gmail.com, outlook.com, yahoo.com, etc.) skip DNS entirely and return cached provider classifications. This avoids the DoH call for the vast majority of legitimate email addresses.
+</Aside>
+
+### Production model configuration
+
+The ML Worker's behavior is controlled by a config loaded from KV:
+
+```json
+{
+  "riskThresholds": { "block": 0.65, "warn": 0.35 },
+  "actionOverride": null,
+  "adjustments": {
+    "professionalEmailFactor": 0.5,
+    "professionalDomainFactor": 0.5,
+    "professionalAbnormalityFactor": 0.6
+  },
+  "ood": { "maxRisk": 0.85, "warnZoneMin": 0.6 }
+}
+```
+
+- **`actionOverride`**: Set to `"allow"` for monitoring mode -- runs all detection and logs decisions but never blocks. Critical for safe rollout of new models or config changes.
+- **`adjustments`**: Professional email patterns (name-based addresses at reputable domains) get their risk score multiplied by these factors, reducing false positives on legitimate business emails.
+- **`ood` (out-of-distribution)**: When the model encounters feature vectors outside its training distribution, risk is capped at `maxRisk` (0.85) and flagged if above `warnZoneMin` (0.6). Prevents overconfident predictions on novel patterns.
+
+### Risk heuristics override
+
+A post-model safety net that can override ML decisions based on simple threshold rules. Loaded from KV (`risk-heuristics.json`) with 60-second cache TTL, falling back to hardcoded defaults.
+
+| Heuristic | Block Threshold | Warn Threshold | Score Offset |
+|-----------|----------------|----------------|-------------|
+| TLD risk | 0.9+ | 0.8+ | +0.10 |
+| Domain reputation | 0.95+ | 0.85+ | +0.08 |
+| Sequential confidence | 0.98+ | 0.9+ | +0.05 |
+| Digit ratio | 0.9+ | 0.8+ | +0.05 |
+| Plus-addressing abuse | 0.8+ | -- | +0.03 |
+
+Each rule has a `threshold`, `decision` (`warn` or `block`), `direction` (`gte` or `lte`), and `minScoreOffset`. Rules are applied after model scoring -- they can elevate a score but never reduce it. The KV-based config means you can add or adjust heuristics without redeploying.
+
+```typescript
+interface HeuristicRule {
+  threshold: number;
+  decision: "warn" | "block";
+  reason: string;
+  direction?: "gte" | "lte";  // Default: gte
+  minScoreOffset?: number;
+}
+```
+
+### Random Forest inference at the edge
+
+The model (50 trees, trained offline with scikit-learn) is serialized as JSON and stored in KV. The Worker evaluates it using iterative tree traversal (not recursive, to avoid stack limits on the edge runtime).
+
+```typescript
+type CompactTreeNode =
+  | { t: "l"; v: number } // Leaf: fraud probability
+  | { t: "n"; f: string; v: number; l: CompactTreeNode; r: CompactTreeNode }; // Split node
+
+function predictForestScore(
+  model: ForestModel,
+  features: Record<string, number>,
+): number {
+  const maxDepth = Math.min(model.meta.config?.max_depth ?? 20, 50);
+  let total = 0;
+
+  for (const tree of model.forest) {
+    let node = tree;
+    let depth = 0;
+
+    // Iterative traversal (no recursion)
+    while (node.t === "n" && depth < maxDepth) {
+      const featureValue = features[node.f] ?? 0;
+      node = featureValue <= node.v ? node.l : node.r; // scikit-learn convention
+      depth++;
+    }
+
+    total += node.t === "l" ? node.v : 0.5; // Fallback if depth exceeded
+  }
+
+  return total / model.forest.length; // Average probability across trees
+}
+```
+
+<Aside type="tip" title="Hot-swappable models">
+  Storing the model in KV means you can deploy a new model without redeploying the Worker. The config loader caches the model with a TTL (default 60 seconds per KV's caching behavior). Upload a new model JSON to KV and it propagates globally within the eventual consistency window.
+</Aside>
+
+### Platt calibration
+
+Raw forest outputs are calibrated using Platt scaling (sigmoid fit on out-of-bag predictions from training). This converts raw vote averages into well-calibrated probabilities:
+
+```
+calibrated = 1 / (1 + exp(-(intercept + coef * raw_score)))
+```
+
+Calibration parameters (`intercept`, `coef`) are stored in the model's metadata and applied automatically during inference. The production model's calibration was fitted on 330,139 OOB samples.
+
+### Model fallback
+
+The middleware uses Random Forest as primary and Decision Tree as fallback. If both models are unavailable (KV failure), the system applies a degraded "warn floor" score and fires an ops alert. This ensures the detection pipeline never silently passes traffic unscored.
+
+### Global fraud detection middleware
+
+Instead of wiring fraud detection per-route, a Hono middleware runs on every POST request that contains an `email` field:
+
+```typescript
+async function fraudDetectionMiddleware(c: Context, next: Next) {
+  if (c.req.method !== "POST" || c.get("skipFraudDetection")) {
+    return next();
+  }
+
+  const body = await c.req.raw.clone().json().catch(() => null);
+  const email = body?.email;
+  if (!email) return next();
+
+  // Load model from KV, extract features, score, decide
+  const features = buildFeatureVector(email, c.req);
+  const score = predictForestScore(model, features);
+  const calibrated = applyPlattCalibration(score, model.meta.calibration);
+  const decision = calibrated >= threshold ? "block" : calibrated >= warnThreshold ? "warn" : "allow";
+
+  c.set("fraudDetection", { score: calibrated, decision, signals });
+  return next();
+}
+
+// Register globally
+app.use("/*", fraudDetectionMiddleware);
+```
+
+Routes that need to opt out (e.g., dashboard auth) set a context flag:
+
+```typescript
+app.post("/dashboard/auth", (c) => {
+  c.set("skipFraudDetection", true);
+  // ... handle auth
+});
+```
+
+---
+
+## Service binding RPC pattern
+
+The two Workers communicate via Cloudflare's [service bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/), which use [Workers RPC](https://developers.cloudflare.com/workers/runtime-apis/rpc/) built on Cap'n Proto. Per the docs, there is zero overhead -- both Workers execute on the same thread of the same server.
+
+### ML Worker: Exposing the RPC entrypoint
+
+```typescript
+import { WorkerEntrypoint } from "cloudflare:workers";
+
+class FraudDetectionService extends WorkerEntrypoint<Env> {
+  // RPC method callable by other Workers
+  async validate(request: {
+    email: string;
+    consumer?: string;
+    flow?: string;
+    headers?: Record<string, string | null>;
+  }): Promise<ValidationResult> {
+    // Reconstruct an HTTP request from RPC args
+    // This reuses the same Hono handler for both HTTP and RPC
+    const httpRequest = new Request("http://internal/validate", {
+      method: "POST",
+      headers: this.buildHeaders(request.headers),
+      body: JSON.stringify({
+        email: request.email,
+        consumer: request.consumer,
+      }),
+    });
+
+    const response = await app.fetch(httpRequest, this.env, this.ctx);
+    return response.json() as Promise<ValidationResult>;
+  }
+
+  // Standard HTTP handler (for direct API access)
+  async fetch(request: Request): Promise<Response> {
+    return app.fetch(request, this.env, this.ctx);
+  }
+}
+
+export { FraudDetectionService };
+```
+
+<Aside type="note" title="Single code path">
+  The RPC entrypoint constructs a synthetic HTTP `Request` and feeds it through the same Hono app. This means HTTP API users and RPC callers execute identical validation logic -- no divergent code paths to maintain.
+</Aside>
+
+### Form Worker: Calling via service binding
+
+Wrangler config:
+
+```jsonc
+{
+  "services": [
+    {
+      "binding": "FRAUD_DETECTOR",
+      "service": "markov-mail",
+      "entrypoint": "FraudDetectionService"
+    }
+  ]
+}
+```
+
+Calling the service:
+
+```typescript
+// env.FRAUD_DETECTOR is typed as the RPC interface
+const result = await env.FRAUD_DETECTOR.validate({
+  email: submittedEmail,
+  consumer: "form-worker",
+  flow: "submission",
+  headers: extractCfHeaders(request),
+});
+```
+
+RPC requires `compatibility_date` of `2024-04-03` or later.
+
+---
+
+## Progressive timeout and blacklisting
+
+When a submission is blocked, the offending identifiers are blacklisted with escalating TTLs:
+
+| Offense | Timeout | Cumulative |
+|---------|---------|------------|
+| 1st | 1 hour | 1h |
+| 2nd | 4 hours | 5h |
+| 3rd | 8 hours | 13h |
+| 4th | 12 hours | 25h |
+| 5th+ | 24 hours | 49h+ |
+
+```typescript
+function calculateProgressiveTimeout(
+  offenseCount: number,
+  config: FraudDetectionConfig,
+): number {
+  const schedule = config.timeouts.schedule; // [3600, 14400, 28800, 43200, 86400]
+  const index = Math.min(offenseCount, schedule.length - 1);
+  return schedule[index];
+}
+```
+
+Blacklist entries store multiple identifiers (email, ephemeral ID, JA4, IP) and are checked on the fast path before any Turnstile API call. Each subsequent hit updates `last_seen_at` and increments `offense_count`.
+
+### Blacklist lifecycle
+
+```d2
+direction: right
+
+Block -> Write -> Active: ""
+Active -> L0: next hit
+L0 -> Update: high/med
+L0 -> Active: low {style.stroke-dash: 3}
+Update -> Active: ""
+Active -> Expire: TTL
+Expire -> Free: ""
+
+Block: Blocked
+Write: Write Entry
+Active: Active? {shape: diamond}
+L0: Layer 0 {shape: diamond}
+Update: Escalate
+Expire: Expired
+Free: Cleared
+```
+
+---
+
+## Configuration
+
+All thresholds, weights, and detection parameters live in a centralized config with environment overrides. The override is deep-merged with defaults at every nesting level.
+
+```typescript
+const DEFAULT_CONFIG = {
+  risk: {
+    mode: "defensive" as "defensive" | "additive",
+    blockThreshold: 70,
+    levels: {
+      low: { min: 0, max: 39 },
+      medium: { min: 40, max: 69 },
+      high: { min: 70, max: 100 },
+    },
+    weights: {
+      tokenReplay: 0.28,
+      emailFraud: 0.14,
+      ephemeralId: 0.15,
+      validationFrequency: 0.1,
+      ipDiversity: 0.07,
+      ja4SessionHopping: 0.06,
+      ipRateLimit: 0.07,
+      headerFingerprint: 0.07,
+      tlsAnomaly: 0.04,
+      latencyMismatch: 0.02,
+    },
+  },
+  detection: {
+    ephemeralIdSubmissionThreshold: 2,
+    validationFrequencyBlockThreshold: 3,
+    ipRateLimitThreshold: 3,
+  },
+  timeouts: {
+    schedule: [3600, 14400, 28800, 43200, 86400],
+    maximum: 86400,
+  },
+};
+```
+
+Override via `FRAUD_CONFIG` environment variable (partial objects merge with defaults):
+
+```jsonc
+// wrangler.jsonc
+{
+  "vars": {
+    "FRAUD_CONFIG": {
+      "risk": {
+        "blockThreshold": 60,
+        "weights": { "emailFraud": 0.20 }
+      }
+    }
+  }
+}
+```
+
+After merging, weights are auto-normalized to sum to 1.0 if the override creates an imbalance.
+
+---
+
+## Wrangler bindings reference
+
+Minimal binding configuration for the two-Worker system:
+
+```jsonc
+// Form Worker (forminator) wrangler.jsonc
+{
+  "name": "form-worker",
+  "compatibility_date": "2024-10-11",
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "form-submissions"
+    }
+  ],
+
+  "services": [
+    {
+      "binding": "FRAUD_DETECTOR",
+      "service": "ml-email-worker",
+      "entrypoint": "FraudDetectionService"
+    }
+  ],
+
+  "kv_namespaces": [
+    { "binding": "FORM_CONFIG" }
+  ],
+
+  "assets": {
+    "binding": "ASSETS",
+    "directory": "./frontend/dist"
+  }
+}
+```
+
+```jsonc
+// ML Worker (markov-mail) wrangler.jsonc
+{
+  "name": "ml-email-worker",
+  "compatibility_date": "2024-10-11",
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "email-validations"
+    }
+  ],
+
+  "kv_namespaces": [
+    { "binding": "CONFIG" },
+    { "binding": "DISPOSABLE_DOMAINS_LIST" },
+    { "binding": "TLD_LIST" }
+  ],
+
+  "triggers": {
+    "crons": ["0 */6 * * *"]
+  }
+}
+```
+
+<Aside type="caution" title="Secrets vs vars">
+  API keys and CAPTCHA secrets go in `wrangler secret put`, not in the config file. The `FRAUD_CONFIG` var is safe in wrangler.jsonc since it only contains thresholds and weights.
+</Aside>
+
+---
+
+## Database schema
+
+### Form Worker (5 tables)
+
+| Table | Purpose | Key columns |
+|-------|---------|-------------|
+| `submissions` | Form data + 42 metadata fields | email, ephemeral_id, risk_score_breakdown, ja4, bot_score |
+| `turnstile_validations` | Every validation attempt | token_hash (UNIQUE), detection_type, risk_score_breakdown |
+| `fraud_blacklist` | Progressive mitigation cache | identifier_type, identifier_value, expires_at, offense_count |
+| `fraud_blocks` | Pre-Turnstile forensic log | detection_type, fraud_signals_json |
+| `fingerprint_baselines` | TLS fingerprint anomaly baselines | ja4_bucket, asn_bucket, hit_count |
+
+### ML Worker (4 tables)
+
+| Table | Purpose |
+|-------|---------|
+| `validations` | Every email validation with all signals and features |
+| `training_metrics` | Model training history and accuracy |
+| `ab_test_metrics` | Experiment tracking for model variants |
+| `admin_metrics` | Configuration change audit log |
+
+<Aside type="note" title="D1 constraints">
+  D1 databases are single-threaded and backed by a single Durable Object with a 10 GB maximum. Fraud detection is pattern-based and tolerates D1's eventual consistency for signal collection. The write-before-read pattern ensures the current request's data is always visible to its own signal queries.
+</Aside>
+
+---
+
+## Scheduled tasks
+
+The ML Worker uses a cron trigger (every 6 hours) to update its disposable domain list from external sources:
+
+```typescript
+export default {
+  async scheduled(
+    controller: ScheduledController,
+    env: Env,
+    ctx: ExecutionContext,
+  ) {
+    ctx.waitUntil(updateDisposableDomains(env));
+  },
+
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    return app.fetch(request, env, ctx);
+  },
+};
+```
+
+The `ScheduledController` provides `controller.cron` (the matching expression) and `controller.scheduledTime`. Use `ctx.waitUntil()` for background work that should complete after the handler returns.
+
+---
+
+## Model training pipeline
+
+The Random Forest is trained offline using a Python/CLI toolchain, then deployed to KV for edge inference. The pipeline runs outside the Worker runtime.
+
+### Training data
+
+| Source | Rows | Label |
+|--------|------|-------|
+| Enron email corpus (cleaned) | 172,806 | legit |
+| Synthetic (legit filler) | 327,194 | legit |
+| Synthetic (fraud) | 500,000 | fraud |
+| **Total** | **1,000,000** | **50/50 balanced** |
+
+Synthetic data is generated with deterministic seeds for reproducibility. Fraud patterns include sequential, dated, high-entropy, disposable domain, and plus-addressing variants. The Enron corpus provides real-world legitimate email diversity.
+
+<Aside type="caution" title="No PII in training data">
+  The canonical dataset (`main.csv`) contains only synthetic addresses. The Enron corpus provides email-address-level data only (no message content). Feature exports strip the email column by default.
+</Aside>
+
+### CLI toolchain
+
+```
+cli/commands/
+  model/       train_forest.py, calibrate.ts, pipeline.ts, guardrail.ts
+  features/    export.ts (feature vector CSV generation)
+  data/        synthetic.ts, clean_enron.ts, domains.ts
+  deploy/      deploy.ts, status.ts
+  ab/          create.ts, analyze.ts, status.ts, stop.ts
+  test/        api.ts, batch.ts, cron.ts, detectors.ts
+```
+
+### Training workflow
+
+```d2
+direction: down
+
+Enron -> CSV: ""
+SynthL -> CSV: ""
+SynthF -> CSV: ""
+CSV -> Export -> Feats -> Train: ""
+Train -> Cal -> Guard: ""
+Guard -> KV: pass
+Guard -> Train: fail {style.stroke-dash: 3}
+KV -> Worker: ""
+
+Enron: Enron 172K {shape: page}
+SynthL: Synth 327K {shape: page}
+SynthF: Synth 500K {shape: page}
+CSV: main.csv 1M {shape: page}
+Export: features:export
+Feats: features.csv {shape: page}
+Train: RF 50 trees {shape: hexagon}
+Cal: Platt Cal
+Guard: Guardrails {shape: diamond}
+KV: Upload KV {shape: cylinder}
+Worker: Worker ~60s {shape: oval}
+```
+
+**Step 1: Feature export** -- Extract 45-feature vectors from the canonical dataset:
+
+```bash
+npm run cli features:export -- --input data/main.csv --output tmp/features.csv
+```
+
+**Step 2: Train** -- scikit-learn `RandomForestClassifier` with conflict-zone weighting:
+
+```bash
+python cli/commands/model/train_forest.py \
+  --input tmp/features.csv \
+  --output config/production/random-forest.json \
+  --n-trees 50 --max-depth 6 --min-samples-leaf 20 \
+  --conflict-weight 20.0 --no-split
+```
+
+Key training parameters:
+- **Conflict-zone weighting**: Samples with `bigram_entropy > 3.0` AND `domain_reputation_score >= 0.6` get 20x weight. These are the overlap-region cases where legitimate and fraudulent emails look similar -- forcing the forest to learn deeper patterns in this zone.
+- **`--no-split`**: Trains on 100% of data for production (uses OOB predictions for calibration instead of a held-out set).
+- **Platt calibration**: Fits `LogisticRegression` on OOB predictions to produce well-calibrated probabilities. Outputs `intercept` and `coef` stored in model metadata.
+
+**Step 3: Guardrails** -- Validate model before deployment (accuracy, size under KV 25MB limit, feature alignment).
+
+**Step 4: Deploy** -- Upload model JSON to KV. The Worker picks it up within 60 seconds (KV eventual consistency).
+
+### Production model artifact
+
+The serialized model contains metadata for runtime validation:
+
+```json
+{
+  "meta": {
+    "version": "3.1.0-forest",
+    "features": ["avg_segment_length", "bigram_entropy", "digit_ratio", "..."],
+    "tree_count": 50,
+    "feature_importance": {
+      "domain_reputation_score": 0.203,
+      "provider_is_disposable": 0.185,
+      "digit_ratio": 0.068,
+      "provider_is_free": 0.059,
+      "name_similarity_score": 0.048
+    },
+    "calibration": {
+      "method": "platt",
+      "intercept": -6.2006,
+      "coef": 13.2447,
+      "samples": 330139
+    },
+    "config": {
+      "n_trees": 50,
+      "max_depth": 6,
+      "min_samples_leaf": 20,
+      "conflict_weight": 20.0
+    }
+  },
+  "forest": ["...50 serialized decision trees..."]
+}
+```
+
+Top 5 features by importance: domain reputation (0.203), disposable domain flag (0.185), digit ratio (0.068), free provider flag (0.059), name-email similarity (0.048). Geo features (language/timezone mismatch) have zero importance in the current model -- they contribute to heuristic overrides instead.
+
+---
+
+## A/B testing framework
+
+The ML Worker includes a fully implemented A/B testing framework for comparing model variants. Experiments are configured in KV and use consistent hash-based traffic splitting.
+
+### Experiment configuration
+
+```typescript
+interface ABTestConfig {
+  experimentId: string;
+  description: string;
+  variants: {
+    control: { weight: number; config?: Partial<FraudDetectionConfig> };
+    treatment: { weight: number; config?: Partial<FraudDetectionConfig> };
+  };
+  startDate: string; // ISO 8601
+  endDate: string;
+  enabled: boolean;
+  metadata?: {
+    hypothesis: string;
+    expectedImpact: string;
+    successMetrics: string[];
+  };
+}
+```
+
+### Traffic assignment
+
+Variant assignment uses the first 8 hex characters of the request fingerprint hash, converted to a bucket (0-99). Buckets below the treatment weight go to treatment, the rest to control. This ensures the same device consistently sees the same variant.
+
+```typescript
+function getVariant(fingerprintHash: string, config: ABTestConfig): "control" | "treatment" {
+  const bucket = parseInt(fingerprintHash.substring(0, 8), 16) % 100;
+  return bucket < config.variants.treatment.weight ? "treatment" : "control";
+}
+```
+
+Variant-specific config overrides are deep-merged with the base config, so experiments can change thresholds, weights, or feature flags independently. Weights must sum to 100.
+
+### CLI management
+
+```bash
+npm run cli ab:create   # Create and upload experiment config to KV
+npm run cli ab:status   # Check active experiment status
+npm run cli ab:analyze  # Compare variant performance from D1 metrics
+npm run cli ab:stop     # End experiment and remove from KV
+```
+
+---
+
+## Analytics dashboard
+
+The ML Worker includes an Astro + React analytics dashboard for monitoring fraud detection in production:
+
+- **Metrics grid**: Key KPIs (total validations, block rate, warn rate, avg score)
+- **Time-series charts**: Score distributions and decision trends over time
+- **Block reasons breakdown**: Which heuristics and model signals trigger blocks
+- **Validation table**: Drill into individual validation results with full signal details
+- **Model comparison**: Side-by-side A/B test variant performance
+- **Query builder**: Ad-hoc SQL queries against the D1 metrics tables
+- **System status**: Health indicators for model availability, KV connectivity, cron job status
+
+Authentication uses HMAC-signed session cookies with 24-hour TTL and timing-safe comparison.
+
+---
+
+## Design principles
+
+| Principle | Implementation |
+|-----------|---------------|
+| **Fail-open by default** | Signal collection, ML scoring, blacklist writes -- all return safe baselines on error |
+| **Fail-secure for definitives** | Token replay and Turnstile validation block on error (assume reused/invalid) |
+| **Weight redistribution** | Inactive signals don't suppress the score -- their weight shifts to active ones |
+| **Transparent decisions** | Every score stores a full `ScoringDecision` audit trail with each adjustment step |
+| **Per-request tracing** | A unique request ID generated at entry threads through all DB writes for forensic correlation |
+| **Config-driven thresholds** | All magic numbers live in a mergeable config with auto-normalization for weights |
+| **Progressive mitigation** | Escalating timeouts instead of permanent bans -- reduces false positive impact |
+| **Single code path** | RPC entrypoint constructs a synthetic HTTP request through the same Hono handler as direct API calls |
+| **Monitoring mode** | Action override flag runs all detection and logs decisions without blocking -- safe rollout for new rules |
+
+---
+
+## Extending the system
+
+| Task | Steps |
+|------|-------|
+| **Add a detection layer** | 1. Implement signal collection function (return baseline on error) 2. Add score component + weight to config 3. Wire into Phase 2 of submission pipeline 4. Add normalization function in scoring module |
+| **Add an ML feature** | 1. Implement extractor in feature module 2. Add to feature vector builder 3. Run `features:export` to regenerate CSV 4. Retrain with `train_forest.py` 5. Run guardrails 6. Deploy model JSON to KV (no Worker redeploy) |
+| **Tune thresholds** | 1. Set `mode: 'additive'` to disable deterministic overrides 2. Analyze score distributions from stored breakdowns via dashboard 3. Adjust `FRAUD_CONFIG` in wrangler vars 4. Switch back to `mode: 'defensive'` |
+| **Run an A/B test** | 1. `ab:create` with hypothesis, traffic split, and variant config overrides 2. Monitor via dashboard model comparison view 3. `ab:analyze` to compare variant metrics 4. `ab:stop` and promote winner |
+| **Add a heuristic rule** | 1. Add rule to `risk-heuristics.json` (threshold, decision, reason, offset) 2. Upload to KV 3. Rule takes effect within 60 seconds (no redeploy) |
+| **Safe rollout** | 1. Set `actionOverride: "allow"` in production config 2. Deploy new model or config 3. Monitor decisions in dashboard (logs without blocking) 4. Remove override when confident |
