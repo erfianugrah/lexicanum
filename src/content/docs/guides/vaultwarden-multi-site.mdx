@@ -18,7 +18,8 @@ The guide is structured as a linear build-up: PostgreSQL migration on the primar
 6. **Cloudflare Load Balancer**: Active/passive with tunnel CNAME origins, HTTPS health monitor on `/alive`, cookie session affinity, failover across pools
 7. **Tunnel configuration**: Ingress rules on both tunnels, DNS CNAME removal, LB-owned DNS record
 8. **Secrets management**: SOPS-encrypted Kubernetes secrets with age key
-9. **Gotchas and lessons learned**: Volatile storage flag, WebSocket port removal in v1.31.0, tunnel UUID staleness, pgloader quirks
+9. **Hardening**: securityContext on all containers, image pinning, CronJob safety
+10. **Gotchas and lessons learned**: Volatile storage flag, WebSocket port removal in v1.31.0, tunnel UUID staleness, pgloader quirks, `bash` vs `sh` in Alpine images, restore filename mismatch
 :::
 
 ---
@@ -568,7 +569,7 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: postgres:17
+          image: postgres:17.4-alpine
           ports:
             - containerPort: 5432
               name: postgres
@@ -593,6 +594,12 @@ spec:
             requests:
               cpu: 100m
               memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 70
+            capabilities:
+              drop: ["ALL"]
           volumeMounts:
             - name: postgres-data
               mountPath: /var/lib/postgresql/data
@@ -668,7 +675,12 @@ spec:
           ports:
             - containerPort: 80
               name: http
-
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 100
+            capabilities:
+              drop: ["ALL"]
           env:
             - name: SIGNUPS_ALLOWED
               value: "false"
@@ -787,7 +799,7 @@ The IngressRoute uses the `websecure` entrypoint (port 443 with TLS via ACME DNS
 This CronJob runs every 15 minutes and is the core of the standby sync:
 
 1. **initContainer** (`amazon/aws-cli`): Downloads `vaultwarden-pg-latest.tar.gz` from R2
-2. **main container** (`postgres:17`): Extracts the tarball, runs `pg_restore --clean --if-exists` into the local PG, and copies RSA keys + attachments to the Vaultwarden data PVC
+2. **main container** (`postgres:17.4-alpine`): Extracts the tarball, runs `pg_restore --clean --if-exists` into the local PG, and copies RSA keys + attachments to the Vaultwarden data PVC
 
 ```yaml
 # services/vaultwarden/restore-cronjob.yaml
@@ -798,6 +810,7 @@ metadata:
   namespace: vaultwarden
 spec:
   schedule: "*/15 * * * *"
+  suspend: true
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
@@ -839,14 +852,18 @@ spec:
                 requests:
                   cpu: 50m
                   memory: 64Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
               volumeMounts:
                 - name: restore-tmp
                   mountPath: /restore
           containers:
             - name: restore
-              image: postgres:17
+              image: postgres:17.4-alpine
               command:
-                - bash
+                - sh
                 - -c
                 - |
                   set -e
@@ -883,6 +900,10 @@ spec:
                 requests:
                   cpu: 100m
                   memory: 128Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
               volumeMounts:
                 - name: restore-tmp
                   mountPath: /restore
@@ -899,6 +920,10 @@ spec:
 
 :::tip[pg_restore `|| true`]
 The `pg_restore ... || true` is intentional. On the first restore into a fresh database, `--clean` will emit errors like "table does not exist" for the DROP statements. These are harmless -- the subsequent CREATE + COPY statements succeed. The `|| true` prevents the job from failing on these expected warnings.
+:::
+
+:::caution[Restore CronJob is suspended by default]
+The `suspend: true` field prevents the restore from running automatically. This is a safety measure -- an accidentally running restore CronJob could overwrite data on a site that has become the primary during failover. Unsuspend it explicitly when setting up the standby, and re-suspend it if the k3s site becomes the primary.
 :::
 
 ### 3.9 Backup CronJob (k3s → R2)
@@ -928,9 +953,9 @@ spec:
             fsGroup: 100
           initContainers:
             - name: backup
-              image: postgres:17
+              image: postgres:17.4-alpine
               command:
-                - bash
+                - sh
                 - -c
                 - |
                   set -e
@@ -971,6 +996,10 @@ spec:
                 requests:
                   cpu: 50m
                   memory: 64Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
               volumeMounts:
                 - name: data
                   mountPath: /data
@@ -1015,6 +1044,10 @@ spec:
                 requests:
                   cpu: 50m
                   memory: 64Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
               volumeMounts:
                 - name: backups
                   mountPath: /backups
@@ -1378,3 +1411,33 @@ tofu state show cloudflare_zero_trust_tunnel_cloudflared.k3s | grep cname
 ### LB Monitor Needs Host Header for Tunnel Origins
 
 When the LB pool origin is a tunnel CNAME, the health check request arrives at the tunnel with no `Host` header by default. The tunnel doesn't know which ingress rule to match, so it returns 404. Adding `header { header = "Host" values = ["vault.example.com"] }` to the monitor fixes this.
+
+### `postgres:alpine` Doesn't Have `bash`
+
+The `postgres:17.4-alpine` image uses BusyBox, which provides `sh` but not `bash`. CronJob containers that used `bash -c` will fail with `exec: "bash": executable file not found`. Change all `command:` entries to use `sh -c` instead. This applies to both the backup and restore CronJobs.
+
+### Restore CronJob Should Be Suspended by Default
+
+The restore CronJob (`suspend: true`) is suspended by default to prevent accidental data overwrites. When the k3s site is being used as a standby, unsuspend it:
+
+```bash
+kubectl patch cronjob vaultwarden-restore -n vaultwarden -p '{"spec":{"suspend":false}}'
+```
+
+To trigger a one-off restore without unsuspending the schedule:
+
+```bash
+kubectl create job --from=cronjob/vaultwarden-restore manual-restore -n vaultwarden
+```
+
+### Backup Upload Filename vs Restore Download Filename
+
+The backup CronJob uploads timestamped tarballs (e.g. `vaultwarden-pg-20260227-050000.tar.gz`) but does **not** upload a `vaultwarden-pg-latest.tar.gz` copy. The restore CronJob downloads `vaultwarden-pg-latest.tar.gz`. This works because the **Servarr primary** backup sidecar uploads both timestamped and `latest` copies. However, if k3s becomes the primary during failover, the k3s backup CronJob only uploads timestamped files -- the restore on the other end would fail because there's no `latest` file.
+
+To fix this during failover, either:
+1. Manually copy the latest timestamped backup to `vaultwarden-pg-latest.tar.gz` in R2
+2. Modify the k3s backup CronJob to also upload a `latest` copy (matching the Servarr sidecar behavior)
+
+### Pin PostgreSQL to a Specific Alpine Version
+
+Use `postgres:17.4-alpine` (not `postgres:17`) in all k3s manifests. The floating `17` tag pulls the full Debian-based image which is larger and uses `bash` as the default shell. The `-alpine` variant is smaller, uses `sh`, and produces more predictable behavior on ARM64. Pinning the patch version (17.4) prevents unexpected upgrades.
