@@ -18,6 +18,8 @@ Everything here was learned the hard way through actual cluster failures. Each s
 6. **Disk maintenance**: Journal size limits, containerd log rotation, NFS storage for Loki TSDB
 7. **BMC serial console recovery**: Using `tpi` CLI to recover a node that won't boot
 8. **Power management**: Using `tpi` for power cycling individual slots or the whole board
+9. **Control plane taint and workload redistribution**: Preventing workload pileup on the server node
+10. **Bitnami to official image migration**: Migrating PostgreSQL and Redis from deleted Bitnami images to official images
 :::
 
 ---
@@ -87,10 +89,10 @@ k3s_cluster:
     ansible_user: your_user
     ansible_python_interpreter: /usr/bin/python3
     k3s_version: v1.34.3+k3s3
-    extra_server_args: --disable traefik --disable servicelb
+    extra_server_args: --disable traefik --disable servicelb --node-taint node-role.kubernetes.io/control-plane=:PreferNoSchedule
 ```
 
-The server has `--disable traefik --disable servicelb` because both are replaced with custom deployments (see the Traefik and monitoring guides).
+The server has `--disable traefik --disable servicelb` because both are replaced with custom deployments (see the Traefik and monitoring guides). The `--node-taint` flag applies a `PreferNoSchedule` taint to the control plane node, discouraging (but not preventing) workload pods from landing on the server node. See [Part 12](#part-12-control-plane-taint-and-workload-redistribution) for why this is critical.
 
 ---
 
@@ -954,6 +956,152 @@ The `k3s-agent-uninstall.sh` script removes everything under `/var/lib/rancher/k
 
 ---
 
+## Part 12: Control Plane Taint and Workload Redistribution
+
+### The problem: all pods on one node
+
+Without taints or affinity rules, the k3s scheduler treats all nodes equally. On this cluster, the control plane node (rock1) ended up running 48 of ~68 total pods -- the API server, etcd, scheduler, plus nearly every workload. The three agent nodes were underutilized. When rock1 ran out of memory, it cascaded: kubelet OOM-killed pods, the API server became unresponsive, and agents lost connection, marking rock2 and rock3 as NotReady.
+
+### Root cause
+
+k3s's default scheduler uses resource requests to make placement decisions. If workload manifests don't declare resource requests (or declare very small ones), the scheduler sees every node as equally available and tends to pack pods onto whichever node is most responsive -- usually the control plane, because it's always up first.
+
+### Fix: PreferNoSchedule taint on the control plane
+
+A `PreferNoSchedule` taint tells the scheduler to avoid placing pods on the node unless no other node can accommodate them. Unlike `NoSchedule`, it won't evict existing pods or break DaemonSets.
+
+**Apply immediately (runtime):**
+
+```bash
+kubectl taint nodes rock1 node-role.kubernetes.io/control-plane=:PreferNoSchedule
+```
+
+**Persist across reinstalls** by adding the taint to the Ansible inventory:
+
+```yaml
+# inventory.yml
+extra_server_args: --disable traefik --disable servicelb --node-taint node-role.kubernetes.io/control-plane=:PreferNoSchedule
+```
+
+The k3s Ansible role templates this into the k3s server service file via `extra_server_args`, so the taint is applied automatically on every server start.
+
+### Verification
+
+After applying the taint, existing pods are not evicted (PreferNoSchedule is soft). To redistribute workloads, either restart deployments or drain and uncordon the node:
+
+```bash
+# Check pod distribution:
+kubectl get pods -A -o wide --sort-by=.spec.nodeName | awk '{print $8}' | sort | uniq -c | sort -rn
+
+# Before taint: rock1 had ~48 pods
+# After taint + rolling restarts: rock1 dropped to ~3 pods (control plane components only)
+```
+
+### Taint types reference
+
+| Taint Effect | Behavior | Use Case |
+| :--- | :--- | :--- |
+| `PreferNoSchedule` | Scheduler avoids the node but doesn't guarantee it | Control plane -- keep workloads off but allow DaemonSets and overflow |
+| `NoSchedule` | New pods won't be scheduled unless they tolerate the taint | Dedicated nodes (e.g. GPU, monitoring) |
+| `NoExecute` | Evicts existing pods that don't tolerate the taint | Draining a node, cordoning for maintenance |
+
+---
+
+## Part 13: Bitnami to Official Image Migration
+
+### The problem: deleted Docker Hub images
+
+Bitnami periodically deletes old image tags from Docker Hub. In this cluster, Authentik's PostgreSQL (`bitnami/postgresql:15.4.0-debian-11-r45`) and Redis (`bitnami/redis:7.2.3-debian-11-r2`) had been removed from the registry. The pods only worked because rock1 had the images cached locally from a previous pull. If rock1's containerd cache was cleared, or if the pod was rescheduled to another node, it would fail with `ImagePullBackOff`.
+
+### Why not just update the Bitnami tag?
+
+Bitnami images use a custom directory layout and configuration system that differs from the official images. For PostgreSQL, Bitnami stores data at `/bitnami/postgresql/data`, generates `postgresql.conf` and `pg_hba.conf` externally, and runs as uid 1001. The official `postgres:alpine` image uses `/var/lib/postgresql/data`, expects `PGDATA` to be set explicitly, and runs as uid 70. Swapping to a newer Bitnami tag would work but keeps the dependency on Bitnami's packaging. Since the cluster uses raw manifests (not Helm), there's no benefit to the Bitnami wrapper.
+
+### Migration: PostgreSQL (Bitnami → official)
+
+The existing PVCs have data at the Bitnami layout. The key challenge is pointing the official image at the existing data without a full dump/restore.
+
+**Bitnami layout** (on the PVC):
+
+```
+/bitnami/postgresql/
+└── data/
+    ├── PG_VERSION
+    ├── base/
+    ├── global/
+    ├── pg_hba.conf
+    ├── postgresql.conf
+    └── ...
+```
+
+**Official image expectations:**
+- `PGDATA` must point to the actual data directory
+- The data directory must contain `postgresql.conf` and `pg_hba.conf` (Bitnami generates these externally; official expects them inside the data directory)
+
+**Working configuration:**
+
+```yaml
+containers:
+  - name: postgres
+    image: postgres:15-alpine
+    env:
+      - name: PGDATA
+        value: /var/lib/postgresql/data/pgdata
+    volumeMounts:
+      - name: data
+        mountPath: /var/lib/postgresql/data/pgdata
+        subPath: data   # Points to the existing 'data/' subdirectory within the PVC
+```
+
+The `subPath: data` mount maps the PVC's `data/` directory (where Bitnami stored the actual PostgreSQL files) directly to the `PGDATA` path. PostgreSQL finds its existing data files and starts without needing `initdb`.
+
+:::caution
+Before switching images, verify that `postgresql.conf` and `pg_hba.conf` exist inside the data directory on the PVC. Bitnami sometimes manages these files externally (mounted via ConfigMap or generated at startup). If they're missing, PostgreSQL will refuse to start. You can create minimal versions:
+
+```bash
+# Exec into the old Bitnami container before switching:
+kubectl exec -n authentik postgres-0 -- cat /bitnami/postgresql/data/postgresql.conf > /tmp/postgresql.conf
+kubectl exec -n authentik postgres-0 -- cat /bitnami/postgresql/data/pg_hba.conf > /tmp/pg_hba.conf
+# Then copy them into the data directory if needed
+```
+:::
+
+### Migration: Redis (Bitnami → official)
+
+Redis is simpler because it's typically used as a cache (no persistent data that needs migration):
+
+```yaml
+containers:
+  - name: redis
+    image: redis:7.2-alpine
+    command: ["redis-server"]
+    args: ["--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    securityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      runAsUser: 999
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: ["ALL"]
+```
+
+The official `redis:alpine` image runs as uid 999. Bitnami's runs as uid 1001. If you have a Redis PVC with AOF/RDB files, you'll need to `chown` the files to 999 before switching.
+
+### Image pinning
+
+After migration, pin all images to specific tags to prevent silent breakage:
+
+| Service | Old Image | New Image |
+| :--- | :--- | :--- |
+| Authentik PostgreSQL | `bitnami/postgresql:15.4.0-debian-11-r45` | `postgres:15-alpine` |
+| Authentik Redis | `bitnami/redis:7.2.3-debian-11-r2` | `redis:7.2-alpine` |
+| Vaultwarden PostgreSQL | `postgres:17` | `postgres:17.4-alpine` |
+| Matrix PostgreSQL | `postgres:16-alpine` | `postgres:16-alpine` (already pinned) |
+
+Prefer `-alpine` variants for smaller image size and reduced attack surface on ARM64.
+
+---
+
 ## Troubleshooting Quick Reference
 
 | Symptom | Likely cause | Fix |
@@ -968,6 +1116,9 @@ The `k3s-agent-uninstall.sh` script removes everything under `/var/lib/rancher/k
 | `CgroupV1` warning on kubelet start | Node still on cgroup v1 | Run the cgroup v2 migration ([Part 2](#part-2-cgroup-v2-migration)) |
 | Node won't boot after config change | Corrupted `ubuntuEnv.txt` | BMC serial console recovery ([Part 7](#part-7-bmc-serial-console-recovery)) |
 | Disk pressure on agent nodes | Journal/containerd logs filling SD card | Vacuum journals, clean rotated logs ([Part 5](#part-5-disk-maintenance)) |
+| Most pods scheduled on control plane node | No taints or affinity rules | Apply `PreferNoSchedule` taint on server node ([Part 12](#part-12-control-plane-taint-and-workload-redistribution)) |
+| `ImagePullBackOff` for Bitnami images | Bitnami deletes old tags from Docker Hub | Migrate to official images ([Part 13](#part-13-bitnami-to-official-image-migration)) |
+| `apt update` fails with `EXPKEYSIG 6E2DD2174FA1C3BA` | Cloudflare WARP repository GPG key expired | Move `/etc/apt/sources.list.d/cloudflare-client.list` aside: `mv cloudflare-client.list cloudflare-client.list.disabled`. Not critical -- WARP isn't required for cluster operation. |
 | CrowdSec banning your IP for `http-probing` | Dashboard UI 404s exceeding scenario threshold | Parser-level whitelist (see [Traefik guide](/guides/k3s-traefik/#dashboard-false-positives-parser-level-whitelist)) |
 | Need to check/manage CrowdSec without `cscli` | N/A | Use the Security Dashboard at `security-k3s.example.com` (see [Traefik guide](/guides/k3s-traefik/#security-dashboard-web-ui)) |
 | Prometheus pods crash-looping | KEDA vs Prometheus Operator replica conflict | Delete the KEDA ScaledObject for Prometheus |

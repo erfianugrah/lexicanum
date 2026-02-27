@@ -17,7 +17,8 @@ The guide is structured as a linear build-up: cluster infrastructure first, then
 3. **Jitsi video conferencing**: Prosody, Jicofo, JVB, with Spectrum for media UDP
 4. **LiveKit + Element Call**: LiveKit SFU, lk-jwt-service, TURN, cert-manager, Spectrum
 5. **VyOS routing**: NAT, firewall chains, Cloudflare IP source restrictions
-6. **Security hardening**: SOPS encryption, firewall source groups, path isolation
+6. **Hardening**: securityContext, health probes, OIDC startup ordering, MetalLB tuning
+7. **Security checklist**: SOPS encryption, firewall source groups, path isolation, image pinning
    :::
 
 ---
@@ -635,7 +636,7 @@ env:
   # Disable STUN to prevent wrong IP discovery
   - name: JVB_STUN_SERVERS
     value: "127.0.0.1:1"
-  - name: OICE4J_MAPPING_STUN_ENABLED
+  - name: ICE4J_MAPPING_STUN_ENABLED
     value: "false"
 ```
 
@@ -1410,6 +1411,195 @@ sudo tcpdump -i any host 10.0.0.102 and udp port 7882 -n -c 10
 
 ---
 
+## Part 6: Hardening
+
+After the initial deployment is working, add security contexts, health probes, and startup ordering to all workloads. This section covers the hardening applied to every component in the Matrix, Jitsi, LiveKit, and Maubot stacks.
+
+### Security contexts
+
+Every container gets at minimum `allowPrivilegeEscalation: false`. Containers that support it also drop all Linux capabilities and run as a specific non-root UID. The level of hardening depends on the container's runtime requirements:
+
+| Component | `runAsNonRoot` | `runAsUser` | `drop: ALL` | `readOnlyRootFilesystem` | Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| Synapse | Yes | 991 | Yes | No | Official Synapse UID |
+| Matrix PostgreSQL | Yes | 70 | Yes | No | Official postgres UID |
+| Element Web | No | — | Yes | No | nginx runs as root in the stock image |
+| Synapse Admin | No | — | Yes | No | Uses non-numeric user "sws" |
+| Prosody | No | — | No | No | Uses s6-overlay (needs capabilities) |
+| Jicofo | No | — | No | No | Uses s6-overlay |
+| JVB | No | — | No | No | Uses s6-overlay |
+| Jitsi Web | No | — | No | No | Uses s6-overlay |
+| LiveKit Server | No | — | Yes | No | Runs as root |
+| lk-jwt-service | No | — | Yes | No | Runs as root |
+| Redis (LiveKit) | Yes | 999 | Yes | Yes | Official redis UID; fully locked down |
+| Maubot | No | — | No | No | Uses su-exec and chown at startup |
+
+**Full hardening example** (LiveKit Redis -- the most locked-down container):
+
+```yaml
+securityContext:
+  allowPrivilegeEscalation: false
+  runAsNonRoot: true
+  runAsUser: 999
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+```
+
+**Baseline-only example** (Jitsi containers -- s6-overlay requires capabilities):
+
+```yaml
+securityContext:
+  allowPrivilegeEscalation: false
+```
+
+:::caution[Jitsi and s6-overlay]
+All Jitsi containers (`jitsi/web`, `jitsi/prosody`, `jitsi/jicofo`, `jitsi/jvb`) use s6-overlay as their init system, which requires Linux capabilities to function. Setting `capabilities: { drop: ["ALL"] }` on these containers causes them to fail at startup. Only `allowPrivilegeEscalation: false` is safe.
+:::
+
+:::caution[Maubot and su-exec]
+Maubot uses `su-exec` and `chown` at startup to fix file permissions. Dropping all capabilities prevents this from working. Only `allowPrivilegeEscalation: false` is safe for the main container. The `config-init` initContainer can safely drop all capabilities since it only runs `cp` commands.
+:::
+
+### Health probes
+
+Every long-running container gets liveness and readiness probes. The probe type depends on what the container exposes:
+
+| Component | Probe Type | Target | Notes |
+| :--- | :--- | :--- | :--- |
+| Synapse | HTTP | `/health` :8008 | Built-in health endpoint |
+| Matrix PostgreSQL | exec | `pg_isready -U matrix -d synapse` | Native PG health check |
+| Element Web | HTTP | `/` :80 | Static file server |
+| Synapse Admin | HTTP | `/` :8080 | Static file server |
+| Prosody | TCP | :5222 | XMPP client port |
+| Jicofo | TCP | :8888 | Internal REST API |
+| JVB | HTTP | `/about/health` :8080 | Built-in health endpoint |
+| Jitsi Web | HTTP | `/` :80 | nginx frontend |
+| LiveKit Server | HTTP | `/` :7880 | HTTP signaling port |
+| lk-jwt-service | HTTP | `/healthz` :8080 | Explicit health endpoint |
+| Redis (LiveKit) | exec | `redis-cli ping` | Returns PONG when ready |
+| Maubot | TCP | :29316 | Web UI / API port |
+
+**Example probe configuration** (JVB):
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /about/health
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /about/health
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+```
+
+### Synapse OIDC init container
+
+Synapse crash-loops on startup if it can't reach the Authentik OIDC discovery endpoint. This is a startup ordering issue -- Synapse starts before Authentik is ready and fails to validate the OIDC provider configuration.
+
+**Fix**: Add a `wait-for-oidc` initContainer that polls the OIDC discovery endpoint:
+
+```yaml
+initContainers:
+  # Wait for Authentik OIDC discovery endpoint before starting Synapse.
+  # Synapse crash-loops if it can't reach the OIDC provider on startup.
+  - name: wait-for-oidc
+    image: alpine:3.21
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        apk add --no-cache curl
+        echo "Waiting for Authentik OIDC endpoint..."
+        until curl -sf --max-time 5 \
+          https://authentik.example.com/application/o/matrix/.well-known/openid-configuration \
+          > /dev/null 2>&1; do
+          echo "OIDC endpoint not ready, retrying in 10s..."
+          sleep 10
+        done
+        echo "OIDC endpoint is ready."
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: 100m
+        memory: 64Mi
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+```
+
+This goes before the existing `config-init` initContainer in the Synapse Deployment spec.
+
+### JVB ICE4J typo
+
+The JVB env var for disabling STUN mapping was misspelled as `OICE4J_MAPPING_STUN_ENABLED` (missing leading `I`). The correct env var is:
+
+```yaml
+- name: ICE4J_MAPPING_STUN_ENABLED
+  value: "false"
+```
+
+With the typo, JVB ignored the setting and still attempted STUN discovery, potentially advertising the wrong IP address.
+
+### MetalLB probe timeout tuning
+
+The default MetalLB Helm-generated probe timeout of `timeoutSeconds: 1` is too aggressive for ARM64 boards. Under load, the speaker and controller pods can take longer than 1 second to respond to health checks, causing constant liveness failures and pod restarts.
+
+**Fix**: Increase `timeoutSeconds` from 1 to 5 on all MetalLB probes:
+
+```yaml
+# Applied to controller, speaker, and frr containers
+livenessProbe:
+  httpGet:
+    path: /metrics
+    port: monitoring
+  timeoutSeconds: 5    # was: 1
+  # ... other fields unchanged
+readinessProbe:
+  httpGet:
+    path: /metrics
+    port: monitoring
+  timeoutSeconds: 5    # was: 1
+```
+
+Also added resource requests/limits to all 8 MetalLB containers (controller, speaker, frr, reloader, frr-metrics, and 3 init containers) that were previously missing them.
+
+### Resource limits for init containers
+
+Init containers that lacked resource limits were added:
+
+```yaml
+# Synapse wait-for-oidc
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    cpu: 100m
+    memory: 64Mi
+
+# Maubot config-init
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    cpu: 100m
+    memory: 64Mi
+```
+
+---
+
 ## Resource Summary
 
 | Component       | CPU request | Memory request | CPU limit | Memory limit |
@@ -1437,6 +1627,13 @@ sudo tcpdump -i any host 10.0.0.102 and udp port 7882 -n -c 10
 | :---------------------------------- | :----------------------------------------------------------------------------- |
 | All k8s Secrets SOPS-encrypted      | `matrix-secrets`, `jitsi-secrets`, `livekit-secrets`, `cloudflare-credentials` |
 | No plaintext secrets in ConfigMaps  | Keys injected via `envFrom`/`secretKeyRef`, not in configmap values            |
+| `allowPrivilegeEscalation: false` on all containers | Every container in matrix, jitsi, livekit, and maubot namespaces |
+| `capabilities.drop: ALL` where possible | All containers except Jitsi (s6-overlay) and Maubot (su-exec) |
+| `runAsNonRoot` + `runAsUser` where possible | Synapse (991), PostgreSQL (70), Redis (999) |
+| Health probes on all containers | Liveness + readiness on every long-running container (see [Part 6](#part-6-hardening)) |
+| Synapse OIDC startup ordering | `wait-for-oidc` initContainer prevents crash-loops |
+| MetalLB probe timeouts tuned | `timeoutSeconds: 5` (not 1) for ARM64 boards |
+| Resource limits on all containers | Including init containers and MetalLB sidecar containers |
 | lk-jwt-service homeserver allowlist | `LIVEKIT_FULL_ACCESS_HOMESERVERS=*` -- allows any federated user. OpenID token validation still applies per-user. Restrict to specific domains (comma-separated) if federation is not needed. |
 | RoomService API requires auth       | Returns `unauthenticated` without LiveKit API key header                       |
 | LiveKit `room.auto_create: false`   | Prevents unauthorized room creation                                            |
