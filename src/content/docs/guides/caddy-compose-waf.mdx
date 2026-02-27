@@ -98,7 +98,7 @@ Traffic flows through five security layers in order:
 2. **IPsum blocklist** — known-bad IPs get a 403 before any WAF processing
 3. **Coraza WAF** — OWASP Core Rule Set with custom pre/post rules and Policy Engine exclusions
 4. **Authelia forward auth** — TOTP/WebAuthn 2FA for protected services
-5. **Rate limiting** — per-service zone configuration with dynamic thresholds
+5. **Rate limiting** — condition-based rate limiting with per-service rules and dynamic thresholds
 
 The wafctl sidecar sits alongside Caddy, continuously tailing logs and serving a management
 API. The React dashboard is compiled into static files and served directly by Caddy.
@@ -275,14 +275,12 @@ COPY --from=cloudflare-ips /tmp/cf_trusted_proxies.caddy /etc/caddy/cf_trusted_p
 COPY --from=waf-dashboard /build/dist/ /etc/caddy/waf-ui/
 COPY errors/ /etc/caddy/errors/
 COPY coraza/ /etc/caddy/coraza/
-COPY scripts/update-ipsum.sh /usr/local/bin/update-ipsum.sh
 COPY scripts/rotate-audit-log.sh /usr/local/bin/rotate-audit-log.sh
 COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/update-ipsum.sh /usr/local/bin/rotate-audit-log.sh /usr/local/bin/entrypoint.sh \
-    && echo '0 2 * * * /usr/local/bin/update-ipsum.sh >> /var/log/ipsum-update.log 2>&1' \
-       >> /var/spool/cron/crontabs/root \
+RUN chmod +x /usr/local/bin/rotate-audit-log.sh /usr/local/bin/entrypoint.sh \
     && echo '0 * * * * /usr/local/bin/rotate-audit-log.sh >> /var/log/audit-rotate.log 2>&1' \
-       >> /var/spool/cron/crontabs/root
+       >> /var/spool/cron/crontabs/root \
+    && chmod 0600 /var/spool/cron/crontabs/root
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 ```
@@ -299,13 +297,14 @@ Note that the wafctl stage (5) compiles the sidecar binary but the final stage d
 with its own `wafctl/Dockerfile`. This keeps the Caddy image lean and allows independent
 sidecar updates without rebuilding the entire image.
 
-The final stage also installs **two cron jobs**: the IPsum blocklist update (daily at 02:00)
-and the Coraza audit log rotation (hourly, copytruncate when >256MB).
+The final stage installs **one cron job**: the Coraza audit log rotation (hourly, copytruncate
+when >256MB). The IPsum blocklist refresh is handled by wafctl's Go scheduler (see below),
+not by cron.
 
 The build-time data fetching (stages 2-3) means the image is never empty on first boot.
 The entrypoint script bridges the gap between build-time and runtime: it seeds the IPsum
 blocklist from the baked-in snapshot if the runtime copy is missing or lacks an `# Updated:`
-header, starts `crond` for daily updates, then execs Caddy as PID 1.
+header, starts `crond` for audit log rotation, then execs Caddy as PID 1.
 
 ---
 
@@ -327,6 +326,7 @@ The Caddyfile is organized around composable snippets that site blocks mix and m
     servers {
         strict_sni_host on
         protocols h1 h2 h3
+        trusted_proxies_strict
         import /etc/caddy/cf_trusted_proxies.caddy
     }
 }
@@ -430,7 +430,7 @@ The Caddyfile is organized around composable snippets that site blocks mix and m
 }
 
 # IPsum blocklist — the snippet file is generated at build time and
-# updated daily by cron. It defines @ipsum_blocked and a route block.
+# updated daily by wafctl's Go scheduler. It defines @ipsum_blocked and a route block.
 (ipsum_blocklist) {
     import /data/coraza/ipsum_block.caddy
 }
@@ -482,6 +482,15 @@ The Caddyfile is organized around composable snippets — `cors`, `static_cache`
 `error_pages` — that each site block imports as needed. A `waf_off` variant exists for
 services that don't need WAF processing (metrics endpoints, respond-only blocks).
 
+The `trusted_proxies_strict` directive in the `servers` block is a critical security measure.
+By default, Caddy parses `X-Forwarded-For` left-to-right, taking the first untrusted IP as
+the client address. An attacker can exploit this by sending a spoofed `X-Forwarded-For: 127.0.0.1`
+header — Cloudflare appends the real IP to the right, and Caddy picks up the spoofed leftmost
+value. With `trusted_proxies_strict`, parsing is right-to-left: the first untrusted IP from
+the right is the one appended by the last trusted proxy (Cloudflare), which is the real client
+IP. For direct connections (not through a trusted proxy), `X-Forwarded-For` is ignored entirely
+and the raw TCP peer address is used.
+
 The critical architectural decision is the **WAF config loading order**. Seven files are
 loaded in a specific sequence that mixes baked-in rules with dynamically generated ones:
 
@@ -505,25 +514,27 @@ Settings panel the single source of truth for WAF mode, preventing configuration
 
 wafctl is a stdlib-only Go HTTP service and CLI tool — zero external dependencies, not even a
 router library. It handles log parsing, SecRule generation, configuration management, and the
-dashboard REST API in roughly 8,100 lines of Go (plus 9,900 lines of tests across 13 test files).
+dashboard REST API in roughly 10,700 lines of Go (plus 12,300 lines of tests across 16 test files).
 
 ### File Organization
 
 | File | Responsibility |
 |------|---------------|
-| `main.go` | HTTP server, 31 route handlers, CORS middleware |
+| `main.go` | HTTP server, route handlers, CORS middleware |
 | `models.go` | All data models (events, config, exclusions, rate limits) |
 | `logparser.go` | Incremental Coraza audit log parser with offset tracking |
-| `rl_analytics.go` | Combined access log parser for 429 events and IPsum blocks |
 | `generator.go` | SecRule generation from Policy Engine exclusions |
 | `deploy.go` | Deploy pipeline, SHA-256 fingerprinting, Caddy admin API reload |
-| `config.go` | WAF settings store (mode, paranoia, thresholds) |
+| `config.go` | WAF settings store (mode, paranoia, thresholds, CRS v4 extended settings) |
 | `exclusions.go` | Policy Engine exclusion CRUD, validation, atomic file writes |
-| `ratelimit.go` | Rate limit zone config and Caddy snippet generation |
-| `blocklist.go` | IPsum file parser, cached stats, on-demand refresh |
+| `blocklist.go` | IPsum file parser, cached stats, on-demand refresh, scheduled refresh |
 | `geoip.go` | Pure-Go MMDB reader, three-tier IP resolution |
 | `crs_rules.go` | CRS catalog with search/autocomplete |
-| `cli.go` | CLI subcommands (config, rules, events, deploy, blocklist) |
+| `cli.go` | CLI subcommands (config, rules, events, deploy, blocklist, ratelimit) |
+| `rl_rules.go` | Rate limit rule store with CRUD, validation, v1 migration |
+| `rl_generator.go` | Rate limit Caddy config generator, condition-to-matcher translation |
+| `rl_analytics.go` | Combined access log parser for 429/IPsum events, rule attribution |
+| `rl_advisor.go` | Traffic analysis, statistical anomaly detection (MAD, Fano, IQR), recommendations |
 
 ### Route Registration Pattern
 
@@ -682,7 +693,7 @@ func reloadCaddy(caddyfilePath, caddyAdminURL string, configFiles ...string) err
 ### Generate-on-Boot
 
 On startup, `generateOnBoot()` regenerates all config files from stored JSON state (WAF config,
-exclusions, rate limit zones). This means a full stack restart always picks up the latest
+exclusions, rate limit rules). This means a full stack restart always picks up the latest
 generator output without requiring a manual deploy action. No Caddy reload is performed —
 Caddy reads the files fresh on its own startup.
 
@@ -703,7 +714,13 @@ rules into ModSecurity `SecRule` directives that Coraza understands.
 | `honeypot` | `deny,status:403` (consolidated `@pm`) | Dynamic honeypot paths merged into one rule |
 | `raw` | Verbatim SecRule | Free-form directives for edge cases |
 | `remove_by_id` | Post-CRS `SecRuleRemoveById` | Configure-time rule exclusion |
+| `remove_by_tag` | Post-CRS `SecRuleRemoveByTag` | Configure-time exclusion by tag category |
 | `update_target_by_id` | Post-CRS `SecRuleUpdateTargetById` | Exclude specific variables from a rule |
+| `update_target_by_tag` | Post-CRS `SecRuleUpdateTargetByTag` | Exclude variables from a tag category |
+| `runtime_remove_by_id` | `ctl:ruleRemoveById` | Remove entire rule for matching requests |
+| `runtime_remove_by_tag` | `ctl:ruleRemoveByTag` | Remove rule category for matching requests |
+| `runtime_remove_target_by_id` | `ctl:ruleRemoveTargetById` | Exclude variable from specific rule at runtime |
+| `runtime_remove_target_by_tag` | `ctl:ruleRemoveTargetByTag` | Exclude variable from tag category at runtime |
 
 ### Condition Fields
 
@@ -712,11 +729,21 @@ Conditions map to ModSecurity variables with operator support:
 | Field | SecRule Variable | Supported Operators |
 |-------|-----------------|---------------------|
 | `ip` | `REMOTE_ADDR` | `eq`, `neq`, `ip_match`, `not_ip_match` |
-| `path` | `REQUEST_URI` | `eq`, `contains`, `begins_with`, `ends_with`, `regex`, `in` |
+| `path` | `REQUEST_URI` | `eq`, `neq`, `contains`, `begins_with`, `ends_with`, `regex`, `in` |
 | `host` | `SERVER_NAME` | `eq`, `neq`, `contains` |
 | `method` | `REQUEST_METHOD` | `eq`, `neq`, `in` |
 | `user_agent` | `REQUEST_HEADERS:User-Agent` | `eq`, `contains`, `regex` |
+| `header` | `REQUEST_HEADERS:<Name>` | `eq`, `contains`, `regex` |
+| `query` | `QUERY_STRING` | `contains`, `regex` |
 | `country` | `REQUEST_HEADERS:Cf-Ipcountry` | `eq`, `neq`, `in` |
+| `cookie` | `REQUEST_COOKIES:<Name>` | `eq`, `neq`, `contains`, `regex` |
+| `body` | `REQUEST_BODY` | `contains`, `regex` |
+| `args` | `ARGS:<Name>` | `eq`, `neq`, `contains`, `regex` |
+| `uri_path` | `REQUEST_FILENAME` | `eq`, `neq`, `contains`, `begins_with`, `ends_with`, `regex` |
+| `referer` | `REQUEST_HEADERS:Referer` | `eq`, `neq`, `contains`, `regex` |
+| `response_header` | `RESPONSE_HEADERS:<Name>` | `eq`, `contains`, `regex` |
+| `response_status` | `RESPONSE_STATUS` | `eq`, `neq`, `in` |
+| `http_version` | `REQUEST_PROTOCOL` | `eq`, `neq` |
 
 Multiple conditions on a single exclusion combine with `chain` (logical AND). The `in`
 operator generates separate rules for each value (logical OR) — e.g., blocking multiple
@@ -842,7 +869,7 @@ built into static files and served by Caddy.
 | `/blocklist` | `BlocklistPanel` | IPsum stats, IP check search, manual refresh |
 | `/events` | `EventsTable` | Paginated event log with expandable detail rows, JSON export |
 | `/policy` | `PolicyEngine` | Three-tab rule builder: Quick Actions, Advanced, Raw Editor |
-| `/rate-limits` | `RateLimitsPanel` | Per-zone rate limit management |
+| `/rate-limits` | `RateLimitsPanel` | Condition-based rate limit rule management |
 | `/services` | `ServicesList` | Per-service stats, top URIs, triggered rules |
 | `/settings` | `SettingsPanel` | Global + per-service WAF mode, paranoia, thresholds |
 
@@ -893,8 +920,11 @@ and generates a Caddy `client_ip` matcher snippet baked into the image.
 file. If missing, or if the file lacks an `# Updated:` header comment (indicating it came from
 an older build), the baked-in snapshot is copied to the volume.
 
-**Daily cron** — a cron job at 02:00 downloads a fresh list, filters, generates the snippet,
-atomically writes it, and reloads Caddy.
+**Scheduled refresh** — wafctl's Go scheduler (`StartScheduledRefresh()`) runs a background
+goroutine that sleeps until the next refresh hour (default 06:00 UTC, configurable via
+`WAF_BLOCKLIST_REFRESH_HOUR`), then loops daily. This replaced an earlier cron-based approach,
+keeping the refresh lifecycle entirely within the Go process for better observability and
+error handling.
 
 **On-demand refresh** — `POST /api/blocklist/refresh` triggers the same pipeline immediately
 from the dashboard. The Go handler downloads the list, parses it, generates the Caddy snippet,
@@ -931,6 +961,7 @@ The stack applies defense-in-depth at every layer:
 | **Pre-commit hooks** | Block unencrypted secrets, check for SOPS markers, glob-based exemptions |
 | **File operations** | Atomic writes (temp + fsync + rename) prevent partial reads |
 | **WAF config** | Single source of truth in wafctl, not scattered across Caddyfile |
+| **Client IP integrity** | `trusted_proxies_strict` prevents XFF header spoofing via right-to-left parsing |
 | **TLS** | ACME DNS challenge (no exposed port 80), Encrypted Client Hello, strict SNI |
 
 The pre-commit hook deserves special mention. It inspects staged files for unencrypted secrets
@@ -1046,8 +1077,8 @@ The Makefile supports two deployment modes configurable via `.env.mk`:
 :::tip[Version Sync]
 Image tags must stay in sync across multiple files: `Makefile`, `compose.yaml`, `README.md`,
 `test/docker-compose.test.yml`, `.github/workflows/build.yml`, and `AGENTS.md`. The Caddy tag
-format is `<project-version>-<caddy-version>` (e.g., `1.30.0-2.11.1`) and wafctl uses simple
-semver (e.g., `0.22.0`). Version is injected at build time via `-ldflags "-X main.version=..."`.
+format is `<project-version>-<caddy-version>` (e.g., `2.2.2-2.11.1`) and wafctl uses simple
+semver (e.g., `1.2.2`). Version is injected at build time via `-ldflags "-X main.version=..."`.
 :::
 
 ---
@@ -1071,7 +1102,7 @@ GitHub Actions automates the full build-sign-release cycle:
 Cosign keyless signing uses GitHub's OIDC identity — no signing keys to manage. Verification:
 
 ```bash
-cosign verify your-registry/caddy:1.30.0-2.11.1 \
+cosign verify your-registry/caddy:2.2.2-2.11.1 \
   --certificate-identity-regexp='github.com/your-org/caddy-compose' \
   --certificate-oidc-issuer='https://token.actions.githubusercontent.com'
 ```
@@ -1097,6 +1128,12 @@ wafctl rules create # Create rule (JSON on stdin or --file)
 wafctl rules delete ID
 wafctl deploy       # Deploy WAF config to Caddy
 wafctl events       # List events (--hours, --limit, --service, --type, --client, --method, --rule)
+wafctl ratelimit list       # List all rate limit rules (alias: rl)
+wafctl ratelimit get ID     # Get a rate limit rule by ID
+wafctl ratelimit create     # Create rule (JSON on stdin or --file)
+wafctl ratelimit delete ID  # Delete a rate limit rule
+wafctl ratelimit deploy     # Deploy rate limit configs to Caddy
+wafctl ratelimit global     # Show global rate limit settings
 wafctl blocklist stats
 wafctl blocklist check IP
 wafctl blocklist refresh
