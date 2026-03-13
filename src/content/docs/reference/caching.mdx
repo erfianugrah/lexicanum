@@ -56,23 +56,32 @@ same-zone -> cf-options
 
 cross-zone -> ignored
 
+ignored -> o2o: Own the domain?
 ignored -> cache-api: Per-colo OK?
 ignored -> kv: Need global?
+
+o2o: Intermediate domain\n+ O2O {
+  rules: Cache Rules apply
+  tiered: Tiered Cache works
+  no-code: No code changes
+}
 
 kv -> do: Concurrent writes?
 ```
 
-| Scenario                       | Approach                 | Effort    |
-| ------------------------------ | ------------------------ | --------- |
-| Non-CF or same zone            | `fetch()` + `cf` options | Low       |
-| Cross-zone, simple needs       | Cache API                | Low       |
-| Cross-zone, global consistency | KV                       | High      |
-| Cross-zone, coordinated writes | KV + Durable Objects     | Very high |
+| Scenario                       | Approach                   | Effort    |
+| ------------------------------ | -------------------------- | --------- |
+| Non-CF or same zone            | `fetch()` + `cf` options   | Low       |
+| Cross-zone, path-based routing | Intermediate domain + O2O  | Low       |
+| Cross-zone, simple needs       | Cache API                  | Low       |
+| Cross-zone, global consistency | KV                         | High      |
+| Cross-zone, coordinated writes | KV + Durable Objects       | Very high |
 
-<Aside type="tip" title="Start with Cache API">
-  If per-colo consistency is acceptable, Cache API is much simpler than
-  KV. Only choose KV if you need a single global cache (fewer misses, global
-  invalidation), or need to purge by tags/metadata.
+<Aside type="tip" title="Prefer intermediate domain + O2O when possible">
+  If you control the DNS zone and the SaaS provider supports Custom Hostnames,
+  the intermediate domain pattern lets you use standard Cache Rules with no code
+  changes. It also supports Tiered Cache and standard cache purge, unlike Cache
+  API. Only fall back to Cache API or KV if you can't set up O2O.
 </Aside>
 
 ---
@@ -276,7 +285,106 @@ Two additional caching features affect how content is stored and retrieved:
 
 ## Cross-zone caching solutions
 
-When `cf` options don't work (cross-zone fetches), you have two choices: Cache API for simplicity, or KV for global consistency.
+When `cf` options don't work (cross-zone fetches), you have three choices: an intermediate domain with O2O for full CDN cache support, Cache API for per-colo simplicity, or KV for global consistency.
+
+### Intermediate domain + O2O
+
+When a Worker or Snippet fetches a cross-zone orange-clouded origin, the calling zone's cache is bypassed entirely. But the bypass is triggered by a **zone ownership check on the fetch target URL** -- if the URL belongs to a different zone, the optimization kicks in.
+
+The workaround: fetch an intermediate domain that **you own** (in your zone), and CNAME it to the SaaS provider's zone with O2O (Orange-to-Orange) configured. Since the fetch target belongs to your zone, your cache layer is active -- Cache Rules apply, Tiered Cache works, and standard cache purge works. The actual routing to the SaaS zone happens via CNAME resolution + O2O **below** the cache layer.
+
+#### How it works
+
+```d2
+direction: right
+
+eyeball: Eyeball\neyeball.your-zone.com {
+  shape: person
+}
+
+worker: Worker/Snippet {
+  fetch: "fetch('saas-intermediate\n.your-zone.com')"
+}
+
+cache: Calling Zone Cache {
+  shape: cylinder
+  rules: Cache Rules apply
+  tiered: Tiered Cache works
+}
+
+cname: DNS CNAME\n→ saas-zone.com {
+  shape: diamond
+}
+
+saas: SaaS Zone\n(O2O) {
+  worker: SaaS Worker
+  origin: SaaS Origin
+}
+
+eyeball -> worker: /saas-path/*
+worker -> cache: ownership = same zone
+cache -> cname: MISS
+cname -> saas: O2O
+saas -> cache: response
+cache -> worker: cached
+```
+
+**Cache HIT flow:**
+1. User requests `eyeball.your-zone.com/saas-path/*`
+2. Worker rewrites URL to `saas-intermediate.your-zone.com`
+3. Cache check: **HIT** -- response served from your zone's cache
+
+**Cache MISS flow:**
+1. User requests `eyeball.your-zone.com/saas-path/*`
+2. Worker rewrites URL to `saas-intermediate.your-zone.com`
+3. Cache check: **MISS** -- CNAME resolves to SaaS zone via O2O
+4. SaaS zone processes request and responds
+5. Your zone's Cache Rules apply -- response cached against intermediate domain
+
+#### Setup
+
+1. **DNS CNAME** (your zone): `saas-intermediate.your-zone.com` → `your-hostname.saas-zone.com` (proxied)
+2. **Custom Hostname** (SaaS zone): Add `saas-intermediate.your-zone.com` as a Custom Hostname with O2O
+3. **Cache Rule** (your zone): Match `http.host eq "saas-intermediate.your-zone.com"` -- set Edge TTL, cache eligibility, etc.
+4. **Worker/Snippet** (your zone): Fetch the intermediate domain instead of the SaaS domain directly
+
+```typescript
+// Before (cross-zone, cache bypassed):
+const resp = await fetch("https://saas-provider.com/api");
+
+// After (intermediate domain, cache rules apply):
+const resp = await fetch("https://saas-intermediate.your-zone.com/api");
+```
+
+#### Verified behavior
+
+Tested with two zones on different Cloudflare accounts:
+
+| Fetch target | `CF-Cache-Status` | `Cache-Control` | Origin re-executed? |
+|---|---|---|---|
+| Direct cross-zone (`origin.other-zone.com`) | _(none)_ | Origin's `no-store` passed through | Yes, every request |
+| Intermediate domain (`intermediate.my-zone.com`) | `MISS` then `HIT` | Cache Rule override applied | Only on first request |
+
+The origin returned `Cache-Control: no-store`. The calling zone's Cache Rule overrode it to `public, max-age=60`. On the second request, the response body was identical (same `originRequestId`) confirming the cache served the actual origin response, not a stale asset.
+
+#### Considerations
+
+| Aspect | Detail |
+|---|---|
+| **Cache keys** | If multiple eyeball domains share one intermediate domain, include a distinguishing header (e.g. `x-original-domain`) in the cache key via Cache Rules to avoid serving wrong content across domains |
+| **Cache purge** | Purge targets the intermediate domain, not the eyeball domain. Use the Cache Purge API with URL + header for per-eyeball-domain purge when using custom cache keys |
+| **Cache analytics** | Cache overview analytics remain visible against the eyeball domain in your zone |
+| **Security rulesets** | Subrequests from Workers/Snippets to the intermediate domain skip WAF/security rulesets but do hit the rules engine (Cache Rules, Origin Rules, etc.) |
+| **Tiered Cache** | Works, unlike Cache API |
+| **SaaS requirement** | SaaS provider must support Custom Hostnames and route based on a passed header (e.g. `x-original-domain`) |
+| **Future SaaS migrations** | If another service you use migrates to Cloudflare, the intermediate domain pattern needs to be applied again per SaaS provider |
+
+<Aside type="caution" title="Cache key isolation is critical">
+  If the same intermediate domain serves content for multiple eyeball domains
+  (e.g. many country-specific TLDs), you **must** include a distinguishing value in the
+  cache key. Without this, all domains share a single cache entry per path —
+  serving wrong content across domains.
+</Aside>
 
 ### Cache API
 
