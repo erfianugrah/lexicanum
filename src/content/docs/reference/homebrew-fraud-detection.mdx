@@ -1,12 +1,12 @@
 ---
 title: "We have fraud detection at home"
-description: Architecture reference for building a multi-layer form fraud detection system with ML email classification, TLS fingerprinting, and weighted risk scoring on Cloudflare Workers
+description: Architecture reference for building a multi-layer form fraud detection system with 48-feature Random Forest email classification, TLS fingerprinting, container-based model retraining, and weighted risk scoring on Cloudflare Workers
 author: Erfi Anugrah
 ---
 
 import { Aside } from "@astrojs/starlight/components";
 
-How [**forminator**](https://github.com/erfianugrah/forminator) and [**markov-mail**](https://github.com/erfianugrah/markov-mail) implement multi-layer fraud detection for form submissions on Cloudflare Workers. Two Workers -- one handling form submissions with multi-layer detection and 10-component risk scoring, the other running Random Forest ML inference on email addresses -- connected via RPC service bindings.
+How [**forminator**](https://github.com/erfianugrah/forminator) and [**markov-mail**](https://github.com/erfianugrah/markov-mail) implement multi-layer fraud detection for form submissions on Cloudflare Workers. Two Workers -- one handling form submissions with multi-layer detection and 10-component risk scoring, the other running a 48-feature Random Forest classifier on email addresses with automated weekly retraining -- connected via RPC service bindings.
 
 This serves as a reference template for building similar systems. All patterns are derived from production code.
 
@@ -56,7 +56,7 @@ D1: D1 {
 | Component           | Role                                                            | Tech                                         |
 | ------------------- | --------------------------------------------------------------- | -------------------------------------------- |
 | **Form Worker**     | Submission intake, multi-layer fraud detection, risk scoring    | Hono on Workers, D1, KV                      |
-| **ML Worker**       | Email fraud classification, feature extraction, model inference | Hono on Workers, D1, 3x KV                   |
+| **ML Worker**       | Email fraud classification, feature extraction, model inference | Hono on Workers, D1, 3x KV, Containers       |
 | **Service Binding** | Worker-to-Worker RPC (zero overhead, same-thread execution)     | `WorkerEntrypoint` from `cloudflare:workers` |
 | **Turnstile**       | CAPTCHA validation, ephemeral device IDs (Enterprise)           | Cloudflare Turnstile                         |
 | **Bot Management**  | JA4 fingerprints, bot scores, JS detection (Enterprise)         | Cloudflare Bot Management                    |
@@ -570,21 +570,24 @@ function sanitizeString(input: string): string {
 
 ## ML email classification
 
-The ML Worker extracts a 45-dimension feature vector from an email address and scores it with a Random Forest classifier. It serves as both a standalone HTTP API and an RPC service.
+The ML Worker extracts a 48-dimension feature vector from an email address and scores it with a Random Forest classifier. It serves as both a standalone HTTP API and an RPC service.
 
 ### Feature vector
 
-Features span seven categories:
+Features span ten categories:
 
-| Category        | Examples                                                            | Count |
-| --------------- | ------------------------------------------------------------------- | ----- |
-| **Identity**    | Local part length, digit ratio, word boundaries, segment count      | ~8    |
-| **Linguistic**  | Pronounceability, vowel ratio, consonant clusters, bigram entropy   | ~7    |
-| **Statistical** | Shannon entropy, character distribution, Benford's Law conformance  | ~6    |
-| **N-gram**      | Character bigram/trigram naturalness across language models         | ~8    |
-| **Structural**  | Plus-addressing, sequential patterns, date patterns, pattern family | ~6    |
-| **Domain/MX**   | Disposable domain flag, TLD risk, MX provider category              | ~5    |
-| **Geo/Network** | Language mismatch, timezone mismatch, name-email similarity         | ~5    |
+| Category            | Examples                                                                   | Count |
+| ------------------- | -------------------------------------------------------------------------- | ----- |
+| **Sequential**      | `sequential_confidence`, `plus_risk`                                       | 2     |
+| **Local Part**      | `local_length`, `digit_ratio`, `has_year_suffix`, `alpha_prefix_naturalness`, `digit_position_ratio` | 5     |
+| **Identity**        | `name_similarity_score`, `name_token_overlap`, `name_in_email`             | 3     |
+| **Geo**             | `geo_language_mismatch`, `geo_timezone_mismatch`, `geo_anomaly_score`      | 3     |
+| **MX/Provider**     | `mx_has_records`, `mx_record_count`, `mx_provider_*` (8 one-hot), `provider_is_free`, `provider_is_disposable` | 12    |
+| **Domain/TLD**      | `tld_risk_score`, `domain_reputation_score`, `entropy_score`               | 3     |
+| **Linguistic**      | `pronounceability`, `vowel_ratio`, `max_consonant_cluster`, `repeated_char_ratio`, `syllable_estimate`, `impossible_cluster_count` | 6     |
+| **Structure**       | `has_word_boundaries`, `segment_count`, `avg_segment_length`, `segments_without_vowels_ratio` | 4     |
+| **Statistical**     | `unique_char_ratio`, `vowel_gap_ratio`, `max_digit_run`, `bigram_entropy`  | 4     |
+| **N-gram**          | `ngram_bigram_score`, `ngram_trigram_score`, `ngram_overall_score`, `ngram_confidence`, `ngram_risk_score`, `ngram_is_natural` | 6     |
 
 ### ML middleware pipeline
 
@@ -603,7 +606,7 @@ Req: POST /validate
 HasEmail: email? {shape: diamond}
 Skip: pass through
 Load: Load from KV
-Feat: 45 Features
+Feat: 48 Features
 RF: Random Forest {shape: hexagon}
 Cal: Platt Cal
 OOD: OOD? {shape: diamond}
@@ -615,7 +618,7 @@ Next: Route Handler
 
 ### Detectors
 
-The 45 features are produced by specialized detector modules. Each operates independently and returns structured results.
+The 48 features are produced by specialized detector modules. Each operates independently and returns structured results.
 
 #### Sequential pattern detection
 
@@ -657,7 +660,7 @@ Three feature groups measuring how "natural" an email local part looks:
 
 #### N-gram naturalness
 
-Bigram and trigram frequency analysis across 7 language models (English, Spanish, French, German, Italian, Portuguese, Romanized). Scores how likely a character sequence is to appear in natural text for each language, taking the best match. Higher naturalness = lower fraud risk.
+Bigram and trigram frequency analysis across 8 language groups (English, Spanish, French, German, Italian, Portuguese, Romanized, and a universal/mixed set). Input is NFD-normalized to strip diacritics while preserving base characters, reducing false positives on international names. Scores how likely a character sequence is to appear in natural text for each language, taking the best match. Language detection uses suffix-based heuristics (e.g., `-ez` for Spanish, `-stein` for German, `-ovich` for Russian). Higher naturalness = lower fraud risk.
 
 #### Benford's Law analysis
 
@@ -672,7 +675,7 @@ Resolves the email domain's MX records to classify the provider and detect suspi
 - **Resolution**: Cloudflare DNS-over-HTTPS (`cloudflare-dns.com/dns-query`) with 500ms fetch timeout via `AbortController` (wrapped in a 1500ms middleware timeout with background retry)
 - **Caching**: In-memory with 15-minute TTL. Concurrent requests for the same domain are deduplicated via an inflight map.
 - **Provider classification**: Google, Microsoft, iCloud, Yahoo, Zoho, Proton, self-hosted (MX points to own domain), other. Provider is determined by the MX exchange hostname patterns.
-- **Features produced**: `mx_has_records`, `mx_record_count`, and one-hot encoded `mx_provider_*` flags (7 providers)
+- **Features produced**: `mx_has_records`, `mx_record_count`, and one-hot encoded `mx_provider_*` flags (8 providers: Google, Microsoft, iCloud, Yahoo, Zoho, Proton, self-hosted, other). Cache bounded to 10k entries with LRU eviction.
 
 <Aside type="note" title="Well-known provider fast path">
   Common domains (gmail.com, outlook.com, yahoo.com, etc.) skip DNS entirely and
@@ -686,7 +689,7 @@ The ML Worker's behavior is controlled by a config loaded from KV:
 
 ```json
 {
-  "riskThresholds": { "block": 0.65, "warn": 0.35 },
+  "riskThresholds": { "block": 0.88, "warn": 0.56 },
   "actionOverride": null,
   "adjustments": {
     "professionalEmailFactor": 0.5,
@@ -727,7 +730,7 @@ interface HeuristicRule {
 
 ### Random Forest inference at the edge
 
-The model (50 trees, trained offline with scikit-learn) is serialized as JSON and stored in KV. The Worker evaluates it using iterative tree traversal (not recursive, to avoid stack limits on the edge runtime).
+The model (20 trees, trained both offline via scikit-learn and online via a container-based TypeScript CART implementation) is serialized as JSON and stored in KV. The Worker evaluates it using iterative tree traversal (not recursive, to avoid stack limits on the edge runtime).
 
 ```typescript
 type CompactTreeNode =
@@ -774,7 +777,7 @@ Raw forest outputs are calibrated using Platt scaling (sigmoid fit on out-of-bag
 calibrated = 1 / (1 + exp(-(intercept + coef * raw_score)))
 ```
 
-Calibration parameters (`intercept`, `coef`) are stored in the model's metadata and applied automatically during inference. The production model's calibration was fitted on 330,139 OOB samples.
+Calibration parameters (`intercept`, `coef`) are stored in the model's metadata and applied automatically during inference. The production model's calibration was fitted on 50,000 OOB samples.
 
 ### Model fallback
 
@@ -1072,8 +1075,30 @@ Minimal binding configuration for the two-Worker system:
     { "binding": "TLD_LIST" },
   ],
 
+  "containers": [
+    {
+      "class_name": "TrainerContainer",
+      "image": "./container/Dockerfile",
+      "max_instances": 1,
+    },
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "TRAINER",
+        "class_name": "TrainerContainer",
+      },
+    ],
+  },
+
   "triggers": {
-    "crons": ["0 */6 * * *"],
+    "crons": ["0 */6 * * *", "0 3 * * SUN"],
+  },
+
+  "assets": {
+    "directory": "./public/",
+    "binding": "ASSETS",
   },
 }
 ```
@@ -1098,14 +1123,17 @@ Minimal binding configuration for the two-Worker system:
 | `fraud_blocks`          | Pre-Turnstile forensic log        | detection_type, fraud_signals_json                           |
 | `fingerprint_baselines` | TLS fingerprint anomaly baselines | ja4_bucket, asn_bucket, hit_count                            |
 
-### ML Worker (4 tables)
+### ML Worker (5 tables)
 
-| Table              | Purpose                                              |
-| ------------------ | ---------------------------------------------------- |
-| `validations`      | Every email validation with all signals and features |
-| `training_metrics` | Model training history and accuracy                  |
-| `ab_test_metrics`  | Experiment tracking for model variants               |
-| `admin_metrics`    | Configuration change audit log                       |
+| Table              | Purpose                                                                                        |
+| ------------------ | ---------------------------------------------------------------------------------------------- |
+| `validations`      | Every email validation with all signals and features (86 columns)                              |
+| `training_samples` | Auto-collected 48-feature vectors from live validations, with labels and source tracking        |
+| `training_metrics` | Model training history: accuracy, precision, recall, F1, FPR, anomaly detection                |
+| `ab_test_metrics`  | Experiment tracking for model variants                                                         |
+| `admin_metrics`    | Configuration change audit log                                                                 |
+
+The `training_samples` table drives the automated retraining loop. Each validation writes a feature vector with an auto-assigned label (`known_disposable`, `known_provider`, or `model`) keyed by a unique email hash. Manual review labels get 5x weight during training. Samples older than 14 days are pruned after each retraining cycle.
 
 <Aside type="note" title="D1 constraints">
   D1 databases are single-threaded and backed by a single Durable Object with a
@@ -1118,7 +1146,13 @@ Minimal binding configuration for the two-Worker system:
 
 ## Scheduled tasks
 
-The ML Worker uses a cron trigger (every 6 hours) to update its disposable domain list from external sources:
+The ML Worker uses two cron triggers to run three background tasks:
+
+| Cron Expression  | Schedule           | Task                                                                                              |
+| ---------------- | ------------------ | ------------------------------------------------------------------------------------------------- |
+| `0 */6 * * *`    | Every 6 hours      | Refresh disposable domain list from external GitHub sources (71k+ domains stored in KV)           |
+| `0 */6 * * *`    | Every 6 hours      | Prune validation records older than 30 days from D1 (GDPR compliance)                             |
+| `0 3 * * SUN`    | Sundays 3AM UTC    | Automated model retraining via `TrainerContainer` Durable Object (see training pipeline below)    |
 
 ```typescript
 export default {
@@ -1127,22 +1161,42 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ) {
+    // Domain refresh + data pruning run on every cron trigger
     ctx.waitUntil(updateDisposableDomains(env));
-  },
+    ctx.waitUntil(pruneOldValidations(env.DB, 30));
 
-  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
-    return app.fetch(request, env, ctx);
+    // Weekly retraining runs only on the Sunday schedule
+    if (controller.cron === "0 3 * * SUN") {
+      ctx.waitUntil(triggerContainerRetraining(env));
+    }
   },
 };
 ```
 
-The `ScheduledController` provides `controller.cron` (the matching expression) and `controller.scheduledTime`. Use `ctx.waitUntil()` for background work that should complete after the handler returns.
+The weekly retraining task sends training parameters (`nTrees: 20, maxDepth: 6, minSamplesLeaf: 20, conflictWeight: 20`) to the `TrainerContainer` Durable Object, which runs a full pipeline: fetch live training data from D1, train a new Random Forest, run guardrails, and upload the validated model to KV. After success, training samples older than 14 days are pruned.
 
 ---
 
 ## Model training pipeline
 
-The Random Forest is trained offline using a Python/CLI toolchain, then deployed to KV for edge inference. The pipeline runs outside the Worker runtime.
+The Random Forest is trained through two complementary pipelines: an **automated container-based pipeline** that retrains weekly on live production data, and an **offline CLI pipeline** for initial training and major model revisions.
+
+### Container-based retraining (production)
+
+A weekly cron (Sundays 3AM UTC) triggers the `TrainerContainer` Durable Object, which runs a Bun-based Docker container. The container:
+
+1. Fetches the current training dataset from the Worker's D1 database (auto-collected feature vectors from every `/validate` call)
+2. Trains a new Random Forest using a TypeScript CART implementation with Gini impurity, random feature subsampling, and conflict-zone weighting
+3. Applies Platt calibration via Newton-Raphson optimization on OOB predictions
+4. Runs guardrails (recall >= 95%, FPR <= 5%, FNR <= 5%)
+5. Uploads the validated model to KV (propagates globally within 60 seconds)
+6. Prunes training samples older than 14 days
+
+If guardrails fail, the existing model remains active and a training failure event is logged.
+
+### Offline CLI pipeline (development)
+
+For initial training and major model changes, an offline Python/CLI toolchain produces the model artifact.
 
 ### Training data
 
@@ -1193,14 +1247,14 @@ SynthF: Synth 500K {shape: page}
 CSV: main.csv 1M {shape: page}
 Export: features:export
 Feats: features.csv {shape: page}
-Train: RF 50 trees {shape: hexagon}
+Train: RF 20 trees {shape: hexagon}
 Cal: Platt Cal
 Guard: Guardrails {shape: diamond}
 KV: Upload KV {shape: cylinder}
 Worker: Worker ~60s {shape: oval}
 ```
 
-**Step 1: Feature export** -- Extract 45-feature vectors from the canonical dataset:
+**Step 1: Feature export** -- Extract 48-feature vectors from the canonical dataset:
 
 ```bash
 npm run cli features:export -- --input data/main.csv --output tmp/features.csv
@@ -1212,7 +1266,7 @@ npm run cli features:export -- --input data/main.csv --output tmp/features.csv
 python cli/commands/model/train_forest.py \
   --input tmp/features.csv \
   --output config/production/random-forest.json \
-  --n-trees 50 --max-depth 6 --min-samples-leaf 20 \
+  --n-trees 20 --max-depth 6 --min-samples-leaf 20 \
   --conflict-weight 20.0 --no-split
 ```
 
@@ -1233,34 +1287,45 @@ The serialized model contains metadata for runtime validation:
 ```json
 {
   "meta": {
-    "version": "3.1.0-forest",
-    "features": ["avg_segment_length", "bigram_entropy", "digit_ratio", "..."],
-    "tree_count": 50,
+    "version": "5.0.0-48feat",
+    "features": ["avg_segment_length", "bigram_entropy", "digit_ratio", "...48 total..."],
+    "tree_count": 20,
+    "nTrees": 20,
+    "maxDepth": 6,
     "feature_importance": {
-      "domain_reputation_score": 0.203,
-      "provider_is_disposable": 0.185,
-      "digit_ratio": 0.068,
-      "provider_is_free": 0.059,
-      "name_similarity_score": 0.048
+      "provider_is_disposable": 0.160,
+      "domain_reputation_score": 0.142,
+      "digit_position_ratio": 0.119,
+      "digit_ratio": 0.072,
+      "name_token_overlap": 0.057,
+      "max_digit_run": 0.056,
+      "bigram_entropy": 0.051,
+      "has_year_suffix": 0.047,
+      "provider_is_free": 0.040,
+      "entropy_score": 0.033
     },
     "calibration": {
       "method": "platt",
-      "intercept": -6.2006,
-      "coef": 13.2447,
-      "samples": 330139
+      "intercept": -4.5568,
+      "coef": 8.9711,
+      "samples": 50000
     },
     "config": {
-      "n_trees": 50,
+      "n_trees": 20,
       "max_depth": 6,
       "min_samples_leaf": 20,
-      "conflict_weight": 20.0
+      "conflict_weight": 20.0,
+      "conflict_entropy_threshold": 3.0,
+      "conflict_reputation_threshold": 0.6,
+      "no_split": true,
+      "oob_calibration": true
     }
   },
-  "forest": ["...50 serialized decision trees..."]
+  "forest": ["...20 serialized decision trees..."]
 }
 ```
 
-Top 5 features by importance: domain reputation (0.203), disposable domain flag (0.185), digit ratio (0.068), free provider flag (0.059), name-email similarity (0.048). Geo features (language/timezone mismatch) have zero importance in the current model -- they contribute to heuristic overrides instead.
+Top 5 features by importance: disposable domain flag (0.160), domain reputation (0.142), digit position ratio (0.119), digit ratio (0.072), name-token overlap (0.057). The `digit_position_ratio` feature -- measuring where digits appear relative to the local part length -- was introduced in the 48-feature model and ranks 3rd by importance, demonstrating its value for distinguishing `john1990@` (birth year at end) from `2024signup@` (timestamp at start). Geo features (language/timezone mismatch) have near-zero importance in the current model -- they contribute to heuristic overrides instead.
 
 ---
 
@@ -1318,17 +1383,21 @@ npm run cli ab:stop     # End experiment and remove from KV
 
 ## Analytics dashboard
 
-The ML Worker includes a Vite + React analytics dashboard for monitoring fraud detection in production:
+The ML Worker includes an Astro 5 + React 19 + Tailwind CSS 4 analytics dashboard (19 components) for monitoring fraud detection in production:
 
 - **Metrics grid**: Key KPIs (total validations, block rate, warn rate, avg score)
-- **Time-series charts**: Score distributions and decision trends over time
+- **Time-series charts**: Score distributions and decision trends over time (Recharts)
 - **Block reasons breakdown**: Which heuristics and model signals trigger blocks
 - **Validation table**: Drill into individual validation results with full signal details
 - **Model comparison**: Side-by-side A/B test variant performance
+- **Review queue**: Manual label review for training sample correction
+- **Training panel**: Training pipeline control and status monitoring
+- **Threshold tuner**: Interactive threshold adjustment UI
 - **Query builder**: Ad-hoc SQL queries against the D1 metrics tables
 - **System status**: Health indicators for model availability, KV connectivity, cron job status
+- **Export**: Data export in multiple formats
 
-Authentication uses HMAC-signed session cookies with 24-hour TTL and timing-safe comparison.
+Authentication uses HMAC-signed session cookies (SHA-256 derived signing key) with 24-hour TTL, `HttpOnly`/`Secure`/`SameSite=Strict` flags, and timing-safe comparison. Login is rate-limited to 5 attempts per minute per IP.
 
 ---
 
@@ -1353,7 +1422,7 @@ Authentication uses HMAC-signed session cookies with 24-hour TTL and timing-safe
 | Task                      | Steps                                                                                                                                                                                                                    |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **Add a detection layer** | 1. Implement signal collection function (return baseline on error) 2. Add score component + weight to config 3. Wire into Phase 2 of submission pipeline 4. Add normalization function in scoring module                 |
-| **Add an ML feature**     | 1. Implement extractor in feature module 2. Add to feature vector builder 3. Run `features:export` to regenerate CSV 4. Retrain with `train_forest.py` 5. Run guardrails 6. Deploy model JSON to KV (no Worker redeploy) |
+| **Add an ML feature**     | 1. Implement extractor in detector module 2. Add to `buildFeatureVector()` in `feature-vector.ts` 3. Run `features:export` to regenerate CSV 4. Retrain with `train_forest.py` (offline) or trigger container retraining 5. Run guardrails 6. Deploy model JSON to KV (no Worker redeploy) |
 | **Tune thresholds**       | 1. Set `mode: 'additive'` to disable deterministic overrides 2. Analyze score distributions from stored breakdowns via dashboard 3. Adjust `FRAUD_CONFIG` in wrangler vars 4. Switch back to `mode: 'defensive'`         |
 | **Run an A/B test**       | 1. `ab:create` with hypothesis, traffic split, and variant config overrides 2. Monitor via dashboard model comparison view 3. `ab:analyze` to compare variant metrics 4. `ab:stop` and promote winner                    |
 | **Add a heuristic rule**  | 1. Add rule to `risk-heuristics.json` (threshold, decision, reason, offset) 2. Upload to KV 3. Rule takes effect within 60 seconds (no redeploy)                                                                         |
