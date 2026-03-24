@@ -1,0 +1,320 @@
+---
+title: "Recursive DNS on GL-MT3000: Unbound Behind AdGuard Home"
+description: Replace public DNS resolvers on a GL-MT3000 travel router with a self-contained recursive Unbound instance fronted by AdGuard Home, using OpenWrt's procd for process supervision
+author: "Erfi Anugrah"
+---
+
+A guide to running a fully recursive DNS stack on the GL-MT3000 travel router. AdGuard Home handles filtering and client-facing DNS on port 53; Unbound runs as a recursive resolver on port 5335, querying root servers directly instead of forwarding to public providers like `1.1.1.1` or `8.8.8.8`. No data leaves to third-party resolvers.
+
+The GL-MT3000 runs OpenWrt (aarch64_cortex-a53) with GL.iNet's firmware layer on top. The OpenWrt `unbound-daemon` package is available in opkg, but the GL.iNet init script manages Unbound via UCI and generates its own config — it does not use `/etc/unbound/unbound.conf`. This guide works around that by disabling the UCI-managed service and running Unbound directly under a custom procd init script.
+
+---
+
+## Prerequisites
+
+- GL-MT3000 with AdGuard Home already running (enabled via GL.iNet admin panel → Applications → AdGuard Home)
+- SSH access enabled (LuCI → System → Administration → SSH Access, or GL.iNet admin panel → System → Advanced Settings)
+- An SSH key added in LuCI → System → Administration → SSH Keys (recommended over password auth)
+
+:::tip[SCP requires sftp-server]
+The GL-MT3000's default Dropbear SSH server does not ship with `sftp-server`, which modern `scp` requires. Install it before transferring files:
+
+```bash
+opkg update && opkg install openssh-sftp-server
+```
+
+After that, `scp` works normally from your local machine.
+:::
+
+---
+
+## Part 1: Install Unbound
+
+SSH into the router and install the daemon package:
+
+```bash
+opkg update
+opkg install unbound-daemon
+```
+
+Fetch the root hints file (list of DNS root servers) and bootstrap the DNSSEC trust anchor:
+
+```bash
+curl -o /etc/unbound/root.hints https://www.internic.net/domain/named.root
+unbound-anchor -a /etc/unbound/root.key
+```
+
+The `unbound-anchor` command creates or updates `root.key`, which Unbound needs for DNSSEC validation (`auto-trust-anchor-file` in the config). Without it, DNSSEC will fail on first start.
+
+:::caution[The UCI init script does not use /etc/unbound/]
+The OpenWrt `unbound` package ships an init script (`/etc/init.d/unbound`) that generates its config from UCI into `/var/lib/unbound/unbound.conf`. It never reads `/etc/unbound/unbound.conf`. Running `service unbound start` with your own config in `/etc/unbound/` will result in a crash loop — the UCI script runs its own generated config, which may be broken or missing `root.hints`.
+
+The fix: disable the UCI-managed service and run a custom procd init script pointing at `/etc/unbound/unbound.conf`.
+:::
+
+---
+
+## Part 2: Configure Unbound
+
+Create `/etc/unbound/unbound.conf`. The key differences from a standard Unbound config:
+
+- `interface: 127.0.0.1` + `port: 5335` — loopback only, AGH is the public-facing resolver
+- `access-control: 0.0.0.0/0 refuse` — only localhost (AGH) can query Unbound
+- `use-caps-for-id: no` — 0x20 encoding causes resolution failures with authoritative servers that don't preserve query name casing; disabled for reliability
+- `module-config: "validator iterator"` — DNSSEC validation enabled
+- Cache sized for standalone use (no upstream cache layer)
+- `so-sndbuf`/`so-rcvbuf` omitted — require sysctl tuning not present on stock OpenWrt
+- Local zones for `lan`, `gl-mt3000`, and the `10.69.69.0/24` reverse zone pulled from the UCI-generated config
+
+```conf
+# /etc/unbound/unbound.conf
+# Standalone recursive resolver — upstream for AdGuard Home on :5335
+
+server:
+    do-daemonize: no
+    username: ""
+    chroot: ""
+    directory: "/etc/unbound"
+    pidfile: "/var/run/unbound.pid"
+    use-syslog: yes
+    verbosity: 1
+    log-queries: no
+    log-replies: no
+    log-servfail: yes
+    log-time-ascii: yes
+
+    interface: 127.0.0.1
+    port: 5335
+
+    do-ip4: yes
+    do-udp: yes
+    do-tcp: yes
+    prefer-ip6: no
+    do-ip6: no
+
+    access-control: 127.0.0.1/32 allow
+    access-control: 0.0.0.0/0 refuse
+
+    # DNSSEC
+    harden-glue: yes
+    harden-dnssec-stripped: yes
+    harden-below-nxdomain: yes
+    harden-algo-downgrade: yes
+    qname-minimisation: yes
+    aggressive-nsec: yes
+    val-clean-additional: yes
+    val-permissive-mode: no
+    module-config: "validator iterator"
+    auto-trust-anchor-file: /etc/unbound/root.key
+
+    # Privacy & hardening
+    use-caps-for-id: no
+    rrset-roundrobin: yes
+    hide-identity: yes
+    hide-version: yes
+    minimal-responses: yes
+
+    private-address: 10.0.0.0/8
+    private-address: 100.64.0.0/10
+    private-address: 169.254.0.0/16
+    private-address: 172.16.0.0/12
+    private-address: 192.168.0.0/16
+    private-address: fc00::/7
+    private-address: fe80::/10
+
+    # Local zones (update if your LAN subnet changes)
+    domain-insecure: lan
+    private-domain: lan
+    local-zone: lan static
+    local-data: "lan. 7200 IN SOA localhost. nobody.invalid. 1 3600 1200 9600 300"
+    local-data: "lan. 7200 IN NS localhost."
+
+    domain-insecure: gl-mt3000
+    private-domain: gl-mt3000
+    local-zone: gl-mt3000 static
+    local-data: "gl-mt3000. 7200 IN SOA localhost. nobody.invalid. 1 3600 1200 9600 300"
+    local-data: "gl-mt3000. 7200 IN NS localhost."
+    local-data: "gl-mt3000. 300 IN A 10.69.69.1"
+
+    domain-insecure: 69.69.10.in-addr.arpa
+    local-zone: 69.69.10.in-addr.arpa static
+    local-data: "69.69.10.in-addr.arpa. 7200 IN SOA localhost. nobody.invalid. 1 3600 1200 9600 300"
+    local-data: "69.69.10.in-addr.arpa. 7200 IN NS localhost."
+    local-data-ptr: "10.69.69.1 300 gl-mt3000"
+
+    local-zone: local always_nxdomain
+
+    # Cache — sized for standalone use on MT-3000 (512MB RAM total)
+    # No upstream cache layer; Unbound sees all queries from AGH
+    key-cache-size: 8m
+    msg-cache-size: 16m
+    rrset-cache-size: 32m
+    cache-min-ttl: 0
+    cache-max-ttl: 72000
+    cache-max-negative-ttl: 60
+    val-bogus-ttl: 300
+    infra-host-ttl: 900
+
+    prefetch: yes
+    prefetch-key: yes
+
+    # Serve stale entries while refreshing — useful on a router where
+    # upstream hiccups affect all devices on the network
+    serve-expired: yes
+    serve-expired-ttl: 86400
+    serve-expired-client-timeout: 1800
+
+    # Performance — MT-3000 has 2 cores (Filogic 820 / MT7981B, dual-core Cortex-A53)
+    num-threads: 2
+    msg-cache-slabs: 4
+    rrset-cache-slabs: 4
+    infra-cache-slabs: 4
+    key-cache-slabs: 4
+    ratelimit-slabs: 4
+    ip-ratelimit-slabs: 4
+
+    edns-buffer-size: 1232
+    so-reuseport: yes
+    jostle-timeout: 200
+    outgoing-range: 4096
+    outgoing-port-permit: 10240-65535
+    num-queries-per-thread: 1024
+    target-fetch-policy: "3 2 1 0 0"
+
+    extended-statistics: yes
+    statistics-interval: 0
+    statistics-cumulative: yes
+
+    tls-cert-bundle: /etc/ssl/certs/ca-certificates.crt
+    root-hints: /etc/unbound/root.hints
+```
+
+Transfer it to the router:
+
+```bash
+scp unbound.conf root@10.69.69.1:/etc/unbound/unbound.conf
+```
+
+---
+
+## Part 3: Procd Init Script
+
+The UCI-managed `unbound` service must be disabled before starting the custom one — both try to bind port 5335 and will conflict.
+
+```bash
+service unbound disable
+service unbound stop
+```
+
+Create the procd init script:
+
+```bash
+cat > /etc/init.d/unbound-custom << 'EOF'
+#!/bin/sh /etc/rc.common
+
+START=18
+STOP=50
+USE_PROCD=1
+PROG=/usr/sbin/unbound
+
+start_service() {
+    procd_open_instance "unbound"
+    procd_set_param command $PROG -d -c /etc/unbound/unbound.conf
+    procd_set_param respawn
+    procd_close_instance
+}
+EOF
+
+chmod +x /etc/init.d/unbound-custom
+service unbound-custom enable
+service unbound-custom start
+```
+
+Verify it is listening:
+
+```bash
+netstat -lunp | grep 5335
+```
+
+Expected output:
+
+```
+udp  0  0  127.0.0.1:5335  0.0.0.0:*  <PID>/unbound
+udp  0  0  127.0.0.1:5335  0.0.0.0:*  <PID>/unbound
+```
+
+The duplicate line is normal — one entry per thread (num-threads: 2).
+
+:::note[do-daemonize: no is required for procd]
+procd manages the process lifecycle directly. If `do-daemonize: yes` is set, Unbound forks and exits the foreground process, which procd interprets as a crash. Always use `do-daemonize: no` with procd-managed services.
+:::
+
+---
+
+## Part 4: Point AdGuard Home at Unbound
+
+In the AdGuard Home web UI:
+
+1. **Settings → DNS settings → Upstream DNS servers**
+2. Replace all existing entries (`1.1.1.1`, `8.8.8.8`, `9.9.9.9`) with:
+   ```
+   127.0.0.1:5335
+   ```
+3. Switch from **Parallel requests** to **Load-balancing** (irrelevant with a single upstream, but cleaner)
+4. Click **Apply**, then **Test upstreams**
+
+A green confirmation means AGH can reach Unbound and resolve through it. All DNS queries from devices on the network now recurse against root servers via Unbound, with AGH handling filtering and logging in front.
+
+:::caution[Fallback DNS servers]
+Leave the Fallback DNS servers field empty if you want fully recursive DNS. Adding a public fallback (e.g. `9.9.9.9`) means AGH will fall back to that provider if Unbound is unreachable — useful for resilience on a travel router, but it reintroduces a third-party resolver under failure conditions.
+:::
+
+---
+
+## Troubleshooting
+
+**Crash loop on service start**
+
+Run Unbound directly to see the error:
+
+```bash
+unbound -c /etc/unbound/unbound.conf -d 2>&1
+```
+
+Common causes:
+
+- `root.hints` missing — fetch it: `curl -o /etc/unbound/root.hints https://www.internic.net/domain/named.root`
+- Port already in use — check if the UCI service is still running: `netstat -lunp | grep 5335`
+- Config syntax error — install `unbound-checkconf` (`opkg install unbound-checkconf`) and run `unbound-checkconf /etc/unbound/unbound.conf`
+
+**Logs**
+
+With `use-syslog: yes`, Unbound logs to the system log:
+
+```bash
+logread -f | grep unbound
+```
+
+**Test resolution directly**
+
+From the router:
+
+```bash
+nslookup google.com 127.0.0.1
+# or
+nslookup -port=5335 google.com 127.0.0.1
+```
+
+---
+
+## Persistence After Firmware Upgrade
+
+GL.iNet firmware upgrades preserve a curated set of config files from `/etc/` when "Keep Settings" is enabled, but custom files outside the default backup list (like `/etc/unbound/` and `/etc/init.d/unbound-custom`) may not survive. Add them to `/etc/sysupgrade.conf` to ensure persistence, and back up regardless:
+
+```bash
+# from your local machine
+scp root@10.69.69.1:/etc/unbound/unbound.conf ./unbound.conf
+scp root@10.69.69.1:/etc/init.d/unbound-custom ./unbound-custom
+```
+
+After an upgrade, the UCI `unbound` service may re-enable itself. Check with `service unbound status` and disable again if needed.
