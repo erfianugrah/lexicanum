@@ -10,21 +10,15 @@ How [**video-resizer-2**](https://github.com/erfianugrah/video-resizer-2) handle
 
 Single endpoint for video resize, frame extraction, spritesheet generation, and audio extraction. Three-tier transform routing: Media binding for R2 sources, cdn-cgi/media for remote sources, FFmpeg container for oversized/advanced transforms. Results stored persistently in R2 with edge cache on top. Zero memory buffering -- all streams flow through without loading into Worker memory.
 
-Rewrite of v1 (~40K lines) in ~3K lines using Hono, Zod 4, and Cloudflare Containers.
-
-**Live:** https://videos.erfi.io
-
 ---
-
-## Overview
 
 Three transform tiers + four transformation modes:
 
-| Tier | Source | Size Limit | Method | Latency | Worker Memory |
-|------|--------|-----------|--------|---------|---------------|
-| 1 | R2 | ≤100MB | `env.MEDIA.input(stream)` | ~2-10s | Stream only |
-| 2 | Remote/Fallback | ≤100 MiB | `cdn-cgi/media` URL fetch | ~3-15s | Zero |
-| 3 | Any | >100 MiB or container-only params | FFmpeg Container DO | ~60-120s (async) | Zero |
+| Tier | Source          | Size Limit                        | Method                          | Latency          | Worker Memory |
+| ---- | --------------- | --------------------------------- | ------------------------------- | ---------------- | ------------- |
+| 1    | R2              | ≤100MB                            | `env.MEDIA.input(stream)`       | ~2-10s           | Stream only   |
+| 2    | Remote/Fallback | ≤100 MiB                          | `cdn-cgi/media` URL fetch       | ~3-15s           | Zero          |
+| 3    | Any             | >100 MiB or container-only params | FFmpeg Container DO (via Queue) | ~60-300s (async) | Zero          |
 
 Transformation modes:
 
@@ -33,7 +27,7 @@ Transformation modes:
 - **Spritesheet**: Grid previews for scrubbing UIs
 - **Audio**: Extract m4a audio tracks
 
-Container-only features (fps, speed, rotate, crop, bitrate, h265/vp9 codecs) route to the FFmpeg container regardless of file size.
+Container-only features (fps, speed, rotate, crop, bitrate, h265/vp9/av1 codecs) route to the FFmpeg container regardless of file size. Container transforms are dispatched via Cloudflare Queue for deploy safety and automatic retry.
 
 ---
 
@@ -111,24 +105,25 @@ Container: FFmpeg Container DO
 
 ### Design patterns (v1 -> v2)
 
-| v1 Pattern | v2 Pattern | Why |
-|-----------|-----------|-----|
-| Strategy per mode (5 files) | Single transform handler, mode via params | Modes are just param combinations, not separate code paths |
+| v1 Pattern                                  | v2 Pattern                                                   | Why                                                                                                                                        |
+| ------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Strategy per mode (5 files)                 | Single transform handler, mode via params                    | Modes are just param combinations, not separate code paths                                                                                 |
 | Reactive error handling (9402 -> container) | Proactive size-based routing + reactive `Cf-Resized` parsing | HEAD check + size thresholds for proactive routing; `Cf-Resized` header parsing for reactive fallback on CF error codes (9402, 9404, etc.) |
-| 5 singleton config managers | Single Zod 4 schema + KV hot-reload | One source of truth, validated on upload |
-| Akamai translation in middleware | Pure function `translateAkamaiParams()` | Testable, no side effects |
-| KV chunked storage (5 MiB chunks) | R2 persistent store + edge cache | No chunking needed, R2 handles any size |
-| `__r2src` self-referencing URL | `env.MEDIA.input(stream)` binding | Direct R2 stream, no HTTP subrequest |
+| 5 singleton config managers                 | Single Zod 4 schema + KV hot-reload                          | One source of truth, validated on upload                                                                                                   |
+| Akamai translation in middleware            | Pure function `translateAkamaiParams()`                      | Testable, no side effects                                                                                                                  |
+| KV chunked storage (5 MiB chunks)           | R2 persistent store + edge cache                             | No chunking needed, R2 handles any size                                                                                                    |
+| `__r2src` self-referencing URL              | `env.MEDIA.input(stream)` binding                            | Direct R2 stream, no HTTP subrequest                                                                                                       |
 
 ### Cache hierarchy
 
-| Layer | Scope | Speed | Range Support | Persistence |
-|-------|-------|-------|--------------|-------------|
-| Edge cache (`caches.default`) | Per-colo | Fastest | Native (206) | Ephemeral |
-| R2 persistent store (`_transformed/`) | Global | Fast | Via cache.match | Permanent until bust |
-| KV version registry | Global | Fast | N/A | Manual bust |
+| Layer                                 | Scope           | Speed                                             | Range Support   | Persistence          |
+| ------------------------------------- | --------------- | ------------------------------------------------- | --------------- | -------------------- |
+| Edge cache (`caches.default`)         | Per data center | Workers run before cache; same local store as CDN | Native (206)    | Ephemeral            |
+| R2 persistent store (`_transformed/`) | Global          | Fast                                              | Via cache.match | Permanent until bust |
+| KV version registry                   | Global          | Fast                                              | N/A             | Manual bust          |
 
 On every successful transform, the output flows sequentially with zero memory buffering:
+
 1. Transform output -> stream to R2 via `FixedLengthStream`
 2. R2 get -> stream to `cache.put`
 3. `cache.match` -> serve to client (native range request support)
@@ -139,33 +134,33 @@ Subsequent requests: edge cache HIT (fastest) or R2 HIT -> cache.put -> cache.ma
 
 Every response includes:
 
-| Header | Value | Notes |
-|--------|-------|-------|
-| `X-R2-Cache` | `HIT` or `MISS` | Whether result came from R2 persistent store |
-| `cf-cache-status` | `HIT`, `MISS`, etc. | CF edge cache status |
-| `X-Transform-Source` | `binding`, `cdn-cgi`, `container` | Which tier performed the transform |
-| `X-Source-Type` | `r2`, `remote`, `fallback` | Which source provided the original |
-| `X-Cache-Key` | `video:path:w=1280:c=auto` | Deterministic cache key |
-| `X-Request-ID` | UUID | Per-request trace ID |
-| `X-Processing-Time-Ms` | number | Transform duration |
-| `X-Derivative` | name | Resolved derivative |
-| `X-Resolved-Width/Height` | number | Final dimensions |
-| `Via` | `video-resizer` | Loop prevention |
-| `Cache-Tag` | comma-separated | Purge-by-tag support |
+| Header                    | Value                             | Notes                                        |
+| ------------------------- | --------------------------------- | -------------------------------------------- |
+| `X-R2-Cache`              | `HIT` or `MISS`                   | Whether result came from R2 persistent store |
+| `cf-cache-status`         | `HIT`, `MISS`, etc.               | CF edge cache status                         |
+| `X-Transform-Source`      | `binding`, `cdn-cgi`, `container` | Which tier performed the transform           |
+| `X-Source-Type`           | `r2`, `remote`, `fallback`        | Which source provided the original           |
+| `X-Cache-Key`             | `video:path:w=1280:c=auto`        | Deterministic cache key                      |
+| `X-Request-ID`            | UUID                              | Per-request trace ID                         |
+| `X-Processing-Time-Ms`    | number                            | Transform duration                           |
+| `X-Derivative`            | name                              | Resolved derivative                          |
+| `X-Resolved-Width/Height` | number                            | Final dimensions                             |
+| `Via`                     | `video-resizer`                   | Loop prevention                              |
+| `Cache-Tag`               | comma-separated                   | Purge-by-tag support                         |
 
 ### Mode capabilities
 
-| Feature | Video | Frame | Spritesheet | Audio | Container |
-|---------|-------|-------|-------------|-------|-----------|
-| **Dimensions** | 10-2000px | 10-2000px | Required | - | 10-2000px |
-| **Fit modes** | Yes | Yes | Yes | - | Yes |
-| **Time** | 0-10m | 0-10m | 0-10m | 0-10m | Unlimited |
-| **Duration** | 1s-60s | - | 1s-60s | 1s-60s | Unlimited |
-| **Format** | - | jpg/png | JPEG only | m4a only | mp4/webm |
-| **Quality/compression** | Yes | - | - | - | Yes (CRF) |
-| **FPS/Speed/Rotate/Crop** | No | No | No | No | Yes |
-| **Bitrate control** | No | No | No | No | Yes |
-| **Input size limit** | 100 MiB (binding) | 100 MiB (cdn-cgi, configurable) | 100 MiB | 100 MiB | 20 GB disk |
+| Feature                   | Video             | Frame                           | Spritesheet | Audio    | Container  |
+| ------------------------- | ----------------- | ------------------------------- | ----------- | -------- | ---------- |
+| **Dimensions**            | 10-2000px         | 10-2000px                       | Required    | -        | 10-2000px  |
+| **Fit modes**             | Yes               | Yes                             | Yes         | -        | Yes        |
+| **Time**                  | 0-10m             | 0-10m                           | 0-10m       | 0-10m    | Unlimited  |
+| **Duration**              | 1s-60s            | -                               | 1s-60s      | 1s-60s   | Unlimited  |
+| **Format**                | -                 | jpg/png                         | JPEG only   | m4a only | mp4/webm   |
+| **Quality/compression**   | Yes               | -                               | -           | -        | Yes (CRF)  |
+| **FPS/Speed/Rotate/Crop** | No                | No                              | No          | No       | Yes        |
+| **Bitrate control**       | No                | No                              | No          | No       | Yes        |
+| **Input size limit**      | 100 MiB (binding) | 100 MiB (cdn-cgi, configurable) | 100 MiB     | 100 MiB  | 20 GB disk |
 
 ---
 
@@ -196,8 +191,9 @@ Fallback: if cdn-cgi returns 404/5xx, tries next source in priority order.
 For transforms the binding/cdn-cgi can't handle. Returns 202 immediately, processes asynchronously, stores result in R2.
 
 ```
-Request 1: -> 202 Processing (Retry-After: 30)
-Container:  -> downloads source -> ffmpeg -> stores in R2
+Request 1: -> 202 Processing (jobId + ws URL, Retry-After: 10)
+Queue:      -> consumer dispatches to container DO
+Container:  -> downloads source -> ffmpeg -> stores in R2 (via outbound handler)
 Request 2: -> R2 HIT -> cache.put -> cache.match -> 200 video/mp4
 ```
 
@@ -219,9 +215,11 @@ Container-only params that trigger this tier: `fps`, `speed`, `rotate`, `crop`, 
 
 Containers only intercept HTTP traffic (not HTTPS). `FFmpegContainer.outbound` intercepts all HTTP:
 
-- `POST /internal/container-result` -> stores transcoded output in R2 via `FixedLengthStream`
+- `GET /internal/job-progress` -> forwards progress to TransformJobDO + updates D1
+- `POST /internal/container-result` -> stores transcoded output in R2, updates D1 + TransformJobDO
 - `GET /internal/r2-source` -> serves raw R2 objects via binding (for R2-only sources)
-- Everything else -> `fetch()` with http->https upgrade (source downloads)
+- `GET (large files)` -> proxy with source dedup (tee to R2 `_source-cache/` + container)
+- Everything else -> `fetch()` with http->https upgrade
 
 Source downloads use HTTPS directly (`enableInternet=true`, not intercepted).
 
@@ -229,12 +227,12 @@ Source downloads use HTTPS directly (`enableInternet=true`, not intercepted).
 
 Node.js 22 + ffmpeg in `node:22-slim` Docker image.
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/transform` | POST | Sync: stream source in, receive output |
-| `/transform-async` | POST | Async: stream source + callbackUrl, 202 |
-| `/transform-url` | POST | Async URL-based: container fetches source directly |
-| `/health` | GET | Health check |
+| Endpoint           | Method | Description                                        |
+| ------------------ | ------ | -------------------------------------------------- |
+| `/transform`       | POST   | Sync: stream source in, receive output             |
+| `/transform-async` | POST   | Async: stream source + callbackUrl, 202            |
+| `/transform-url`   | POST   | Async URL-based: container fetches source directly |
+| `/health`          | GET    | Health check                                       |
 
 ### ffmpeg features
 
@@ -247,24 +245,35 @@ Node.js 22 + ffmpeg in `node:22-slim` Docker image.
 ### Quality presets
 
 | Preset | CRF | FFmpeg Preset |
-|--------|-----|---------------|
-| low | 28 | fast |
-| medium | 23 | medium |
-| high | 18 | medium |
+| ------ | --- | ------------- |
+| low    | 28  | fast          |
+| medium | 23  | medium        |
+| high   | 18  | medium        |
 
-### Async flow (verified)
+### Queue-based async flow
 
-1. Transform handler detects oversized source (>100 MiB) or container-only params
-2. DO dedup check (`jobInFlight` flag) -- skips if already processing
-3. Fires `POST /transform-url` to container DO with source URL + callback URL
-4. Returns 202 JSON (`{ status: "processing", message: "...", path: "..." }`) with `Retry-After: 30`
-5. Container downloads source via HTTPS, streams to disk via `pipeline()`
-6. Container runs ffmpeg with all available threads
-7. Container `stat()`s output for Content-Length, streams to callback via `http://` (outbound handler intercepts)
-8. Outbound handler stores in R2 (`_transformed/{cacheKey}`) via `FixedLengthStream`
-9. Next request: Worker checks R2 -> HIT -> `cache.put` -> `cache.match` -> serve
+Container transforms are dispatched via Cloudflare Queue for durability (messages survive deploys, automatic retry with dead letter queue).
 
-**Verified**: 725MB .mov -> 37.8MB .mp4, served from edge cache in 0.6s with range requests.
+1. Transform handler enqueues job to `TRANSFORM_QUEUE` + registers in D1 `transform_jobs` table
+2. Returns 202 JSON with `jobId` + WebSocket URL for real-time progress
+3. Queue consumer picks up job, checks R2 for existing result (idempotent dedup)
+4. If no result: dispatches to FFmpegContainer DO via `/transform-url`
+5. Container downloads source via HTTPS (or R2 via `/internal/r2-source`), streams to disk
+6. Container runs ffmpeg, reports progress via `/internal/job-progress` -> TransformJobDO -> WebSocket broadcast
+7. Container streams output to callback via `http://` (outbound handler intercepts)
+8. Outbound handler stores in R2 (`_transformed/{cacheKey}`), updates D1 + TransformJobDO
+9. Queue consumer retries in 120s, finds R2 result, acks message
+10. Next client request: R2 HIT -> `cache.put` -> `cache.match` -> serve
+
+**Verified**: 725MB .mov -> 31MB .mp4, served from edge cache in 0.1s with range requests.
+
+### Source dedup
+
+The outbound handler caches remote source downloads in R2 (`_source-cache/{path}`). Uses `body.tee()` to stream to both the container and R2. Concurrent containers transforming the same 725MB source share one download instead of each downloading independently.
+
+### Spritesheet via ffmpeg
+
+For spritesheets routed to the container (oversized sources), ffmpeg uses `fps=1,tile=COLSxROWS` filter. `imageCount` defaults to 20, grid layout via `ceil(sqrt(N))` columns, output as JPEG.
 
 ---
 
@@ -272,51 +281,52 @@ Node.js 22 + ffmpeg in `node:22-slim` Docker image.
 
 ### Canonical transform params
 
-| Param | Type | Range/Values | Example |
-|-------|------|-------------|---------|
-| `width` | int | 10-2000 | `?width=1280` |
-| `height` | int | 10-2000 | `?height=720` |
-| `fit` | enum | contain, cover, scale-down | `?fit=cover` |
-| `mode` | enum | video, frame, spritesheet, audio | `?mode=frame` |
-| `time` | string | 0s-10m | `?time=5s` |
-| `duration` | string | 1s-60s (binding), unlimited (container) | `?duration=10s` |
-| `audio` | bool | true/false | `?audio=false` |
-| `format` | enum | jpg, png (frame); m4a (audio) | `?format=png` |
-| `filename` | string | alphanumeric, max 120 | `?filename=clip` |
-| `derivative` | string | config key | `?derivative=tablet` |
-| `quality` | enum | low, medium, high, auto | `?quality=high` |
-| `compression` | enum | low, medium, high, auto | `?compression=low` |
-| `fps` | float | >0 (container) | `?fps=24` |
-| `speed` | float | >0 (container) | `?speed=2` |
-| `rotate` | float | any (container) | `?rotate=90` |
-| `crop` | string | geometry (container) | `?crop=640:480:0:0` |
-| `bitrate` | string | (container) | `?bitrate=2M` |
-| `imageCount` | int | >0 | `?imageCount=10` |
-| `loop` | bool | playback hint header | `?loop=true` |
-| `autoplay` | bool | playback hint header | `?autoplay=true` |
-| `muted` | bool | playback hint header | `?muted=true` |
-| `preload` | enum | none, metadata, auto | `?preload=auto` |
-| `debug` | any | `view` for JSON diagnostics | `?debug=view` |
+| Param         | Type   | Range/Values                            | Example              |
+| ------------- | ------ | --------------------------------------- | -------------------- |
+| `width`       | int    | 10-2000                                 | `?width=1280`        |
+| `height`      | int    | 10-2000                                 | `?height=720`        |
+| `fit`         | enum   | contain, cover, scale-down              | `?fit=cover`         |
+| `mode`        | enum   | video, frame, spritesheet, audio        | `?mode=frame`        |
+| `time`        | string | 0s-10m                                  | `?time=5s`           |
+| `duration`    | string | 1s-60s (binding), unlimited (container) | `?duration=10s`      |
+| `audio`       | bool   | true/false                              | `?audio=false`       |
+| `format`      | enum   | jpg, png (frame); m4a (audio)           | `?format=png`        |
+| `filename`    | string | alphanumeric, max 120                   | `?filename=clip`     |
+| `derivative`  | string | config key                              | `?derivative=tablet` |
+| `quality`     | enum   | low, medium, high, auto                 | `?quality=high`      |
+| `compression` | enum   | low, medium, high, auto                 | `?compression=low`   |
+| `fps`         | float  | >0 (container)                          | `?fps=24`            |
+| `speed`       | float  | >0 (container)                          | `?speed=2`           |
+| `rotate`      | float  | any (container)                         | `?rotate=90`         |
+| `crop`        | string | geometry (container)                    | `?crop=640:480:0:0`  |
+| `bitrate`     | string | (container)                             | `?bitrate=2M`        |
+| `dpr`         | float  | >0                                      | `?dpr=2`             |
+| `imageCount`  | int    | >0                                      | `?imageCount=10`     |
+| `loop`        | bool   | playback hint header                    | `?loop=true`         |
+| `autoplay`    | bool   | playback hint header                    | `?autoplay=true`     |
+| `muted`       | bool   | playback hint header                    | `?muted=true`        |
+| `preload`     | enum   | none, metadata, auto                    | `?preload=auto`      |
+| `debug`       | any    | `view` for JSON diagnostics             | `?debug=view`        |
 
 ### Akamai/IMQuery compatibility
 
 Full Akamai Image & Video Manager parameter translation. Explicit canonical params always win.
 
-| Akamai Param | Canonical | Value Translation |
-|-------------|-----------|-------------------|
-| `imwidth` | `width` | Direct; triggers derivative matching |
-| `imheight` | `height` | Direct |
-| `impolicy` | `derivative` | Policy = derivative |
-| `imformat` | `format` | `h264`->`mp4`; `h265`/`vp9`->container |
-| `imdensity` | `dpr` | Pixel density multiplier |
-| `imref` | consumed | Parsed for derivative matching context |
-| `im-viewwidth` | -- | Sets `Sec-CH-Viewport-Width` hint |
-| `im-viewheight` | -- | Sets `Viewport-Height` hint |
-| `im-density` | -- | Sets `Sec-CH-DPR` hint |
-| `w`, `h`, `q`, `f` | width, height, quality, format | Shorthands |
-| `obj-fit` | `fit` | `crop`->`cover`, `fill`->`contain` |
-| `start`, `dur` | `time`, `duration` | Shorthands |
-| `mute` | `audio` | **Inverted**: `mute=true` -> `audio=false` |
+| Akamai Param       | Canonical                      | Value Translation                            |
+| ------------------ | ------------------------------ | -------------------------------------------- |
+| `imwidth`          | `width`                        | Direct; triggers derivative matching         |
+| `imheight`         | `height`                       | Direct                                       |
+| `impolicy`         | `derivative`                   | Policy = derivative                          |
+| `imformat`         | `format`                       | `h264`->`mp4`; `h265`/`vp9`/`av1`->container |
+| `imdensity`        | `dpr`                          | Pixel density multiplier                     |
+| `imref`            | consumed                       | Parsed for derivative matching context       |
+| `im-viewwidth`     | --                             | Sets `Sec-CH-Viewport-Width` hint            |
+| `im-viewheight`    | --                             | Sets `Viewport-Height` hint                  |
+| `im-density`       | --                             | Sets `Sec-CH-DPR` hint                       |
+| `w`, `h`, `q`, `f` | width, height, quality, format | Shorthands                                   |
+| `obj-fit`          | `fit`                          | `crop`->`cover`, `fill`->`contain`           |
+| `start`, `dur`     | `time`, `duration`             | Shorthands                                   |
+| `mute`             | `audio`                        | **Inverted**: `mute=true` -> `audio=false`   |
 
 ### Derivatives
 
@@ -324,13 +334,24 @@ Named presets that bundle dimensions + quality + mode into a single parameter:
 
 ```json
 {
-  "tablet": { "width": 1280, "height": 720, "fit": "contain", "duration": "5m" },
+  "tablet": {
+    "width": 1280,
+    "height": 720,
+    "fit": "contain",
+    "duration": "5m"
+  },
   "mobile": { "width": 854, "height": 640, "fit": "contain", "duration": "5m" },
-  "thumbnail": { "width": 640, "height": 360, "mode": "frame", "format": "png", "time": "0s" }
+  "thumbnail": {
+    "width": 640,
+    "height": 360,
+    "mode": "frame",
+    "format": "png",
+    "time": "0s"
+  }
 }
 ```
 
-**Canonical invariant**: derivative dimensions replace any explicit params. `?imwidth=1280` is used for derivative *selection* only, never for the actual transform or cache key.
+**Canonical invariant**: derivative dimensions replace any explicit params. `?imwidth=1280` is used for derivative _selection_ only, never for the actual transform or cache key.
 
 ### Responsive sizing
 
@@ -375,7 +396,7 @@ cache.put (edge cache)
 Client (200 or 206 with Content-Range)
 ```
 
-No `tee()`, no `arrayBuffer()`, no memory buffering. Sequential streaming through R2 then edge cache. `cache.match` provides native range request handling (206 + Content-Range) for video seeking.
+No `tee()`, no `arrayBuffer()`, no memory buffering. Sequential streaming through R2 then `cache.put`. The final `cache.match` with the original client request (which may include a `Range` header) provides automatic 206 + Content-Range handling for video seeking — no manual byte math needed.
 
 ---
 
@@ -385,15 +406,22 @@ Origins configured as an array with regex matcher, capture groups, and prioritiz
 
 ```json
 {
-  "origins": [{
-    "name": "standard",
-    "matcher": "^/([^.]+)\\.(mp4|webm|mov)",
-    "sources": [
-      { "type": "remote", "priority": 0, "url": "https://videos.erfi.dev" },
-      { "type": "r2", "priority": 1, "bucketBinding": "VIDEOS" }
-    ],
-    "ttl": { "ok": 86400, "redirects": 300, "clientError": 60, "serverError": 10 }
-  }]
+  "origins": [
+    {
+      "name": "standard",
+      "matcher": "^/([^.]+)\\.(mp4|webm|mov)",
+      "sources": [
+        { "type": "remote", "priority": 0, "url": "https://videos.erfi.dev" },
+        { "type": "r2", "priority": 1, "bucketBinding": "VIDEOS" }
+      ],
+      "ttl": {
+        "ok": 86400,
+        "redirects": 300,
+        "clientError": 60,
+        "serverError": 10
+      }
+    }
+  ]
 }
 ```
 
@@ -401,11 +429,11 @@ Sources tried in priority order. If one fails (404, 5xx, timeout), falls through
 
 ### Auth types
 
-| Type | How |
-|------|-----|
+| Type     | How                                                             |
+| -------- | --------------------------------------------------------------- |
 | `aws-s3` | Presigned URLs via `aws4fetch` (cached in KV with auto-refresh) |
-| `bearer` | `Authorization: Bearer {token}` from env var |
-| `header` | Custom header name + value from env var |
+| `bearer` | `Authorization: Bearer {token}` from env var                    |
+| `header` | Custom header name + value from env var                         |
 
 ---
 
@@ -413,16 +441,16 @@ Sources tried in priority order. If one fails (404, 5xx, timeout), falls through
 
 ### Error recovery strategies
 
-| Strategy | When | What happens |
-|----------|------|--------------|
-| `Cf-Resized` error parsing | cdn-cgi returns 200 with `err=XXXX` in header | Parse CF error code, route to appropriate recovery |
-| Reactive container fallback (9402) | cdn-cgi `Cf-Resized: err=9402` (origin too large) | Route to FFmpeg container, return 202 |
-| Source retry (9404/9407/9504) | cdn-cgi `Cf-Resized: err=9404/9407/9504` | Try next source in priority order |
-| Duration limit retry | Binding rejects duration | Extract max from error, retry with capped duration |
-| Alternative source retry | Source 404/5xx HTTP status | Try next source in priority order |
-| Binding → container fallback | Binding MediaError | Re-fetch from R2, route to container |
-| Raw passthrough | All transforms fail | Serve untransformed source |
-| 202 Processing | Container async (>100 MiB) or reactive 9402 | Return JSON with `Retry-After: 30` |
+| Strategy                           | When                                              | What happens                                          |
+| ---------------------------------- | ------------------------------------------------- | ----------------------------------------------------- |
+| `Cf-Resized` error parsing         | cdn-cgi returns 200 with `err=XXXX` in header     | Parse CF error code, route to appropriate recovery    |
+| Reactive container fallback (9402) | cdn-cgi `Cf-Resized: err=9402` (origin too large) | Route to FFmpeg container, return 202                 |
+| Source retry (9404/9407/9504)      | cdn-cgi `Cf-Resized: err=9404/9407/9504`          | Try next source in priority order                     |
+| Duration limit retry               | Binding rejects duration                          | Extract max from error, retry with capped duration    |
+| Alternative source retry           | Source 404/5xx HTTP status                        | Try next source in priority order                     |
+| Binding → container fallback       | Binding MediaError                                | Re-fetch from R2, route to container                  |
+| Raw passthrough                    | All transforms fail                               | Serve untransformed source                            |
+| 202 Processing                     | Container async (>100 MiB) or reactive 9402       | Return JSON with `jobId`, `ws` URL, `Retry-After: 10` |
 
 ### `Cf-Resized` header
 
@@ -430,39 +458,47 @@ Sources tried in priority order. If one fails (404, 5xx, timeout), falls through
 
 Known CF error codes:
 
-| Code | Meaning | v2 Action |
-|------|---------|-----------|
-| 9401 | Invalid options (width/height out of range) | Try next source |
-| 9402 | Origin too large / no response | Route to FFmpeg container (202) |
-| 9404 | Resource not found at origin | Try next source |
-| 9406 | Malformed URL | Try next source |
-| 9407 | DNS error for origin hostname | Try next source |
-| 9408 | Origin returned HTTP 4xx | Try next source |
-| 9412 | Origin returned non-media content | Try next source |
-| 9504 | Origin unreachable (timeout/refused) | Try next source |
-| 9509 | Origin returned HTTP 5xx | Try next source |
+| Code | Meaning                                     | v2 Action                       |
+| ---- | ------------------------------------------- | ------------------------------- |
+| 9401 | Invalid options (width/height out of range) | Try next source                 |
+| 9402 | Origin too large / no response              | Route to FFmpeg container (202) |
+| 9404 | Resource not found at origin                | Try next source                 |
+| 9406 | Malformed URL                               | Try next source                 |
+| 9407 | DNS error for origin hostname               | Try next source                 |
+| 9408 | Origin returned HTTP 4xx                    | Try next source                 |
+| 9412 | Origin returned non-media content           | Try next source                 |
+| 9504 | Origin unreachable (timeout/refused)        | Try next source                 |
+| 9509 | Origin returned HTTP 5xx                    | Try next source                 |
 
 ### Auto mode switching
 
 `format=m4a` without explicit `mode=audio` automatically switches to audio mode, clearing irrelevant params (width, height, fit). This maintains compatibility with v1 clients that relied on format-based mode inference.
 
 All errors return structured JSON:
+
 ```json
-{ "error": { "code": "NO_MATCHING_ORIGIN", "message": "No origin matched: /path" } }
+{
+  "error": {
+    "code": "NO_MATCHING_ORIGIN",
+    "message": "No origin matched: /path"
+  }
+}
 ```
 
 ---
 
 ## Dedup Stack
 
-Four layers prevent duplicate work:
+Six layers prevent duplicate work:
 
-| Layer | Scope | What it deduplicates |
-|-------|-------|---------------------|
-| Edge cache (`caches.default`) | Per-colo | All requests -- `cf-cache-status: HIT` |
-| R2 persistent cache | Global | All transform results across colos |
-| `RequestCoalescer` (in-memory LRU) | Per-isolate | Concurrent requests in same isolate |
-| DO `jobInFlight` flag | Global per-transform | Container async jobs (same params hash = same DO) |
+| Layer                              | Scope                | What it deduplicates                              |
+| ---------------------------------- | -------------------- | ------------------------------------------------- |
+| Edge cache (`caches.default`)      | Per-colo             | All requests -- `cf-cache-status: HIT`            |
+| R2 persistent cache                | Global               | All transform results across colos                |
+| `RequestCoalescer` (in-memory LRU) | Per-isolate          | Concurrent requests in same isolate               |
+| DO `jobInFlight` flag              | Global per-transform | Container async jobs (same params hash = same DO) |
+| Queue consumer R2 check            | Global               | Re-dispatch after container already completed     |
+| Source cache (`_source-cache/`)    | Global               | Multiple containers downloading same source file  |
 
 ---
 
@@ -471,6 +507,7 @@ Four layers prevent duplicate work:
 Auth-gated dashboard at `/admin/dashboard` (Astro + React + Tailwind v4):
 
 - **Analytics tab**: stat cards (total requests, success, errors, cache hit rate), latency metrics (avg, p50, p95), breakdown tables (by status, origin, derivative, transform source), recent errors table with time range selector
+- **Jobs tab**: auto-discovers container transform jobs from D1, shows active jobs with live status (WebSocket via DO Hibernation API), recent jobs table with output size and duration, text filter for search
 - **Debug tab**: test any URL with live param resolution, origin matching, response headers, timing, cache status
 
 Auth: HMAC-SHA256 signed session cookie (HttpOnly, Secure, SameSite=Strict, 24h expiry). Login validates against `CONFIG_API_TOKEN` with timing-safe comparison.
@@ -479,14 +516,17 @@ Auth: HMAC-SHA256 signed session cookie (HttpOnly, Secure, SameSite=Strict, 24h 
 
 All endpoints require `Authorization: Bearer {CONFIG_API_TOKEN}`.
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/admin/config` | GET | Retrieve current config |
-| `/admin/config` | POST | Upload new config (Zod 4 validated) |
-| `/admin/cache/bust` | POST | Bump cache version for a path |
-| `/admin/analytics` | GET | Request summary (`?hours=24`) |
-| `/admin/analytics/errors` | GET | Recent errors (`?hours=24&limit=50`) |
-| `/admin/dashboard` | GET | Dashboard UI (session auth) |
+| Endpoint                  | Method | Description                                                              |
+| ------------------------- | ------ | ------------------------------------------------------------------------ |
+| `/admin/config`           | GET    | Retrieve current config                                                  |
+| `/admin/config`           | POST   | Upload new config (Zod 4 validated)                                      |
+| `/admin/cache/bust`       | POST   | Bump cache version for a path                                            |
+| `/admin/analytics`        | GET    | Request summary (`?hours=24`)                                            |
+| `/admin/analytics/errors` | GET    | Recent errors (`?hours=24&limit=50`)                                     |
+| `/admin/jobs`             | GET    | List active/recent container jobs (`?hours=24&filter=bunny&active=true`) |
+| `/admin/jobs/:id`         | GET    | Single job status from TransformJobDO                                    |
+| `/ws/job/:id`             | GET    | WebSocket upgrade for real-time job progress                             |
+| `/admin/dashboard`        | GET    | Dashboard UI (session auth)                                              |
 
 ### Analytics (D1)
 
@@ -500,43 +540,47 @@ Every request logged to D1 via `waitUntil`. Weekly cron drops + recreates for 7-
 
 ```
 src/
-  index.ts                    # Hono app wiring (70 lines)
+  index.ts                    # Hono app wiring (~90 lines)
   middleware/                  # via, config, passthrough, auth, error
-  handlers/                   # admin, internal, transform, dashboard
+  handlers/                   # admin, internal, transform, jobs, dashboard
   config/                     # Zod 4 schema, KV loader
   params/                     # Canonical params, Akamai translation, derivatives, responsive
-  transform/                  # Media binding, cdn-cgi, FFmpeg container DO
+  transform/                  # Media binding, cdn-cgi, FFmpeg container DO, TransformJobDO
   sources/                    # Origin routing, auth, presigned URLs
   cache/                      # Cache key, store, version (KV), coalescing
   analytics/                  # D1 middleware, aggregation queries
+  queue/                      # Queue consumer, D1 job registry
 container/
   Dockerfile                  # node:22-slim + ffmpeg
-  server.mjs                  # /transform, /transform-url, /health
+  server.mjs                  # /transform, /transform-url, /health (with progress reporting)
 dashboard/
-  src/components/Dashboard.tsx # Analytics + Debug tabs (React)
+  src/components/Dashboard.tsx # Analytics + Jobs + Debug tabs (React)
 scripts/
-  smoke.ts                    # 62 smoke tests with tail log capture
+  smoke.ts                    # 64+ smoke tests with tail log capture
 ```
 
 ### Bindings
 
-| Binding | Type | Resource |
-|---------|------|----------|
-| `MEDIA` | Media | Media Transformations binding |
-| `VIDEOS` | R2 | Source videos + transform cache (`_transformed/`) |
-| `CONFIG` | KV | Worker config (hot-reload, 5-min TTL) |
-| `CACHE_VERSIONS` | KV | Cache version management |
-| `ANALYTICS` | D1 | Request analytics |
-| `FFMPEG_CONTAINER` | DO | FFmpeg container instances |
-| `ASSETS` | Static Assets | Dashboard UI |
+| Binding            | Type          | Resource                                                                            |
+| ------------------ | ------------- | ----------------------------------------------------------------------------------- |
+| `MEDIA`            | Media         | Media Transformations binding                                                       |
+| `VIDEOS`           | R2            | Source videos + transform cache (`_transformed/`) + source cache (`_source-cache/`) |
+| `CONFIG`           | KV            | Worker config (hot-reload, 5-min TTL)                                               |
+| `CACHE_VERSIONS`   | KV            | Cache version management                                                            |
+| `ANALYTICS`        | D1            | Request analytics + job registry (`transform_log` + `transform_jobs`)               |
+| `FFMPEG_CONTAINER` | Container DO  | FFmpeg container instances (4 vCPU, 12GB, 20GB disk)                                |
+| `TRANSFORM_JOB`    | DO            | Job state machine + WebSocket progress (Hibernation API)                            |
+| `TRANSFORM_QUEUE`  | Queue         | Durable job dispatch (retry + DLQ)                                                  |
+| `ASSETS`           | Static Assets | Dashboard UI                                                                        |
 
 ### Testing
 
 ```bash
-npm run test:run              # 151 unit tests (vitest + workers pool)
-npm run test:smoke            # 62 smoke tests against live (4 min)
+npm run test:run              # 180 unit tests (vitest + workers pool)
+npm run test:e2e              # 74 E2E tests against live (vitest, 60s timeout)
+npm run test:smoke            # 64+ smoke tests against live
 npm run test:smoke:container  # + container async polling (~10 min)
-npm run test:browser          # 18 Playwright browser tests
+npm run test:browser          # 22 Playwright browser tests
 npm run check                 # TypeScript strict
 ```
 
@@ -748,23 +792,30 @@ worker1: Worker
 sizecheck: Size > limit? {
   shape: diamond
 }
+queue: TRANSFORM_QUEUE
+consumer: Queue Consumer
 container_do: Container DO
 container: FFmpeg Container
-client1: 202 Processing
+client1: 202 + jobId + ws URL
 download: Download source
 ffmpeg: ffmpeg (4 vCPU)
 outbound: Outbound handler
 r2store: R2 put
+jobdo: TransformJobDO
 
 req1 -> worker1: imwidth=320
 worker1 -> sizecheck
-sizecheck -> container_do: yes
+sizecheck -> queue: yes (enqueue)
 worker1 -> client1: immediate 202
-container_do -> container: /transform-url
+queue -> consumer: batch delivery
+consumer -> container_do: /transform-url
+container_do -> container: start
 container -> download: fetch HTTPS
+container -> jobdo: progress via /internal/job-progress
 download -> ffmpeg: stream to disk
 ffmpeg -> outbound: callback POST
 outbound -> r2store: FixedLengthStream
+outbound -> jobdo: complete
 
 req2: Request 2 (same URL)
 worker2: Worker
@@ -851,7 +902,10 @@ Passthrough: Raw Passthrough
 ```
 
 :::note[Reference]
+
 - [Cloudflare Media Transformations docs](https://developers.cloudflare.com/stream/transform-videos/)
 - [Cloudflare Containers docs](https://developers.cloudflare.com/containers/)
+- [Cloudflare Queues docs](https://developers.cloudflare.com/queues/)
+- [Durable Objects WebSocket Hibernation](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
 - [Cloudflare Cache API docs](https://developers.cloudflare.com/workers/runtime-apis/cache/)
-:::
+  :::
