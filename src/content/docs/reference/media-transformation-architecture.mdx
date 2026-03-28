@@ -1,252 +1,514 @@
 ---
 title: Media Transformation Architecture
-description: Multi-mode media transformation (video, frame, spritesheet, audio) on Cloudflare Workers with KV caching, cdn-cgi/media, and Container FFmpeg fallback
+description: Multi-mode media transformation (video, frame, spritesheet, audio) on Cloudflare Workers with R2 persistent cache, Media Transformations binding, cdn-cgi/media, and Container FFmpeg fallback
 author: Erfi Anugrah
 ---
 
 import { Aside, Card, CardGrid } from "@astrojs/starlight/components";
 
-How [**video-resizer**](https://github.com/erfianugrah/video-resizer) handles media transformation on Cloudflare Workers.
+How [**video-resizer-2**](https://github.com/erfianugrah/video-resizer-2) handles media transformation on Cloudflare Workers.
 
-Single endpoint for video resize, frame extraction, spritesheet generation, and audio extraction. Configuration lives in KV so you don't need to redeploy when changing settings. Two-layer cache (CDN edge + KV) with param validation before hitting `cdn-cgi/media` for transformations. Videos exceeding the cdn-cgi size limit are handled by a Cloudflare Container running ffmpeg.
+Single endpoint for video resize, frame extraction, spritesheet generation, and audio extraction. Three-tier transform routing: Media binding for R2 sources, cdn-cgi/media for remote sources, FFmpeg container for oversized/advanced transforms. Results stored persistently in R2 with edge cache on top. Zero memory buffering -- all streams flow through without loading into Worker memory.
+
+Rewrite of v1 (~40K lines) in ~3K lines using Hono, Zod 4, and Cloudflare Containers.
+
+**Live:** https://videos.erfi.io
 
 ---
 
 ## Overview
 
-Five transformation strategies:
+Three transform tiers + four transformation modes:
 
-- **Video**: Resize, compress, adjust quality/playback via `cdn-cgi/media`
+| Tier | Source | Size Limit | Method | Latency | Worker Memory |
+|------|--------|-----------|--------|---------|---------------|
+| 1 | R2 | ≤100MB | `env.MEDIA.input(stream)` | ~2-10s | Stream only |
+| 2 | Remote/Fallback | ≤256MB | `cdn-cgi/media` URL fetch | ~3-15s | Zero |
+| 3 | Any | >256MB or container-only params | FFmpeg Container DO | ~60-120s (async) | Zero |
+
+Transformation modes:
+
+- **Video**: Resize, compress, adjust quality/playback
 - **Frame**: Extract stills at timestamps (jpg/png)
 - **Spritesheet**: Grid previews for scrubbing UIs
 - **Audio**: Extract m4a audio tracks
-- **Container (FFmpeg)**: Fallback for oversized videos that exceed `cdn-cgi/media` limits
 
-Config-driven mode enablement, strong validation, mode-specific strategies. Each mode handles its own param prep and validation (strategy pattern).
+Container-only features (fps, speed, rotate, crop, bitrate, h265/vp9 codecs) route to the FFmpeg container regardless of file size.
 
 ---
 
 ## Core Concepts
 
-### Request lifecycle
+### Request flow
 
-| Step         | Action                   | Details                                                     |
-| ------------ | ------------------------ | ----------------------------------------------------------- |
-| 1. Parse     | Normalize query params   | Config, derivatives, IMQuery, aliases, mode inference       |
-| 2. Cache     | KV cache check           | Dimension-normalized keys (derivatives resolved to w/h)     |
-| 3. Select    | Choose strategy          | Video / Frame / Spritesheet / Audio                         |
-| 4. Build     | Create cdn-cgi URL       | Cache version, origins, path resolution                     |
-| 5. Transform | Fetch via cdn-cgi        | Or container fallback on 9402 error                         |
-| 6. Store     | KV streaming chunk store | 5 MiB chunks, pull-based reads, FixedLengthStream responses |
-| 7. Shape     | Format response          | Headers, filename, range request support                    |
+```
+                            +-----------------------------+
+                            |      Cloudflare Edge        |
+         +------------------+  cf-cache-status: HIT?      |
+         |  edge cache hit   |  -> serve from edge cache   |
+         |                  +----------+------------------+
+         |                             | cache miss
+         |                  +----------v------------------+
+         |                  |      Worker Middleware       |
+         |                  |  via check -> config load -> |
+         |                  |  cdn-cgi passthrough ->      |
+         |                  |  non-video passthrough       |
+         |                  +----------+------------------+
+         |                             |
+         |                  +----------v------------------+
+         |                  |     Param Resolution        |
+         |                  |  Akamai/IMQuery translate -> |
+         |                  |  parse canonical params ->   |
+         |                  |  resolve derivative ->       |
+         |                  |  responsive sizing           |
+         |                  +----------+------------------+
+         |                             |
+         |                  +----------v------------------+
+         |                  |     Origin Matching         |
+         |                  |  regex match -> capture      |
+         |                  |  groups -> sources by        |
+         |                  |  priority                    |
+         |                  +----------+------------------+
+         |                             |
+         |                  +----------v------------------+
+         |                  |  R2 Transform Cache Check   |
+         |                  |  _transformed/{cacheKey}?   +--> hit --> cache.put --> cache.match --> serve
+         |                  +----------+------------------+
+         |                             | miss
+         |                  +----------v------------------+
+         |                  |  Per-Isolate Coalescing     |
+         |                  |  in-flight dedup (LRU)      +--> joined --> clone response
+         |                  +----------+------------------+
+         |                             |
+         |              +--------------+--------------------+
+         |              |              |                    |
+         |    +---------v----+  +------v------+  +----------v-----------+
+         |    |  R2 Source   |  | Remote/     |  |  Container-Only      |
+         |    |  <=100MB     |  | Fallback    |  |  params or >256MB    |
+         |    |  -> binding  |  | <=256MB     |  |  -> FFmpeg Container |
+         |    |              |  | -> cdn-cgi  |  |    DO (async, 202)   |
+         |    +------+-------+  +------+------+  +----------+-----------+
+         |           |                 |                     |
+         |           v                 v                     v
+         |    +------------------------------------------------+
+         |    |     Store: transform -> R2 -> cache -> serve   |
+         |    |  R2 put (FixedLengthStream) -> R2 get ->       |
+         |    |  cache.put -> cache.match -> serve (range OK)  |
+         |    +------------------------+-----------------------+
+         |                             |
+         +-----------------------------+
+```
 
-### Design patterns
+### Design patterns (v1 -> v2)
 
-| Pattern                     | Purpose                                  | Benefit                                       |
-| --------------------------- | ---------------------------------------- | --------------------------------------------- |
-| **Strategy per mode**       | Each mode = own validation + params      | Add modes without touching handler            |
-| **Reactive error handling** | Container fallback on cdn-cgi 9402 error | No pre-flight HEAD, works for R2              |
-| **Config + schema**         | Zod validation + runtime defaults        | New modes work even if config lags            |
-| **Translation layer**       | Map Akamai/short params to internal      | Support multiple param conventions            |
-| **Cache key normalization** | Derivatives resolved to dimensions       | `?imwidth=1280` and `?width=1280` share cache |
+| v1 Pattern | v2 Pattern | Why |
+|-----------|-----------|-----|
+| Strategy per mode (5 files) | Single transform handler, mode via params | Modes are just param combinations, not separate code paths |
+| Reactive error handling (9402 -> container) | Proactive size-based routing | HEAD check + size thresholds, no wasted transforms |
+| 5 singleton config managers | Single Zod 4 schema + KV hot-reload | One source of truth, validated on upload |
+| Akamai translation in middleware | Pure function `translateAkamaiParams()` | Testable, no side effects |
+| KV chunked storage (5 MiB chunks) | R2 persistent store + edge cache | No chunking needed, R2 handles any size |
+| `__r2src` self-referencing URL | `env.MEDIA.input(stream)` binding | Direct R2 stream, no HTTP subrequest |
+
+### Cache hierarchy
+
+| Layer | Scope | Speed | Range Support | Persistence |
+|-------|-------|-------|--------------|-------------|
+| Edge cache (`caches.default`) | Per-colo | Fastest | Native (206) | Ephemeral |
+| R2 persistent store (`_transformed/`) | Global | Fast | Via cache.match | Permanent until bust |
+| KV version registry | Global | Fast | N/A | Manual bust |
+
+On every successful transform, the output flows sequentially with zero memory buffering:
+1. Transform output -> stream to R2 via `FixedLengthStream`
+2. R2 get -> stream to `cache.put`
+3. `cache.match` -> serve to client (native range request support)
+
+Subsequent requests: edge cache HIT (fastest) or R2 HIT -> cache.put -> cache.match (cross-colo).
+
+### Headers
+
+Every response includes:
+
+| Header | Value | Notes |
+|--------|-------|-------|
+| `X-R2-Cache` | `HIT` or `MISS` | Whether result came from R2 persistent store |
+| `cf-cache-status` | `HIT`, `MISS`, etc. | CF edge cache status |
+| `X-Transform-Source` | `binding`, `cdn-cgi`, `container` | Which tier performed the transform |
+| `X-Source-Type` | `r2`, `remote`, `fallback` | Which source provided the original |
+| `X-Cache-Key` | `video:path:w=1280:c=auto` | Deterministic cache key |
+| `X-Request-ID` | UUID | Per-request trace ID |
+| `X-Processing-Time-Ms` | number | Transform duration |
+| `X-Derivative` | name | Resolved derivative |
+| `X-Resolved-Width/Height` | number | Final dimensions |
+| `Via` | `video-resizer` | Loop prevention |
+| `Cache-Tag` | comma-separated | Purge-by-tag support |
 
 ### Mode capabilities
 
-| Feature                 | Video     | Frame     | Spritesheet | Audio    | Container |
-| ----------------------- | --------- | --------- | ----------- | -------- | --------- |
-| **Dimensions**          | 10-2000px | 10-2000px | Required    | -        | 10-2000px |
-| **Fit modes**           | Yes       | Yes       | Yes         | -        | Yes       |
-| **Time**                | 0-10m     | 0-10m     | 0-10m       | 0-10m    | 0-10m     |
-| **Duration**            | 1-300s    | -         | 1-300s      | 1-300s   | No limit  |
-| **Format control**      | -         | jpg/png   | JPEG only   | m4a only | mp4 only  |
-| **Quality/compression** | Yes       | -         | -           | -        | Yes (CRF) |
-| **Input size limit**    | 256 MiB   | 256 MiB   | 256 MiB     | 256 MiB  | 6 GiB     |
+| Feature | Video | Frame | Spritesheet | Audio | Container |
+|---------|-------|-------|-------------|-------|-----------|
+| **Dimensions** | 10-2000px | 10-2000px | Required | - | 10-2000px |
+| **Fit modes** | Yes | Yes | Yes | - | Yes |
+| **Time** | 0-10m | 0-10m | 0-10m | 0-10m | Unlimited |
+| **Duration** | 1s-60s | - | 1s-60s | 1s-60s | Unlimited |
+| **Format** | - | jpg/png | JPEG only | m4a only | mp4/webm |
+| **Quality/compression** | Yes | - | - | - | Yes (CRF) |
+| **FPS/Speed/Rotate/Crop** | No | No | No | No | Yes |
+| **Bitrate control** | No | No | No | No | Yes |
+| **Input size limit** | 100 MiB (binding) | 256 MiB (cdn-cgi) | 256 MiB | 256 MiB | 20 GB disk |
 
 ---
 
-## Container FFmpeg Fallback
+## Three-Tier Transform Routing
 
-### Why
+### Tier 1: Media Binding (R2 sources, ≤100MB)
 
-`cdn-cgi/media` rejects inputs exceeding its size limit (256 MiB for this account, 100 MB default) with error 9402 "Origin Too Large". Previously these were served untransformed. Now a Cloudflare Container running ffmpeg handles them.
+Direct streaming from R2 into the Media Transformations binding. No HTTP subrequest, no video bytes in Worker memory.
 
-### How it works
-
-The container path is **reactive** -- it lives in the error handler, not in a pre-check:
-
-1. `cdn-cgi/media` attempts the transformation normally
-2. For oversized inputs, cdn-cgi returns HTTP 400 with CF error code 9402
-3. The error handler detects 9402 and checks if the container is enabled
-4. For R2 sources, constructs a `__r2src` URL the container can fetch
-5. Sends a POST to the container's `/transform` endpoint with resize params
-6. Container downloads source, runs ffmpeg, streams output back
-7. Worker tees the response: one leg to client, one to KV streaming storage
-8. Container response returns directly (bypasses error handler finalization to avoid `Cache-Control: no-store` and fallback headers)
-9. Subsequent requests hit KV cache
-
-### Container spec
-
-- **Image**: Alpine + Node 22 + ffmpeg (`container/Dockerfile`)
-- **Instance type**: `standard-4` (4 vCPU, 12 GiB RAM, 20 GB disk)
-- **Sleep**: 5 minutes idle timeout, scales to zero
-- **Max instances**: 5 concurrent
-- **Endpoint**: `POST /transform` with JSON body (sourceUrl, width, height, quality, fit, etc.)
-- **Output**: Streams MP4 with `Content-Length`, `-movflags +faststart`, stereo AAC audio
-
-### ffmpeg command
-
-```bash
-ffmpeg -i input.mp4 \
-  -vf "scale=W:H:force_original_aspect_ratio=decrease" \
-  -c:v libx264 -preset medium -crf {18|23|28} \
-  -c:a aac -b:a 128k -ac 2 \
-  -movflags +faststart \
-  output.mp4
+```
+R2 bucket.get(key) -> ReadableStream -> env.MEDIA.input(stream).transform(params).output()
 ```
 
-Quality mapping: low=CRF 28, medium=CRF 23, high=CRF 18. Audio is always downmixed to stereo for web playback.
+Fallback: if the binding rejects the input (MediaError), falls back to container.
 
-### Configuration
+### Tier 2: cdn-cgi/media (Remote sources, ≤256MB)
 
-Feature flag in the video config (updatable via KV without redeployment):
+Constructs a cdn-cgi/media URL with transform params and lets the edge handle both fetch and transform. Zero Worker memory usage.
+
+```
+/cdn-cgi/media/width=1280,height=720,fit=contain/{sourceUrl}?v={version}
+```
+
+Fallback: if cdn-cgi returns 404/5xx, tries next source in priority order.
+
+### Tier 3: FFmpeg Container (>256MB or container-only params)
+
+For transforms the binding/cdn-cgi can't handle. Returns 202 immediately, processes asynchronously, stores result in R2.
+
+```
+Request 1: -> 202 Processing (Retry-After: 30)
+Container:  -> downloads source -> ffmpeg -> stores in R2
+Request 2: -> R2 HIT -> cache.put -> cache.match -> 200 video/mp4
+```
+
+Container-only params that trigger this tier: `fps`, `speed`, `rotate`, `crop`, `bitrate`, h265/vp9 codecs, duration >60s.
+
+---
+
+## Container FFmpeg
+
+### Architecture
+
+- `FFmpegContainer extends Container` Durable Object with outbound handler
+- Instance key: `ffmpeg:{origin}:{path}:{paramsHash}` (FNV-1a hash ensures unique DO per transform)
+- Instance type: custom `{ vcpu: 4, memory_mib: 12288, disk_mb: 20000 }` (max available)
+- `sleepAfter`: 15m, `enableInternet`: true
+- DO tracks `jobInFlight` flag for dedup -- rejects duplicate `/transform-url` requests
+
+### Outbound handler
+
+Containers only intercept HTTP traffic (not HTTPS). `FFmpegContainer.outbound` intercepts all HTTP:
+
+- `POST /internal/container-result` -> stores transcoded output in R2 via `FixedLengthStream`
+- `GET /internal/r2-source` -> serves raw R2 objects via binding (for R2-only sources)
+- Everything else -> `fetch()` with http->https upgrade (source downloads)
+
+Source downloads use HTTPS directly (`enableInternet=true`, not intercepted).
+
+### Container server
+
+Node.js 22 + ffmpeg in `node:22-slim` Docker image.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/transform` | POST | Sync: stream source in, receive output |
+| `/transform-async` | POST | Async: stream source + callbackUrl, 202 |
+| `/transform-url` | POST | Async URL-based: container fetches source directly |
+| `/health` | GET | Health check |
+
+### ffmpeg features
+
+- Dynamic threads: `os.availableParallelism()` (up to 4 on max instance)
+- Fast seeking: `-ss` before `-i`
+- Even dimension enforcement: odd widths/heights rounded down for libx264
+- Source streaming: `pipeline()` to disk (no OOM on 725MB+)
+- Output streaming: `createReadStream()` + explicit Content-Length from `stat()`
+
+### Quality presets
+
+| Preset | CRF | FFmpeg Preset |
+|--------|-----|---------------|
+| low | 28 | fast |
+| medium | 23 | medium |
+| high | 18 | medium |
+
+### Async flow (verified)
+
+1. Transform handler detects oversized source (>256MB) or container-only params
+2. DO dedup check (`jobInFlight` flag) -- skips if already processing
+3. Fires `POST /transform-url` to container DO with source URL + callback URL
+4. Returns 202 JSON (`{ status: "processing", message: "...", path: "..." }`) with `Retry-After: 30`
+5. Container downloads source via HTTPS, streams to disk via `pipeline()`
+6. Container runs ffmpeg with all available threads
+7. Container `stat()`s output for Content-Length, streams to callback via `http://` (outbound handler intercepts)
+8. Outbound handler stores in R2 (`_transformed/{cacheKey}`) via `FixedLengthStream`
+9. Next request: Worker checks R2 -> HIT -> `cache.put` -> `cache.match` -> serve
+
+**Verified**: 725MB .mov -> 37.8MB .mp4, served from edge cache in 0.6s with range requests.
+
+---
+
+## Parameters
+
+### Canonical transform params
+
+| Param | Type | Range/Values | Example |
+|-------|------|-------------|---------|
+| `width` | int | 10-2000 | `?width=1280` |
+| `height` | int | 10-2000 | `?height=720` |
+| `fit` | enum | contain, cover, scale-down | `?fit=cover` |
+| `mode` | enum | video, frame, spritesheet, audio | `?mode=frame` |
+| `time` | string | 0s-10m | `?time=5s` |
+| `duration` | string | 1s-60s (binding), unlimited (container) | `?duration=10s` |
+| `audio` | bool | true/false | `?audio=false` |
+| `format` | enum | jpg, png (frame); m4a (audio) | `?format=png` |
+| `filename` | string | alphanumeric, max 120 | `?filename=clip` |
+| `derivative` | string | config key | `?derivative=tablet` |
+| `quality` | enum | low, medium, high, auto | `?quality=high` |
+| `compression` | enum | low, medium, high, auto | `?compression=low` |
+| `fps` | float | >0 (container) | `?fps=24` |
+| `speed` | float | >0 (container) | `?speed=2` |
+| `rotate` | float | any (container) | `?rotate=90` |
+| `crop` | string | geometry (container) | `?crop=640:480:0:0` |
+| `bitrate` | string | (container) | `?bitrate=2M` |
+| `imageCount` | int | >0 | `?imageCount=10` |
+| `loop` | bool | playback hint header | `?loop=true` |
+| `autoplay` | bool | playback hint header | `?autoplay=true` |
+| `muted` | bool | playback hint header | `?muted=true` |
+| `preload` | enum | none, metadata, auto | `?preload=auto` |
+| `debug` | any | `view` for JSON diagnostics | `?debug=view` |
+
+### Akamai/IMQuery compatibility
+
+Full Akamai Image & Video Manager parameter translation. Explicit canonical params always win.
+
+| Akamai Param | Canonical | Value Translation |
+|-------------|-----------|-------------------|
+| `imwidth` | `width` | Direct; triggers derivative matching |
+| `imheight` | `height` | Direct |
+| `impolicy` | `derivative` | Policy = derivative |
+| `imformat` | `format` | `h264`->`mp4`; `h265`/`vp9`->container |
+| `imdensity` | `dpr` | Pixel density multiplier |
+| `imref` | consumed | Parsed for derivative matching context |
+| `im-viewwidth` | -- | Sets `Sec-CH-Viewport-Width` hint |
+| `im-viewheight` | -- | Sets `Viewport-Height` hint |
+| `im-density` | -- | Sets `Sec-CH-DPR` hint |
+| `w`, `h`, `q`, `f` | width, height, quality, format | Shorthands |
+| `obj-fit` | `fit` | `crop`->`cover`, `fill`->`contain` |
+| `start`, `dur` | `time`, `duration` | Shorthands |
+| `mute` | `audio` | **Inverted**: `mute=true` -> `audio=false` |
+
+### Derivatives
+
+Named presets that bundle dimensions + quality + mode into a single parameter:
 
 ```json
 {
-  "container": {
-    "enabled": true,
-    "maxInputSize": 6442450944,
-    "maxOutputForKV": 2147483648,
-    "timeoutMs": 600000,
-    "quality": {
-      "low": { "crf": 28, "preset": "fast" },
-      "medium": { "crf": 23, "preset": "medium" },
-      "high": { "crf": 18, "preset": "medium" }
-    },
-    "sleepAfter": "5m",
-    "maxInstances": 5,
-    "fallbackToDirectStream": true
-  }
+  "tablet": { "width": 1280, "height": 720, "fit": "contain", "duration": "5m" },
+  "mobile": { "width": 854, "height": 640, "fit": "contain", "duration": "5m" },
+  "thumbnail": { "width": 640, "height": 360, "mode": "frame", "format": "png", "time": "0s" }
 }
 ```
 
-### Wrangler config
+**Canonical invariant**: derivative dimensions replace any explicit params. `?imwidth=1280` is used for derivative *selection* only, never for the actual transform or cache key.
 
-Containers, DO bindings, and migrations must be **per-environment** (Wrangler does not inherit these from top-level):
+### Responsive sizing
 
-```jsonc
-"env": {
-  "production": {
-    "containers": [{
-      "name": "video-resizer-ffmpeg-prod",
-      "class_name": "FFmpegContainer",
-      "image": "./container/Dockerfile",
-      "max_instances": 5,
-      "instance_type": "standard-4"
-    }],
-    "durable_objects": {
-      "bindings": [{
-        "class_name": "FFmpegContainer",
-        "name": "FFMPEG_CONTAINER"
-      }]
-    },
-    "migrations": [{
-      "new_sqlite_classes": ["FFmpegContainer"],
-      "tag": "v1"
-    }]
-  }
+When no explicit dimensions are provided, auto-sizing from client signals:
+
+1. Client Hints headers (`Sec-CH-Viewport-Width`, `Sec-CH-DPR`, `Width`)
+2. `CF-Device-Type` header (mobile/tablet/desktop)
+3. Breakpoint matching from config
+
+---
+
+## Caching
+
+### Cache key
+
+Deterministic, built from resolved params (after derivative resolution):
+
+```
+{mode}:{path}[:w={width}][:h={height}][:mode-specific-params][:e={etag}][:v={version}]
+```
+
+Same derivative always produces the same key regardless of trigger: `?derivative=tablet`, `?impolicy=tablet`, and `?imwidth=1280` (resolved via responsive to tablet) all produce identical keys.
+
+### Cache busting
+
+- **R2 sources**: R2 object etag in cache key -- automatic bust when source changes
+- **Remote sources**: KV-backed version number -- manual bust via `POST /admin/cache/bust`
+- **Purge by tag**: `Cache-Tag` header with derivative, origin, mode tags for CF purge API
+
+### Storage flow (zero memory buffering)
+
+```
+Transform output
+  |
+  v (FixedLengthStream, streaming)
+R2 put (_transformed/{cacheKey})
+  |
+  v (R2 get, streaming)
+cache.put (edge cache)
+  |
+  v (cache.match, native range support)
+Client (200 or 206 with Content-Range)
+```
+
+No `tee()`, no `arrayBuffer()`, no memory buffering. Sequential streaming through R2 then edge cache. `cache.match` provides native range request handling (206 + Content-Range) for video seeking.
+
+---
+
+## Multi-Origin Routing
+
+Origins configured as an array with regex matcher, capture groups, and prioritized sources:
+
+```json
+{
+  "origins": [{
+    "name": "standard",
+    "matcher": "^/([^.]+)\\.(mp4|webm|mov)",
+    "sources": [
+      { "type": "remote", "priority": 0, "url": "https://videos.erfi.dev" },
+      { "type": "r2", "priority": 1, "bucketBinding": "VIDEOS" }
+    ],
+    "ttl": { "ok": 86400, "redirects": 300, "clientError": 60, "serverError": 10 }
+  }]
 }
+```
+
+Sources tried in priority order. If one fails (404, 5xx, timeout), falls through to next. Last resort: raw passthrough from any source.
+
+### Auth types
+
+| Type | How |
+|------|-----|
+| `aws-s3` | Presigned URLs via `aws4fetch` (cached in KV with auto-refresh) |
+| `bearer` | `Authorization: Bearer {token}` from env var |
+| `header` | Custom header name + value from env var |
+
+---
+
+## Error Handling
+
+| Strategy | When | What happens |
+|----------|------|--------------|
+| Duration limit retry | Binding rejects duration | Extract max from error, retry with capped duration |
+| Alternative source retry | Source 404/5xx | Try next source in priority order |
+| Container fallback | Binding MediaError | Re-fetch from R2, route to container |
+| Raw passthrough | All transforms fail | Serve untransformed source |
+| 202 Processing | Container async (>256MB) | Return JSON with Retry-After, container processes in background |
+
+All errors return structured JSON:
+```json
+{ "error": { "code": "NO_MATCHING_ORIGIN", "message": "No origin matched: /path" } }
 ```
 
 ---
 
-## Configuration
+## Dedup Stack
 
-### Parameters
+Four layers prevent duplicate work:
 
-| Param      | Values                                         | Range/Rules                                              |
-| ---------- | ---------------------------------------------- | -------------------------------------------------------- |
-| `mode`     | `video` \| `frame` \| `spritesheet` \| `audio` | Auto-set to `audio` if `format=m4a`                      |
-| `format`   | `jpg` \| `png` \| `m4a`                        | Frame: jpg/png, Audio: m4a, Video: n/a, Spritesheet: n/a |
-| `time`     | `0s` - `10m`                                   | Default: `0s` (start position)                           |
-| `duration` | `1s` - `300s`                                  | Omit = full length (up to platform limits)               |
-| `width`    | `10` - `2000`                                  | Required for spritesheet                                 |
-| `height`   | `10` - `2000`                                  | Required for spritesheet                                 |
-| `fit`      | `contain` \| `scale-down` \| `cover`           | Video/Frame/Spritesheet only                             |
+| Layer | Scope | What it deduplicates |
+|-------|-------|---------------------|
+| Edge cache (`caches.default`) | Per-colo | All requests -- `cf-cache-status: HIT` |
+| R2 persistent cache | Global | All transform results across colos |
+| `RequestCoalescer` (in-memory LRU) | Per-isolate | Concurrent requests in same isolate |
+| DO `jobInFlight` flag | Global per-transform | Container async jobs (same params hash = same DO) |
 
-:::note[Audio mode restrictions]
-Audio disallows: `width`, `height`, `fit`, `quality`, `compression`, playback params
-:::
+---
 
-### Cache model
+## Dashboard
 
-**KV keys** are normalized to dimensions (derivatives are resolved):
+Auth-gated dashboard at `/admin/dashboard` (Astro + React + Tailwind v4):
 
-```
-video:sample.mp4:w=1280:h=720:c=auto
-frame:clip.mp4:t=5s:w=640:h=360:f=png
-audio:rocky.mp4:duration=120s:t=30s:f=m4a
-```
+- **Analytics tab**: stat cards (total requests, success, errors, cache hit rate), latency metrics (avg, p50, p95), breakdown tables (by status, origin, derivative, transform source), recent errors table with time range selector
+- **Debug tab**: test any URL with live param resolution, origin matching, response headers, timing, cache status
 
-Both `?width=1280&height=720` and `?imwidth=1280` (resolved via the `tablet` derivative to 1280x720) produce the same cache key. One transformation serves both param conventions.
+Auth: HMAC-SHA256 signed session cookie (HttpOnly, Secure, SameSite=Strict, 24h expiry). Login validates against `CONFIG_API_TOKEN` with timing-safe comparison.
 
-**Chunked storage**: Files over 20 MiB are stored as 5 MiB chunks with a JSON manifest at the base key. The streaming chunk processor reads the response body incrementally -- memory usage is bounded at ~10 MiB regardless of file size.
+### Admin API
 
-**cdn-cgi URL**: Includes all transform params + `version` for cache busting.
+All endpoints require `Authorization: Bearer {CONFIG_API_TOKEN}`.
 
-**Headers**: Auto-corrected `Content-Type` per mode, optional `Content-Disposition` filename.
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/admin/config` | GET | Retrieve current config |
+| `/admin/config` | POST | Upload new config (Zod 4 validated) |
+| `/admin/cache/bust` | POST | Bump cache version for a path |
+| `/admin/analytics` | GET | Request summary (`?hours=24`) |
+| `/admin/analytics/errors` | GET | Recent errors (`?hours=24&limit=50`) |
+| `/admin/dashboard` | GET | Dashboard UI (session auth) |
 
-### KV chunked read/write
+### Analytics (D1)
 
-**Storage** (`streamStorage.ts`): `StreamingChunkProcessor` accumulates incoming stream data into a 5 MiB buffer, copies it via `.slice()`, and uploads each chunk through a concurrency-limited queue (max 2 concurrent KV writes). A manifest JSON with chunk sizes is stored at the base key.
-
-**Retrieval** (`getVideo.ts`):
-
-- **Full content (200)**: Pull-based `ReadableStream` with `pull()` that fetches one KV chunk per call. Piped through `FixedLengthStream` so Cloudflare preserves `Content-Length`.
-- **Range requests (206)**: Pre-calculates which chunks overlap the byte range, fetches only those via pull-based stream, slices at boundaries. Also uses `FixedLengthStream`. Browsers need `Content-Length` on 206 responses for video seeking.
-- **Full-file ranges** (`Range: bytes=0-`): Falls through to the full content path (200) to avoid the browser getting stuck on a single 206 response covering the entire file.
+Every request logged to D1 via `waitUntil`. Weekly cron drops + recreates for 7-day rolling window.
 
 ---
 
 ## Development
 
-### Extending the system
+### Project structure
 
-| Task              | Steps                                                                                                                                                                                                 |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Add mode**      | 1. Implement strategy (`prepareTransformParams`, `validateOptions`, `updateDiagnostics`)<br/>2. Add case to `createTransformationStrategy`<br/>3. Add to config defaults/validOptions<br/>4. Document |
-| **Add param**     | 1. Add to config validOptions/defaults<br/>2. Handle in option parser<br/>3. Map in param mapping<br/>4. Validate in supporting strategies                                                            |
-| **Adjust limits** | Update `timeUtils` validators, update docs/tests                                                                                                                                                      |
+```
+src/
+  index.ts                    # Hono app wiring (70 lines)
+  middleware/                  # via, config, passthrough, auth, error
+  handlers/                   # admin, internal, transform, dashboard
+  config/                     # Zod 4 schema, KV loader
+  params/                     # Canonical params, Akamai translation, derivatives, responsive
+  transform/                  # Media binding, cdn-cgi, FFmpeg container DO
+  sources/                    # Origin routing, auth, presigned URLs
+  cache/                      # Cache key, store, version (KV), coalescing
+  analytics/                  # D1 middleware, aggregation queries
+container/
+  Dockerfile                  # node:22-slim + ffmpeg
+  server.mjs                  # /transform, /transform-url, /health
+dashboard/
+  src/components/Dashboard.tsx # Analytics + Debug tabs (React)
+scripts/
+  smoke.ts                    # 62 smoke tests with tail log capture
+```
 
-### Key files
+### Bindings
 
-| File                                                      | Purpose                                               |
-| --------------------------------------------------------- | ----------------------------------------------------- |
-| `src/handlers/videoHandler.ts`                            | Main request handler, KV cache check, post-processing |
-| `src/domain/strategies/*.ts`                              | Strategy implementations per mode                     |
-| `src/domain/commands/originsExecution.ts`                 | cdn-cgi URL construction, fetch, error routing        |
-| `src/services/errorHandler/transformationErrorHandler.ts` | Error handler with container fallback                 |
-| `src/services/containerTransformService.ts`               | Container request/response management                 |
-| `src/services/kvStorage/streamStorage.ts`                 | Streaming chunk storage                               |
-| `src/services/kvStorage/streamChunkProcessor.ts`          | Buffer-to-chunk processor                             |
-| `src/services/kvStorage/getVideo.ts`                      | Chunked retrieval with range support                  |
-| `src/services/kvStorage/keyUtils.ts`                      | Cache key generation with derivative normalization    |
-| `src/utils/responseBuilder.ts`                            | Response construction, 206 handling                   |
-| `src/config/VideoConfigurationManager.ts`                 | Config singleton with container config                |
-| `container/src/server.js`                                 | FFmpeg container HTTP server                          |
+| Binding | Type | Resource |
+|---------|------|----------|
+| `MEDIA` | Media | Media Transformations binding |
+| `VIDEOS` | R2 | Source videos + transform cache (`_transformed/`) |
+| `CONFIG` | KV | Worker config (hot-reload, 5-min TTL) |
+| `CACHE_VERSIONS` | KV | Cache version management |
+| `ANALYTICS` | D1 | Request analytics |
+| `FFMPEG_CONTAINER` | DO | FFmpeg container instances |
+| `ASSETS` | Static Assets | Dashboard UI |
+
+### Testing
+
+```bash
+npm run test:run              # 151 unit tests (vitest + workers pool)
+npm run test:smoke            # 62 smoke tests against live (4 min)
+npm run test:smoke:container  # + container async polling (~10 min)
+npm run test:browser          # 18 Playwright browser tests
+npm run check                 # TypeScript strict
+```
 
 ### Operations
 
 ```bash
-# Upload config (including container.enabled flag)
-node tools/config-wrapper.js upload \
-  --config config/worker-config.json \
-  --env production --token <token> --force
-
-# Deploy (builds container image + worker)
-npm run deploy:prod  # requires CLOUDFLARE_API_TOKEN
-
-# Debug
-?debug=true          # adds diagnostics to response headers
+npm run deploy                # deploy worker + container + dashboard
+npm run dashboard:build       # rebuild Astro dashboard
+npm run dev                   # local dev (requires Docker for containers)
 ```
 
 ---
@@ -258,20 +520,24 @@ Use `--range 0-1023` to check headers without downloading full files
 :::
 
 ```bash
-# Audio (auto mode via format=m4a)
-curl -I "https://cdn.erfi.dev/rocky.mp4?format=m4a&filename=audio.m4a"
+# Video resize (Akamai param)
+curl -I "https://videos.erfi.io/rocky.mp4?imwidth=640"
 
 # Frame thumbnail (PNG, 640x360)
-curl -I "https://cdn.erfi.dev/rocky.mp4?mode=frame&time=4s&width=640&height=360&fit=cover&format=png"
+curl -I "https://videos.erfi.io/rocky.mp4?mode=frame&time=4s&width=640&height=360&format=png"
 
-# Spritesheet (800x600, 60s window)
-curl -I "https://cdn.erfi.dev/rocky.mp4?mode=spritesheet&width=800&height=600&duration=60s"
+# Audio extraction
+curl -I "https://videos.erfi.io/rocky.mp4?mode=audio&duration=30s"
 
-# Video (resized via cdn-cgi)
-curl -I "https://cdn.erfi.dev/rocky.mp4?width=1280&height=720"
+# Derivative
+curl -I "https://videos.erfi.io/rocky.mp4?derivative=tablet"
 
-# Large video (container ffmpeg fallback, >256 MiB source)
-curl -I "https://cdn.erfi.dev/videos/big_buck_bunny_1080p.mov?width=640"
+# Debug diagnostics (JSON)
+curl -s "https://videos.erfi.io/rocky.mp4?derivative=tablet&debug=view" | jq .diagnostics
+
+# Large video (container async, 725MB)
+curl -I "https://videos.erfi.io/big_buck_bunny_1080p.mov?imwidth=320"
+# -> 202 Processing (first request) or 200 video/mp4 (after container finishes)
 ```
 
 ### Interactive demos
@@ -279,25 +545,25 @@ curl -I "https://cdn.erfi.dev/videos/big_buck_bunny_1080p.mov?width=640"
 <CardGrid>
   <Card title="Video" icon="video">
     <video controls width="100%" preload="metadata">
-      <source src="https://cdn.erfi.dev/rocky.mp4?width=640&height=360" type="video/mp4" />
+      <source src="https://videos.erfi.io/rocky.mp4?width=640&height=360" type="video/mp4" />
     </video>
-    <small>640x360 size</small>
+    <small>640x360 resize via cdn-cgi/media</small>
   </Card>
 
 <Card title="Frame" icon="picture">
   <img
-    alt="Frame at 4s"
-    src="https://cdn.erfi.dev/rocky.mp4?mode=frame&time=9s&width=640&height=360&fit=cover&format=png"
+    alt="Frame at 9s"
+    src="https://videos.erfi.io/rocky.mp4?mode=frame&time=9s&width=640&height=360&fit=cover&format=png"
     loading="lazy"
     style="width:100%"
   />
-  <small>`.png` at 9s timestamp</small>
+  <small>PNG frame at 9s timestamp</small>
 </Card>
 
 <Card title="Spritesheet" icon="grid">
   <img
     alt="Spritesheet"
-    src="https://cdn.erfi.dev/rocky.mp4?mode=spritesheet&width=800&height=600"
+    src="https://videos.erfi.io/rocky.mp4?mode=spritesheet&width=800&height=600"
     loading="lazy"
     style="width:100%"
   />
@@ -305,8 +571,8 @@ curl -I "https://cdn.erfi.dev/videos/big_buck_bunny_1080p.mov?width=640"
 </Card>
 
   <Card title="Audio" icon="microphone">
-    <audio controls src="https://cdn.erfi.dev/rocky.mp4?mode=audio&time=0s&duration=30s" style="width:100%"></audio>
-    <small>`m4a` audio clip</small>
+    <audio controls src="https://videos.erfi.io/rocky.mp4?mode=audio&time=0s&duration=30s" style="width:100%"></audio>
+    <small>m4a audio clip (30s)</small>
   </Card>
 </CardGrid>
 
@@ -319,307 +585,164 @@ curl -I "https://cdn.erfi.dev/videos/big_buck_bunny_1080p.mov?width=640"
 ```d2
 direction: right
 
-Client -> Handler: ""
-Handler -> KV: cache check
-KV -> Client: HIT
-KV -> Strategy: MISS
-Strategy -> VS: video
-Strategy -> FS: frame
-Strategy -> SS: spritesheet
-Strategy -> AS: audio
-VS -> CdnCgi: ""
-FS -> CdnCgi: ""
-SS -> CdnCgi: ""
-AS -> CdnCgi: ""
-CdnCgi -> Store: OK
-CdnCgi -> ErrorHandler: 9402
-ErrorHandler -> Container: enabled
-ErrorHandler -> DirectStream: disabled/failed
-Container -> Store: ""
-Store -> Client: ""
-DirectStream -> Client: ""
+Client -> Edge: request
+Edge -> Client: cache HIT
+Edge -> Worker: cache MISS
+
+Worker -> R2Cache: check _transformed/
+R2Cache -> Worker: R2 HIT
+R2Cache -> Coalesce: R2 MISS
+Worker -> CachePut: R2 HIT
+
+Coalesce -> Binding: R2 source <=100MB
+Coalesce -> CdnCgi: remote <=256MB
+Coalesce -> Container: >256MB or fps/speed/etc
+
+Binding -> R2Store: transform output
+CdnCgi -> R2Store: transform output
+Container -> R2Async: async (202)
+
+R2Store -> CachePut: stream from R2
+R2Async -> R2Store: callback stores in R2
+
+CachePut -> CacheMatch: cache.put
+CacheMatch -> Client: cache.match (range OK)
 
 Client: Client
-Handler: videoHandler
-KV: KV Cache {
+Edge: CF Edge Cache {
   shape: diamond
 }
-Strategy: Select Strategy {
+Worker: Worker Middleware + Params
+R2Cache: R2 _transformed/ {
   shape: diamond
 }
-VS: VideoStrategy
-FS: FrameStrategy
-SS: SpritesheetStrategy
-AS: AudioStrategy
-CdnCgi: cdn-cgi/media {
-  shape: diamond
-}
-ErrorHandler: Error Handler {
-  shape: diamond
-}
-Container: FFmpeg Container
-DirectStream: Direct Stream
-Store: Store in KV
+Coalesce: Coalesce + Route
+Binding: env.MEDIA binding
+CdnCgi: cdn-cgi/media
+Container: FFmpeg Container DO
+R2Store: R2 put (FixedLengthStream)
+R2Async: R2 put (via outbound handler)
+CachePut: cache.put
+CacheMatch: cache.match
 ```
 
-### Container fallback flow
-
-How oversized videos are handled:
+### Container async flow
 
 ```d2
 direction: right
 
-Request -> CdnCgi: transform
-CdnCgi -> Error: 9402 Origin Too Large
-Error -> Check: container enabled?
-Check -> Container: yes
-Check -> Direct: no
-Container -> Fetch: source via __r2src
-Fetch -> FFmpeg: resize/transcode
-FFmpeg -> Tee: stream output
-Tee -> Client: client leg
-Tee -> KVStore: cache leg
-KVStore -> Chunks: 5 MiB chunks
+Request -> Worker: imwidth=320
+Worker -> Check: HEAD source
+Check -> DO: >256MB
+DO -> Container: POST /transform-url
+Worker -> Client: 202 Processing
 
-Request: Request
-CdnCgi: cdn-cgi/media
-Error: Error Handler
-Check: Config Check {
+Container -> Download: fetch source (HTTPS)
+Download -> FFmpeg: stream to disk
+FFmpeg -> Callback: stream output
+Callback -> Outbound: http:// callback
+Outbound -> R2: FixedLengthStream
+
+NextRequest -> Worker2: same URL
+Worker2 -> R2Check: _transformed/{key}
+R2Check -> CachePut2: R2 HIT
+CachePut2 -> CacheMatch2: cache.put
+CacheMatch2 -> Client2: 200 video/mp4
+
+Request: Request 1
+Worker: Worker
+Check: Size Check {
   shape: diamond
 }
+DO: Container DO
 Container: FFmpeg Container
-Direct: Direct Stream (raw)
-Fetch: Fetch Source
-FFmpeg: ffmpeg process
-Tee: tee() stream
-Client: Client
-KVStore: KV Streaming Store
-Chunks: Chunked KV entries
-```
+Client: 202 JSON (Retry-After: 30)
+Download: Source Download
+FFmpeg: ffmpeg process (4 vCPU)
+Callback: Callback POST
+Outbound: Outbound Handler
+R2: R2 _transformed/
 
-### Strategy pattern for transformation modes
-
-Each mode has its own validation and parameter preparation:
-
-```d2
-direction: down
-
-Request -> Parse -> Factory
-Factory -> Video: mode=video
-Factory -> Frame: mode=frame
-Factory -> Sprite: mode=spritesheet
-Factory -> Audio: mode=audio
-Factory -> ContainerV: oversized
-
-Video -> VParams
-Frame -> FParams
-Sprite -> SParams
-Audio -> AParams
-ContainerV -> CVParams
-
-VParams -> CDN
-FParams -> CDN
-SParams -> CDN
-AParams -> CDN
-CVParams -> Container
-
-Request: Request with params
-Parse: Parse Options
-Factory: StrategyFactory
-Video: VideoStrategy
-Frame: FrameStrategy
-Sprite: SpritesheetStrategy
-Audio: AudioStrategy
-ContainerV: ContainerVideoStrategy
-VParams: |md
-  Validate & Prepare
-  width, height, fit
-  quality, compression
-  playback params
-|
-FParams: |md
-  Validate & Prepare
-  time, format
-  width, height, fit
-|
-SParams: |md
-  Validate & Prepare
-  width, height required
-  time, duration, fit
-|
-AParams: |md
-  Validate & Prepare
-  time, duration
-  format=m4a only
-|
-CVParams: |md
-  Validate & Prepare
-  width, height, fit
-  quality (CRF mapped)
-  no duration limit
-|
-CDN: Build cdn-cgi URL
-Container: Container /transform
+NextRequest: Request 2
+Worker2: Worker
+R2Check: R2 Check {
+  shape: diamond
+}
+CachePut2: cache.put
+CacheMatch2: cache.match
+Client2: 200 video/mp4 (range OK)
 ```
 
 ### Caching layers
 
-Two-layer caching with KV and CDN edge:
-
 ```d2
 direction: right
 
-Request -> KV
-KV -> Return1: Hit
-KV -> CDN: Miss
-CDN -> Return2: Hit
-CDN -> Transform: Miss
-Transform -> Store -> Return3
+Request -> Edge
+Edge -> Return1: HIT (cf-cache-status: HIT, X-R2-Cache: HIT)
+Edge -> R2: MISS
+R2 -> CachePut: HIT (X-R2-Cache: HIT)
+R2 -> Transform: MISS
+Transform -> R2Store: stream (FixedLengthStream)
+R2Store -> R2Read: R2 put complete
+R2Read -> CachePut: stream from R2
+CachePut -> CacheMatch: cache.put
+CacheMatch -> Return2: cache.match (range OK)
 
 Request: Request
-KV: KV Cache? {
+Edge: Edge Cache {
   shape: diamond
 }
-Return1: Return Cached
-CDN: CDN Cache? {
+Return1: Serve (fastest)
+R2: R2 _transformed/ {
   shape: diamond
 }
-Return2: Return Cached
-Transform: Transform Media
-Store: Store in KV
-Return3: Return Response
+CachePut: cache.put
+Transform: Transform (binding/cdn-cgi/container)
+R2Store: R2 put
+R2Read: R2 get
+CacheMatch: cache.match
+Return2: Serve (with range support)
 ```
 
-### KV chunked storage
-
-How large transformed outputs are stored and retrieved:
+### Origins resolution
 
 ```d2
 direction: right
 
-Response -> Processor: stream
-Processor -> Chunk0: 5 MiB
-Processor -> Chunk1: 5 MiB
-Processor -> ChunkN: remainder
-Processor -> Manifest: JSON
-
-Chunk0 -> KV: key_chunk_0
-Chunk1 -> KV: key_chunk_1
-ChunkN -> KV: key_chunk_N
-Manifest -> KV: base key
-
-KV -> Pull: pull() ReadableStream
-Pull -> Fixed: FixedLengthStream
-Fixed -> Client: with Content-Length
-
-Response: Container/cdn-cgi Response
-Processor: StreamingChunkProcessor
-Chunk0: Chunk 0 (.slice() copy)
-Chunk1: Chunk 1 (.slice() copy)
-ChunkN: Chunk N
-Manifest: Manifest
-KV: KV Namespace
-Pull: Pull-based read
-Fixed: FixedLengthStream
-Client: Client
-```
-
-### Origins resolution and fallback
-
-Multi-source storage with automatic fallback:
-
-```d2
-direction: right
-
-Request -> Resolve -> Match
+Request -> Match
 Match -> Sources: Yes
 Match -> Error404: No
 
-Sources -> R2
-R2 -> Success: Found
-R2 -> Remote: Not Found
-Remote -> Success: Found
-Remote -> Fallback: Not Found
-Fallback -> Success: Found
-Fallback -> Retry: Not Found
-
-Retry -> Exclude: Yes
-Retry -> Error404: No
-Exclude -> Sources
+Sources -> Source1: priority 0
+Source1 -> Success: OK
+Source1 -> Source2: 404/5xx
+Source2 -> Success: OK
+Source2 -> Source3: 404/5xx
+Source3 -> Success: OK
+Source3 -> Passthrough: all failed
 
 Request: Request
-Resolve: Origin Resolver
-Match: Matches Origin? {
+Match: Origin Match? {
   shape: diamond
 }
-Sources: Try Sources in Priority
+Sources: Sources by Priority
+Source1: Source (remote) {
+  shape: diamond
+}
+Source2: Source (R2) {
+  shape: diamond
+}
+Source3: Source (fallback) {
+  shape: diamond
+}
+Success: Transform
 Error404: 404 Not Found
-R2: R2 Bucket? {
-  shape: diamond
-}
-Success: Return Content
-Remote: Remote URL? {
-  shape: diamond
-}
-Fallback: Fallback URL? {
-  shape: diamond
-}
-Retry: From cdn-cgi? {
-  shape: diamond
-}
-Exclude: Exclude Failed Source
+Passthrough: Raw Passthrough
 ```
-
-### R2 source URL resolution (`__r2src`)
-
-`cdn-cgi/media` needs a valid HTTP URL as the source video -- it sends HEAD/GET probes to fetch the content for transformation. R2 bucket bindings aren't HTTP-addressable, so R2 sources use a self-referencing URL pattern with a `__r2src` query parameter.
-
-**The problem:** R2 bindings produce `r2:path` references, not HTTP URLs. Passing these to `cdn-cgi/media` results in 9402 errors because cdn-cgi can't resolve them.
-
-**The solution:** When building the source URL for an R2 origin, the worker generates `https://cdn.erfi.dev/{path}?__r2src={bucketBinding}`. When cdn-cgi sends its HEAD/GET probe back to this URL, the worker intercepts requests with `__r2src` early in `index.ts` and serves raw R2 content directly via the bucket binding -- bypassing the transformation pipeline entirely.
-
-The same `__r2src` pattern is used by the FFmpeg container to fetch R2 sources -- the container calls this URL and the Worker serves the R2 object.
-
-```d2
-direction: right
-
-Client -> Worker: /videos/rocky.mp4?width=640
-Worker -> CdnCgi: /cdn-cgi/media/width=640/https://cdn.erfi.dev/rocky.mp4?__r2src=VIDEOS_BUCKET
-CdnCgi -> Worker2: HEAD rocky.mp4?__r2src=VIDEOS_BUCKET
-Worker2 -> R2: r2Bucket.head("rocky.mp4")
-R2 -> Worker2: metadata
-Worker2 -> CdnCgi: 200 OK + headers
-CdnCgi -> Worker3: GET rocky.mp4?__r2src=VIDEOS_BUCKET
-Worker3 -> R2b: r2Bucket.get("rocky.mp4")
-R2b -> Worker3: stream
-Worker3 -> CdnCgi: 200 OK + body
-CdnCgi -> Client: transformed video
-
-Client: Client
-Worker: Worker (build cdn-cgi URL)
-CdnCgi: cdn-cgi/media
-Worker2: Worker (__r2src intercept)
-Worker3: Worker (__r2src intercept)
-R2: R2 Bucket
-R2b: R2 Bucket
-```
-
-### Cache versioning and cdn-cgi cache busting
-
-`cdn-cgi/media` has its own internal cache that can't be purged directly. Cache versioning solves this by appending a `v=N` query parameter to the source URL inside the cdn-cgi path.
-
-When you purge KV cache entries, the next request sees a KV miss and increments the version (e.g. `v=1` to `v=2`). This changes the cdn-cgi URL, forcing it to treat the request as new and re-fetch + re-transform the source.
-
-```
-# v=1 (cached in cdn-cgi)
-/cdn-cgi/media/width=640/https://cdn.erfi.dev/rocky.mp4?__r2src=VIDEOS_BUCKET&v=1
-
-# After KV purge -> v=2 (cdn-cgi cache miss, fresh transform)
-/cdn-cgi/media/width=640/https://cdn.erfi.dev/rocky.mp4?__r2src=VIDEOS_BUCKET&v=2
-```
-
-Versions are stored in the `VIDEO_CACHE_KEY_VERSIONS` KV namespace. Under normal operation, the version stays stable. It only increments when a KV cache miss occurs (i.e. after a purge).
 
 :::note[Reference]
-Refer to [Cloudflare docs](https://developers.cloudflare.com/stream/transform-videos/#options) for the latest options supported.
+- [Cloudflare Media Transformations docs](https://developers.cloudflare.com/stream/transform-videos/)
+- [Cloudflare Containers docs](https://developers.cloudflare.com/containers/)
+- [Cloudflare Cache API docs](https://developers.cloudflare.com/workers/runtime-apis/cache/)
 :::
