@@ -14,11 +14,12 @@ Single endpoint for video resize, frame extraction, spritesheet generation, and 
 
 Three transform tiers + four transformation modes:
 
-| Tier | Source          | Size Limit                        | Method                          | Latency          | Worker Memory |
-| ---- | --------------- | --------------------------------- | ------------------------------- | ---------------- | ------------- |
-| 1    | R2              | ≤100MB                            | `env.MEDIA.input(stream)`       | ~2-10s           | Stream only   |
-| 2    | Remote/Fallback | ≤100 MiB                          | `cdn-cgi/media` URL fetch       | ~3-15s           | Zero          |
-| 3    | Any             | >100 MiB or container-only params | FFmpeg Container DO (via Queue) | ~60-300s (async) | Zero          |
+| Tier | Source          | Size Limit                        | Method                          | Latency            | Worker Memory |
+| ---- | --------------- | --------------------------------- | ------------------------------- | ------------------ | ------------- |
+| 1    | R2              | ≤100 MiB (configurable)           | `env.MEDIA.input(stream)`       | ~2-10s             | Stream only   |
+| 2    | Remote/Fallback | ≤100 MiB (configurable)           | `cdn-cgi/media` URL fetch       | ~3-15s             | Zero          |
+| 3a   | Any             | 100-256 MiB or container-only params | FFmpeg Container DO (sync)   | ~30-120s (sync)    | Zero          |
+| 3b   | Any             | >256 MiB or container-only params | FFmpeg Container DO (via Queue) | ~60-300s (async)   | Zero          |
 
 Transformation modes:
 
@@ -27,7 +28,7 @@ Transformation modes:
 - **Spritesheet**: Grid previews for scrubbing UIs
 - **Audio**: Extract m4a audio tracks
 
-Container-only features (fps, speed, rotate, crop, bitrate, h265/vp9/av1 codecs) route to the FFmpeg container regardless of file size. Container transforms are dispatched via Cloudflare Queue for deploy safety and automatic retry.
+Container-only features (fps, speed, rotate, crop, bitrate, h265/vp9/av1 codecs, duration >60s) route to the FFmpeg container regardless of file size. Sync container transforms run inline; async transforms (>256 MiB) are dispatched via Cloudflare Queue for deploy safety and automatic retry.
 
 ---
 
@@ -47,7 +48,7 @@ Edge -> Middleware: MISS
 Middleware -> Params: ""
 Middleware: |md
   Worker Middleware
-  via check → config → passthrough
+  via check → config → cdnCgi passthrough → nonVideo passthrough
 |
 
 Params -> Origins: ""
@@ -74,10 +75,10 @@ R2Cache: R2 _transformed/ {
 Coalesce -> Route: ""
 Coalesce: |md
   Per-Isolate Coalescing
-  in-flight dedup (LRU)
+  in-flight dedup (bounded FIFO + TTL)
 |
 
-Route -> Binding: R2 ≤100MB
+Route -> Binding: R2 ≤100 MiB
 Route -> CdnCgi: Remote ≤100 MiB
 Route -> Container: >100 MiB or fps/speed/etc
 
@@ -160,13 +161,13 @@ Every response includes:
 | **Quality/compression**   | Yes               | -                               | -           | -        | Yes (CRF)  |
 | **FPS/Speed/Rotate/Crop** | No                | No                              | No          | No       | Yes        |
 | **Bitrate control**       | No                | No                              | No          | No       | Yes        |
-| **Input size limit**      | 100 MiB (binding) | 100 MiB (cdn-cgi, configurable) | 100 MiB     | 100 MiB  | 20 GB disk |
+| **Input size limit**      | 100 MiB (binding, configurable) | 100 MiB (cdn-cgi, configurable) | 100 MiB     | 100 MiB  | 20 GB disk |
 
 ---
 
 ## Three-Tier Transform Routing
 
-### Tier 1: Media Binding (R2 sources, ≤100MB)
+### Tier 1: Media Binding (R2 sources, ≤100 MiB)
 
 Direct streaming from R2 into the Media Transformations binding. No HTTP subrequest, no video bytes in Worker memory.
 
@@ -188,16 +189,21 @@ Fallback: if cdn-cgi returns 404/5xx, tries next source in priority order.
 
 ### Tier 3: FFmpeg Container (>100 MiB or container-only params)
 
-For transforms the binding/cdn-cgi can't handle. Returns 202 immediately, processes asynchronously, stores result in R2.
+For transforms the binding/cdn-cgi can't handle. Two sub-modes based on size:
+
+- **Sync (100-256 MiB):** dispatches directly to Container DO, streams result back inline
+- **Async (>256 MiB):** returns 202 immediately, dispatches via Queue, stores result in R2
 
 ```
-Request 1: -> 202 Processing (jobId + SSE URL, Retry-After: 10)
-Queue:      -> consumer dispatches to container DO
-Container:  -> downloads source -> ffmpeg -> stores in R2 (via outbound handler)
-Request 2: -> R2 HIT -> cache.put -> cache.match -> 200 video/mp4
+Sync:       -> dispatch to Container DO -> stream result -> R2 put -> cache.put -> serve
+Async:
+  Request 1: -> 202 Processing (jobId + SSE URL, Retry-After: 10)
+  Queue:      -> consumer dispatches to container DO
+  Container:  -> downloads source -> ffmpeg -> stores in R2 (via outbound handler)
+  Request 2: -> R2 HIT -> cache.put -> cache.match -> 200 video/mp4
 ```
 
-Container-only params that trigger this tier: `fps`, `speed`, `rotate`, `crop`, `bitrate`, h265/vp9 codecs, duration >60s.
+Container-only params that trigger this tier: `fps`, `speed`, `rotate`, `crop`, `bitrate`, h265/vp9/av1 codecs, duration >60s.
 
 ---
 
@@ -455,7 +461,7 @@ Sources tried in priority order. If one fails (404, 5xx, timeout), falls through
 | Alternative source retry           | Source 404/5xx HTTP status                        | Try next source in priority order                     |
 | Binding → container fallback       | Binding MediaError                                | Re-fetch from R2, route to container                  |
 | Raw passthrough                    | All transforms fail                               | Serve untransformed source                            |
-| 202 Processing                     | Container async (>100 MiB) or reactive 9402       | Return JSON with `jobId`, SSE URL, `Retry-After: 10`  |
+| 202 Processing                     | Container async (>256 MiB) or reactive 9402       | Return JSON with `jobId`, SSE URL, `Retry-After: 10`  |
 
 ### `Cf-Resized` header
 
@@ -497,7 +503,7 @@ All errors return structured JSON:
 
 ## Dedup Stack
 
-Six layers prevent duplicate work:
+Five layers prevent duplicate work:
 
 | Layer                                 | Scope       | What it deduplicates                              |
 | ------------------------------------- | ----------- | ------------------------------------------------- |
@@ -755,8 +761,8 @@ R2Cache -> Worker: R2 HIT
 R2Cache -> Coalesce: R2 MISS
 Worker -> CachePut: R2 HIT
 
-Coalesce -> Binding: R2 source <=100MB
-Coalesce -> CdnCgi: remote <=100MiB
+Coalesce -> Binding: R2 source <=100 MiB
+Coalesce -> CdnCgi: remote <=100 MiB
 Coalesce -> Container: >100 MiB or fps/speed/etc
 
 Binding -> R2Store: transform output
