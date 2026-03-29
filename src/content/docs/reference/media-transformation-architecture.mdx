@@ -191,7 +191,7 @@ Fallback: if cdn-cgi returns 404/5xx, tries next source in priority order.
 For transforms the binding/cdn-cgi can't handle. Returns 202 immediately, processes asynchronously, stores result in R2.
 
 ```
-Request 1: -> 202 Processing (jobId + ws URL, Retry-After: 10)
+Request 1: -> 202 Processing (jobId + SSE URL, Retry-After: 10)
 Queue:      -> consumer dispatches to container DO
 Container:  -> downloads source -> ffmpeg -> stores in R2 (via outbound handler)
 Request 2: -> R2 HIT -> cache.put -> cache.match -> 200 video/mp4
@@ -209,14 +209,14 @@ Container-only params that trigger this tier: `fps`, `speed`, `rotate`, `crop`, 
 - Instance key: `ffmpeg:{origin}:{path}:{paramsHash}` (FNV-1a hash ensures unique DO per transform)
 - Instance type: custom `{ vcpu: 4, memory_mib: 12288, disk_mb: 20000 }` (max available)
 - `sleepAfter`: 15m, `enableInternet`: true
-- DO tracks `jobInFlight` flag for dedup -- rejects duplicate `/transform-url` requests
+- Dedup handled by queue consumer R2 check (not per-DO flag)
 
 ### Outbound handler
 
 Containers only intercept HTTP traffic (not HTTPS). `FFmpegContainer.outbound` intercepts all HTTP:
 
-- `GET /internal/job-progress` -> forwards progress to TransformJobDO + updates D1
-- `POST /internal/container-result` -> stores transcoded output in R2, updates D1 + TransformJobDO
+- `GET /internal/job-progress` -> updates D1 status + percent progress
+- `POST /internal/container-result` -> stores transcoded output in R2, updates D1
 - `GET /internal/r2-source` -> serves raw R2 objects via binding (for R2-only sources)
 - `GET (large files)` -> proxy with source dedup (tee to R2 `_source-cache/` + container)
 - Everything else -> `fetch()` with http->https upgrade
@@ -242,7 +242,7 @@ Node.js 22 + ffmpeg in `node:22-slim` Docker image.
 - Source streaming: `pipeline()` to disk (no OOM on 725MB+)
 - Output streaming: `createReadStream()` + explicit Content-Length from `stat()`
 - Spritesheet: `fps=N/duration,tile=COLSxROWS` filter, imageCount defaults to 20, JPEG output
-- Progress reporting: stderr `time=HH:MM:SS` parsing → `/internal/job-progress` → TransformJobDO → WebSocket
+- Progress reporting: stderr `time=HH:MM:SS` parsing → `/internal/job-progress` → D1 percent update → SSE
 
 Note: `av1` codec triggers container routing but the container currently encodes as h264 (no libaom/libsvtav1 installed). h265 (libx265) and vp9 (libvpx-vp9) are fully supported.
 
@@ -259,15 +259,16 @@ Note: `av1` codec triggers container routing but the container currently encodes
 Container transforms are dispatched via Cloudflare Queue for durability (messages survive deploys, automatic retry with dead letter queue).
 
 1. Transform handler enqueues job to `TRANSFORM_QUEUE` + registers in D1 `transform_jobs` table
-2. Returns 202 JSON with `jobId` + WebSocket URL for real-time progress
+2. Returns 202 JSON with `jobId` + SSE URL for real-time progress
 3. Queue consumer picks up job, checks R2 for existing result (idempotent dedup)
 4. If no result: dispatches to FFmpegContainer DO via `/transform-url`
 5. Container downloads source via HTTPS (or R2 via `/internal/r2-source`), streams to disk
-6. Container runs ffmpeg, reports progress via `/internal/job-progress` -> TransformJobDO -> WebSocket broadcast
+6. Container runs ffmpeg, reports progress via `/internal/job-progress` -> D1 percent update
 7. Container streams output to callback via `http://` (outbound handler intercepts)
-8. Outbound handler stores in R2 (`_transformed/{cacheKey}`), updates D1 + TransformJobDO
+8. Outbound handler stores in R2 (`_transformed/{cacheKey}`), updates D1
 9. Queue consumer retries in 120s, finds R2 result, acks message
 10. Next client request: R2 HIT -> `cache.put` -> `cache.match` -> serve
+11. DLQ consumer marks jobs as `'failed'` when all 10 retries exhausted
 
 **Verified**: 725MB .mov -> 31MB .mp4, served from edge cache in 0.1s with range requests.
 
@@ -454,7 +455,7 @@ Sources tried in priority order. If one fails (404, 5xx, timeout), falls through
 | Alternative source retry           | Source 404/5xx HTTP status                        | Try next source in priority order                     |
 | Binding → container fallback       | Binding MediaError                                | Re-fetch from R2, route to container                  |
 | Raw passthrough                    | All transforms fail                               | Serve untransformed source                            |
-| 202 Processing                     | Container async (>100 MiB) or reactive 9402       | Return JSON with `jobId`, `ws` URL, `Retry-After: 10` |
+| 202 Processing                     | Container async (>100 MiB) or reactive 9402       | Return JSON with `jobId`, SSE URL, `Retry-After: 10`  |
 
 ### `Cf-Resized` header
 
@@ -498,14 +499,13 @@ All errors return structured JSON:
 
 Six layers prevent duplicate work:
 
-| Layer                              | Scope                | What it deduplicates                              |
-| ---------------------------------- | -------------------- | ------------------------------------------------- |
-| Edge cache (`caches.default`)      | Per-colo             | All requests -- `cf-cache-status: HIT`            |
-| R2 persistent cache                | Global               | All transform results across colos                |
-| `RequestCoalescer` (in-memory LRU) | Per-isolate          | Concurrent requests in same isolate               |
-| DO `jobInFlight` flag              | Global per-transform | Container async jobs (same params hash = same DO) |
-| Queue consumer R2 check            | Global               | Re-dispatch after container already completed     |
-| Source cache (`_source-cache/`)    | Global               | Multiple containers downloading same source file  |
+| Layer                                 | Scope       | What it deduplicates                              |
+| ------------------------------------- | ----------- | ------------------------------------------------- |
+| Edge cache (`caches.default`)         | Per-colo    | All requests -- `cf-cache-status: HIT`            |
+| R2 persistent cache                   | Global      | All transform results across colos                |
+| `RequestCoalescer` (signal pattern)   | Per-isolate | Concurrent requests in same isolate               |
+| Queue consumer R2 check               | Global      | Re-dispatch after container already completed     |
+| Source cache (`_source-cache/`)       | Global      | Multiple containers downloading same source file  |
 
 ---
 
@@ -513,8 +513,8 @@ Six layers prevent duplicate work:
 
 Auth-gated dashboard at `/admin/dashboard` (Astro + React + Tailwind v4):
 
-- **Analytics tab**: stat cards (total requests, success, errors, cache hit rate), latency metrics (avg, p50, p95), breakdown tables (by status, origin, derivative, transform source), recent errors table with time range selector
-- **Jobs tab**: auto-discovers container transform jobs from D1, shows active jobs with live status (WebSocket via DO Hibernation API), recent jobs table with output size and duration, text filter for search
+- **Analytics tab**: stat cards (total requests, success, errors, cache hit rate), latency metrics (avg, p50, p95), breakdown tables (by status, origin, derivative, transform source), recent errors table with admin noise filter toggle
+- **Jobs tab**: auto-discovers container transform jobs from D1, active jobs with SSE progress bars, status filter buttons (All/Active/Complete/Failed with counts), debounced search filter, expandable detail rows with param badges
 - **Debug tab**: test any URL with live param resolution, origin matching, response headers, timing, cache status
 
 Auth: HMAC-SHA256 signed session cookie (HttpOnly, Secure, SameSite=Strict, 24h expiry). Login validates against `CONFIG_API_TOKEN` with timing-safe comparison.
@@ -531,8 +531,7 @@ All endpoints require `Authorization: Bearer {CONFIG_API_TOKEN}`.
 | `/admin/analytics`        | GET    | Request summary (`?hours=24`)                                            |
 | `/admin/analytics/errors` | GET    | Recent errors (`?hours=24&limit=50`)                                     |
 | `/admin/jobs`             | GET    | List active/recent container jobs (`?hours=24&filter=bunny&active=true`) |
-| `/admin/jobs/:id`         | GET    | Single job status from TransformJobDO                                    |
-| `/ws/job/:id`             | GET    | WebSocket upgrade for real-time job progress                             |
+| `/sse/job/:id`            | GET    | SSE stream for real-time job progress (D1 polling)                       |
 | `/admin/dashboard`        | GET    | Dashboard UI (session auth)                                              |
 
 ### Analytics (D1)
@@ -547,23 +546,23 @@ Every request logged to D1 via `waitUntil`. Weekly cron drops + recreates for 7-
 
 ```
 src/
-  index.ts                    # Hono app wiring (~90 lines)
+  index.ts                    # Hono app wiring (~95 lines)
   middleware/                  # via, config, passthrough, auth, error
-  handlers/                   # admin, internal, transform, jobs, dashboard
+  handlers/                   # admin, internal, transform, jobs (SSE), dashboard
   config/                     # Zod 4 schema, KV loader
   params/                     # Canonical params, Akamai translation, derivatives, responsive
-  transform/                  # Media binding, cdn-cgi, FFmpeg container DO, TransformJobDO
+  transform/                  # Media binding, cdn-cgi, FFmpeg container DO, job types
   sources/                    # Origin routing, auth, presigned URLs
-  cache/                      # Cache key, store, version (KV), coalescing
-  analytics/                  # D1 middleware, aggregation queries
-  queue/                      # Queue consumer, D1 job registry
+  cache/                      # Cache key, version (KV), coalescing (signal pattern)
+  queue/                      # Queue consumer + DLQ, D1 job registry
+  analytics/                  # D1 middleware, aggregation queries, schema.sql (SSOT)
 container/
   Dockerfile                  # node:22-slim + ffmpeg
   server.mjs                  # /transform, /transform-url, /health (with progress reporting)
 dashboard/
-  src/components/Dashboard.tsx # Analytics + Jobs + Debug tabs (React)
+  src/components/             # Dashboard, AnalyticsTab, JobsTab, DebugTab, shared
 scripts/
-  smoke.ts                    # 64+ smoke tests with tail log capture
+  smoke.ts                    # 84 smoke tests with tail log capture
 ```
 
 ### Bindings
@@ -576,17 +575,16 @@ scripts/
 | `CACHE_VERSIONS`   | KV            | Cache version management                                                            |
 | `ANALYTICS`        | D1            | Request analytics + job registry (`transform_log` + `transform_jobs`)               |
 | `FFMPEG_CONTAINER` | Container DO  | FFmpeg container instances (4 vCPU, 12GB, 20GB disk)                                |
-| `TRANSFORM_JOB`    | DO            | Job state machine + WebSocket progress (Hibernation API)                            |
 | `TRANSFORM_QUEUE`  | Queue         | Durable job dispatch (retry + DLQ)                                                  |
 | `ASSETS`           | Static Assets | Dashboard UI                                                                        |
 
 ### Testing
 
 ```bash
-npm run test:run              # 180 unit tests (vitest + workers pool)
-npm run test:e2e              # 74 E2E tests against live (vitest, 60s timeout)
-npm run test:smoke            # 64+ smoke tests against live
-npm run test:smoke:container  # + container async polling (~10 min)
+npm run test:run              # 186 unit tests (vitest + workers pool)
+npm run test:e2e              # 92 E2E tests against live (vitest, 60s timeout)
+npx tsx scripts/smoke.ts      # 84 smoke tests against live
+npx tsx scripts/smoke.ts --container  # + container async polling (~10 min)
 npm run test:browser          # 22 Playwright browser tests
 npm run check                 # TypeScript strict
 ```
@@ -803,12 +801,12 @@ queue: TRANSFORM_QUEUE
 consumer: Queue Consumer
 container_do: Container DO
 container: FFmpeg Container
-client1: 202 + jobId + ws URL
+client1: 202 + jobId + SSE URL
 download: Download source
 ffmpeg: ffmpeg (4 vCPU)
 outbound: Outbound handler
 r2store: R2 put
-jobdo: TransformJobDO
+d1: D1 (status + percent)
 
 req1 -> worker1: imwidth=320
 worker1 -> sizecheck
@@ -818,11 +816,11 @@ queue -> consumer: batch delivery
 consumer -> container_do: /transform-url
 container_do -> container: start
 container -> download: fetch HTTPS
-container -> jobdo: progress via /internal/job-progress
+container -> d1: progress via /internal/job-progress
 download -> ffmpeg: stream to disk
 ffmpeg -> outbound: callback POST
 outbound -> r2store: FixedLengthStream
-outbound -> jobdo: complete
+outbound -> d1: complete
 
 req2: Request 2 (same URL)
 worker2: Worker
@@ -913,6 +911,5 @@ Passthrough: Raw Passthrough
 - [Cloudflare Media Transformations docs](https://developers.cloudflare.com/stream/transform-videos/)
 - [Cloudflare Containers docs](https://developers.cloudflare.com/containers/)
 - [Cloudflare Queues docs](https://developers.cloudflare.com/queues/)
-- [Durable Objects WebSocket Hibernation](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
 - [Cloudflare Cache API docs](https://developers.cloudflare.com/workers/runtime-apis/cache/)
   :::
