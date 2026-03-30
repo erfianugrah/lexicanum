@@ -28,7 +28,7 @@ Transformation modes:
 - **Spritesheet**: Grid previews for scrubbing UIs
 - **Audio**: Extract m4a audio tracks
 
-Container-only features (fps, speed, rotate, crop, bitrate, h265/vp9/av1 codecs, duration >60s) route to the FFmpeg container regardless of file size. Sync container transforms run inline; async transforms (>256 MiB) are dispatched via Cloudflare Queue for deploy safety and automatic retry.
+Container-only features (fps, speed, rotate, crop, bitrate, h265/vp9/av1 codecs, duration >60s) route to the FFmpeg container regardless of file size. All container paths check source size: ≤256 MiB uses sync container (streams through DO); >256 MiB uses async queue (container fetches directly via URL, returns 202 immediately). This prevents DO timeout on large files.
 
 ---
 
@@ -54,7 +54,7 @@ Middleware: |md
 Params -> Origins: ""
 Params: |md
   Param Resolution
-  Akamai translate → parse → derivative → responsive
+  Akamai translate → imwidth breakpoint match → parse (with warnings) → derivative → responsive
 |
 
 Origins -> R2Cache: ""
@@ -75,7 +75,7 @@ R2Cache: R2 _transformed/ {
 Coalesce -> Route: ""
 Coalesce: |md
   Per-Isolate Coalescing
-  in-flight dedup (bounded FIFO + TTL)
+  in-flight dedup (bounded FIFO + TTL + 60s timeout, 202 excluded)
 |
 
 Route -> Binding: R2 ≤100 MiB
@@ -146,6 +146,7 @@ Every response includes:
 | `X-Processing-Time-Ms`    | number                            | Transform duration                           |
 | `X-Derivative`            | name                              | Resolved derivative                          |
 | `X-Resolved-Width/Height` | number                            | Final dimensions                             |
+| `X-Param-Warnings`        | semicolon-separated               | Validation warnings for rejected params      |
 | `Via`                     | `video-resizer`                   | Loop prevention                              |
 | `Cache-Tag`               | comma-separated                   | Purge-by-tag support                         |
 
@@ -223,7 +224,7 @@ Container-only params that trigger this tier: `fps`, `speed`, `rotate`, `crop`, 
 Containers only intercept HTTP traffic (not HTTPS). `FFmpegContainer.outbound` intercepts all HTTP:
 
 - `GET /internal/job-progress` -> updates D1 status + percent progress
-- `POST /internal/container-result` -> stores transcoded output in R2, updates D1
+- `POST /internal/container-result` -> stores transcoded output in R2, awaits D1 `completeJob` inline (with 1 retry)
 - `GET /internal/r2-source` -> serves raw R2 objects via binding (for R2-only sources)
 - `GET (large files)` -> proxy with source dedup (tee to R2 `_source-cache/` + container)
 - Everything else -> `fetch()` with http->https upgrade
@@ -276,7 +277,7 @@ Container transforms are dispatched via Cloudflare Queue for durability (message
 9. Queue consumer retries with exponential backoff (120s, 240s, 480s... capped at 900s), finds R2 result, acks message
 10. Container-side dedup prevents duplicate ffmpeg processes if retry arrives while transform is still running
 11. Next client request: R2 HIT -> `cache.put` -> `cache.match` -> serve
-12. DLQ consumer marks jobs as `'failed'` when all 10 retries exhausted
+12. DLQ consumer checks R2 first (container may have completed but D1 wasn't updated), marks `'complete'` if found, otherwise `'failed'`
 13. Stuck jobs can be retried/deleted via `POST /admin/jobs/retry` (resets D1, cleans R2, re-enqueues)
 
 **Verified**: 725MB .mov -> 31MB .mp4, served from edge cache in 0.1s with range requests.
@@ -328,8 +329,8 @@ Full Akamai Image & Video Manager parameter translation. Explicit canonical para
 
 | Akamai Param       | Canonical                      | Value Translation                            |
 | ------------------ | ------------------------------ | -------------------------------------------- |
-| `imwidth`          | `width`                        | Direct; triggers derivative matching         |
-| `imheight`         | `height`                       | Direct                                       |
+| `imwidth`          | (breakpoint match)             | NOT forwarded as `width` — matched against responsive breakpoints to select a derivative. Any value works, including >2000. |
+| `imheight`         | (breakpoint match)             | NOT forwarded as `height` — matched against responsive breakpoints to select a derivative |
 | `impolicy`         | `derivative`                   | Policy = derivative                          |
 | `imformat`         | `format`                       | `h264`->`mp4`; `h265`/`vp9`/`av1`->container |
 | `imdensity`        | `dpr`                          | Pixel density multiplier                     |
@@ -365,15 +366,16 @@ Named presets that bundle dimensions + quality + mode into a single parameter:
 }
 ```
 
-**Canonical invariant**: derivative dimensions replace any explicit params. `?imwidth=1280` is used for derivative _selection_ only, never for the actual transform or cache key.
+**Canonical invariant**: derivative dimensions replace any explicit params. `?imwidth=1280` is matched against responsive breakpoints to select a derivative (e.g. tablet), then the derivative's width/height are used for the transform and cache key. `imwidth` is never forwarded as a raw `width` param — values >2000 (like `imwidth=2160`) work correctly because they bypass Zod's 10-2000 validation entirely.
 
 ### Responsive sizing
 
 When no explicit dimensions are provided, auto-sizing from client signals:
 
-1. Client Hints headers (`Sec-CH-Viewport-Width`, `Sec-CH-DPR`, `Width`)
-2. `CF-Device-Type` header (mobile/tablet/desktop)
-3. Breakpoint matching from config
+1. **IMQuery breakpoint matching**: `imwidth`/`imheight` values are matched against `config.responsive.breakpoints` (sorted ascending by `maxWidth`). First breakpoint where `imwidth ≤ maxWidth` selects the derivative. Runs before Zod validation so values >2000 work correctly.
+2. Client Hints headers (`Sec-CH-Viewport-Width`, `Sec-CH-DPR`, `Width`)
+3. `CF-Device-Type` header (mobile/tablet/desktop)
+4. `config.responsive.defaultDerivative` fallback
 
 ---
 
@@ -462,7 +464,7 @@ Sources tried in priority order. If one fails (404, 5xx, timeout), falls through
 | Source retry (9404/9407/9504)      | cdn-cgi `Cf-Resized: err=9404/9407/9504`          | Try next source in priority order                     |
 | Duration limit retry               | Binding rejects duration                          | Extract max from error, retry with capped duration    |
 | Alternative source retry           | Source 404/5xx HTTP status                        | Try next source in priority order                     |
-| Binding → container fallback       | Binding MediaError                                | Re-fetch from R2, route to container                  |
+| Binding → container fallback       | Binding MediaError                                | Re-fetch from R2, check size (>256MB → async queue), route to container |
 | Raw passthrough                    | All transforms fail                               | Serve untransformed source                            |
 | 202 Processing                     | Container async (>256 MiB) or reactive 9402       | Return JSON with `jobId`, SSE URL, `Retry-After: 10`  |
 
@@ -512,7 +514,7 @@ Five layers prevent duplicate work:
 | ------------------------------------- | ----------- | ------------------------------------------------- |
 | Edge cache (`caches.default`)         | Per-colo    | All requests -- `cf-cache-status: HIT`            |
 | R2 persistent cache                   | Global      | All transform results across colos                |
-| `RequestCoalescer` (signal pattern)   | Per-isolate | Concurrent requests in same isolate               |
+| `RequestCoalescer` (signal pattern)   | Per-isolate | Concurrent requests in same isolate. 60s safety timeout prevents stuck entries. 202 async responses excluded (they produce nothing for joiners). |
 | Queue consumer R2 check               | Global      | Re-dispatch after container already completed     |
 | Source cache (`_source-cache/`)       | Global      | Multiple containers downloading same source file  |
 
@@ -524,7 +526,7 @@ Auth-gated dashboard at `/admin/dashboard` (Astro + React + Tailwind v4):
 
 - **Analytics tab**: stat cards (total requests, success, errors, cache hit rate), latency metrics (avg, p50, p95), breakdown tables (by status, origin, derivative, transform source), recent errors table with admin noise filter toggle
 - **Jobs tab**: auto-discovers container transform jobs from D1, active jobs with SSE progress bars, status filter buttons (All/Active/Complete/Failed with counts), debounced search filter, expandable detail rows with param badges, retry/delete actions on individual jobs, bulk "Clear stale" for stuck jobs
-- **Debug tab**: test any URL with live param resolution, origin matching, response headers, timing, cache status
+- **Debug Workbench**: form-driven param builder with mode-aware fields, inline media preview (video/image/audio auto-detection), collapsible JSON tree diagnostics, side-by-side comparison mode with header diff, SSE container job progress tracking, Akamai/IMQuery compatibility tester with URL generation, URL hash persistence for shareability
 
 Auth: HMAC-SHA256 signed session cookie (HttpOnly, Secure, SameSite=Strict, 24h expiry). Login validates against `CONFIG_API_TOKEN` with timing-safe comparison.
 
@@ -591,11 +593,11 @@ scripts/
 ### Testing
 
 ```bash
-npm run test:run              # 186 unit tests (vitest + workers pool)
+npm run test:run              # 202 unit tests (vitest + workers pool)
 npm run test:e2e              # 92 E2E tests against live (vitest, 60s timeout)
 npx tsx scripts/smoke.ts      # 84 smoke tests against live
 npx tsx scripts/smoke.ts --container  # + container async polling (~10 min)
-npm run test:browser          # 22 Playwright browser tests
+npm run test:browser          # 49 Playwright browser tests (deploy first)
 npm run check                 # TypeScript strict
 ```
 
