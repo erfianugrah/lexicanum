@@ -1,0 +1,377 @@
+---
+title: "Docker Servarr Stack Security: Hardening Media Automation"
+description: Security reference for hardening Docker Compose *arr stacks (Radarr, Sonarr, Prowlarr, SABnzbd, qBittorrent) with network segmentation, filesystem isolation, credential management, and container hardening — balancing TRaSH Guides hardlink architecture with least-privilege principles
+author: Erfi Anugrah
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+How to harden a Docker Compose media automation stack without breaking hardlinks, download client connectivity, or reverse proxy routing. Covers the real-world tradeoffs between security recommendations (CIS Docker Benchmark, no-new-privileges, read-only filesystems) and what actually works with LinuxServer.io images, binhex VPN containers, and Unraid's FUSE filesystem.
+
+**TL;DR:** The biggest wins are filesystem isolation (stop mounting your entire appdata directory), network segmentation (isolate databases), and credential rotation. Most CIS Docker Benchmark recommendations (`no-new-privileges`, `read_only`, `cap_drop: ALL`) break LinuxServer.io images due to s6-overlay's setuid requirements.
+
+---
+
+## The Threat Model
+
+The [Usenet](https://en.wikipedia.org/wiki/Usenet) and torrent ecosystem is adversarial. Malicious executables hide behind media filenames. The *arr applications (Radarr, Sonarr, Prowlarr) process untrusted content from indexers and download clients. A compromise of any single container in the stack can chain into lateral movement if:
+
+1. All containers share a flat network (every service can reach every other service)
+2. Volume mounts expose the entire host appdata tree
+3. Databases run without authentication
+4. Containers run with excessive privileges
+
+The goal is reducing blast radius: if Radarr gets popped through an RCE or a malicious Usenet download, the attacker should be confined to media files — not password manager databases, tunnel credentials, or Postgres instances for unrelated services.
+
+---
+
+## Filesystem Isolation
+
+### The Problem: Shared Appdata Mounts
+
+A common pattern is mounting a broad appdata directory like `/path/to/appdata:/data` across all containers. This follows the [TRaSH Guides](https://trash-guides.info/Hardlinks/Hardlinks-and-Instant-Moves/) recommendation for hardlinks, but if that directory contains appdata for other services, every container gets read-write access to everything:
+
+| Example exposed directory | Risk |
+|---|---|
+| Password manager data | Credential database |
+| Postgres data dirs | Raw database files for unrelated services |
+| Auth gateway config | Authentication secrets and session keys |
+| Tunnel credentials | Cloudflare/Tailscale/VPN node keys |
+| Container management data | Stored credentials for orchestration tools |
+
+A compromised Radarr container can read and write all of this.
+
+### The Fix: Dedicated Media Parent Directory
+
+Docker cannot hardlink across separate bind mounts, even if they share the same underlying filesystem. This is a kernel limitation — each bind mount gets a different mount namespace entry, and `link(2)` returns `EXDEV` (cross-device link) across mount boundaries. This is [confirmed by moby/moby#7457](https://github.com/moby/moby/issues/7457).
+
+The TRaSH Guides hardlink architecture requires a single shared parent mount containing both the download and media directories. The solution is to make that parent contain *only* media and downloads — not your entire appdata tree.
+
+```bash
+# Create isolated parent under your appdata share
+mkdir -p /path/to/appdata/servarr
+
+# Move media + download dirs into it
+mv /path/to/appdata/media /path/to/appdata/servarr/media
+mv /path/to/appdata/usenet /path/to/appdata/servarr/usenet
+mv /path/to/appdata/torrents /path/to/appdata/servarr/torrents
+```
+
+<Aside type="tip" title="Unraid shfs rename is instant">
+  On Unraid's FUSE user share (`shfs`), `mv` within the same share is a directory rename — not a data copy. Even multi-terabyte directories move in milliseconds. Verify with `time mv` on a test directory first.
+</Aside>
+
+Then mount the isolated parent:
+
+```yaml
+# Radarr, Sonarr, SABnzbd — need shared mount for hardlinks
+volumes:
+  - /path/to/appdata/servarr:/data            # only media + downloads
+  - /path/to/appdata/radarr/config:/config     # service-specific config
+
+# Bazarr — only needs media (writes subtitles, no hardlinks)
+volumes:
+  - /path/to/appdata/servarr/media:/data/media
+  - /path/to/appdata/bazarr/config:/config
+
+# Jellyfin — media playback only, read-only
+volumes:
+  - /path/to/appdata/servarr/media:/data/media:ro
+  - /path/to/appdata/jellyfin/config:/config
+
+# Jellyseerr/Overseerr — API-only request management, no filesystem access needed
+volumes:
+  - /path/to/appdata/jellyseerr/config:/app/config
+```
+
+Container paths remain identical (`/data/media/movies`, `/data/usenet/complete`, etc.) so no application reconfiguration is needed. The only change is the host path in the compose file.
+
+### Which Containers Need What
+
+| Container | Mount | Justification |
+|---|---|---|
+| Radarr | `/data` (RW) | Hardlinks from `/data/usenet` and `/data/torrents` to `/data/media/movies` |
+| Sonarr | `/data` (RW) | Same pattern for TV |
+| SABnzbd | `/data` (RW) | Writes to `/data/usenet/{intermediate,complete}`, must be same mount for hardlink chain |
+| Bazarr | `/data/media` (RW) | Writes subtitles next to media files only |
+| Jellyfin / Plex / Emby | `/data/media` (RO) | Playback only — verify no local metadata writing is configured |
+| Navidrome | `/music` (RO) | Music playback only |
+| Jellyseerr / Overseerr | None | Talks to Radarr/Sonarr/Jellyfin via API exclusively |
+| Prowlarr | None | Indexer management — no media filesystem access |
+| FlareSolverr | None | Captcha solving — no filesystem access |
+| qBittorrent | `/media`, `/torrents` (RW) | Separate mounts — doesn't need the full `/data` parent |
+
+<Aside type="caution" title="Jellyfin read-only caveat">
+  If your media server is configured to save metadata alongside media files (NFO files, trickplay images), the `:ro` mount will cause failures. In Jellyfin, check **Libraries → Display → Save artwork into media folders**. If disabled (default), `:ro` is safe.
+</Aside>
+
+---
+
+## Network Segmentation
+
+### The Problem: Flat Network
+
+A single Docker bridge network means every container can reach every other container on every port. A compromised Radarr can connect to your unauthenticated Redis, query your Postgres database, or use FlareSolverr's headless browser as an SSRF proxy.
+
+### Practical Segmentation
+
+Full microsegmentation (one network per service pair) is impractical — the *arr stack has complex interdependencies. The highest-value isolation is separating databases and caches from the application tier.
+
+```yaml
+networks:
+  servarr:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.1.0/24
+          gateway: 10.10.1.1
+  db_backend:
+    driver: bridge
+    internal: true  # no internet access
+    ipam:
+      config:
+        - subnet: 10.10.2.0/24
+          gateway: 10.10.2.1
+  media:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.3.0/24
+          gateway: 10.10.3.1
+```
+
+| Network | Containers | Purpose |
+|---|---|---|
+| `servarr` | All *arr apps, download clients, indexers, request managers | Main communication tier |
+| `db_backend` | Monitoring app + its Postgres + its Redis | Database isolation — only the app that owns the DB can reach it |
+| `media` | Media servers (Jellyfin/Plex), music servers (Navidrome), request managers | Media playback tier |
+
+Multi-homed containers (on multiple networks) bridge the tiers. A monitoring app sits on both `servarr` (to reach *arr APIs) and `db_backend` (to reach its database). Media servers sit on both `servarr` (for reverse proxy IP preservation) and `media`.
+
+<Aside type="caution" title="Check existing subnet allocations before creating networks">
+  Docker assigns subnets to networks. If another stack already uses a given subnet, your new network creation will fail with `Pool overlaps with other one on this address space`. List existing subnets first:
+
+  ```bash
+  docker network ls --format '{{.Name}}' | xargs -I{} \
+    docker network inspect {} --format '{{.Name}}: {{range .IPAM.Config}}{{.Subnet}}{{end}}'
+  ```
+</Aside>
+
+### The `internal: true` Flag
+
+Networks marked `internal: true` have no internet access — Docker does not create a gateway route. This is ideal for database and cache networks where the containers never need to reach the internet.
+
+### Reverse Proxy IP Preservation
+
+If your reverse proxy (Caddy, Nginx, Traefik) is on the host network and connects to containers by static IP, moving containers to different networks changes their IPs. Two approaches:
+
+1. **Multi-home the container**: assign it to both the old network (keeping its IP for the reverse proxy) and the new network
+2. **Update the reverse proxy config**: change the upstream IP to the new network's IP
+
+Option 1 avoids cross-stack coordination:
+
+```yaml
+media-server:
+  networks:
+    servarr:
+      ipv4_address: 10.10.1.15  # reverse proxy targets this IP
+    media:
+      ipv4_address: 10.10.3.2   # internal media tier
+```
+
+---
+
+## Credential Management
+
+### Database Passwords
+
+`POSTGRES_PASSWORD` in the official Postgres (and TimescaleDB) images is only applied during initial database creation — when the data directory is empty. Changing the environment variable on an existing database does **nothing**. You must `ALTER USER` inside the running database first:
+
+```bash
+# Step 1: Change password in the live database
+docker exec <db-container> psql -U <db-user> \
+  -c "ALTER USER <db-user> PASSWORD 'new-secure-password';"
+
+# Step 2: Update POSTGRES_PASSWORD and connection strings in compose
+# Step 3: Restart the stack
+```
+
+If you skip step 1 and just change the env var, the application will fail to connect — the old password is still stored in the database's `pg_authid` catalog.
+
+### Redis Authentication
+
+Redis without `--requirepass` accepts connections from any container on the same network. Add authentication:
+
+```yaml
+redis:
+  command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+```
+
+Update the connection URL in the application:
+
+```yaml
+REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+```
+
+The healthcheck also needs the password:
+
+```yaml
+healthcheck:
+  test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD} ping | grep -q PONG"]
+```
+
+Docker Compose interpolates `${REDIS_PASSWORD}` from the `.env` file at compose-parse time, not at container runtime. The literal password value is baked into the container's command and healthcheck.
+
+### Secret Encryption at Rest
+
+Use [SOPS](https://github.com/getsops/sops) with [age](https://github.com/FiloSottile/age) to encrypt `.env` files in git:
+
+```bash
+sops --encrypt --age age1... .env > .env.enc
+```
+
+Add a pre-commit hook to prevent committing unencrypted secrets. **Do not** add an `.allow-unencrypted` bypass file — it completely disables the hook regardless of content (the hook checks `if [ -f ".allow-unencrypted" ]; then exit 0; fi`).
+
+<Aside type="caution" title="CI/CD workflows and plaintext secrets">
+  If your CI/CD workflow hardcodes secrets in the YAML payload (common with Portainer git redeploy), those secrets are permanently in git history. Use secret references (`${{ secrets.* }}` in GitHub Actions, Woodpecker secrets, etc.) instead. Even if the workflow is dead code targeting a non-existent branch, the secrets remain in git history forever.
+</Aside>
+
+---
+
+## Container Hardening: What Works and What Breaks
+
+### CIS Docker Benchmark vs LinuxServer.io Reality
+
+The CIS Docker Benchmark recommends several hardening measures. Most break LinuxServer.io containers due to their s6-overlay init system.
+
+| CIS Recommendation | Works with LinuxServer? | Why |
+|---|---|---|
+| `security_opt: [no-new-privileges:true]` | No | s6-overlay uses `s6-overlay-suexec`, a setuid binary. `no-new-privileges` ignores the suid bit, causing `fatal: insufficient privileges` |
+| `cap_drop: [ALL]` (alone) | No | s6 init needs `CHOWN`, `SETUID`, `SETGID`, `DAC_OVERRIDE`, `FOWNER` for PUID/PGID user switching |
+| `cap_drop: [ALL]` + selective `cap_add` | Partially | Works if you add back the 5 capabilities above, but adds compose complexity for marginal gain |
+| `read_only: true` | No | [LinuxServer docs](https://docs.linuxserver.io/misc/read-only/) confirm: PUID/PGID variables stop working, Docker Mods don't run, container runs as UID 911 |
+| `user: 1000:100` | Only for non-LinuxServer images | LinuxServer images handle user mapping internally via s6-overlay. Setting `user:` bypasses their init |
+
+<Aside type="tip" title="Where no-new-privileges does work">
+  For non-LinuxServer images that already run as non-root (e.g., Navidrome with an explicit `user:` directive, Redis Alpine), `no-new-privileges` is safe and recommended.
+</Aside>
+
+### The Privileged Container: binhex VPN Images
+
+`binhex/arch-qbittorrentvpn` with WireGuard requires `privileged: true`. This is not a misconfiguration — the image needs to:
+
+- Create and manage WireGuard tunnel interfaces (`wg0`)
+- Manipulate iptables for the kill-switch
+- Configure routing tables
+- Load kernel modules
+
+Removing `privileged: true` and substituting `cap_add: [NET_ADMIN]` with `devices: [/dev/net/tun]` does not work with this image's init scripts. The `cap_add: NET_ADMIN` alongside `privileged: true` is redundant (privileged grants all capabilities) and should be removed for clarity.
+
+### UMASK
+
+LinuxServer containers default to `UMASK=0000` — files are created with mode `777`. On a shared volume, this means any container (or host user) can read and write any file.
+
+`UMASK=0002` is the recommended value: owner and group get full access, others get read-only. Combined with a shared PGID (e.g., `PGID=100` on Unraid's `users` group), this gives all containers in the stack write access via group membership while preventing world-writable files.
+
+### Image Pinning
+
+| Practice | Risk | Recommendation |
+|---|---|---|
+| `:latest` tag | Image can change without notice — supply chain risk | Pin to version tags |
+| Version tags (e.g., `radarr:6.1.1`) | Tag could theoretically be rewritten on the registry | Acceptable for homelab |
+| SHA digest (e.g., `@sha256:abc...`) | Immutable, CIS-recommended | Impractical for updates — reasonable for production |
+
+For images where the `:latest` tag contains unreleased code (no matching version tag exists), pinning is a downgrade. In this case, keep `:latest` and note the risk.
+
+### Health Checks
+
+The *arr applications expose unauthenticated `/ping` endpoints:
+
+```yaml
+healthcheck:
+  test: ["CMD-SHELL", "curl -sf http://localhost:7878/ping || exit 1"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 30s
+```
+
+Do not parse `config.xml` for API keys in healthchecks — `/ping` is simpler and doesn't break if the config format changes. Other common endpoints:
+
+| Service | Healthcheck Endpoint | Tool |
+|---|---|---|
+| Radarr / Sonarr / Prowlarr | `/ping` | `curl` |
+| Jellyfin | `/health` | `curl` |
+| SABnzbd | `/api?mode=version` | `curl` |
+| FlareSolverr | `/health` | `curl` |
+| Navidrome | `/ping` | `wget` (no curl in image) |
+| Jellyseerr | `/api/v1/status` | `wget` (no curl in image) |
+
+<Aside type="tip" title="start_period matters for VPN containers">
+  VPN containers (qBittorrent with WireGuard) take 30-60 seconds to establish the tunnel before the WebUI starts. Set `start_period` accordingly or omit the healthcheck — a failed health check during VPN negotiation will cause dependent containers to never start if using `depends_on: condition: service_healthy`.
+</Aside>
+
+---
+
+## GPU Capability Narrowing
+
+NVIDIA GPU passthrough defaults to `NVIDIA_DRIVER_CAPABILITIES=all`, which exposes all driver capabilities. Most services need a subset:
+
+| Service | Needed Capabilities | Reason |
+|---|---|---|
+| Jellyfin / Plex / Emby | `gpu`, `video`, `compute`, `utility` | NVENC/NVDEC transcoding + tone mapping |
+| Bazarr | `compute`, `utility` | Subtitle OCR processing |
+
+Remove `graphics`, `compat32`, and `display` unless the container needs X11 rendering or 32-bit library compatibility.
+
+---
+
+## Deployment Considerations
+
+### Dockge and Docker Compose Plugin
+
+Unraid ships Docker without the Compose plugin. If you use Dockge, it bundles its own Compose binary inside its container. To manage stacks from the CLI:
+
+```bash
+# Not this (no compose plugin on Unraid):
+docker compose up -d
+
+# Use Dockge's bundled compose:
+docker exec dockge docker compose \
+  -f /opt/stacks/<stack-name>/compose.yaml \
+  --project-name <stack-name> up -d
+```
+
+### Startup Order and Timing
+
+VPN containers (qBittorrent) take 30-60 seconds to negotiate the tunnel before exposing their WebUI. Radarr/Sonarr start faster and will log "Connection refused" errors when checking download clients during this window. These are transient — the health check system caches the failure until the next check interval. Force a refresh via the API:
+
+```bash
+curl -X POST 'http://localhost:7878/api/v3/command' \
+  -H 'Content-Type: application/json' \
+  -H 'X-Api-Key: YOUR_API_KEY' \
+  -d '{"name":"CheckHealth"}'
+```
+
+### binhex WEBUI_PASSWORD Behavior
+
+The `WEBUI_PASSWORD` environment variable in binhex images only takes effect when the qBittorrent config file is created for the first time. On existing installations, the image logs `qBittorrent config file already exists, skipping copy` and the env var is ignored. Change the password through the qBittorrent WebUI instead.
+
+---
+
+## Verification Checklist
+
+After applying hardening changes, verify each layer:
+
+| Check | Command | Expected |
+|---|---|---|
+| Hardlinks work | `stat /path/to/hardlinked/file` | `Links: 2` (or more) |
+| Filesystem isolation | `docker exec radarr ls /data/` | Only `media/`, `usenet/`, `torrents/` — no appdata dirs |
+| Read-only enforcement | `docker exec jellyfin touch /data/media/test` | `Read-only file system` |
+| Removed mounts | `docker exec jellyseerr ls /data/` | `No such file or directory` |
+| Network isolation | `docker exec radarr curl -sf --connect-timeout 3 http://<DB_IP>:5432/` | Connection refused / timeout |
+| DB auth works | `docker exec <db-container> psql -U <user> -c "SELECT 1;"` | Returns `1` |
+| Redis requires auth | `docker exec <redis-container> redis-cli ping` | `NOAUTH Authentication required` |
+| VPN connected | `docker logs <vpn-container> \| grep -i wireguard` | `Successfully brought Wireguard interface 'up'` |
+| Inter-service connectivity | `docker exec bazarr curl -sf http://<RADARR_IP>:7878/ping` | `{"status": "OK"}` |
+| Health checks passing | `docker ps --format 'table {{.Names}}\t{{.Status}}'` | All show `(healthy)` |
