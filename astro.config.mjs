@@ -1,5 +1,5 @@
 // @ts-check
-import { defineConfig } from "astro/config";
+import { defineConfig, fontProviders } from "astro/config";
 import starlight from "@astrojs/starlight";
 import remarkD2 from "remark-d2";
 import sitemap from "@astrojs/sitemap";
@@ -11,6 +11,40 @@ import react from "@astrojs/react";
 // https://astro.build/config
 export default defineConfig({
   site: "https://erfi.dev",
+  fonts: [
+    {
+      name: "IBM Plex Sans",
+      cssVariable: "--font-plex-sans",
+      provider: fontProviders.fontsource(),
+      // Variable font: single woff2 per subset, weight axis 100-700
+      weights: ["100 700"],
+      styles: ["normal", "italic"],
+      subsets: ["latin"],
+      fallbacks: [
+        "system-ui",
+        "-apple-system",
+        "Segoe UI",
+        "Roboto",
+        "sans-serif",
+      ],
+    },
+    {
+      name: "IBM Plex Mono",
+      cssVariable: "--font-plex-mono",
+      provider: fontProviders.fontsource(),
+      // Static font — only the weights we actually use
+      weights: [400, 600],
+      styles: ["normal"],
+      subsets: ["latin"],
+      fallbacks: [
+        "ui-monospace",
+        "SFMono-Regular",
+        "Menlo",
+        "Consolas",
+        "monospace",
+      ],
+    },
+  ],
   integrations: [sitemap(), starlight({
     title: "Erfi's Lexicanum",
     favicon: "/ea_favicon.png",
