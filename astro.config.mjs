@@ -136,6 +136,11 @@ export default defineConfig({
     ],
   }), react()],
   markdown: {
+    // Explicit so GFM tables always render. astro 6.4.2 + @astrojs/mdx 5.x
+    // had a regression where gfm defaulted to false in the MDX pipeline when
+    // a markdown config block was present (tables leaked as raw `| ... |`
+    // text). Fixed in 6.4.5 / mdx 6.0.3; kept explicit as a guardrail.
+    gfm: true,
     remarkPlugins: [
       remarkMath,
       [remarkD2, {
