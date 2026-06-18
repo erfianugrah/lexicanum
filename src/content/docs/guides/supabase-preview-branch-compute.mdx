@@ -1,0 +1,306 @@
+---
+title: Supabase preview-branch compute sizing & a CI parity model
+description: Why GitHub-triggered Supabase preview branches always come up Micro, why that OOMs on reset, how to provision them at a larger size from CI, and the feature-parity gaps (plus an IPv6 gotcha) you inherit when you take the lifecycle into your own hands.
+author: "Erfi Anugrah"
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+## The problem
+
+With the Supabase GitHub integration's **Automatic branching** enabled, every
+pull request spins up its own preview branch (a full, isolated Supabase project).
+That branch **always provisions on the Micro compute tier (1 GB RAM)**, and there
+is **no setting anywhere** to change that default.
+
+Micro is fine for steady-state use, but **resetting a branch** tears down all
+tables/buckets and replays every migration + reseed — effectively a
+`supabase db reset`. On a non-trivial schema, that replay can exhaust Micro's
+1 GB and fail with an out-of-memory error. The manual fix is to open the branch's
+infrastructure menu, bump Micro → Small, then reset again — per branch, by hand.
+
+This guide shows what's actually configurable, the cost delta, and a
+CI-driven workaround that provisions branches at the size you want — along with
+the feature-parity gaps and an IPv6 gotcha you inherit by owning the lifecycle.
+
+## Where compute size *can* be set
+
+Size is settable, but **only at branch creation**, and **only via the CLI or
+Management API** — never for the auto-branching flow.
+
+| Surface | Size knob? | Notes |
+|---|---|---|
+| `supabase branches create --size <tier>` | ✅ | A branch created with `--size small` provisions `ci_small` (2 GB). |
+| `POST /v1/projects/{ref}/branches` (`desired_instance_size`) | ✅ | Enum `pico\|nano\|micro\|small\|medium` — API caps branches at **medium**. |
+| `PATCH /v1/branches/{ref}` (resize existing) | ❌ | Body has `branch_name / git_branch / reset_on_push / persistent / status / notify_url` only — **no size field**. |
+| `supabase branches update` | ❌ | No `--size` flag — you cannot resize an existing branch from the CLI. |
+| `config.toml` | ❌ | Syncs DB/API/Auth/seed/function settings to branches, but carries **no compute-size key**. |
+| GitHub integration UI (auto-branching) | ❌ | Exposes only *Automatic branching*, *Branch limit*, *Supabase changes only* — **no default-size setting**. |
+
+The takeaway: **auto-created PR branches always come up Micro**, and resizing
+after the fact is dashboard-only. To get a larger tier programmatically you must
+be the one calling `branches create --size`.
+
+:::caution[Resize is not programmable]
+Because `PATCH /v1/branches` and `branches update` have no size field, you
+cannot script "bump this Micro branch to Small". You must either create it at the
+right size up front (this guide) or bump it manually in the dashboard.
+:::
+
+## Cost delta
+
+From `GET /v1/projects/{ref}/billing/addons`:
+
+| Tier | RAM | Direct conns | Pooler conns | Price |
+|---|---|---|---|---|
+| Micro (`ci_micro`) | 1 GB | 60 | 200 | **$0.01344/hr** (~$10/mo) |
+| Small (`ci_small`) | 2 GB | 90 | 400 | **$0.0206/hr** (~$15/mo) |
+
+Branch compute bills **only while the branch is awake**, is shown as "Branching
+Compute Hours" on the invoice, and is **not covered by the Spend Cap** and **not
+eligible for Compute Credits**. Preview branches auto-pause on inactivity and
+auto-delete when the PR merges/closes, so the delta is small in practice.
+
+## The two flows
+
+```d2
+direction: right
+
+pr: Pull Request opened
+
+auto: Auto-branching (built-in) {
+  shape: rectangle
+  body: |md
+    - Supabase GitHub App reacts to PR
+    - Creates branch **always Micro**
+    - Runs configure / migrate / seed / deploy
+    - Posts `Supabase Preview` check + PR comment
+    - Auto-deletes on PR close
+    - **No size knob**
+  |
+}
+
+diy: DIY via GitHub Actions {
+  shape: rectangle
+  body: |md
+    - Auto-branching **off**
+    - `branches create --size small`
+    - You run `db push` (migrate)
+    - You run seed / functions deploy
+    - You build your own check / cleanup
+    - **You choose the size**
+  |
+}
+
+pr -> auto: size = Micro, fixed
+pr -> diy: size = your choice {
+  style.stroke-dash: 3
+}
+```
+
+## The workaround: own the lifecycle in CI
+
+To control size you turn **Automatic branching off** (otherwise you get a
+duplicate Micro branch and/or hit the branch limit) and let a workflow own
+create → migrate → delete.
+
+:::danger[Two hard gotchas — read these first]
+1. **GitHub-hosted runners have no IPv6.** A branch's direct
+   `POSTGRES_URL_NON_POOLING` resolves to an **IPv6-only** `db.<ref>.supabase.co`
+   host, so `psql`/`db push` against it fail with
+   `Network is unreachable`. Use the **IPv4 session pooler** instead (see
+   [the IPv6 gotcha](#gotcha-github-runners-have-no-ipv6)).
+2. **A CLI-created branch starts empty** — no migrations are pre-applied. The
+   auto-branching "migrate" step does not run for branches you create yourself,
+   so **you must run `db push`**.
+:::
+
+<Tabs>
+<TabItem label="Workflow">
+
+```yaml
+# .github/workflows/supabase-preview.yml
+name: supabase-preview
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, closed]
+    branches: [main]
+    # gate on Supabase files if you like; remove to run on every PR
+    paths: ['supabase/**']
+
+permissions:
+  contents: read
+concurrency:
+  group: sb-preview-${{ github.event.pull_request.number }}
+
+env:
+  SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+  PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}   # parent project ref
+  BRANCH_NAME: ci-preview-${{ github.event.pull_request.number }}
+
+jobs:
+  upsert:
+    # same-repo only (forks carry no secrets); skip on close
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: supabase/setup-cli@v2
+        with: { version: latest, github-token: ${{ github.token }} }
+
+      - name: Create branch at Small (idempotent)
+        run: |
+          set -euo pipefail
+          if ! supabase branches get "$BRANCH_NAME" --project-ref "$PROJECT_ID" >/dev/null 2>&1; then
+            supabase branches create "$BRANCH_NAME" \
+              --project-ref "$PROJECT_ID" --git-branch "${{ github.head_ref }}" \
+              --size small --yes
+          fi
+
+      - name: Resolve IPv4 session-pooler URL  # GH runners have no IPv6
+        run: |
+          set -euo pipefail
+          supabase branches get "$BRANCH_NAME" --project-ref "$PROJECT_ID" -o env > creds.env
+          POOLER=$(grep '^POSTGRES_URL=' creds.env | cut -d= -f2- | tr -d '"')
+          SESSION="${POOLER/:6543/:5432}"   # transaction pooler -> session mode
+          echo "::add-mask::$SESSION"
+          echo "PGURL=$SESSION" >> "$GITHUB_ENV"
+
+      - name: Apply migrations
+        run: supabase db push --db-url "$PGURL" --include-all --yes
+
+      # Optional parity steps the auto-branching pipeline would do for you:
+      # - name: Seed
+      #   run: psql "$PGURL" -f supabase/seed.sql
+      # - name: Deploy edge functions
+      #   run: supabase functions deploy --project-ref "$(echo "$PGURL" | grep -oP 'postgres\.\K[a-z0-9]+')"
+
+  cleanup:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+    steps:
+      - uses: supabase/setup-cli@v2
+        with: { version: latest, github-token: ${{ github.token }} }
+      - run: supabase branches delete "ci-preview-${{ github.event.pull_request.number }}" --project-ref "${{ secrets.SUPABASE_PROJECT_ID }}" --yes || true
+```
+
+</TabItem>
+<TabItem label="Secrets & setup">
+
+1. **`SUPABASE_ACCESS_TOKEN`** — an account access token
+   (`supabase login` token, or dashboard → Account → Access Tokens). Set as a
+   repo secret: `gh secret set SUPABASE_ACCESS_TOKEN --repo <owner>/<repo> < tokenfile`.
+2. **`SUPABASE_PROJECT_ID`** — the **parent** project ref (not a branch ref).
+3. In the dashboard: **Integrations → GitHub → turn *Automatic branching* off**
+   so Supabase doesn't also create a Micro branch.
+4. `supabase/setup-cli@v2` is the official CLI installer action.
+
+:::caution[The access token is account-wide]
+Supabase access tokens are **account-scoped** — there is no project-scoped token
+for branch management. A leaked token can manage every project in your account.
+Store it in repo secrets only, restrict who can edit workflows, and rotate it.
+:::
+
+</TabItem>
+</Tabs>
+
+## Feature-parity matrix
+
+Auto-branching runs a fixed pipeline (`clone → pull → health → configure →
+migrate → seed → deploy`) and wires in GitHub checks. Owning the lifecycle means
+replicating the parts you need:
+
+| Auto-branching does | DIY equivalent | Notes |
+|---|---|---|
+| Create branch on PR | `branches create --size` | You also get size control |
+| **configure** (apply `config.toml`) | Not done by `db push` — apply via Management API / CLI yourself | Gap to replicate |
+| **migrate** | `supabase db push --db-url <session-pooler>` | Applies pending migrations |
+| **seed** (`seed.sql`) | `psql "$PGURL" -f supabase/seed.sql` | Not run by `db push`; add explicitly |
+| **deploy** (edge functions) | `supabase functions deploy` | Only if you have functions |
+| `Supabase Preview` status check | Make the workflow itself a required check | Rebuild |
+| PR comment with branch status | Add a comment step if wanted | Rebuild |
+| Auto-delete on PR close | `cleanup` job on `closed` event | — |
+
+Net: you gain **size control** and lose the integration's turnkey
+check/comment/configure/seed/deploy ergonomics, which you rebuild in YAML.
+
+## Gotcha: GitHub runners have no IPv6
+
+A branch's direct connection string points at an **IPv6-only** host:
+
+```
+PGURL = postgresql://postgres@db.<ref>.supabase.co:5432/postgres
+psql: error: connection to server at "db.<ref>.supabase.co" (2a05:d014:...),
+      port 5432 failed: Network is unreachable
+```
+
+`supabase db push` against it fails and the CLI tells you why:
+
+```
+Your network does not support IPv6, which is required for direct connections.
+Retry with your project's IPv4 transaction pooler connection string via --db-url.
+```
+
+**Why auto-branching doesn't hit this:** Supabase runs its migrate step on its
+own (IPv6-capable) infrastructure. The moment *you* run migrations from a
+GitHub-hosted runner, you're on an IPv4-only network.
+
+**Fix:** use the **IPv4 pooler**. The branch's `POSTGRES_URL` is the
+**transaction** pooler (`...pooler.supabase.com:6543`). For migrations, derive
+the **session** pooler by swapping the port to `5432` (session mode supports the
+advisory locks / session state that `db push` needs):
+
+```bash
+POOLER=$(grep '^POSTGRES_URL=' creds.env | cut -d= -f2- | tr -d '"')
+SESSION="${POOLER/:6543/:5432}"   # session pooler, IPv4-reachable
+supabase db push --db-url "$SESSION" --include-all --yes
+```
+
+:::tip[Implications]
+- Any DB access from CI (migrations, seeding, smoke tests via `psql`) **must**
+  use the pooler URL, not `POSTGRES_URL_NON_POOLING`.
+- Use **session** mode (`:5432`) for migrations; **transaction** mode (`:6543`)
+  is fine for simple app queries but can break multi-statement / advisory-lock
+  operations.
+- Alternatively, buy the **IPv4 add-on** for direct connections, or run the
+  workflow on a self-hosted IPv6-capable runner. The pooler is the free path.
+- Mask the URL (`::add-mask::`) — it contains the DB password.
+:::
+
+## What a run looks like
+
+The DIY lifecycle, end to end:
+
+- Auto-created PR branches report `ci_micro` (1 GB) from the billing API.
+- `branches create … --size small` reports `ci_small` (2 GB).
+- A branch created via the CLI/API starts **empty** — `db push` then applies
+  every migration:
+
+```
+pastes table present before db push: f          # branch starts empty
+Applying migration 20260407101812_remote_schema.sql...
+... (all migrations) ...
+Finished supabase db push.
+table public.pastes present: t
+table public.slugs present: t
+```
+
+- On the `closed` event, only the `cleanup` job runs and the branch is deleted,
+  stopping the compute billing.
+
+## Recommendation
+
+- **Short term:** if a repo's branches OOM on reset, either bump Micro→Small by
+  hand, or adopt the CI workflow above to provision at Small from the start.
+- **The clean fix is a product gap:** a *default branch compute size* setting in
+  the GitHub integration / `config.toml`, so auto-created PR branches honor it
+  and you keep all the turnkey ergonomics. The integration UI confirms this knob
+  does not exist today. Worth filing as a feature request.
+
+## See also
+
+- Supabase docs: [Branching](https://supabase.com/docs/guides/deployment/branching),
+  [Working with branches](https://supabase.com/docs/guides/deployment/branching/working-with-branches),
+  [Manage Branching usage](https://supabase.com/docs/guides/platform/manage-your-usage/branching)
