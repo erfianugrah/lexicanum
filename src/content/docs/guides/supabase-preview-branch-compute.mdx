@@ -53,8 +53,8 @@ From `GET /v1/projects/{ref}/billing/addons`:
 
 | Tier | RAM | Direct conns | Pooler conns | Price |
 |---|---|---|---|---|
-| Micro (`ci_micro`) | 1 GB | 60 | 200 | **$0.01344/hr** (~$10/mo) |
-| Small (`ci_small`) | 2 GB | 90 | 400 | **$0.0206/hr** (~$15/mo) |
+| Micro (`ci_micro`) | 1 GB | 60 | 200 | **\$0.01344/hr** (~\$10/mo) |
+| Small (`ci_small`) | 2 GB | 90 | 400 | **\$0.0206/hr** (~\$15/mo) |
 
 Branch compute bills **only while the branch is awake**, is shown as "Branching
 Compute Hours" on the invoice, and is **not covered by the Spend Cap** and **not
@@ -146,7 +146,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: supabase/setup-cli@v2
-        with: { version: latest, github-token: ${{ github.token }} }
+        with:
+          version: latest
+          github-token: ${{ github.token }}
 
       - name: Create branch at Small (idempotent)
         run: |
@@ -182,9 +184,21 @@ jobs:
       SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
     steps:
       - uses: supabase/setup-cli@v2
-        with: { version: latest, github-token: ${{ github.token }} }
+        with:
+          version: latest
+          github-token: ${{ github.token }}
       - run: supabase branches delete "ci-preview-${{ github.event.pull_request.number }}" --project-ref "${{ secrets.SUPABASE_PROJECT_ID }}" --yes || true
 ```
+
+:::caution[Don't put `${{ }}` inside a YAML flow mapping]
+Write `with:` as a block, not inline. The tempting one-liner
+`with: { version: latest, github-token: ${{ github.token }} }` is **invalid
+YAML**: the `{{` of the expression opens a nested flow mapping the parser never
+closes. GitHub can't parse the file, so it **silently refuses to register the
+workflow** — the `pull_request` event fires nothing, and the only trace is a
+phantom run marked "failure" with zero jobs. Block style (`with:` then indented
+`key: value` lines) avoids it entirely.
+:::
 
 </TabItem>
 <TabItem label="Secrets & setup">
@@ -264,9 +278,73 @@ supabase db push --db-url "$SESSION" --include-all --yes
 - Use **session** mode (`:5432`) for migrations; **transaction** mode (`:6543`)
   is fine for simple app queries but can break multi-statement / advisory-lock
   operations.
-- Alternatively, buy the **IPv4 add-on** for direct connections, or run the
-  workflow on a self-hosted IPv6-capable runner. The pooler is the free path.
+- Alternatives to the pooler: buy the **IPv4 add-on** ($0.0055/hr) for direct
+  connections, run on a **self-hosted IPv6-capable runner**, or give the
+  GitHub-hosted runner IPv6 egress with **Cloudflare WARP** (next section). The
+  pooler is the simplest free path; reach for the others only if you specifically
+  need the *direct* connection.
 - Mask the URL (`::add-mask::`) — it contains the DB password.
+:::
+
+### Alternative: Cloudflare WARP for IPv6 egress
+
+If you want the **direct** connection from a GitHub-hosted runner (e.g. to avoid
+the pooler entirely), Cloudflare WARP can hand the IPv4-only runner working
+public IPv6 egress. WARP routes through Cloudflare's network, so it reaches
+arbitrary IPv6 destinations — including the `db.<ref>.supabase.co` host — even
+though the runner has no native IPv6.
+
+```yaml
+- name: Cloudflare WARP (IPv6 egress, IPv4 stays direct)
+  run: |
+    set -euo pipefail
+    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+      | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+      | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+    sudo apt-get update -qq && sudo apt-get install -y -qq cloudflare-warp
+    sudo warp-cli --accept-tos registration new
+    sudo warp-cli --accept-tos mode warp
+    # keep IPv4 OUT of the tunnel so the runner's link to GitHub is untouched
+    sudo warp-cli --accept-tos tunnel ip add-range 0.0.0.0/0
+    sudo warp-cli --accept-tos connect
+    # connect is async — gate on the daemon actually reporting Connected
+    for i in $(seq 1 30); do
+      sudo warp-cli --accept-tos status 2>/dev/null | grep -qi Connected && break
+      sleep 2
+    done
+    curl -s6 --max-time 10 https://api6.ipify.org    # confirm public IPv6 egress
+
+- name: db push over the DIRECT connection
+  run: |
+    supabase branches get "$BRANCH_NAME" --project-ref "$PROJECT_ID" -o env > creds.env
+    DIRECT=$(grep '^POSTGRES_URL_NON_POOLING=' creds.env | cut -d= -f2- | tr -d '"')
+    echo "::add-mask::$DIRECT"
+    supabase db push --db-url "$DIRECT" --include-all --yes
+```
+
+Two footguns that make this fail silently if you skip them:
+
+- **Split-tunnel in default Exclude mode** — `tunnel ip add-range 0.0.0.0/0`
+  *excludes* all IPv4 from the tunnel, so only IPv6 routes through WARP and the
+  runner's IPv4 connection to the GitHub Actions service is left alone. Without
+  this, full-tunnel mode pushes everything through Cloudflare.
+- **`warp-cli connect` is asynchronous** — it returns `Success` immediately, well
+  before the tunnel is up. Polling `curl` alone races; gate on
+  `warp-cli status` reporting `Connected` first, otherwise the IPv6 probe runs
+  against a tunnel that hasn't finished establishing and you get a false
+  negative.
+
+On a clean runner this brings up a `CloudflareWARP` interface with a global
+`2606:4700:…` address and a default IPv6 route; `db push` then applies every
+migration over the direct host.
+
+:::caution[Tradeoffs]
+WARP adds a **Cloudflare dependency** to every CI run and still needs the same
+account-wide `SUPABASE_ACCESS_TOKEN`. WARP egress is shared NAT (outbound only,
+no dedicated IP) — fine for `db push`, not for anything needing a stable source
+IP. It's a genuine option when you must use the direct connection, but the IPv4
+session pooler stays the simpler default.
 :::
 
 ## What a run looks like
