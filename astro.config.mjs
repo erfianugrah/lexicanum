@@ -1,5 +1,6 @@
 // @ts-check
 import { defineConfig, fontProviders } from "astro/config";
+import { unified } from "@astrojs/markdown-remark";
 import starlight from "@astrojs/starlight";
 import remarkD2 from "remark-d2";
 import sitemap from "@astrojs/sitemap";
@@ -136,24 +137,27 @@ export default defineConfig({
     ],
   }), react()],
   markdown: {
-    // Explicit so GFM tables always render. astro 6.4.2 + @astrojs/mdx 5.x
-    // had a regression where gfm defaulted to false in the MDX pipeline when
-    // a markdown config block was present (tables leaked as raw `| ... |`
-    // text). Fixed in 6.4.5 / mdx 6.0.3; kept explicit as a guardrail.
-    gfm: true,
-    remarkPlugins: [
-      remarkMath,
-      [remarkD2, {
-        compilePath: "public/d2",
-        linkPath: "/d2",
-        defaultD2Opts: ["-t=100", "--dark-theme=200", "--layout=elk"],
-      }],
-    ],
+    // Astro 7 switched the default processor to Sätteri; remark/rehype plugins
+    // require the unified() pipeline from @astrojs/markdown-remark.
+    // Plugins and gfm are passed directly into unified() (the top-level
+    // markdown.remarkPlugins / rehypePlugins / gfm options are deprecated in v7).
+    processor: unified({
+      // gfm: true is the default; kept explicit as a guardrail against regressions.
+      gfm: true,
+      remarkPlugins: [
+        remarkMath,
+        [remarkD2, {
+          compilePath: "public/d2",
+          linkPath: "/d2",
+          defaultD2Opts: ["-t=100", "--dark-theme=200", "--layout=elk"],
+        }],
+      ],
+      rehypePlugins: [rehypeKatex],
+    }),
     syntaxHighlight: {
       type: "shiki",
       excludeLangs: ["d2"],
     },
-    rehypePlugins: [rehypeKatex],
   },
   build: {
     concurrency: 4,
