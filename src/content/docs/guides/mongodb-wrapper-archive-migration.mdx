@@ -1,0 +1,269 @@
+---
+title: Migrating a static MongoDB archive into Postgres with the Supabase MongoDB wrapper
+description: The MongoDB wrapper is a live foreign-data-wrapper connector, not a migration tool - so for a static archive the right move is a one-off copy through it, then decommission Mongo. Covers why the wrapper is native (platform-only), a batched _id-keyset copy that is idempotent and resumable, and the empty-string keyset gotcha that silently copies zero rows through the wrapper but not against a plain-text stub.
+author: "Erfi Anugrah"
+---
+
+## The problem
+
+You have a large MongoDB collection of historical documents that no longer
+changes - an append-only log, an event history, an archived dataset - and you
+want to stop running Mongo for it. The rest of your data has already moved to
+Postgres, but this one big legacy collection is **static** (write-once,
+read-occasionally) and rebuilding your migration tooling just for it is
+unappealing. The [Supabase MongoDB wrapper](https://supabase.com/docs/guides/database/extensions/wrappers/mongodb)
+gets floated as a way to just *keep the data in Mongo and query it from Postgres*,
+with no migration at all.
+
+That framing is the trap. The wrapper is a **live foreign-data-wrapper (FDW)
+connector, not a migration shortcut**. Data stays in Mongo and Postgres queries
+it over the network on every scan. As a bridge while you migrate the rest it is
+fine; as a way to *avoid* migrating that data forever it means you keep running
+and paying for two databases, and you keep an inbound network path open between
+Supabase and your Mongo box indefinitely.
+
+For a **static archive** the calculus is simple: an extra system running
+forever for data that never changes is more overhead than a one-time copy. So
+use the wrapper as a **one-off copy tool**, verify row counts, then drop the
+connection and decommission Mongo.
+
+This guide is the whole path, verified end-to-end against a real hosted Supabase
+project (`wrappers 0.6.2`) reading a seeded MongoDB Atlas cluster.
+
+## What the wrapper is and is not
+
+The wrapper maps a Mongo collection to a foreign table. Top-level BSON fields
+map to declared columns by exact name; a special `_doc jsonb` column receives
+the **whole document** for nested and array access.
+
+```sql
+create foreign table mongo.events (
+  _id  text,
+  _doc jsonb
+)
+  server mongo_server
+  options ( database 'app', collection 'events' );
+```
+
+It supports `where` / `order by` / `limit` pushdown, and `INSERT` / `UPDATE` /
+`DELETE` when `rowid_column` is set. What it does **not** do is the part people
+assume away:
+
+| Limitation | Consequence for a "leave it in Mongo" plan |
+|---|---|
+| No aggregate pushdown | `count`/`sum`/`avg`/`min`/`max` fetch all rows and compute in Postgres - every dashboard query drags the collection over the network |
+| No nested-field SQL without `_doc` | `address.city` as a column name does not traverse; you must go through `_doc -> ... ->> ...` |
+| No multi-document transactions | Not a transactional store you can lean on |
+| No `import foreign schema` | Every foreign table is declared by hand |
+| Dynamic Supabase egress IPs | The remote must allow a broad IP range (see below) - a standing exposure |
+
+None of that matters for a **one-off drain**. All of it matters if you keep the
+connector live in production. That is the asymmetry that decides it.
+
+## It is a native wrapper, so it only exists on hosted projects
+
+The MongoDB wrapper is a [**native** FDW, not a Wasm one](https://supabase.com/docs/guides/database/extensions/wrappers/overview). Native wrappers are
+compiled into the Supabase platform Postgres image, so `create foreign data
+wrapper mongodb_wrapper` works on a hosted project but not on a plain local
+Postgres - `supabase start`'s local image does not ship `mongodb_fdw_handler`,
+and there is no `fdw_package_url` install path the way there is for Wasm wrappers
+(Snowflake, Stripe, and the like).
+
+The practical consequence: you cannot dry-run the full migration on a local
+stack. If you want to exercise the copy SQL before pointing it at a hosted
+project, run it against an ordinary Postgres table with the same two columns
+(`_id text, _doc jsonb`) loaded from a `mongosh` dump. The SQL is identical;
+switching to the real foreign table is a one-line change to the source relation.
+
+:::note[Check the wrapper is installed]
+None of this works unless the wrapper is present on the project, so check first:
+
+```sql
+create extension if not exists wrappers with schema extensions;
+create foreign data wrapper mongodb_wrapper
+  handler mongodb_fdw_handler
+  validator mongodb_fdw_validator;
+select fdwname from pg_foreign_data_wrapper where fdwname = 'mongodb_wrapper';
+```
+
+A returned row means it is installed.
+:::
+
+## Setup
+
+Store the connection string in Vault (never inline it in `pg_foreign_server`),
+create the server, then the foreign table.
+
+```sql
+-- 1. secret in Vault, capture the key id
+select vault.create_secret(
+  'mongodb+srv://user:password@cluster.example.mongodb.net/',
+  'mongo_archive',
+  'one-off archive migration'
+);  -- returns a uuid
+
+-- 2. server referencing the secret
+create server mongo_server
+  foreign data wrapper mongodb_wrapper
+  options ( conn_string_id '<KEY_ID_FROM_ABOVE>' );
+
+-- 3. schema + foreign table (_id text, _doc jsonb catch-all)
+create schema if not exists mongo;
+create foreign table mongo.events (_id text, _doc jsonb)
+  server mongo_server
+  options ( database 'app', collection 'events' );
+
+-- live read: proves the connector works end to end
+select _id, _doc->>'type', _doc->'payload'->>'name'
+from mongo.events limit 3;
+```
+
+## The caveat that bites on first connect: dynamic egress IPs
+
+The first live read will very likely **fail** - not with a timeout, but a TLS
+reject on every shard:
+
+```
+ERROR: HV000: Kind: Server selection timeout: No available servers.
+  ... Error: Kind: I/O error: received fatal alert: InternalError ...
+```
+
+This is the IP allowlist. **Supabase's outbound egress IPs are dynamic** - there
+is no fixed range to safelist. On MongoDB Atlas you must add `0.0.0.0/0` to
+Network Access (or front Mongo with a fixed-IP proxy and safelist only that). It
+is easy to miss because *your own* box (whose IP you allowlisted to seed the
+data) connects fine, while Supabase - a different, shifting source IP - does not.
+
+:::caution[The self-hosted case is worse]
+For a **self-hosted** Mongo box, `0.0.0.0/0` means opening your firewall to
+Supabase's dynamic egress. That standing inbound exposure, for data that never
+changes, is the case for draining and decommissioning rather than running the
+connector live.
+:::
+
+## The copy: batched `_id`-keyset, not a single CTAS
+
+The obvious one-liner is wrong at scale:
+
+```sql
+-- do not do this at scale
+create table public.events as
+select _id, _doc from mongo.events;
+```
+
+A single `CREATE TABLE AS` streams the entire collection over the FDW in one
+transaction. On a managed Postgres running `wal_level = logical`, that is fully
+WAL-logged (the `wal_level = minimal` CTAS optimization does not apply), so a
+large collection produces an equally large volume of WAL and backup churn, held
+in one long transaction that will trip `statement_timeout` long before it
+finishes.
+
+Instead, page by **`_id` keyset**. ObjectId's leading 4 bytes are a creation
+timestamp, and the wrapper returns `_id` as a 24-char lowercase hex string, so
+lexicographic `_id` order tracks insertion order and keyset pagination pushes
+down cleanly (`where _id > <last>` becomes a Mongo `$gt`, with the hex coerced
+back to an ObjectId). Each batch is its own bounded transaction.
+
+```bash
+# destination created up front (PK gives idempotency + a useful index)
+psql -c "create table if not exists public.events (
+           _id text primary key, _doc jsonb);
+         create index if not exists events_doc_gin
+           on public.events using gin (_doc);"
+
+# batched keyset copy
+last_id="000000000000000000000000"   # zero ObjectId - see gotcha below
+while :; do
+  next=$(psql -tA -c "
+    with batch as (
+      select _id, _doc from mongo.events
+      where _id > '${last_id}' order by _id limit 1000
+    ), ins as (
+      insert into public.events (_id, _doc)
+      select _id, _doc from batch
+      on conflict (_id) do nothing
+    )
+    select coalesce(max(_id), '') from batch;")
+  [ -z "$next" ] && break
+  last_id="$next"
+done
+```
+
+`on conflict (_id) do nothing` makes it **idempotent and resumable**: interrupt
+it, run it again, and it tops up to exact parity without duplicating. That is the
+property a multi-hour drain of an interruptible archive needs. A single CTAS has
+neither.
+
+## The gotcha only the real wrapper exposes
+
+Notice the keyset seeds with `000000000000000000000000`, the all-zeros ObjectId,
+**not** an empty string. This matters, and it is invisible until you run against
+the real wrapper:
+
+- Against a **plain-text stub** (`_id` is a Postgres `text` column), `_id > ''`
+  matches every row - the migration works, tests pass, everything is green.
+- Through the **real wrapper**, `''` is not a valid 24-char hex, so it cannot
+  coerce to an ObjectId. The pushed-down `$gt` filter matches **nothing**, and
+  the migration silently copies **zero rows** with no error.
+
+The all-zeros ObjectId is a valid 24-char hex that sorts below every real `_id`,
+so it works both locally and through the wrapper. It is a green-but-wrong bug: a
+local test does not catch it because the stub does not share the wrapper's
+type-coercion semantics. Test the copy against the real
+wrapper at least once before you trust it, even if a shaped stub is green.
+
+## Verify, then decommission
+
+```sql
+select
+  (select count(*) from mongo.events)                                      as mongo_src,
+  (select count(*) from public.events)                                     as pg_target,
+  (select count(distinct _id) from public.events)                          as distinct_id,
+  (select count(*) from public.events where _doc->>'type' is null)         as top_level_nulls,
+  (select count(*) from public.events where _doc->'payload'->>'name' is not null) as nested_ok;
+```
+
+You want `mongo_src = pg_target = distinct_id`, `top_level_nulls = 0`, and
+`nested_ok = pg_target` (proving both top-level and nested jsonb survived, for
+whatever fields your documents actually carry). Then cut the cord:
+
+```sql
+drop server mongo_server cascade;   -- drops the foreign table too
+-- and delete the Vault secret holding the Mongo credentials
+```
+
+Now the data lives in Postgres as queryable `jsonb`, Mongo is gone, and there is
+no standing network path to maintain.
+
+## The jsonb table is not a normalized schema
+
+The `select _id, _doc` copy lands a **raw jsonb** table. It is queryable
+(`_doc -> ... ->> ...`, plus a GIN index for containment), but it is **not** the
+same relational shape as a set of typed, normalized tables. If you need the data
+in a normalized shape, the jsonb landing table is a *staging* step and you still
+need a transform pass - a bounded, one-time job against a local Postgres table,
+not an ongoing ETL against a live Mongo connector. Decide which you actually
+need before you start; it is the difference between an afternoon and a project.
+
+## Storage cost
+
+"One-time copy versus a system running forever" is the right frame, but do not
+gloss the storage cost. On Supabase's Pro/Team plans, database disk (gp3) runs
+[$0.125/GB/month](https://supabase.com/docs/guides/platform/manage-your-usage/disk-size)
+while [Storage](https://supabase.com/docs/guides/storage/pricing) runs
+$0.0213/GB/month - roughly 6x cheaper per GB, before you compress the dump or
+count the GIN index a *queryable* hot table needs. So if the archive is queried
+*rarely*, a compressed dump in Storage loaded on demand is the cheaper home; if
+it is queried *regularly*, the Postgres jsonb table earns its disk. Size the
+decision to query frequency, not migration convenience.
+
+## Gotchas
+
+- **The wrapper is native, so it is hosted-only.** `create foreign data wrapper mongodb_wrapper` works on a Supabase project but not on a plain local Postgres, and there is no `fdw_package_url` install path. Confirm it exists before you design around it.
+- **The remote must allow Supabase's egress, and that egress is dynamic.** There is no fixed IP range to safelist - allow `0.0.0.0/0` on the Mongo side, or front it with a fixed-IP proxy and safelist only that. The first connection fails with a TLS reject if you skip this, and it is easy to misdiagnose because your own machine (already allowlisted) connects fine.
+- **Seed keyset pagination with the all-zeros ObjectId** (`000000000000000000000000`), not an empty string. `''` cannot coerce to an ObjectId, so the pushed-down filter matches nothing and the copy silently moves zero rows.
+- **Do not use a single `CREATE TABLE AS` at scale.** One unbounded statement is one giant WAL-logged transaction that trips `statement_timeout`. Page by `_id` keyset in bounded batches instead.
+- **No aggregate pushdown.** `count`/`sum`/`avg`/`min`/`max` fetch every row and compute in Postgres - do not run them against the live foreign table on a large collection.
+- **Nested fields only through `_doc`.** Dotted column names do not traverse; use `_doc -> ... ->> ...` with a GIN index for containment queries.
+- **No `import foreign schema`, no multi-document transactions.** Declare each foreign table by hand, and do not treat the connector as a transactional store.
+- **Drop the connection when the copy is done.** `drop server mongo_server cascade` and delete the Vault secret, so no credentials or standing network path linger.
