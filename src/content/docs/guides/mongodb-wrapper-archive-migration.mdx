@@ -257,6 +257,83 @@ count the GIN index a *queryable* hot table needs. So if the archive is queried
 it is queried *regularly*, the Postgres jsonb table earns its disk. Size the
 decision to query frequency, not migration convenience.
 
+Those two figures are Supabase's published Pro/Team list prices (linked above,
+re-checked against the docs), not a benchmark. The Storage round-trip below was
+exercised end-to-end against a real project - dump, compress, upload, download,
+reload, query - so the *procedure* is verified even though the per-GB rates are
+cited list prices rather than something measured here.
+
+### Setting up the Storage-archive path
+
+If you land on the *queried-rarely* side, here is the whole loop. It starts from
+the `public.events` landing table the copy above produced.
+
+**1. Dump the table to a compressed file.** A portable `jsonl` line dump piped
+through `zstd` keeps it readable and re-loadable anywhere:
+
+```bash
+psql "$DB_URL" -c "\copy public.events to stdout" | zstd -19 > events.jsonl.zst
+```
+
+How much you save depends entirely on the data - jsonb with repetitive keys and
+string values compresses hard (10-70x on synthetic data), varied binary-ish
+payloads far less. Measure your own dump before assuming the win.
+
+**2. Create the destination bucket first.** `supabase storage cp` does **not**
+create buckets - it fails with `Bucket not found` if the target does not exist,
+and the CLI has no `create-bucket` subcommand. Make it once in the Dashboard
+(Storage -> New bucket, keep it private), or over the Storage API:
+
+```bash
+curl -X POST "https://<ref>.supabase.co/storage/v1/bucket" \
+  -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "apikey: $SERVICE_ROLE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"archive","name":"archive","public":false}'
+```
+
+**3. Push the dump to Storage.** Now the CLI upload works
+(`ss:///<bucket>/<path>`):
+
+```bash
+supabase storage cp events.jsonl.zst ss:///archive/events.jsonl.zst --experimental
+```
+
+The object now lives at the ~6x-cheaper Storage rate, independent of any
+provisioned disk.
+
+**4. Free the disk - and understand what "free" means here.** Drop the table
+(and with it the GIN index) so the space is released *inside* the disk:
+
+```sql
+drop table public.events;   -- releases the space + GIN index within the disk
+```
+
+The catch, confirmed by testing: `drop` reclaims space *inside* the volume
+(database size visibly shrinks) but Supabase's gp3 disk **auto-grows and never
+auto-shrinks**. Your *provisioned* (billed) disk stays at its high-water mark
+until you explicitly [reduce it](https://supabase.com/docs/guides/platform/database-size#reducing-disk-size),
+which has cooldowns and floor limits. So the drop stops further growth and lets
+you downsize; it does not, by itself, drop next month's disk bill. Plan the
+downsize as a deliberate step.
+
+**5. Load on demand to query, then let it evaporate.** Pull the dump back,
+decompress, and `\copy` into a *temporary* table so the disk footprint lasts
+only for the session:
+
+```bash
+supabase storage cp ss:///archive/events.jsonl.zst events.jsonl.zst --experimental
+zstd -d events.jsonl.zst -o events.jsonl
+psql "$DB_URL" <<'SQL'
+create temp table events (_id text, _doc jsonb);
+\copy events from 'events.jsonl'
+-- ... query events here; add a GIN index only if this session needs one ...
+SQL
+```
+
+The temp table is dropped when the session ends. This is the whole tradeoff made
+concrete: cheap at rest, a download-and-load tax per query. If that tax starts
+hurting, that is the signal to keep the data resident in the jsonb table instead.
+
 ## Gotchas
 
 - **The wrapper is native, so it is hosted-only.** `create foreign data wrapper mongodb_wrapper` works on a Supabase project but not on a plain local Postgres, and there is no `fdw_package_url` install path. Confirm it exists before you design around it.
