@@ -75,46 +75,21 @@ auto-delete when the PR merges/closes, so the delta is small in practice.
 
 ## The three approaches
 
-```d2
-direction: right
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
 
-pr: Pull Request opened
+  pr     [label="Pull Request opened"];
+  auto   [label="A. Auto-branching only\n- GitHub App creates branch Micro\n- configure / migrate / seed / deploy\n- No size knob -> OOM risk on reset"];
+  resize [label="B. Auto-branching + resize\n- App creates branch Micro (still)\n- CI polls for the branch ref\n- PATCH .../billing/addons -> Small\n- Restarts PG; keeps the integration"];
+  diy    [label="C. DIY create-at-size\n- Auto-branching off\n- branches create --size small\n- You run migrate / seed / deploy\n- Born Small; no restart, no OOM"];
 
-auto: A. Auto-branching only {
-  shape: rectangle
-  body: |md
-    - GitHub App creates branch **Micro**
-    - configure / migrate / seed / deploy
-    - **No size knob** -> OOM risk on reset
-  |
-}
-
-resize: B. Auto-branching + resize {
-  shape: rectangle
-  body: |md
-    - App creates branch **Micro** (still)
-    - CI polls for the branch ref
-    - PATCH .../billing/addons -> Small
-    - Restarts PG; keeps the integration
-  |
-}
-
-diy: C. DIY create-at-size {
-  shape: rectangle
-  body: |md
-    - Auto-branching **off**
-    - branches create --size small
-    - You run migrate / seed / deploy
-    - Born Small; no restart, no OOM
-  |
-}
-
-pr -> auto: Micro, fixed
-pr -> resize: Micro then Small {
-  style.stroke-dash: 3
-}
-pr -> diy: Small from boot {
-  style.stroke-dash: 3
+  pr -> auto   [label="Micro, fixed"];
+  pr -> resize [label="Micro then Small", style=dashed];
+  pr -> diy    [label="Small from boot", style=dashed];
 }
 ```
 
@@ -370,10 +345,99 @@ replicating the parts you need:
 | **deploy** (edge functions) | `supabase functions deploy` | Only if you have functions |
 | `Supabase Preview` status check | Make the workflow itself a required check | Rebuild |
 | PR comment with branch status | Add a comment step if wanted | Rebuild |
-| Auto-delete on PR close | `cleanup` job on `closed` event | — |
+| Auto-delete on PR close | `cleanup` job on `closed` event | - |
 
 Net: you gain **size control** and lose the integration's turnkey
 check/comment/configure/seed/deploy ergonomics, which you rebuild in YAML.
+
+## Gotcha: the configure step needs your `config.toml` secrets (or it lies with `MIGRATIONS_FAILED`)
+
+This one only bites the **full-deploy** path — native auto-branching, or a
+branch created **with a git association** so Supabase runs the whole
+`configure -> migrate -> deploy -> seed` pipeline from your repo. Approach C
+above sidesteps it precisely because bare-branch + `db push` skips `configure`
+(the "Gap to replicate" row in the matrix). If you *do* want configure parity,
+read this first.
+
+The branch status reflects the **whole** deploy, and a failure in the
+`configure` step is still reported as **`MIGRATIONS_FAILED`** — so you go
+debugging SQL that was never wrong. The usual trigger: `config.toml` sets custom
+Auth via `env()` secrets, e.g.
+
+```toml
+[auth.rate_limit]
+email_sent = 30            # a custom rate limit ...
+
+[auth.email.smtp]
+sender_name = "Pasteriser" # ... and a custom SMTP sender ...
+pass = "env(RESEND_API_KEY)"  # ... whose password is an env() secret
+
+[auth.external.github]
+enabled = true
+client_id = "env(GH_OAUTH_CLIENT_ID)"
+secret = "env(GH_OAUTH_CLIENT_SECRET)"
+```
+
+**A preview branch does not inherit the parent project's secrets.** So
+`env(RESEND_API_KEY)` resolves to empty, and because you asked for a custom
+sender name / email rate limit *without* a valid SMTP password, Supabase rejects
+the configure step with a 401:
+
+```
+unexpected status 401: {"message":"Custom SMTP required to configure
+SMTP_SENDER_NAME or RATE_LIMIT_EMAIL_SENT. Missing SMTP_PASS fields."}
+```
+
+The deploy aborts and the branch lands `MIGRATIONS_FAILED`. Same project, same
+schema; the only variable is whether the branch got the secrets:
+
+| Branch | secrets supplied at create | result |
+|---|---|---|
+| default compute, no secrets | no | `MIGRATIONS_FAILED` (configure step) |
+| nano compute, no secrets | no | `MIGRATIONS_FAILED` (configure step) |
+| default compute, `secrets` in create body | **yes** | `FUNCTIONS_DEPLOYED` — all migrations applied, tables present |
+
+Every migration replays clean via `psql` in all three cases — the SQL is never
+the problem.
+
+:::caution[The real error is dashboard-only]
+The Management API (`GET /v1/branches/{id}` and the branches list) exposes only
+the status enum, **not** the deploy log. You see the 401 and which step failed
+only in the dashboard's branch **View logs**. So the failure is doubly
+misleading: a wrong label (`MIGRATIONS_FAILED`) over a hidden cause (configure).
+Read the dashboard log the first time a branch fails; do not trust the status.
+:::
+
+### Fix: give the branch its secrets
+
+- **Native integration:** commit a dotenvx-encrypted `supabase/.env.preview` and
+  upload the decrypt key once with `supabase secrets set --env-file
+  supabase/.env.keys`. The branching executor decrypts it for every branch it
+  creates. Only designated secret fields accept the `encrypted:` syntax -
+  relevantly `auth.email.smtp.pass` and `auth.external.*.secret`.
+- **Self-driven (Management API):** pass a `secrets` object in the create body -
+  no committed ciphertext, the values come from GitHub Actions secrets:
+
+  ```sh
+  curl -fsSL -X POST -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg gb "$GIT_BRANCH" --arg r "$RESEND_API_KEY" \
+          --arg ci "$GH_OAUTH_CLIENT_ID" --arg cs "$GH_OAUTH_CLIENT_SECRET" \
+          '{branch_name:$gb, git_branch:$gb, secrets:{RESEND_API_KEY:$r, GH_OAUTH_CLIENT_ID:$ci, GH_OAUTH_CLIENT_SECRET:$cs}}')" \
+    "https://api.supabase.com/v1/projects/$PROJECT_ID/branches"
+  ```
+- **Or dodge it:** disable custom SMTP / external OAuth for ephemeral branches
+  (a throwaway preview should not send real email or do real OAuth anyway), or
+  take the bare-branch + `db push` route which never runs configure.
+
+:::note[Poll the list status, not the single-branch GET]
+The branches **list** returns the deploy-workflow status
+(`CREATING_PROJECT -> RUNNING_MIGRATIONS -> MIGRATIONS_PASSED ->
+FUNCTIONS_DEPLOYED`, or `..._FAILED`) — gate on this. The single-branch
+`GET /v1/branches/{id}` returns the child *project* status, which flips
+`ACTIVE_HEALTHY` **before** migrations finish; gating on it declares a branch
+ready while the deploy is still running (or about to fail).
+:::
 
 ## Gotcha: GitHub runners have no IPv6
 
@@ -498,6 +562,15 @@ Applying migration 20260407101812_remote_schema.sql...
 Finished supabase db push.
 table public.pastes present: t
 table public.slugs present: t
+```
+
+The branch is a genuinely isolated instance with **no production data copied**.
+Counting rows over REST against each project confirms it — the branch has its
+own ref and keys and starts empty, while the parent still has its data:
+
+```
+# branch (pwhpidokrvvgrcuymejh)   -> content-range: */0    (0 rows, RLS-visible)
+# parent (dewddkcmwrzbpynylyhg)   -> content-range: 0-0/1  (its own data)
 ```
 
 - On the `closed` event, only the `cleanup` job runs and the branch is deleted,
