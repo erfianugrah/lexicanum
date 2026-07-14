@@ -1,0 +1,274 @@
+---
+title: "Cloudflare + Supabase: an architecture reference"
+description: The full integration surface between Cloudflare Workers and Supabase - data access (REST vs Hyperdrive vs raw driver), writes, Auth (edge JWT verify vs getUser), Storage, Realtime, and the security model - every path benchmarked from a Worker on CF's edge
+author: Erfi Anugrah
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Every way a Cloudflare Worker talks to Supabase, which path to use for what, and what each one actually costs. All numbers below were measured from a Worker running on Cloudflare's edge (`wrangler dev --remote`) against a Supabase project in Frankfurt (`eu-central-1`), 2026-07-14.
+
+**TL;DR:**
+
+- **Reads:** `supabase-js` over PostgREST is ~210ms with a fat tail; a cacheable read through either the Worker **Cache API** or **Hyperdrive** is ~10ms. The Cache API needs no extra infra and matches Hyperdrive for pure read caching.
+- **Raw Postgres drivers (`pg`, `postgres.js`) cannot reach Supabase's Supavisor pooler from the Workers runtime** - node-postgres terminates the connection, postgres.js hangs. Hyperdrive is the only working wire-protocol path from a Worker.
+- **Writes:** Hyperdrive (~172ms) beats PostgREST (~208ms) because it skips the PostgREST layer - but it also skips RLS, so you own authorization in the Worker.
+- **Auth:** verifying a Supabase JWT at the edge with cached JWKS is **~0ms**; a `getUser()` round-trip is ~207ms. Verify locally for latency, round-trip only when you need revocation.
+
+---
+
+## Topology
+
+```d2
+direction: right
+
+browser: Browser {shape: person}
+
+cf: Cloudflare {
+  worker: Worker / Pages Function {shape: rectangle}
+  cache: Cache API / KV {shape: rectangle}
+  hd: Hyperdrive {shape: rectangle}
+}
+
+sb: Supabase (eu-central-1) {
+  rest: PostgREST {shape: rectangle}
+  auth: "Auth (GoTrue)" {shape: rectangle}
+  storage: Storage {shape: rectangle}
+  rt: Realtime {shape: rectangle}
+  pg: Postgres {shape: cylinder}
+}
+
+browser -> cf.worker: HTTPS
+cf.worker -> cf.cache: read cache
+cf.worker -> cf.hd: pooled SQL
+cf.worker -> sb.rest: "supabase-js / REST"
+cf.worker -> sb.auth: "verify / getUser"
+cf.worker -> sb.storage: signed URL
+cf.hd -> sb.pg: "direct :5432"
+sb.rest -> sb.pg
+sb.auth -> sb.pg
+browser -> sb.rt: "WS (direct)"
+```
+
+The pattern this reference assumes is `Browser -> Worker -> Supabase`: the browser never holds a Supabase key, and the Worker is the trust boundary. Realtime is the one surface that usually stays browser-direct (see below).
+
+---
+
+## The measured matrix
+
+25-row / ~50KB reads and single-row writes, `n=40`/`n=20`, times in milliseconds, from the edge to Frankfurt.
+
+### Reads
+
+| Path | median | p95 | notes |
+|---|---|---|---|
+| PostgREST over HTTPS (`supabase-js`) | 213 | 591 | the default path; fat tail from TLS/connection variance |
+| Worker **Cache API** in front of REST | 10 | 18 | first call ~258ms (cache fill), then edge-local |
+| **Hyperdrive** - cached read | 10 | 18 | deterministic query, default 60s TTL |
+| **Hyperdrive** - uncached read (`now()`) | 215 | 229 | bound by RTT, same floor as REST but tighter tail |
+| raw `node-postgres` -> Supavisor | - | - | **fails**: `Connection terminated unexpectedly` |
+| raw `postgres.js` -> Supavisor | - | - | **fails**: connection hangs (6s timeout) |
+
+### Writes
+
+| Path | median | p95 | notes |
+|---|---|---|---|
+| PostgREST insert (`supabase-js`) | 208 | 264 | enforces RLS via the key |
+| **Hyperdrive** insert | 172 | 231 | pooled direct connection, skips PostgREST - **and skips RLS** |
+| raw driver -> Supavisor | - | - | **fails** (same as reads) |
+
+### Auth
+
+| Operation | median | p95 | notes |
+|---|---|---|---|
+| Verify JWT at the edge (`jose` + cached JWKS) | ~0 | ~0 | first call 263ms (JWKS fetch), then local |
+| `getUser()` round-trip (`/auth/v1/user`) | 207 | 219 | revocation-aware |
+| Tampered token | - | - | correctly rejected |
+
+---
+
+## Data plane: how a Worker reaches the database
+
+There are three ways, and only two of them work from a Worker.
+
+### A. supabase-js over PostgREST (the default)
+
+`createClient(url, key)` then `.from()/.rpc()`. Every call is an HTTPS request to PostgREST. This is the path to prefer for most work: it carries auth, enforces Row Level Security via the anon/authenticated key, needs no `nodejs_compat`, and gives you the full `supabase-js` surface (Auth, Storage, Realtime). The cost is a full request to Frankfurt per call (~210ms here) with a fat tail.
+
+<Aside type="caution">
+Disable session persistence in a Worker - the browser defaults break outside a
+browser: `createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } })`.
+</Aside>
+
+### B. Raw Postgres driver - does not work from a Worker
+
+Pointing `node-postgres` or `postgres.js` straight at a Supavisor pooler string from the Workers runtime failed both ways: node-postgres returns `Connection terminated unexpectedly` immediately, postgres.js hangs until timeout. This is the TLS-over-socket path the Workers runtime does not carry cleanly to Supavisor. The takeaway is firm: **do not plan on a raw driver to Supavisor from a Worker.** If you need the Postgres wire protocol from a Worker, use Hyperdrive (next). A raw driver against Supavisor is fine from a normal Node/Bun server - it is specifically the Worker runtime that is the wall.
+
+### C. Hyperdrive - the working wire-protocol path
+
+Hyperdrive is Cloudflare's pooler + read cache living in their network. The Worker gets a `connectionString` from a binding and connects with `node-postgres`; Hyperdrive handles the TCP/TLS to Postgres and keeps the real pool warm near the database. It is the only way to run raw SQL from a Worker that worked, and it is faster than REST for writes and cache-eligible reads.
+
+The win on reads is the **cache**, not the connection. A deterministic read is served from Hyperdrive's cache near the Worker (~10ms). The moment the query is non-cacheable - a volatile function like `now()`, or any write - it drops to the same ~210ms RTT floor as REST. Hyperdrive's pooling buys you the tight write path (~172ms vs 208ms) and a tighter tail, not a shorter wire.
+
+<Aside type="note">
+For a pure read cache you may not need Hyperdrive at all - the Worker **Cache
+API** hit the same ~10ms in front of a REST fetch, with zero extra infra and no
+`nodejs_compat`. Reach for Hyperdrive when you need real SQL (joins, `COPY`,
+transactions) or a faster write path; reach for Cache API when you just want to
+stop paying for a repeated read.
+</Aside>
+
+### Connection modes and ports
+
+| Mode | Host / port | IP | Use from a Worker |
+|---|---|---|---|
+| Direct connection | `db.<ref>.supabase.co:5432` | **IPv6-only** (no A record) unless IPv4 add-on | Behind Hyperdrive |
+| Supavisor - transaction | `aws-N-<region>.pooler.supabase.com:6543` | IPv4 | Not from a Worker (raw driver fails); fine from a server |
+| Supavisor - session | `aws-N-<region>.pooler.supabase.com:5432` | IPv4 | Hyperdrive's IPv4 fallback if direct is unreachable |
+| PostgREST | `<ref>.supabase.co:443` | IPv4/IPv6 | `supabase-js` (path A) |
+
+<Aside type="note">
+Point Hyperdrive at the **Direct connection**, not a pooler - Hyperdrive does
+its own pooling and stacking it on Supavisor is the anti-pattern. As of 2026-07
+Hyperdrive reached Supabase's IPv6-only direct connection with no IPv4 add-on,
+so the historical "needs IPv4/session pooler" workaround was not required here.
+Keep it as the fallback if a create ever fails on connectivity.
+</Aside>
+
+---
+
+## Setting up Hyperdrive (verified)
+
+**1. Least-privilege role** (do not `grant postgres` - that hands a Worker-reachable role superuser-adjacent rights):
+
+```sql
+create role hyperdrive_user login password 'GENERATE_A_STRONG_ONE';
+grant usage on schema public to hyperdrive_user;
+grant select on all tables in schema public to hyperdrive_user;
+-- add insert/update/execute only for exactly what the Worker needs
+```
+
+**2. Create the config** against the direct connection (Hyperdrive verifies connectivity at create time):
+
+```sh
+wrangler hyperdrive create my-supabase \
+  --connection-string="postgres://hyperdrive_user:PASSWORD@db.<ref>.supabase.co:5432/postgres"
+```
+
+**3. Bind it** in `wrangler.jsonc` (`pg` needs `nodejs_compat`):
+
+```jsonc
+{
+  "compatibility_date": "2026-07-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "hyperdrive": [{ "binding": "HYPERDRIVE", "id": "<config-id>" }]
+}
+```
+
+**4. Query** (`pg >= 8.16.3`, fresh client per request - Hyperdrive keeps the pool warm):
+
+```ts
+import { Client } from "pg";
+const client = new Client({ connectionString: env.HYPERDRIVE.connectionString });
+await client.connect();
+const { rows } = await client.query("select id, body from t order by id limit $1", [25]);
+```
+
+---
+
+## Auth: verify at the edge, or round-trip
+
+Supabase issues asymmetric JWTs (ES256 here) with a JWKS endpoint at `<url>/auth/v1/.well-known/jwks.json`. That gives a Worker two options with very different cost:
+
+- **Verify locally** with `jose` against the cached JWKS - `createRemoteJWKSet` fetches the keys once (~263ms first call) then verifies every subsequent token in **~0ms**, no round-trip. Rejects tampered tokens correctly. Use this for the hot path.
+- **`getUser()`** hits `/auth/v1/user` (~207ms) and is revocation-aware - it fails immediately if the user was signed out or deleted server-side. Use it only where revocation matters (sensitive mutations), not on every request.
+
+```ts
+import { createRemoteJWKSet, jwtVerify } from "jose";
+const jwks = createRemoteJWKSet(new URL(`${env.SUPABASE_URL}/auth/v1/.well-known/jwks.json`));
+const { payload } = await jwtVerify(token, jwks, { audience: "authenticated" });
+// payload.sub, payload.role - ~0ms after the first JWKS fetch
+```
+
+<Aside type="caution">
+Edge verification proves the token was signed and unexpired - it does **not**
+know the token was revoked. That is the whole trade: ~0ms local verify vs a
+~207ms revocation check. Pick per-route, do not blanket-`getUser()`.
+</Aside>
+
+Keys: the browser gets the **anon** key (public, RLS applies). The Worker holds the **service_role** / `sb_secret_` key as a Wrangler secret and never ships it to the client. On a Hyperdrive/raw-SQL path there is no key at all - the Postgres role is the identity, and RLS does not apply (see the security model).
+
+---
+
+## Storage
+
+Verified round-trip: create bucket -> upload -> signed URL -> fetch all work against the Storage REST API with the service key. The CF-relevant pattern is to **serve Storage objects through a Worker and cache them at the edge**: the Worker mints or proxies a signed URL, fetches the object, and puts it in the Cache API. Objects are effectively immutable per signed URL, so the same ~10ms edge-cache behaviour as the read path applies to a hot object after the first fill.
+
+```ts
+// Worker: proxy + edge-cache a private Storage object
+const cache = caches.default;
+let res = await cache.match(request);
+if (!res) {
+  const signed = await mintSignedUrl(env, path); // service key, server-side
+  res = await fetch(signed);
+  res = new Response(res.body, res);
+  res.headers.set("cache-control", "public, max-age=60");
+  ctx.waitUntil(cache.put(request, res.clone()));
+}
+return res;
+```
+
+Do not put the service key or a bucket-wide token in the browser - the Worker is where the privileged Storage call happens.
+
+---
+
+## Realtime
+
+Realtime is a WebSocket to Supabase. A Worker is a poor place to terminate a long-lived WS (request-scoped, no persistent connection), so the normal shape is **browser-direct** to Realtime with an anon key and RLS-backed channel authorization - the one surface that legitimately bypasses the Worker. If you must relay (to hide the project from the browser, or fan-out server-side), a **Durable Object** is the right CF primitive for holding the socket, not a stateless Worker. Not benchmarked here - it is a connection-lifetime concern, not a latency one.
+
+---
+
+## Security model (where auth is enforced)
+
+| Path | Who enforces authorization | Key / identity |
+|---|---|---|
+| `supabase-js` REST (anon) | **RLS**, via the anon/authenticated JWT | anon key, in the browser or Worker |
+| `supabase-js` REST (service) | **Your code** - service key bypasses RLS | service key, Worker-only secret |
+| Hyperdrive / raw SQL | **Your code** - Postgres role bypasses PostgREST + RLS | DB role, no JWT |
+| Auth (edge verify) | `jose` signature + `exp`/`aud` checks | JWKS (public) |
+
+The load-bearing point: **the moment you leave PostgREST (Hyperdrive or raw SQL), RLS is gone.** That path suits `Browser -> Worker -> Supabase` where the Worker already authorizes every request and the browser holds no key. It does not suit letting a client drive queries. Give the Hyperdrive role exactly the grants the Worker uses, never `postgres`. Keep the service key and the Hyperdrive connection string server-side (the Hyperdrive string lives in the config, not in Worker secrets, which is a nice property).
+
+---
+
+## Decision guide
+
+| You want... | Use |
+|---|---|
+| Auth, Storage, Realtime, CRUD with RLS | **supabase-js / PostgREST** |
+| A repeated read to stop costing ~210ms | **Worker Cache API** (no extra infra) |
+| Real SQL (joins, `COPY`, transactions) from a Worker, or a faster write path | **Hyperdrive** |
+| Cheapest possible auth check on the hot path | **Edge JWT verify** (jose + JWKS) |
+| Revocation-aware auth on a sensitive route | **`getUser()`** round-trip |
+| Long-lived Realtime | **Browser-direct**, or a **Durable Object** relay |
+| Raw driver straight to Supavisor from a Worker | **Do not** - it fails; use Hyperdrive |
+| An uncacheable read/write to be materially faster | Move the data closer (read replica / region); the wire is the floor |
+
+---
+
+## Reproducing
+
+The harness lives on the `hyperdrive-bench` branch of the pastebin repo under `bench/` - a standalone module Worker (`pg`, `postgres`, `jose`), not wired into the app. Recreate a least-privilege role + Hyperdrive config per the setup above, drop a `bench/.dev.vars` with `SUPABASE_ANON_KEY` / `SUPABASE_SERVICE_KEY` / `PG_TXN` / `PG_SESSION` / `TEST_JWT`, then:
+
+```sh
+wrangler dev --remote --config bench/wrangler.jsonc --port 8799
+curl 'http://localhost:8799/reads?n=40'
+curl 'http://localhost:8799/writes?n=20'
+curl 'http://localhost:8799/auth?n=30'
+```
+
+Every role, table, test user, Storage bucket, and Hyperdrive config used for the run above was torn down afterwards - there are no standing credentials.
+
+---
+
+Sources: [Cloudflare Hyperdrive - Supabase](https://developers.cloudflare.com/hyperdrive/examples/connect-to-postgres/postgres-database-providers/supabase/) - [Hyperdrive query caching](https://developers.cloudflare.com/hyperdrive/configuration/query-caching/) - [Workers Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/) - [Supabase - Connecting to Postgres](https://supabase.com/docs/guides/database/connecting-to-postgres) - [Supabase Auth - JWTs](https://supabase.com/docs/guides/auth/jwts) - measured eu-central-1, 2026-07-14.

@@ -1,0 +1,368 @@
+---
+title: Hand-rolling a multi-tenant Supabase platform (cheaper than one project per tenant)
+description: If you provision one Supabase project per end-tenant, every idle tenant is a linear ~$10/mo compute floor you cannot pause on a paid plan. This works the numbers, then builds and TESTS the alternative - shared-instance multi-tenancy isolated by RLS, with a stable-facade gateway and an external JWT issuer, promoting a tenant to its own project only when it converts. Includes a live end-to-end RLS isolation proof against a real Supabase project and measured provisioning latency.
+author: "Erfi Anugrah"
+---
+
+If you are building a platform that gives each of your end-users a backend -
+an app builder, a low-code tool, a per-customer workspace - the obvious move is
+"provision one Supabase project per tenant". It is clean, it isolates tenants,
+and the Management API makes it a single call. It also quietly commits you to a
+**linear compute floor**: every tenant is a dedicated Postgres instance you pay
+for whether or not anyone is using it, and on a **paid plan you cannot pause a
+project**. This doc works out what that actually costs, then builds and tests a
+cheaper architecture.
+
+Everything with a number attached is either from the public
+[Supabase pricing page](https://supabase.com/pricing) or measured live against a
+real project (created and destroyed for this doc); the isolation model is
+proven with a runnable test you can re-run yourself.
+
+## The constraint that starts it all
+
+On a paid plan, projects do not pause:
+
+- "Projects under a paid plan cannot be paused and are not subject to automatic
+  pausing for inactivity. To pause a project currently under a paid plan, first
+  transfer the project to an organization on the Free plan." -
+  [free-project-pausing](https://supabase.com/docs/guides/platform/pause).
+- The pricing-page feature matrix lists Pausing as Free "after 1 week of
+  inactivity", paid plans "Never".
+
+So a per-tenant-project platform pays for every tenant's compute continuously.
+There is no idle switch.
+
+## What one idle tenant costs
+
+Billing is per organization for the plan, and **per project, per hour** for
+compute. From the pricing page:
+
+| Item | Price | Note |
+|---|---|---|
+| Pro plan | \$25/mo | org-level, flat; includes \$10/mo compute credit |
+| Compute credit | \$10/mo | covers exactly **one** Micro instance |
+| Micro compute | \$10/mo (\$0.01344/hr) | 2-core ARM, 1 GB RAM, 60 direct / 200 pooler conns |
+
+I confirmed the Micro figure straight from the live billing API on a freshly
+created project (`GET /v1/projects/{ref}/billing/addons`):
+
+```json
+{ "id": "ci_micro", "name": "Micro",
+  "meta": { "cpu_cores": 2, "memory_gb": 1, "connections_direct": 60, "connections_pooler": 200 },
+  "price": { "description": "$0.01344/hour (~$10/month)", "amount": 0.01344, "interval": "hourly" } }
+```
+
+So beyond the first (credit-covered) project, **each always-on tenant is about
+\$10/mo of compute doing nothing while idle**. Ten idle tenants is \$100/mo; a
+thousand is \$10k/mo - a floor that scales with tenant *count*, not usage. That
+linear floor is the whole problem, and it exists only because we assumed
+`tenant == project`.
+
+:::note[The managed escape hatch, and why it is not always the answer]
+Supabase for Platforms (SfP) solves exactly this with **scale-to-zero pricing**:
+a project's compute scales to zero after inactivity and you are not billed
+compute while it sleeps. But it is gated ("Only select customers have access ...
+Submit this form to get access") and applies only to Nano instances; on a normal
+paid org you "cannot launch Nano instances" and Nano "is billed at the same price
+as Micro". It also carries a platform fee that only makes economic sense above a
+certain scale - talk to Supabase for current terms. Below that scale, or without
+access, you are back to hand-rolling. Sources:
+[supabase-for-platforms](https://supabase.com/docs/guides/integrations/supabase-for-platforms),
+[compute usage](https://supabase.com/docs/guides/platform/manage-your-usage/compute).
+:::
+
+## The reframe: decouple the tenant from the project
+
+The floor is fixed only if a tenant must be a physical instance. Break that:
+
+> **Logical tenant** (stable `tenant_id`, stable endpoint, stable auth issuer) is
+> not the same thing as a **physical backend** (a project, a row-range in a
+> shared project, or a snapshot). A registry maps `tenant_id -> placement`.
+
+Once decoupled, "where does an idle tenant live" is a placement policy. The
+cheap answer for small, intermittently-used tenants: they do not get their own
+instance at all - they share one.
+
+## Architecture: tiered tenancy
+
+```d2
+direction: right
+
+client: Tenant clients {shape: person}
+idp: External IdP {
+  shape: hexagon
+  tooltip: one stable JWKS issuer for all tenants
+}
+gw: Gateway (stable facade) {
+  shape: rectangle
+  body: |md
+    - routes tenant_id -> placement
+    - injects project keys
+    - clients never see a ref
+  |
+}
+cp: Control plane {
+  shape: rectangle
+  body: |md
+    - registry: tenant_id -> {tier, placement}
+    - drives Management API
+    - promotion jobs
+  |
+}
+tierS: Tier S - shared multi-tenant {
+  shape: cylinder
+  body: |md
+    ONE always-warm project
+    many tenants, RLS by tenant_id
+    marginal cost per tenant ~= 0
+  |
+}
+tierD: Tier D - dedicated projects {
+  shape: cylinder
+  body: |md
+    one project per paying tenant
+    full isolation + portability
+    ~10/mo each
+  |
+}
+
+client -> idp: authenticate
+client -> gw: request + JWT
+idp -> gw: JWT (role + tenant_id claim)
+gw -> cp: resolve placement
+gw -> tierS: free / idle majority
+gw -> tierD: paying tenants
+tierS -> tierD: promote on conversion {style.stroke-dash: 3}
+cp -> tierS: provision / seed
+cp -> tierD: provision / migrate
+```
+
+**Tier S - shared multi-tenant.** The free / idle / trial majority live together
+in one always-warm project, isolated at the row level by RLS on a `tenant_id`
+claim. Their marginal compute cost is ~\$0 because the instance is sized to
+*aggregate* load and amortized across everyone. No pausing problem, because
+nothing is idle - the shared instance is always warm and always cheap per tenant.
+
+**Tier D - dedicated project.** When a tenant converts or grows, it graduates to
+its own project. Now the \$10/mo is justified by revenue, and it gets hard
+isolation, its own backups, and portability.
+
+**Gateway (stable facade).** Clients hit one stable host; the gateway reads the
+registry and routes to the shared project (with the tenant's scope) or the
+tenant's dedicated ref, injecting the right keys. Clients never see a project
+ref, so moving a tenant between tiers is invisible to them.
+
+**External IdP (the load-bearing choice).** Use one external issuer (Clerk,
+Auth0, WorkOS, or your own) as the stable JWT issuer for every tenant. Each
+project - shared or dedicated - is configured as
+[third-party auth](https://supabase.com/docs/guides/auth/third-party/overview)
+trusting that one JWKS. RLS reads the token's claims; Supabase only needs a valid
+signature and a `role` claim, so a tenant can move S -> D (its physical `ref`
+changes) without logging anyone out, because the *issuer* never changed.
+
+**Promotion is the only migration you build**, and it runs once per tenant at the
+*good* event (a conversion), not on every cold start: provision a dedicated
+project, copy that tenant's slice out of the shared instance (logical
+replication / dump-restore of its rows, roles, storage), repoint the registry,
+reap the old rows.
+
+## Tested: does shared-instance RLS actually isolate tenants?
+
+The entire cost argument rests on one claim - **many tenants in one Postgres,
+isolated by RLS on a JWT claim, cannot see or touch each other**. That is
+testable, so I tested it twice: the mechanism in a throwaway Postgres, then
+end-to-end through a real Supabase project's Data API.
+
+### The model
+
+One shared table, RLS keyed on the `tenant_id` claim, one policy covering reads
+and writes:
+
+```sql
+create table app_notes (
+  id        bigint generated always as identity primary key,
+  tenant_id uuid not null,
+  body      text not null
+);
+alter table app_notes enable row level security;
+grant select, insert, update, delete on app_notes to authenticated;
+
+-- tenant_id comes from the verified JWT, never from client input
+create function jwt_tenant() returns uuid language sql stable as $$
+  select nullif(auth.jwt() -> 'app_metadata' ->> 'tenant_id','')::uuid
+$$;
+
+create policy tenant_isolation on app_notes
+  using      (tenant_id = jwt_tenant())   -- reads
+  with check (tenant_id = jwt_tenant());  -- writes
+```
+
+The `using` clause filters what a tenant can read; `with check` stops a tenant
+writing a row tagged as someone else. `stable` + null-safe parsing means a
+missing claim yields `null` and matches nothing - it **fails closed**.
+
+### Proof 1 - mechanism, on Postgres 17
+
+Setting the role and `request.jwt.claims` GUC exactly as PostgREST does, inside
+a transaction per tenant context:
+
+| Test | Expectation | Result |
+|---|---|---|
+| Tenant A reads | only A's rows | **pass** |
+| Tenant B reads (same table) | only B's rows | **pass** |
+| A inserts a row tagged B | blocked by `with check` | **pass** (RLS violation) |
+| A reassigns its row to B | blocked by `with check` | **pass** (RLS violation) |
+| Unknown-tenant claim reads | nothing | **pass** (0 rows) |
+| Missing claim reads | nothing (fail-closed) | **pass** (0 rows) |
+| `service_role` (BYPASSRLS) reads | all tenants (admin plane) | **pass** |
+
+### Proof 2 - end-to-end, live Supabase Data API
+
+The stronger test: a real project, real users created through GoTrue with
+`tenant_id` in `app_metadata`, real issued JWTs, and requests through the actual
+PostgREST endpoint (`https://<ref>.supabase.co/rest/v1/app_notes`). The token a
+user receives carries exactly what the policy reads:
+
+```json
+{ "role": "authenticated",
+  "app_metadata": { "provider": "email", "tenant_id": "1111...-1111" } }
+```
+
+Results, with real HTTP status codes returned by the Data API:
+
+| # | Action (as real signed-in user) | Result |
+|---|---|---|
+| 1 | User A `POST` a tenant-A note | `201 Created` |
+| 2 | User B `POST` a tenant-B note | `201 Created` |
+| 3 | User A `POST` a row tagged **tenant B** | `403` - `new row violates row-level security policy` |
+| 4 | User A `GET /app_notes` | `200` - only A's row |
+| 5 | User B `GET /app_notes` | `200` - only B's row |
+| 6 | Anon `GET /app_notes` (no user) | `200` - `[]` |
+
+Two users, one physical project, complete isolation - enforced by Postgres, not
+by application code. That is the shared tier working through the real stack.
+
+### Proof 3 - a tenant cannot forge its own `tenant_id`
+
+The isolation is only as good as the claim it keys on. `tenant_id` lives in
+`app_metadata` (admin-only) rather than `user_metadata` (client-writable) - so I
+tested whether a signed-in user can escalate. Tenant A, with a real token, tried
+to reach a seeded tenant-B secret:
+
+| Attack (as authenticated user A) | Result |
+|---|---|
+| `PUT /auth/v1/user` setting own `app_metadata.tenant_id = B` | ignored; fresh token still shows `app_metadata.tenant_id = A` |
+| `GET /app_notes` with the post-attack token | `200` - `[]`; the seeded tenant-B secret stays invisible |
+| Public `signup` smuggling `app_metadata.tenant_id = B` | not applied |
+
+This is the difference between safe and broken: had the policy keyed on
+`user_metadata` (which the client *can* set via `PUT /auth/v1/user`), a user
+could assign themselves any `tenant_id`. Keying on `app_metadata`, with the
+control plane as its only writer, is load-bearing - and now tested, not assumed.
+
+### Measured: the cost of the thing we are avoiding
+
+While I had the live project, I measured the per-tenant-project lifecycle that
+the shared tier lets you skip:
+
+| Operation | Measured | Method |
+|---|---|---|
+| Create project -> `ACTIVE_HEALTHY` | **138 s** | poll `GET /v1/projects/{ref}` |
+| Delete project (API call) | ~2 s | `DELETE /v1/projects/{ref}` |
+| Provisioned size on a paid org | `ci_micro`, \$0.01344/hr | billing addons API |
+| Add a tenant to the **shared** tier | 2 API calls, instant, \$0 marginal | create user + insert row |
+
+That is the contrast in one table: a dedicated tenant is ~2.3 minutes of
+provisioning and \$10/mo forever; a shared tenant is two instant calls and no
+marginal compute.
+
+## Cost and feature comparison
+
+| | One project per tenant | Shared tier (this doc) | SfP scale-to-zero |
+|---|---|---|---|
+| Idle-tenant compute | \$10/mo each (linear) | ~\$0 marginal | \$0 while asleep |
+| Add a tenant | provision (~140 s) | instant | provision |
+| Isolation | hard (separate instance) | logical (RLS) | hard |
+| Wake latency | n/a (always on) | none (always warm) | cold start |
+| Per-tenant backup / portability | native | needs work (filtered dump) | native |
+| White-label / own billing | yours to build | yours to build | built in |
+| Availability | anyone | anyone | gated |
+| Operational burden | medium | **you own the isolation model** | managed |
+
+The shared tier wins decisively on idle cost and add-tenant latency, matches
+on always-warm responsiveness, and loses on isolation strength and per-tenant
+portability - which is exactly why you keep **Tier D** for tenants that have
+earned (and are paying for) those properties.
+
+## What you are trading away
+
+:::caution[Honest trade-offs]
+- **Isolation is logical, not physical.** A bug in an RLS policy or a
+  `security definer` function is a cross-tenant data leak. RLS must be tested
+  (as above) and reviewed like the security boundary it is. Physical isolation
+  (Tier D) has a bigger blast-radius margin.
+- **Noisy neighbours.** One tenant's heavy query shares CPU/IO with everyone on
+  that instance. Size for aggregate load and watch for hot tenants (a signal to
+  promote them to Tier D).
+- **You own the control plane.** The gateway, the registry, the external IdP,
+  and the promotion migration are yours to build, run, and keep correct. SfP is
+  managed; this is not.
+- **Per-tenant operations are harder.** "Export just this tenant" or "restore
+  just this tenant" are filtered dumps, not a whole-project backup.
+:::
+
+## Decision
+
+- **Is per-tenant physical isolation / portability a genuine product
+  requirement?** If not, run the **shared tier** for the free/idle majority and
+  promote to a **dedicated project** on conversion. This removes the linear idle
+  floor for the segment that causes it, and keeps hard isolation for the segment
+  that pays for it.
+- **If it is a hard requirement**, it becomes a scale question: at low scale,
+  keep one project per tenant (or let tenants bring their own via OAuth); at high
+  scale, native SfP scale-to-zero is the managed answer - talk to Supabase.
+
+The hand-rolled shared+promote architecture is not "cheaper by cutting corners".
+It is cheaper because it stops paying for isolation that idle free tenants do not
+need, and it is testable end-to-end - which is the part most "just clone SfP"
+plans skip.
+
+## Still design-only (not yet tested)
+
+Honesty about the boundary of the evidence above. These parts are reasoned and
+doc-grounded but **not** yet proven end-to-end:
+
+- **External-IdP portability across projects.** The claim that one external
+  issuer's token validates against *two different* projects (so a tenant
+  survives an S -> D move without re-login) uses the project's own GoTrue in the
+  tests above, not an external JWKS issuer configured on two projects. Untested.
+- **The promotion migration** (copy one tenant's slice from the shared instance
+  into a fresh dedicated project, repoint, verify the same token works). Design
+  only.
+- **The gateway** (ref-hiding, key injection, placement routing). Not built.
+- **Scale / noisy-neighbour.** Everything above used 2 tenants and a handful of
+  rows; nothing measures many-tenant contention or the amortization claim under
+  load.
+
+The *core* claim - shared-instance RLS gives real, forge-resistant per-tenant
+isolation through the live Data API - is tested (Proofs 1-3). The surrounding
+control plane is architecture, and should be treated as such until built and
+tested the same way.
+
+## Verified / tested
+
+| Claim | How it was checked |
+|---|---|
+| Paid projects cannot be paused | [pausing docs](https://supabase.com/docs/guides/platform/pause) + pricing matrix |
+| Pro \$25/mo, \$10 credit = one Micro, Micro \$10/mo | [pricing page](https://supabase.com/pricing) |
+| Micro = `ci_micro`, \$0.01344/hr, 1 GB / 60+200 conns | live `GET /v1/projects/{ref}/billing/addons` |
+| Create -> healthy = 138 s; delete ~2 s | live, timed against Management API |
+| RLS isolation, `with check`, fail-closed, bypass | Proof 1 - Postgres 17, 7/7 pass |
+| Isolation through real PostgREST + GoTrue JWTs | Proof 2 - live project, 6/6 pass |
+| A tenant cannot forge its `tenant_id` (`app_metadata` admin-only) | Proof 3 - live project, 3/3 attacks fail |
+| Third-party auth: any JWKS issuer + `role` claim works | doc-cited, **not** tested: [third-party auth](https://supabase.com/docs/guides/auth/third-party/overview), [RLS](https://supabase.com/docs/guides/database/postgres/row-level-security) |
+| SfP is gated, Nano/Pico, scale-to-zero pricing | [supabase-for-platforms](https://supabase.com/docs/guides/integrations/supabase-for-platforms) |
+
+_All live measurements were taken on throwaway projects created and deleted for
+this document. Last verified 2026-07-09 against Postgres 17.6 and the current
+Management API._
