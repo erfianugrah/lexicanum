@@ -17,7 +17,7 @@ Every latency here was measured against that setup; every claim about behavior l
 **TL;DR:**
 
 - **Reads:** `supabase-js` over PostgREST is ~210ms with a fat tail; a cacheable read through either the Worker **Cache API** or **Hyperdrive** is ~10ms. The Cache API needs no extra infra and matches Hyperdrive for pure read caching.
-- **Raw Postgres drivers (`pg`, `postgres.js`) cannot reach Supabase's Supavisor pooler from the Workers runtime** — node-postgres terminates the connection, postgres.js hangs. Hyperdrive is the only working wire-protocol path from a Worker.
+- **Raw Postgres drivers (`pg`, `postgres.js`) do run from a Worker** over the runtime's TCP socket API - but pointed at the Supavisor pooler with default settings they failed here (node-postgres terminates, postgres.js hangs); the pooler needs specific flags (`prepare: false` for the transaction pooler, an SSL workaround). Hyperdrive is the managed wire path - pooling plus read cache, over the direct connection - and avoids the hand-tuning.
 - **Writes:** Hyperdrive (~172ms) beats PostgREST (~208ms) because it skips the PostgREST layer - and drops the JWT context (`auth.uid()` is null), so you own authorization in the Worker. RLS itself still applies by DB role unless that role has `BYPASSRLS` (see the security model).
 - **Auth:** verifying a Supabase JWT at the edge with cached JWKS is **~0ms**; a `getUser()` round-trip is ~207ms. Verify locally for latency, round-trip only when you need revocation.
 - **Preview branches:** each PR gets an isolated Supabase project built from your migrations; wire it to a `wrangler versions upload` Worker preview version that never touches the production route. The trap: a branch that fails on a missing `config.toml` `env()` secret is mislabeled **`MIGRATIONS_FAILED`** — the migrations are fine, the branch just never got your custom-SMTP/OAuth secrets.
@@ -73,7 +73,7 @@ The pattern this reference assumes is `Browser -> Worker -> Supabase`: the brows
 |---|---|---|---|
 | RLS CRUD, Auth, Storage, the full SDK | `supabase-js` / PostgREST | ~210ms / call | default; RLS enforced by the key; no `nodejs_compat` |
 | A repeated read made fast | Worker **Cache API** | ~10ms hit | zero extra infra, no `nodejs_compat` |
-| Real SQL (joins, transactions, `COPY`) or faster writes | **Hyperdrive** | ~10ms cached, ~172ms write | only working wire path from a Worker; you own authz |
+| Real SQL (joins, transactions, `COPY`) or faster writes | **Hyperdrive** | ~10ms cached, ~172ms write | managed pooled wire path (raw drivers work too, but the pooler needs specific flags); you own authz |
 | Hot-path auth | edge JWT verify (`jose`) | ~0ms | local after the first JWKS fetch |
 | Revocation-aware auth | `getUser()` | ~207ms | round trip; use per sensitive route |
 | Realtime | browser-direct, or a Durable Object relay | n/a | a stateless Worker cannot hold a long-lived socket |
@@ -160,7 +160,7 @@ Placement, read replica, co-location). Everything here is attacking the same
 
 ## Data plane: how a Worker reaches the database
 
-There are three ways, and only two of them work from a Worker.
+There are three ways to reach the database from a Worker.
 
 ### A. supabase-js over PostgREST (the default)
 
@@ -171,13 +171,13 @@ Disable session persistence in a Worker — the browser defaults break outside a
 browser: `createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } })`.
 </Aside>
 
-### B. Raw Postgres driver — does not work from a Worker
+### B. Raw Postgres driver - works, but the Supavisor pooler needs the right flags
 
-Pointing `node-postgres` or `postgres.js` straight at a Supavisor pooler string from the Workers runtime failed both ways: node-postgres returns `Connection terminated unexpectedly` immediately, postgres.js hangs until timeout. This is the TLS-over-socket path the Workers runtime does not carry cleanly to Supavisor. The takeaway is firm: **do not plan on a raw driver to Supavisor from a Worker.** If you need the Postgres wire protocol from a Worker, use Hyperdrive (next). A raw driver against Supavisor is fine from a normal Node/Bun server — it is specifically the Worker runtime that is the wall.
+Raw `pg` and `postgres.js` do run from the Workers runtime - it exposes a TCP socket API (`connect()` from `cloudflare:sockets`), and both Cloudflare and Supabase document connecting node-postgres / Postgres.js directly from a Worker. What failed in this test was pointing them at the **Supavisor pooler** string with default settings: node-postgres returned `Connection terminated unexpectedly` immediately, postgres.js hung until timeout. The transaction pooler wants `prepare: false` (it does not keep prepared statements) plus an SSL/pooler workaround on the connection string; with defaults the handshake does not complete. So the honest takeaway is not "raw drivers do not work from a Worker" - it is "a raw driver to the Supavisor pooler needs pooler-specific settings." If you want the wire protocol without hand-tuning that, use Hyperdrive (next): it pools, caches, and points at the direct connection for you.
 
-### C. Hyperdrive — the working wire-protocol path
+### C. Hyperdrive - the managed wire-protocol path
 
-Hyperdrive is Cloudflare's pooler + read cache living in their network. The Worker gets a `connectionString` from a binding and connects with `node-postgres`; Hyperdrive handles the TCP/TLS to Postgres and keeps the real pool warm near the database. It is the only way to run raw SQL from a Worker that worked, and it is faster than REST for writes and cache-eligible reads.
+Hyperdrive is Cloudflare's pooler + read cache living in their network. The Worker gets a `connectionString` from a binding and connects with `node-postgres`; Hyperdrive handles the TCP/TLS to Postgres and keeps the real pool warm near the database. It is the managed way to run raw SQL from a Worker - pooled and cache-eligible, faster than REST for writes and cache-eligible reads - without hand-tuning a driver against the pooler.
 
 The win on reads is the **cache**, not the connection. A deterministic read is served from Hyperdrive's cache near the Worker (~10ms). The moment the query is non-cacheable — a volatile function like `now()`, or any write — it drops to the same ~210ms RTT floor as REST. Hyperdrive's pooling buys you the tight write path (~172ms vs 208ms) and a tighter tail, not a shorter wire.
 
@@ -194,7 +194,7 @@ stop paying for a repeated read.
 | Mode | Host / port | IP | Use from a Worker |
 |---|---|---|---|
 | Direct connection | `db.<ref>.supabase.co:5432` | **IPv6-only** (no A record) unless IPv4 add-on | Behind Hyperdrive |
-| Supavisor — transaction | `aws-N-<region>.pooler.supabase.com:6543` | IPv4 | Not from a Worker (raw driver fails); fine from a server |
+| Supavisor - transaction | `aws-N-<region>.pooler.supabase.com:6543` | IPv4 | From a Worker needs `prepare: false` + a pooler SSL workaround (defaults failed here); fine from a server |
 | Supavisor — session | `aws-N-<region>.pooler.supabase.com:5432` | IPv4 | Hyperdrive's IPv4 fallback if direct is unreachable |
 | PostgREST | `<ref>.supabase.co:443` | IPv4/IPv6 | `supabase-js` (path A) |
 
@@ -269,6 +269,8 @@ know the token was revoked. That is the whole trade: ~0ms local verify vs a
 
 Keys: the browser gets the **anon** key (public, RLS applies). The Worker holds the **service_role** / `sb_secret_` key as a Wrangler secret and never ships it to the client. On a Hyperdrive/raw-SQL path there is no key at all - the Postgres role is the identity. RLS still applies unless that role has `BYPASSRLS`, but there is no `auth.uid()` for user-scoped policies, so you own authorization in the Worker (see the security model).
 
+That covers bearer-token auth - a Worker verifying a JWT it was handed. For a Worker or Pages Function that renders authenticated HTML server-side, the session lives in cookies instead: use `@supabase/ssr` with a `getAll` / `setAll` cookie adapter so the SSR client reads and refreshes the session from request/response cookies. Same trust boundary (keys stay server-side), just a cookie transport rather than a bearer header.
+
 ---
 
 ## Storage
@@ -289,7 +291,9 @@ if (!res) {
 return res;
 ```
 
-Do not put the service key or a bucket-wide token in the browser — the Worker is where the privileged Storage call happens.
+Do not put the service key or a bucket-wide token in the browser - the Worker is where the privileged Storage call happens.
+
+Storage also exposes an **S3-compatible endpoint**, reachable from a Worker with a signing client like `aws4fetch`. Use it for multipart uploads of large objects or to point existing S3 tooling at a bucket, where the REST API is awkward.
 
 ---
 
@@ -297,7 +301,7 @@ Do not put the service key or a bucket-wide token in the browser — the Worker 
 
 Realtime is a WebSocket to Supabase, with three modes worth separating:
 
-- **Postgres Changes** streams row changes from the WAL to subscribers. It authorizes *per subscriber per event* and is single-threaded, so throughput scales with subscriber count, not compute - past ~3,000 concurrent subscribers, move off it.
+- **Postgres Changes** streams row changes from the WAL to subscribers. It authorizes *per subscriber per event* and is single-threaded, so throughput scales with subscriber count, not compute; at high subscriber counts it becomes the bottleneck (Supabase's [Realtime benchmarks](https://supabase.com/docs/guides/realtime/benchmarks) give a per-database calculator) and Broadcast is the path that scales.
 - **Broadcast** is the general channel: low-latency messages client-to-client over the WebSocket, the REST endpoint, or *from the database* via `realtime.send()` / `realtime.broadcast_changes()` in a trigger. It is the recommended path at scale, and the one a server can reach without holding a socket (a Worker can POST the Broadcast REST endpoint to push).
 - **Presence** tracks shared ephemeral state (who is online, cursors); not for high-frequency updates.
 
@@ -312,7 +316,7 @@ Pasteriser takes the relay route for its live `/recent` feed: a `realtime.send()
 
 Four load-bearing details, each a silent failure otherwise (all four cost real debugging time to find):
 
-- **The DO subscribes with the anon *JWT*, not the `sb_publishable_` key.** Realtime silently ignores `sb_*` tokens as a private-channel `access_token`, so the join is unauthenticated and receives nothing.
+- **The DO subscribes with the anon *JWT*, not the `sb_publishable_` key.** Realtime silently ignores `sb_*` tokens as a private-channel `access_token`, so the join is unauthenticated and receives nothing. (Supabase is deprecating the legacy anon key by end of 2026; on a new-keys-only project the `access_token` must be a real signed anon/user JWT - still never the `sb_publishable_` key.)
 - **The DO's outbound socket is `fetch("https://...", { headers: { Upgrade: "websocket" } })`, not `new WebSocket("wss://...")`.** A Worker's `fetch` only upgrades an `http(s)` URL; a `wss://` URL is rejected, so the upstream never connects. (A browser `WebSocket` accepts `wss://`, so this only bites server-side.)
 - **Response middleware must skip the `101`.** A header-adding middleware that re-wraps every response with `new Response(body, init)` drops the non-standard `webSocket` property, and the browser upgrade fails with a `1002`.
 - **Rejoin with Broadcast `replay`.** On reconnect, send `broadcast.replay { since, limit }` so anything broadcast during the gap is backfilled - private channels only, DB-originated messages, up to 25 per request, 72h retention; dedup on the client by id (the browser socket stays up while only the DO's upstream reconnects, so a poll fallback would not cover it).
@@ -406,15 +410,17 @@ Rule of thumb: cross-service, app-level async -> Cloudflare Queues; transactiona
 Both run server-side TypeScript; the difference is *where*, and it maps onto the geography model above.
 
 - A **Cloudflare Worker** runs at the edge nearest the user (or, with Smart Placement, nearest the DB). It has the CF primitives - Cache API, Hyperdrive, Durable Objects, R2, Queues - and it is where this reference assumes your logic lives.
-- A **Supabase Edge Function** (Deno) runs co-located with the Supabase services. Its DB, Auth, and Storage calls are effectively local (no ~210ms wire), but it is far from the user and has none of the CF primitives.
+- A **Supabase Edge Function** (Deno) runs at the edge nearest the *user* by default, like a Worker - so its DB/Auth/Storage calls cross the same wire. You opt into DB co-location explicitly with regional invocation (the `x-region` header / `FunctionRegion`), which makes those calls local at the cost of user distance. Either way it has none of the CF primitives.
 
-Put logic next to whatever it talks to most. A function that makes many DB calls and little user I/O is cheaper as an Edge Function (or a Worker with Smart Placement pointed at the DB region); a function that is user-facing, needs the Cache API / a Durable Object / R2, or is part of the CF stack is a Worker. They are not exclusive - a Worker at the edge can invoke an Edge Function for the DB-heavy step.
+Put logic next to whatever it talks to most. A function that makes many DB calls and little user I/O wants to run in the DB region - a region-pinned Edge Function, or a Worker with Smart Placement pointed at the DB region; a function that is user-facing, needs the Cache API / a Durable Object / R2, or is part of the CF stack is a Worker. They are not exclusive - a Worker at the edge can invoke an Edge Function for the DB-heavy step.
 
 <Aside type="caution">
-Edge Functions enforce a platform `verify_jwt` check *before* your handler.
-When you rotate to asymmetric (ES256) signing keys, functions with `verify_jwt`
-on break until you turn it off and verify with `getClaims()` - the same JWKS
-rotation trap that hits any edge JWT verifier.
+Edge Functions enforce a platform `verify_jwt` check *before* your handler. It
+validates both legacy HS256 JWTs and the newer asymmetric (ES256) signing keys,
+so rotating signing keys does not break it. What it rejects is a non-JWT in the
+`Authorization` header - an `sb_publishable_` / `sb_secret_` key is not a JWT, so
+`verify_jwt` turns it away; send a real user JWT, or verify with `getClaims()`
+in-handler.
 </Aside>
 
 ---
@@ -632,7 +638,7 @@ curl 'http://localhost:8799/auth?n=30'
 - **Cloudflare** — [Hyperdrive for Supabase](https://developers.cloudflare.com/hyperdrive/examples/connect-to-postgres/postgres-database-providers/supabase/), [Hyperdrive query caching](https://developers.cloudflare.com/hyperdrive/configuration/query-caching/), [Workers Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/), [wrangler versions upload](https://developers.cloudflare.com/workers/wrangler/commands/#versions-upload)
 - **Supabase** — [Connecting to Postgres](https://supabase.com/docs/guides/database/connecting-to-postgres), [Auth JWTs](https://supabase.com/docs/guides/auth/jwts), [Branching](https://supabase.com/docs/guides/deployment/branching), [Branching config & secrets](https://supabase.com/docs/guides/deployment/branching/configuration), [Management API: create a branch](https://supabase.com/docs/reference/api/v1-create-a-branch)
 - **Cloudflare (more)** - [Smart Placement](https://developers.cloudflare.com/workers/configuration/smart-placement/), [Queues](https://developers.cloudflare.com/queues/), [Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/), [Durable Objects WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/), [R2](https://developers.cloudflare.com/r2/), [Vectorize](https://developers.cloudflare.com/vectorize/), [Workers Rate Limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/)
-- **Supabase (more)** - [Realtime protocol](https://supabase.com/docs/guides/realtime/protocol), [Broadcast](https://supabase.com/docs/guides/realtime/broadcast), [Database Webhooks](https://supabase.com/docs/guides/database/webhooks), [pg_net](https://supabase.com/docs/guides/database/extensions/pg_net), [Cron / pg_cron](https://supabase.com/docs/guides/cron), [Queues (pgmq)](https://supabase.com/docs/guides/queues), [Edge Functions](https://supabase.com/docs/guides/functions), [Read replicas](https://supabase.com/docs/guides/platform/read-replicas), [Database Functions](https://supabase.com/docs/guides/database/functions)
+- **Supabase (more)** - [Realtime protocol](https://supabase.com/docs/guides/realtime/protocol), [Broadcast](https://supabase.com/docs/guides/realtime/broadcast), [Database Webhooks](https://supabase.com/docs/guides/database/webhooks), [pg_net](https://supabase.com/docs/guides/database/extensions/pg_net), [Cron / pg_cron](https://supabase.com/docs/guides/cron), [Queues (pgmq)](https://supabase.com/docs/guides/queues), [Edge Functions](https://supabase.com/docs/guides/functions), [Read replicas](https://supabase.com/docs/guides/platform/read-replicas), [Database Functions](https://supabase.com/docs/guides/database/functions), [Serverless drivers from Workers](https://supabase.com/docs/guides/database/connecting-to-postgres/serverless-drivers), [Edge Function regional invocation](https://supabase.com/docs/guides/functions/regional-invocation), [S3-compatible Storage](https://supabase.com/docs/guides/storage/s3/authentication), [Server-side auth (@supabase/ssr)](https://supabase.com/docs/guides/auth/server-side), [Workers native integration](https://developers.cloudflare.com/workers/databases/third-party-integrations/supabase/)
 - **Compliance / residency** - [DO data location & jurisdictions](https://developers.cloudflare.com/durable-objects/reference/data-location/), [DO data security](https://developers.cloudflare.com/durable-objects/reference/data-security/), [Data Localization Suite](https://developers.cloudflare.com/data-localization/), [Regional Services](https://developers.cloudflare.com/data-localization/regional-services/), [Supabase HIPAA](https://supabase.com/docs/guides/security/hipaa-compliance), [SOC 2](https://supabase.com/docs/guides/security/soc-2-compliance), [Connection logging](https://supabase.com/docs/guides/platform/postgres-connection-logging), [PrivateLink](https://supabase.com/docs/guides/platform/privatelink), [Workers VPC](https://developers.cloudflare.com/workers-vpc/), [VPC Services](https://developers.cloudflare.com/workers-vpc/configuration/vpc-services/), [Hyperdrive to a private database](https://developers.cloudflare.com/hyperdrive/configuration/connect-to-private-database/)
 
 Measured from the Singapore edge to `eu-central-1` (Frankfurt), 2026-07-14. Absolute latencies are distance-dominated; the ratios and path choices generalize (see [Reading the numbers](#reading-the-numbers)).
