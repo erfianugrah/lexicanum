@@ -16,7 +16,7 @@ All numbers below were measured from **Singapore**: a Worker on Cloudflare's edg
 
 - **Reads:** `supabase-js` over PostgREST is ~210ms with a fat tail; a cacheable read through either the Worker **Cache API** or **Hyperdrive** is ~10ms. The Cache API needs no extra infra and matches Hyperdrive for pure read caching.
 - **Raw Postgres drivers (`pg`, `postgres.js`) cannot reach Supabase's Supavisor pooler from the Workers runtime** — node-postgres terminates the connection, postgres.js hangs. Hyperdrive is the only working wire-protocol path from a Worker.
-- **Writes:** Hyperdrive (~172ms) beats PostgREST (~208ms) because it skips the PostgREST layer — but it also skips RLS, so you own authorization in the Worker.
+- **Writes:** Hyperdrive (~172ms) beats PostgREST (~208ms) because it skips the PostgREST layer - and drops the JWT context (`auth.uid()` is null), so you own authorization in the Worker. RLS itself still applies by DB role unless that role has `BYPASSRLS` (see the security model).
 - **Auth:** verifying a Supabase JWT at the edge with cached JWKS is **~0ms**; a `getUser()` round-trip is ~207ms. Verify locally for latency, round-trip only when you need revocation.
 - **Preview branches:** each PR gets an isolated Supabase project built from your migrations; wire it to a `wrangler versions upload` Worker preview version that never touches the production route. The trap: a branch that fails on a missing `config.toml` `env()` secret is mislabeled **`MIGRATIONS_FAILED`** — the migrations are fine, the branch just never got your custom-SMTP/OAuth secrets.
 
@@ -101,7 +101,7 @@ The absolute costs are the Singapore-to-Frankfurt figures below; the *choice* in
 | Path | median | p95 | notes |
 |---|---|---|---|
 | PostgREST insert (`supabase-js`) | 208 | 264 | enforces RLS via the key |
-| **Hyperdrive** insert | 172 | 231 | pooled direct connection, skips PostgREST — **and skips RLS** |
+| **Hyperdrive** insert | 172 | 231 | pooled direct connection, skips PostgREST - no `auth.uid()` context, so you own authz; RLS still applies by role (see security model) |
 | raw driver -> Supavisor | - | - | **fails** (same as reads) |
 
 ### Auth
@@ -265,7 +265,7 @@ know the token was revoked. That is the whole trade: ~0ms local verify vs a
 ~207ms revocation check. Pick per-route, do not blanket-`getUser()`.
 </Aside>
 
-Keys: the browser gets the **anon** key (public, RLS applies). The Worker holds the **service_role** / `sb_secret_` key as a Wrangler secret and never ships it to the client. On a Hyperdrive/raw-SQL path there is no key at all — the Postgres role is the identity, and RLS does not apply (see the security model).
+Keys: the browser gets the **anon** key (public, RLS applies). The Worker holds the **service_role** / `sb_secret_` key as a Wrangler secret and never ships it to the client. On a Hyperdrive/raw-SQL path there is no key at all - the Postgres role is the identity. RLS still applies unless that role has `BYPASSRLS`, but there is no `auth.uid()` for user-scoped policies, so you own authorization in the Worker (see the security model).
 
 ---
 
@@ -299,12 +299,12 @@ Realtime is a WebSocket to Supabase, with three modes worth separating:
 - **Broadcast** is the general channel: low-latency messages client-to-client over the WebSocket, the REST endpoint, or *from the database* via `realtime.send()` / `realtime.broadcast_changes()` in a trigger. It is the recommended path at scale, and the one a server can reach without holding a socket (a Worker can POST the Broadcast REST endpoint to push).
 - **Presence** tracks shared ephemeral state (who is online, cursors); not for high-frequency updates.
 
-Channels are private by default and authorized by RLS policies on `realtime.messages`; the client sets `private: true` and re-sends its JWT on refresh, so keep JWT expiry short.
+Channels are **public** by default; opt into a private channel with `private: true` to gate it behind RLS policies on `realtime.messages`. A private channel re-sends its JWT on refresh, so keep JWT expiry short.
 
 **Where the Worker fits.** A stateless Worker cannot terminate a long-lived socket. Two shapes:
 
 - **Browser-direct** - the browser opens the `wss://<ref>.supabase.co` socket itself with the publishable/anon key and RLS-backed channel authorization. Simplest, and the one surface that legitimately bypasses the Worker - but it exposes the anon key, relaxes the CSP to allow the Supabase host, and is a second surface outside the Worker.
-- **Durable Object relay** - a DO holds ONE server-side subscription and fans out to browsers over a **same-origin** socket. Keeps the browser -> Worker -> Supabase boundary intact (no key in the browser, CSP stays `connect-src 'self'`, one surface). The DO's hibernatable WebSocket API carries thousands of connections with no duration billing while idle.
+- **Durable Object relay** - a DO holds ONE server-side subscription and fans out to browsers over a **same-origin** socket. Keeps the browser -> Worker -> Supabase boundary intact (no key in the browser, CSP stays `connect-src 'self'`, one surface). The hibernatable WebSocket API carries thousands of browser connections cheaply on the *server* side - but the single **outbound** subscription to Supabase does not hibernate (its heartbeats keep the socket active, and an active outbound socket blocks eviction), so the DO bills continuous duration the whole time it holds the feed. Drop the upstream when the last viewer disconnects to let it hibernate.
 
 Pasteriser takes the relay route for its live `/recent` feed: a `realtime.send()` trigger on public-paste inserts, a Durable Object holding the single upstream subscription, and browsers on a same-origin `/api/recent/live` socket - so the anon key never reaches the browser and the CSP is unchanged.
 
@@ -313,7 +313,46 @@ Four load-bearing details, each a silent failure otherwise (all four cost real d
 - **The DO subscribes with the anon *JWT*, not the `sb_publishable_` key.** Realtime silently ignores `sb_*` tokens as a private-channel `access_token`, so the join is unauthenticated and receives nothing.
 - **The DO's outbound socket is `fetch("https://...", { headers: { Upgrade: "websocket" } })`, not `new WebSocket("wss://...")`.** A Worker's `fetch` only upgrades an `http(s)` URL; a `wss://` URL is rejected, so the upstream never connects. (A browser `WebSocket` accepts `wss://`, so this only bites server-side.)
 - **Response middleware must skip the `101`.** A header-adding middleware that re-wraps every response with `new Response(body, init)` drops the non-standard `webSocket` property, and the browser upgrade fails with a `1002`.
-- **Rejoin with Broadcast `replay`.** On reconnect, send `broadcast.replay { since, limit }` so anything broadcast during the gap is backfilled; dedup on the client by id (the browser socket stays up while only the DO's upstream reconnects, so a poll fallback would not cover it).
+- **Rejoin with Broadcast `replay`.** On reconnect, send `broadcast.replay { since, limit }` so anything broadcast during the gap is backfilled - private channels only, DB-originated messages, up to 25 per request, 72h retention; dedup on the client by id (the browser socket stays up while only the DO's upstream reconnects, so a poll fallback would not cover it).
+
+The load-bearing glue - accept the browser socket, hold one upstream, fan out:
+
+```ts
+export class RecentFeedDO {
+  private sockets = new Set<WebSocket>();
+  private upstream?: WebSocket;
+  constructor(private state: DurableObjectState, private env: Env) {}
+
+  // Browser side: same-origin /api/recent/live
+  async fetch(_req: Request): Promise<Response> {
+    const { 0: client, 1: server } = new WebSocketPair();
+    server.accept();
+    this.sockets.add(server);
+    server.addEventListener("close", () => this.sockets.delete(server));
+    this.ensureUpstream();                 // lazily open the ONE upstream
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  private async ensureUpstream() {
+    if (this.upstream) return;
+    // http(s) scheme for fetch(), NOT new WebSocket("wss://...")
+    const url = this.env.SUPABASE_URL.replace(/^wss:/i, "https:")
+      + `/realtime/v1/websocket?apikey=${this.env.SUPABASE_ANON_KEY}&vsn=1.0.0`;
+    const res = await fetch(url, { headers: { Upgrade: "websocket" } });
+    const ws = res.webSocket!; ws.accept(); this.upstream = ws;
+    // phx_join the PRIVATE channel with the anon JWT as access_token
+    ws.send(JSON.stringify({ topic: "realtime:recent:public", event: "phx_join",
+      payload: { config: { private: true }, access_token: this.env.SUPABASE_ANON_KEY },
+      ref: "1" }));
+    ws.addEventListener("message", (e) => {
+      const msg = JSON.parse(e.data as string);
+      if (msg.event !== "broadcast") return;
+      const frame = JSON.stringify(msg.payload.payload); // the row we broadcast
+      for (const s of this.sockets) s.send(frame);        // fan out
+    });
+  }
+}
+```
 
 <Aside type="caution">
 Broadcast-from-database is easy to leave running with no reader. Pasteriser's
@@ -401,7 +440,9 @@ With RLS enabled on a `pastes` table (two rows, both owned by user A), the same 
 | `service_role` (PostgREST, `BYPASSRLS`) | all |
 | `hyperdrive_user` (raw SQL, **no** `BYPASSRLS`) | **0** — RLS denies by default, no policy targets that role |
 
-A least-privilege Hyperdrive role sees **nothing** through RLS-enabled tables unless you add policies for it, grant it `BYPASSRLS`, or the table has RLS off (as `hd_bench` did — 200 rows visible). Decide deliberately: `BYPASSRLS` makes the Worker the sole authorization gate; policies-for-the-role keeps Postgres enforcing. Either way, never hand a Worker-reachable role `postgres`.
+A least-privilege Hyperdrive role sees **nothing** through RLS-enabled tables unless you add policies for it, grant it `BYPASSRLS`, or the table has RLS off (as `hd_bench` did - 200 rows visible). Decide deliberately: `BYPASSRLS` makes the Worker the sole authorization gate; policies-for-the-role keeps Postgres enforcing. Either way, never hand a Worker-reachable role `postgres`.
+
+Because the Worker is the single ingress, it is also the single place to throttle: the [Workers Rate Limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/) binding (or a Durable Object counter) caps abuse at the edge before it reaches Supabase - one rate-limit surface instead of one per client path. This is the same reason the browser-direct Realtime shape is a downgrade: it opens a second ingress the Worker cannot see or throttle.
 
 The deployment shape this suits is `Browser -> Worker -> Supabase`: the Worker authorizes every request and the browser holds no key. Keep the service key and the Hyperdrive connection string server-side (the Hyperdrive string lives in the config, not in Worker secrets, which is a nice property).
 
