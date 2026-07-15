@@ -17,7 +17,7 @@ Every latency here was measured against that setup; every claim about behavior l
 **TL;DR:**
 
 - **Reads:** `supabase-js` over PostgREST is ~210ms with a fat tail; a cacheable read through either the Worker **Cache API** or **Hyperdrive** is ~10ms. The Cache API needs no extra infra and matches Hyperdrive for pure read caching.
-- **Raw Postgres drivers (`pg`, `postgres.js`) do run from a Worker** over the runtime's TCP socket API - but pointed at the Supavisor pooler with default settings they failed here (node-postgres terminates, postgres.js hangs); the pooler needs specific flags (`prepare: false` for the transaction pooler, an SSL workaround). Hyperdrive is the managed wire path - pooling plus read cache, over the direct connection - and avoids the hand-tuning.
+- **Raw Postgres drivers (`pg`, `postgres.js`) run from a Worker** over the runtime's TCP socket API, but against the Supavisor pooler they need pooler-specific flags (`prepare: false`, an SSL workaround) or the connection fails (node-postgres terminates, postgres.js hangs). Hyperdrive is the managed wire path: pooling plus read cache, over the direct connection, no driver tuning.
 - **Writes:** Hyperdrive (~172ms) beats PostgREST (~208ms) because it skips the PostgREST layer - and drops the JWT context (`auth.uid()` is null), so you own authorization in the Worker. RLS itself still applies by DB role unless that role has `BYPASSRLS` (see the security model).
 - **Auth:** verifying a Supabase JWT at the edge with cached JWKS is **~0ms**; a `getUser()` round-trip is ~207ms. Verify locally for latency, round-trip only when you need revocation.
 - **Preview branches:** each PR gets an isolated Supabase project built from your migrations; wire it to a `wrangler versions upload` Worker preview version that never touches the production route. The trap: a branch that fails on a missing `config.toml` `env()` secret is mislabeled **`MIGRATIONS_FAILED`** — the migrations are fine, the branch just never got your custom-SMTP/OAuth secrets.
@@ -122,7 +122,7 @@ These were measured **Singapore edge -> Frankfurt DB**, ~10,000 km apart. Three 
 
 - **The absolute floor is the wire.** A Singapore-to-Frankfurt round trip is ~150-165ms of RTT before any TLS handshake or query work, which is why every uncached, must-reach-the-DB path lands near ~210ms. That floor is geography, not the stack.
 - **The architecture wins are ratios, and they generalize.** A cached read (~10ms) is ~20x faster than the round trip; edge JWT verify (~0ms) removes a ~207ms round trip outright; Hyperdrive's pooled write (~172ms) shaves the PostgREST layer off the wire. Those relationships hold at any region pairing.
-- **Co-locate to collapse the floor.** Put the Worker's effective region and the Supabase region on the same continent - or front the DB with a read replica near the edge - and every wire number drops toward the intra-region floor (single-digit to low-tens of ms), while the cache and verify wins stay proportionally the same. Supabase's APAC region is `ap-southeast-1` (Singapore); this project simply happened to live in Frankfurt.
+- **Co-locate to collapse the floor.** Put the Worker's effective region and the Supabase region on the same continent - or front the DB with a read replica near the edge - and every wire number drops toward the intra-region floor (single-digit to low-tens of ms), while the cache and verify wins stay proportionally the same. Supabase offers regional placement (APAC is `ap-southeast-1`, Singapore), so pairing the Worker's effective region with the database region is a deployment choice.
 
 <Aside type="note">
 If your users and your database are both far from each other, no single region
@@ -171,9 +171,13 @@ Disable session persistence in a Worker — the browser defaults break outside a
 browser: `createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } })`.
 </Aside>
 
-### B. Raw Postgres driver - works, but the Supavisor pooler needs the right flags
+### B. Raw Postgres driver
 
-Raw `pg` and `postgres.js` do run from the Workers runtime - it exposes a TCP socket API (`connect()` from `cloudflare:sockets`), and both Cloudflare and Supabase document connecting node-postgres / Postgres.js directly from a Worker. What failed in this test was pointing them at the **Supavisor pooler** string with default settings: node-postgres returned `Connection terminated unexpectedly` immediately, postgres.js hung until timeout. The transaction pooler wants `prepare: false` (it does not keep prepared statements) plus an SSL/pooler workaround on the connection string; with defaults the handshake does not complete. So the honest takeaway is not "raw drivers do not work from a Worker" - it is "a raw driver to the Supavisor pooler needs pooler-specific settings." If you want the wire protocol without hand-tuning that, use Hyperdrive (next): it pools, caches, and points at the direct connection for you.
+Raw `pg` and `postgres.js` connect from the Workers runtime over its TCP socket API (`connect()` from `cloudflare:sockets`); both Cloudflare and Supabase document driving node-postgres / Postgres.js directly from a Worker. Against the Supavisor pooler the connection needs pooler-specific settings: `prepare: false` for the transaction pooler (it keeps no prepared statements), plus an SSL/pooler workaround on the connection string. With driver defaults the handshake does not complete. For the wire protocol without that tuning, use Hyperdrive (next) - it pools, caches, and targets the direct connection.
+
+<Aside type="caution">
+Pointed at the Supavisor pooler with default driver settings, both drivers fail: node-postgres returns `Connection terminated unexpectedly` immediately, postgres.js hangs until timeout. The fix is `prepare: false` plus the pooler SSL workaround, or Hyperdrive.
+</Aside>
 
 ### C. Hyperdrive - the managed wire-protocol path
 
@@ -194,16 +198,16 @@ stop paying for a repeated read.
 | Mode | Host / port | IP | Use from a Worker |
 |---|---|---|---|
 | Direct connection | `db.<ref>.supabase.co:5432` | **IPv6-only** (no A record) unless IPv4 add-on | Behind Hyperdrive |
-| Supavisor - transaction | `aws-N-<region>.pooler.supabase.com:6543` | IPv4 | From a Worker needs `prepare: false` + a pooler SSL workaround (defaults failed here); fine from a server |
+| Supavisor - transaction | `aws-N-<region>.pooler.supabase.com:6543` | IPv4 | From a Worker needs `prepare: false` + a pooler SSL workaround; fine from a server |
 | Supavisor — session | `aws-N-<region>.pooler.supabase.com:5432` | IPv4 | Hyperdrive's IPv4 fallback if direct is unreachable |
 | PostgREST | `<ref>.supabase.co:443` | IPv4/IPv6 | `supabase-js` (path A) |
 
 <Aside type="note">
 Point Hyperdrive at the **Direct connection**, not a pooler — Hyperdrive does
 its own pooling and stacking it on Supavisor is the anti-pattern. As of 2026-07
-Hyperdrive reached Supabase's IPv6-only direct connection with no IPv4 add-on,
-so the historical "needs IPv4/session pooler" workaround was not required here.
-Keep it as the fallback if a create ever fails on connectivity.
+Hyperdrive connects to Supabase's IPv6-only direct connection without the IPv4
+add-on, so the historical "needs IPv4/session pooler" workaround does not apply.
+Keep it as a fallback if a create fails on connectivity.
 </Aside>
 
 ---
@@ -361,13 +365,13 @@ export class RecentFeedDO {
 ```
 
 <Aside type="caution">
-Broadcast-from-database is easy to leave running with no reader. Pasteriser's
-first attempt shipped the trigger but no subscriber - the frontend never opened
-the socket, the `connect-src 'self'` CSP blocked a direct
-`wss://<ref>.supabase.co`, and every insert enqueued a message with zero
-subscribers against the 2M-message/mo free cap. The fix was the relay above,
-not deleting Broadcast. If you add a broadcast trigger, confirm something
-subscribes and that the socket's origin is allowed.
+Broadcast-from-database is easy to leave running with no reader: ship the
+trigger without a subscriber and every insert still enqueues a message against
+the 2M-message/mo free cap. A `connect-src 'self'` CSP blocks the browser from
+opening a direct `wss://<ref>.supabase.co`, so unless something subscribes
+server-side the messages pile up unread. The relay above is the fix, not
+deleting Broadcast. If you add a broadcast trigger, confirm something subscribes
+and that the socket's origin is allowed.
 </Aside>
 
 ---
@@ -448,7 +452,7 @@ With RLS enabled on a `pastes` table (two rows, both owned by user A), the same 
 | `service_role` (PostgREST, `BYPASSRLS`) | all |
 | `hyperdrive_user` (raw SQL, **no** `BYPASSRLS`) | **0** — RLS denies by default, no policy targets that role |
 
-A least-privilege Hyperdrive role sees **nothing** through RLS-enabled tables unless you add policies for it, grant it `BYPASSRLS`, or the table has RLS off (as `hd_bench` did - 200 rows visible). Decide deliberately: `BYPASSRLS` makes the Worker the sole authorization gate; policies-for-the-role keeps Postgres enforcing. Either way, never hand a Worker-reachable role `postgres`.
+A least-privilege Hyperdrive role sees **nothing** through RLS-enabled tables unless you add policies for it, grant it `BYPASSRLS`, or the table has RLS off (an RLS-disabled table returns every row to any role). Decide deliberately: `BYPASSRLS` makes the Worker the sole authorization gate; policies-for-the-role keeps Postgres enforcing. Either way, never hand a Worker-reachable role `postgres`.
 
 Because the Worker is the single ingress, it is also the single place to throttle: the [Workers Rate Limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/) binding (or a Durable Object counter) caps abuse at the edge before it reaches Supabase - one rate-limit surface instead of one per client path. This is the same reason the browser-direct Realtime shape is a downgrade: it opens a second ingress the Worker cannot see or throttle.
 
@@ -507,7 +511,7 @@ wrangler versions upload \
 
 `versions upload` publishes to a distinct preview URL and never rolls out to the production route. It is this clean because the app's data path is REST (`supabase-js`) — the two vars *are* the whole binding. Read the branch's `ref` (for the URL) and its secret key from the Management API — `GET /v1/branches/{id}` and `GET /v1/projects/{branch-ref}/api-keys?reveal=true` — rather than `supabase branches get`, which needs a linked project a fresh CI checkout does not have.
 
-**Hyperdrive is a static config pointing at one database**; it is not auto-repointed per branch. A Hyperdrive-backed app therefore needs a Hyperdrive config created *per branch* to run the branch DB over the wire protocol — which works: a config created against the branch's (IPv6-only) direct connection serves a branch-only `branch_marker` table to a Worker over the full `Worker -> Hyperdrive -> branch DB` path. Under concurrency (6 workers) that path holds ~66 req/s at p95 105ms / p99 117ms with no failures. The catch is lifecycle: a per-branch Hyperdrive config is another CF resource to create on open and delete on close, so unless you specifically need the wire protocol on previews, the REST binding above is the lighter path.
+**Hyperdrive is a static config pointing at one database**; it is not auto-repointed per branch. A Hyperdrive-backed app therefore needs a Hyperdrive config created *per branch* to run the branch DB over the wire protocol. A config against the branch's (IPv6-only) direct connection carries the full `Worker -> Hyperdrive -> branch DB` path and holds under concurrency - around 66 req/s at p95 ~105ms / p99 ~117ms in a 6-worker test. The catch is lifecycle: a per-branch Hyperdrive config is another CF resource to create on open and delete on close, so unless you specifically need the wire protocol on previews, the REST binding above is the lighter path.
 
 ### The trap: a config failure mislabeled `MIGRATIONS_FAILED`
 
