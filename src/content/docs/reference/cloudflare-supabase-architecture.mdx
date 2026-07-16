@@ -8,7 +8,7 @@ import { Aside } from "@astrojs/starlight/components";
 
 Every way a Cloudflare Worker talks to Supabase, which path to use for what, what each one actually costs, and where its data lives.
 
-All numbers below were measured from **Singapore**: a Worker on Cloudflare's edge (`wrangler dev --remote`, i.e. the edge nearest the developer) against a Supabase project in **Frankfurt (`eu-central-1`)**, 2026-07-14. That is a ~10,000 km round trip, so the absolute latencies are **distance-dominated** - the ~210ms floor is mostly the Singapore-to-Frankfurt wire, not Cloudflare or Supabase overhead. Read the numbers for their **shape**, not their absolute value: the ratios (a cached read at ~10ms vs a ~210ms round trip; edge JWT verify at ~0ms vs a ~207ms `getUser()`) hold anywhere, and the floor collapses when the Worker and the database share a region. See [Reading the numbers](#reading-the-numbers).
+All numbers below were measured from **Singapore**: a Worker on Cloudflare's edge (`wrangler dev --remote`) against a Supabase project in **Frankfurt (`eu-central-1`)**, 2026-07-14 - a ~10,000 km round trip, so the absolute latencies are **distance-dominated**. The ~210ms floor is mostly the Singapore-to-Frankfurt wire, not stack overhead; read the numbers for their shape, and see [Reading the numbers](#reading-the-numbers) for what generalises and what does not.
 
 `wrangler dev --remote` runs the Worker on Cloudflare's real edge with live bindings, so the matrix tracks a deployed Worker - and the patterns here run **in production**, not just a bench: pasteriser (`paste.erfi.io`) serves a live `/recent` feed through the Durable Object Realtime relay, sweeps expired rows with `pg_cron`, and does its CRUD through the RPC and PostgREST paths below - all verified live end to end.
 
@@ -103,7 +103,7 @@ The absolute costs are the Singapore-to-Frankfurt figures below; the *choice* in
 | Path | median | p95 | notes |
 |---|---|---|---|
 | PostgREST insert (`supabase-js`) | 208 | 264 | enforces RLS via the key |
-| **Hyperdrive** insert | 172 | 231 | pooled direct connection, skips PostgREST - no `auth.uid()` context, so you own authz; RLS still applies by role (see security model) |
+| **Hyperdrive** insert | 172 | 231 | pooled direct connection, skips PostgREST - no `auth.uid()` context, so you own authz; RLS still applies by role |
 | raw driver -> Supavisor | - | - | **fails** (same as reads) |
 
 ### Auth
@@ -176,7 +176,7 @@ browser: `createClient(url, key, { auth: { persistSession: false, autoRefreshTok
 Raw `pg` and `postgres.js` connect from the Workers runtime over its TCP socket API (`connect()` from `cloudflare:sockets`); both Cloudflare and Supabase document driving node-postgres / Postgres.js directly from a Worker. Against the Supavisor pooler the connection needs pooler-specific settings: `prepare: false` for the transaction pooler (it keeps no prepared statements), plus an SSL/pooler workaround on the connection string. With driver defaults the handshake does not complete. For the wire protocol without that tuning, use Hyperdrive (next) - it pools, caches, and targets the direct connection.
 
 <Aside type="caution">
-Pointed at the Supavisor pooler with default driver settings, both drivers fail: node-postgres returns `Connection terminated unexpectedly` immediately, postgres.js hangs until timeout. The fix is `prepare: false` plus the pooler SSL workaround, or Hyperdrive.
+Pointed at the Supavisor pooler with default driver settings, both drivers fail, each differently: node-postgres returns `Connection terminated unexpectedly` immediately, postgres.js hangs until timeout (measured). The fix is in the paragraph above.
 </Aside>
 
 ### C. Hyperdrive - the managed wire-protocol path
@@ -271,9 +271,40 @@ know the token was revoked. That is the whole trade: ~0ms local verify vs a
 ~207ms revocation check. Pick per-route, do not blanket-`getUser()`.
 </Aside>
 
-Keys: the browser gets the **anon** key (public, RLS applies). The Worker holds the **service_role** / `sb_secret_` key as a Wrangler secret and never ships it to the client. On a Hyperdrive/raw-SQL path there is no key at all - the Postgres role is the identity. RLS still applies unless that role has `BYPASSRLS`, but there is no `auth.uid()` for user-scoped policies, so you own authorization in the Worker (see the security model).
+Keys: the browser gets the **anon** key (public, RLS applies). The Worker holds the **service_role** / `sb_secret_` key as a Wrangler secret and never ships it to the client. On a Hyperdrive/raw-SQL path there is no key at all - the Postgres role is the identity. RLS still applies unless that role has `BYPASSRLS`, but there is no `auth.uid()` for user-scoped policies, so you own authorization in the Worker - which the next section works through in full.
 
 That covers bearer-token auth - a Worker verifying a JWT it was handed. For a Worker or Pages Function that renders authenticated HTML server-side, the session lives in cookies instead: use `@supabase/ssr` with a `getAll` / `setAll` cookie adapter so the SSR client reads and refreshes the session from request/response cookies. Same trust boundary (keys stay server-side), just a cookie transport rather than a bearer header.
+
+---
+
+## Security model (where auth is enforced)
+
+| Path | Who enforces authorization | Key / identity |
+|---|---|---|
+| `supabase-js` REST (anon) | **RLS**, via the anon/authenticated JWT | anon key, in the browser or Worker |
+| `supabase-js` REST (service) | **Your code** - service key bypasses RLS | service key, Worker-only secret |
+| Hyperdrive / raw SQL | **RLS still applies** unless the DB role has `BYPASSRLS` or owns the table; there is just no `auth.uid()` for user-scoped policies | DB role, no JWT |
+| Auth (edge verify) | `jose` signature + `exp`/`aud` checks | JWKS (public) |
+
+The common belief that "leaving PostgREST turns RLS off" is **wrong** - and the correction matters, because the least-privilege Hyperdrive role this same doc recommends is exactly the case that trips it. RLS is a Postgres feature enforced for **any** role that lacks the `BYPASSRLS` attribute and does not own the table, no matter whether the connection arrives via PostgREST or a raw wire protocol. `service_role` and `postgres` carry `BYPASSRLS` (so REST-with-service-key and raw SQL as `postgres` both skip RLS); a purpose-made `hyperdrive_user` does **not**. What you actually lose by leaving PostgREST is the JWT context: `auth.uid()` is null, so user-scoped policies match nothing.
+
+### RLS enforcement by connection identity
+
+With RLS enabled on a `pastes` table (two rows, both owned by user A), the same query resolves differently depending on how the connection identifies itself:
+
+| Identity (how it connects) | Rows seen |
+|---|---|
+| anon key (PostgREST) | public only |
+| user A JWT (PostgREST) | A's private + public |
+| user B JWT (PostgREST) | public only - **cannot see A's private** |
+| `service_role` (PostgREST, `BYPASSRLS`) | all |
+| `hyperdrive_user` (raw SQL, **no** `BYPASSRLS`) | **0** - RLS denies by default, no policy targets that role |
+
+A least-privilege Hyperdrive role sees **nothing** through RLS-enabled tables unless you add policies for it, grant it `BYPASSRLS`, or the table has RLS off (an RLS-disabled table returns every row to any role). Decide deliberately: `BYPASSRLS` makes the Worker the sole authorization gate; policies-for-the-role keeps Postgres enforcing. Either way, never hand a Worker-reachable role `postgres`.
+
+Because the Worker is the single ingress, it is also the single place to throttle: the [Workers Rate Limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/) binding (or a Durable Object counter) caps abuse at the edge before it reaches Supabase - one rate-limit surface instead of one per client path. This is the same reason the browser-direct Realtime shape is a downgrade: it opens a second ingress the Worker cannot see or throttle.
+
+The deployment shape this suits is `Browser -> Worker -> Supabase`: the Worker authorizes every request and the browser holds no key. Keep the service key and the Hyperdrive connection string server-side (the Hyperdrive string lives in the config, not in Worker secrets, which is a nice property).
 
 ---
 
@@ -314,16 +345,46 @@ Channels are **public** by default; opt into a private channel with `private: tr
 **Where the Worker fits.** A stateless Worker cannot terminate a long-lived socket. Two shapes:
 
 - **Browser-direct** - the browser opens the `wss://<ref>.supabase.co` socket itself with the publishable/anon key and RLS-backed channel authorization. Simplest, and the one surface that legitimately bypasses the Worker - but it exposes the anon key, relaxes the CSP to allow the Supabase host, and is a second surface outside the Worker.
-- **Durable Object relay** - a DO holds ONE server-side subscription and fans out to browsers over a **same-origin** socket. Keeps the browser -> Worker -> Supabase boundary intact (no key in the browser, CSP stays `connect-src 'self'`, one surface). The hibernatable WebSocket API carries thousands of browser connections cheaply on the *server* side - but the single **outbound** subscription to Supabase does not hibernate (its heartbeats keep the socket active, and an active outbound socket blocks eviction), so the DO bills continuous duration the whole time it holds the feed. Drop the upstream when the last viewer disconnects to let it hibernate.
+- **Durable Object relay** - a DO holds ONE server-side subscription and fans out to browsers over a **same-origin** socket. Keeps the browser -> Worker -> Supabase boundary intact (no key in the browser, CSP stays `connect-src 'self'`, one surface), and the hibernatable WebSocket API carries thousands of browser connections cheaply on the *server* side.
+
+<Aside type="caution">
+The relay's *inbound* browser sockets hibernate; its single *outbound* subscription to Supabase does not - the heartbeats keep it active, and an active outbound socket blocks eviction, so the DO bills continuous duration the whole time it holds the feed. Drop the upstream when the last viewer disconnects to let the DO hibernate.
+</Aside>
 
 Pasteriser takes the relay route for its live `/recent` feed: a `realtime.send()` trigger on public-paste inserts, a Durable Object holding the single upstream subscription, and browsers on a same-origin `/api/recent/live` socket - so the anon key never reaches the browser and the CSP is unchanged.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.8;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_sb {
+    label="Supabase (eu-central-1)"; style=rounded; fontsize=12; margin=12;
+    pg [label="Postgres", shape=cylinder];
+    rt [label="Realtime"];
+  }
+  subgraph cluster_cf {
+    label="Cloudflare"; style=rounded; fontsize=12; margin=12;
+    do [label="RecentFeedDO\n(one instance)"];
+  }
+  browsers [label="Browsers (N)", shape=box, style=rounded];
+
+  pg -> rt       [label="realtime.send()\ntrigger on public insert"];
+  rt -> do       [label="1 upstream WS\n(anon JWT, private chan)"];
+  do -> browsers [label="fan-out over N\nsame-origin sockets"];
+}
+```
+
+The asymmetry is the point: one upstream subscription to Supabase, N browser sockets fanned out from the DO. The push path runs `INSERT` -> trigger -> Realtime -> the one upstream -> fan-out; browsers dial the DO in the other direction to set the sockets up.
 
 Four load-bearing details, each a silent failure otherwise (all four cost real debugging time to find):
 
 - **The DO subscribes with the anon *JWT*, not the `sb_publishable_` key.** Realtime silently ignores `sb_*` tokens as a private-channel `access_token`, so the join is unauthenticated and receives nothing. (Supabase is deprecating the legacy anon key by end of 2026; on a new-keys-only project the `access_token` must be a real signed anon/user JWT - still never the `sb_publishable_` key.)
 - **The DO's outbound socket is `fetch("https://...", { headers: { Upgrade: "websocket" } })`, not `new WebSocket("wss://...")`.** A Worker's `fetch` only upgrades an `http(s)` URL; a `wss://` URL is rejected, so the upstream never connects. (A browser `WebSocket` accepts `wss://`, so this only bites server-side.)
 - **Response middleware must skip the `101`.** A header-adding middleware that re-wraps every response with `new Response(body, init)` drops the non-standard `webSocket` property, and the browser upgrade fails with a `1002`.
-- **Rejoin with Broadcast `replay`.** On reconnect, send `broadcast.replay { since, limit }` so anything broadcast during the gap is backfilled - private channels only, DB-originated messages, up to 25 per request, 72h retention; dedup on the client by id (the browser socket stays up while only the DO's upstream reconnects, so a poll fallback would not cover it).
+- **Rejoin with Broadcast `replay`.** On reconnect, send `broadcast.replay { since, limit }` so anything broadcast during the gap is backfilled - private channels only, DB-originated messages, up to 25 per request, at least 72h retention; dedup on the client by id (the browser socket stays up while only the DO's upstream reconnects, so a poll fallback would not cover it).
 
 The load-bearing glue - accept the browser socket, hold one upstream, fan out:
 
@@ -383,6 +444,32 @@ Everything above is the Worker pulling Supabase (request in, response out). The 
 - **Database Webhooks** fire on `INSERT` / `UPDATE` / `DELETE` and POST a JSON payload (`type`, `table`, `record`, `old_record`) to any URL - point one at a Worker route. They are a convenience wrapper around a Postgres trigger calling **`pg_net`**, so they are async: the triggering transaction commits first, the HTTP call fires after.
 - **`pg_net`** is the engine underneath - `net.http_post(url, body, headers)` from any function or trigger. Use it directly for conditional or shaped calls (notify only on certain rows, a different Worker per tenant). Constraints: it fires only after commit, tops out around ~200 req/s, POST is JSON-only (no PATCH/PUT), and responses land in an unlogged table for ~6h (lost on crash) - treat it as fire-and-forget.
 
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_sb {
+    label="Supabase"; style=rounded; fontsize=12; margin=12;
+    pg   [label="Postgres", shape=cylinder];
+    trig [label="trigger"];
+    net  [label="pg_net\n(net.http_post)"];
+  }
+  subgraph cluster_cf {
+    label="Cloudflare"; style=rounded; fontsize=12; margin=12;
+    wkr [label="Worker route"];
+    act [label="purge cache /\nfan-out / notify", style=rounded];
+  }
+
+  pg   -> trig [label="INSERT / UPDATE / DELETE"];
+  trig -> net;
+  net  -> wkr [label="POST JSON, after commit\n(+ shared-secret header)"];
+  wkr  -> act;
+}
+```
+
 Use it for cache invalidation (a row changed, so a Worker purges the Cache API / KV entry), fan-out, and audit or notification pipelines - anything event-driven that would otherwise force the Worker to poll.
 
 Two rules, because the target is a public Worker URL:
@@ -439,37 +526,6 @@ so rotating signing keys does not break it. What it rejects is a non-JWT in the
 `verify_jwt` turns it away; send a real user JWT, or verify with `getClaims()`
 in-handler.
 </Aside>
-
----
-
-## Security model (where auth is enforced)
-
-| Path | Who enforces authorization | Key / identity |
-|---|---|---|
-| `supabase-js` REST (anon) | **RLS**, via the anon/authenticated JWT | anon key, in the browser or Worker |
-| `supabase-js` REST (service) | **Your code** - service key bypasses RLS | service key, Worker-only secret |
-| Hyperdrive / raw SQL | **RLS still applies** unless the DB role has `BYPASSRLS` or owns the table; there is just no `auth.uid()` for user-scoped policies | DB role, no JWT |
-| Auth (edge verify) | `jose` signature + `exp`/`aud` checks | JWKS (public) |
-
-The common belief that "leaving PostgREST turns RLS off" is **wrong** - and the correction matters, because the least-privilege Hyperdrive role this same doc recommends is exactly the case that trips it. RLS is a Postgres feature enforced for **any** role that lacks the `BYPASSRLS` attribute and does not own the table, no matter whether the connection arrives via PostgREST or a raw wire protocol. `service_role` and `postgres` carry `BYPASSRLS` (so REST-with-service-key and raw SQL as `postgres` both skip RLS); a purpose-made `hyperdrive_user` does **not**. What you actually lose by leaving PostgREST is the JWT context: `auth.uid()` is null, so user-scoped policies match nothing.
-
-### RLS enforcement by connection identity
-
-With RLS enabled on a `pastes` table (two rows, both owned by user A), the same query resolves differently depending on how the connection identifies itself:
-
-| Identity (how it connects) | Rows seen |
-|---|---|
-| anon key (PostgREST) | public only |
-| user A JWT (PostgREST) | A's private + public |
-| user B JWT (PostgREST) | public only - **cannot see A's private** |
-| `service_role` (PostgREST, `BYPASSRLS`) | all |
-| `hyperdrive_user` (raw SQL, **no** `BYPASSRLS`) | **0** - RLS denies by default, no policy targets that role |
-
-A least-privilege Hyperdrive role sees **nothing** through RLS-enabled tables unless you add policies for it, grant it `BYPASSRLS`, or the table has RLS off (an RLS-disabled table returns every row to any role). Decide deliberately: `BYPASSRLS` makes the Worker the sole authorization gate; policies-for-the-role keeps Postgres enforcing. Either way, never hand a Worker-reachable role `postgres`.
-
-Because the Worker is the single ingress, it is also the single place to throttle: the [Workers Rate Limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/) binding (or a Durable Object counter) caps abuse at the edge before it reaches Supabase - one rate-limit surface instead of one per client path. This is the same reason the browser-direct Realtime shape is a downgrade: it opens a second ingress the Worker cannot see or throttle.
-
-The deployment shape this suits is `Browser -> Worker -> Supabase`: the Worker authorizes every request and the browser holds no key. Keep the service key and the Hyperdrive connection string server-side (the Hyperdrive string lives in the config, not in Worker secrets, which is a nice property).
 
 ---
 
@@ -577,7 +633,11 @@ Latency is not the only reason region matters. *Where* each hop runs and stores 
 
 - Browser -> nearest CF PoP -> Worker -> Supabase. TLS terminates at the PoP nearest the *user*, which may be outside your residency region. **Regional Services** (Data Localization Suite, an Enterprise add-on) forces TLS termination and request processing into a chosen region; configure it on the Worker's custom domain and pair it with the DO jurisdiction so both compute and decryption stay in-region.
 - **By default the Worker -> Supabase hop is public-internet TLS**, whether PostgREST or Hyperdrive to Supabase's public hostname. Supabase **PrivateLink** (AWS PrivateLink) applies to clients *inside* the same AWS network, so it does not by itself cover a Cloudflare Worker.
-- **The hop does not have to stay public - Workers VPC makes the Worker -> database path private** (beta, free during beta). A TCP **VPC Service** (`--app-protocol postgresql`) plus **Hyperdrive** (`--service-id`) queries a Postgres that is not on the public Internet over a Cloudflare Tunnel; a **VPC Network** binding reaches anything behind a Tunnel, **Cloudflare Mesh** (`network_id: "cf1:network"`), or a **Cloudflare WAN / Magic WAN** on-ramp (GRE / IPsec / CNI) via `fetch()` / `connect()`. The catch for *managed* Supabase: the tunnel or on-ramp must sit in a network that already has private reach to the instance (an AWS VPC consuming Supabase PrivateLink), since you cannot run `cloudflared` inside Supabase's managed network - so this is the direct path for self-hosted Supabase or your own Postgres, and a bridge-VPC exercise for managed. The [Magic WAN interop guide](/guides/magic-wan-interop/) covers the on-ramp side.
+- **The hop does not have to stay public - Workers VPC makes the Worker -> database path private** (beta, free during beta), two ways:
+  - a TCP **VPC Service** (`--app-protocol postgresql`) plus **Hyperdrive** (`--service-id`) queries a Postgres that is not on the public Internet over a Cloudflare Tunnel;
+  - a **VPC Network** binding reaches anything behind a Tunnel, **Cloudflare Mesh** (`network_id: "cf1:network"`), or a **Magic WAN** on-ramp (GRE / IPsec / CNI) via `fetch()` / `connect()`.
+
+  The catch for *managed* Supabase: the tunnel or on-ramp must sit in a network that already has private reach to the instance (an AWS VPC consuming Supabase PrivateLink), since you cannot run `cloudflared` inside Supabase's managed network - so this is the direct path for self-hosted Supabase or your own Postgres, and a bridge-VPC exercise for managed. The [Magic WAN interop guide](/guides/magic-wan-interop/) covers the on-ramp side.
 - DO transport is TLS; DO storage is AES-256 at rest (LUKS), with Cloudflare-managed keys.
 
 **Logs and audit.**
