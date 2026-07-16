@@ -183,7 +183,7 @@ Pointed at the Supavisor pooler with default driver settings, both drivers fail,
 
 Hyperdrive is Cloudflare's pooler + read cache living in their network. The Worker gets a `connectionString` from a binding and connects with `node-postgres`; Hyperdrive handles the TCP/TLS to Postgres and keeps the real pool warm near the database. It is the managed way to run raw SQL from a Worker - pooled and cache-eligible, faster than REST for writes and cache-eligible reads - without hand-tuning a driver against the pooler.
 
-The win on reads is the **cache**, not the connection. A deterministic read is served from Hyperdrive's cache near the Worker (~10ms). The moment the query is non-cacheable - a volatile function like `now()`, or any write - it drops to the same ~210ms RTT floor as REST. Hyperdrive's pooling buys you the tight write path (~172ms vs 208ms) and a tighter tail, not a shorter wire.
+The win on reads is the **cache**, not the connection. A deterministic read is served from Hyperdrive's cache near the Worker (~10ms). The moment the query is non-cacheable - a `STABLE` or `VOLATILE` function like `now()` (Hyperdrive caches neither), or any write - it drops to the same ~210ms RTT floor as REST. Hyperdrive's pooling buys you the tight write path (~172ms vs 208ms) and a tighter tail, not a shorter wire.
 
 <Aside type="note">
 For a pure read cache you may not need Hyperdrive at all - the Worker **Cache
@@ -204,10 +204,11 @@ stop paying for a repeated read.
 
 <Aside type="note">
 Point Hyperdrive at the **Direct connection**, not a pooler - Hyperdrive does
-its own pooling and stacking it on Supavisor is the anti-pattern. As of 2026-07
-Hyperdrive connects to Supabase's IPv6-only direct connection without the IPv4
-add-on, so the historical "needs IPv4/session pooler" workaround does not apply.
-Keep it as a fallback if a create fails on connectivity.
+its own pooling and stacking it on Supavisor is the anti-pattern. In this setup
+(2026-07) the Hyperdrive config reached the IPv6-only direct connection without
+the IPv4 add-on - measured here, not a documented Cloudflare guarantee (CF does
+not spell out IPv6-origin support), so keep the session pooler as the IPv4
+fallback if a create fails on connectivity.
 </Aside>
 
 ---
@@ -220,6 +221,8 @@ Keep it as a fallback if a create fails on connectivity.
 create role hyperdrive_user login password 'GENERATE_A_STRONG_ONE';
 grant usage on schema public to hyperdrive_user;
 grant select on all tables in schema public to hyperdrive_user;
+-- this covers existing tables only; for tables created later, also:
+-- alter default privileges in schema public grant select on tables to hyperdrive_user;
 -- add insert/update/execute only for exactly what the Worker needs
 ```
 
@@ -314,19 +317,21 @@ The full round-trip -- create bucket -> upload -> signed URL -> fetch -- runs ag
 
 ```ts
 // Worker: proxy + edge-cache a private Storage object
+await authorize(request, env);          // authorize FIRST - a cache HIT must not skip authz
 const cache = caches.default;
-let res = await cache.match(request);
+const key = cacheKeyForScope(request);   // scope the key so one fill can't leak across callers
+let res = await cache.match(key);
 if (!res) {
   const signed = await mintSignedUrl(env, path); // service key, server-side
   res = await fetch(signed);
   res = new Response(res.body, res);
   res.headers.set("cache-control", "public, max-age=60");
-  ctx.waitUntil(cache.put(request, res.clone()));
+  ctx.waitUntil(cache.put(key, res.clone()));
 }
 return res;
 ```
 
-Do not put the service key or a bucket-wide token in the browser - the Worker is where the privileged Storage call happens.
+Order matters: authorize before `cache.match`, and scope the cache key to what the caller may see - a cache hit that skips the auth check would serve the private object to whoever requests the same URL next. And do not put the service key or a bucket-wide token in the browser - the Worker is where the privileged Storage call happens.
 
 Storage also exposes an **S3-compatible endpoint**, reachable from a Worker with a signing client like `aws4fetch`. Use it for multipart uploads of large objects or to point existing S3 tooling at a bucket, where the REST API is awkward.
 
@@ -348,7 +353,7 @@ Channels are **public** by default; opt into a private channel with `private: tr
 - **Durable Object relay** - a DO holds ONE server-side subscription and fans out to browsers over a **same-origin** socket. Keeps the browser -> Worker -> Supabase boundary intact (no key in the browser, CSP stays `connect-src 'self'`, one surface), and the hibernatable WebSocket API carries thousands of browser connections cheaply on the *server* side.
 
 <Aside type="caution">
-The relay's *inbound* browser sockets hibernate; its single *outbound* subscription to Supabase does not - the heartbeats keep it active, and an active outbound socket blocks eviction, so the DO bills continuous duration the whole time it holds the feed. Drop the upstream when the last viewer disconnects to let the DO hibernate.
+The relay's *inbound* browser sockets hibernate; its single *outbound* subscription to Supabase does not: the heartbeat runs on a `setInterval`, and a scheduled timer blocks hibernation outright, so the DO bills continuous duration the whole time it holds the feed. (An outbound socket on its own only defers eviction for ~15 minutes; the heartbeat timer is what makes the billing continuous.) Drop the upstream when the last viewer disconnects so the timer clears and the DO can hibernate.
 </Aside>
 
 Pasteriser takes the relay route for its live `/recent` feed: a `realtime.send()` trigger on public-paste inserts, a Durable Object holding the single upstream subscription, and browsers on a same-origin `/api/recent/live` socket - so the anon key never reaches the browser and the CSP is unchanged.
@@ -415,6 +420,11 @@ export class RecentFeedDO {
     ws.send(JSON.stringify({ topic: "realtime:recent:public", event: "phx_join",
       payload: { config: { private: true }, access_token: this.env.SUPABASE_ANON_KEY },
       ref: "1" }));
+    // phx heartbeat every 20s (protocol needs <=25s) or Realtime times the socket out.
+    // A setInterval also blocks DO hibernation - which is why the relay bills continuously.
+    const hb = setInterval(() => ws.send(JSON.stringify(
+      { topic: "phoenix", event: "heartbeat", payload: {}, ref: "hb" })), 20_000);
+    ws.addEventListener("close", () => { clearInterval(hb); this.upstream = undefined; });
     ws.addEventListener("message", (e) => {
       const msg = JSON.parse(e.data as string);
       if (msg.event !== "broadcast") return;
@@ -442,7 +452,7 @@ and that the socket's origin is allowed.
 Everything above is the Worker pulling Supabase (request in, response out). The other direction - the database pushing an event to a Worker - is a separate wire with its own tools, and the one most CF + Supabase designs forget.
 
 - **Database Webhooks** fire on `INSERT` / `UPDATE` / `DELETE` and POST a JSON payload (`type`, `table`, `record`, `old_record`) to any URL - point one at a Worker route. They are a convenience wrapper around a Postgres trigger calling **`pg_net`**, so they are async: the triggering transaction commits first, the HTTP call fires after.
-- **`pg_net`** is the engine underneath - `net.http_post(url, body, headers)` from any function or trigger. Use it directly for conditional or shaped calls (notify only on certain rows, a different Worker per tenant). Constraints: it fires only after commit, tops out around ~200 req/s, POST is JSON-only (no PATCH/PUT), and responses land in an unlogged table for ~6h (lost on crash) - treat it as fire-and-forget.
+- **`pg_net`** is the engine underneath - `net.http_post(url, body, headers)` from any function or trigger. Use it directly for conditional or shaped calls (notify only on certain rows, a different Worker per tenant). Constraints: it fires only after commit, tops out around ~200 req/s, speaks `http_get` / `http_post` / `http_delete` only (no PATCH/PUT; POST bodies are JSON), and responses land in an unlogged table for ~6h (lost on crash) - treat it as fire-and-forget.
 
 ```dot
 digraph {
@@ -483,7 +493,7 @@ Two rules, because the target is a public Worker URL:
 
 Three schedulers, and the split is *where the work runs*:
 
-- **`pg_cron`** runs SQL on a schedule inside Postgres - zero network hop, transactional with your data. Right for data maintenance. Pasteriser burns expired rows every 5 minutes with `DELETE FROM pastes WHERE id IN (SELECT id FROM pastes WHERE expires_at < now() LIMIT 1000)`; the `LIMIT 1000` is load-bearing - an unbounded `DELETE` locks every expired row and stalls concurrent reads, so the bounded batch caps lock-hold and the next run continues. Keep jobs to 8 or fewer concurrent, each under 10 minutes.
+- **`pg_cron`** runs SQL on a schedule inside Postgres - zero network hop, transactional with your data. Right for data maintenance. Pasteriser burns expired rows every 5 minutes with `DELETE FROM pastes WHERE id IN (SELECT id FROM pastes WHERE expires_at < now() LIMIT 1000)`; the `LIMIT 1000` is load-bearing - an unbounded `DELETE` takes row locks on every expired row in one long transaction, blocking concurrent *writes* to them and bloating the table (MVCC readers are unaffected), so the bounded batch caps lock-hold and transaction size and the next run continues. Keep jobs to 8 or fewer concurrent, each under 10 minutes.
 - **Cron Triggers** run a *Worker* on a schedule (`scheduled()` handler, UTC, 15-min wall-time). Right for app logic on a timer - external calls, orchestration. If the scheduled work is "run this SQL" it belongs in pg_cron; if it is "do this app thing" it belongs here.
 - **Workflows** are the durable option when the async work is multi-step and must survive failure: `step.do()` units with per-step retry and state that persists minutes to weeks.
 
@@ -724,8 +734,8 @@ curl 'http://localhost:8799/auth?n=30'
 
 - **Cloudflare** - [Hyperdrive for Supabase](https://developers.cloudflare.com/hyperdrive/examples/connect-to-postgres/postgres-database-providers/supabase/), [Hyperdrive query caching](https://developers.cloudflare.com/hyperdrive/configuration/query-caching/), [Workers Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/), [wrangler versions upload](https://developers.cloudflare.com/workers/wrangler/commands/#versions-upload)
 - **Supabase** - [Connecting to Postgres](https://supabase.com/docs/guides/database/connecting-to-postgres), [Auth JWTs](https://supabase.com/docs/guides/auth/jwts), [Branching](https://supabase.com/docs/guides/deployment/branching), [Branching config & secrets](https://supabase.com/docs/guides/deployment/branching/configuration), [Management API: create a branch](https://supabase.com/docs/reference/api/v1-create-a-branch)
-- **Cloudflare (more)** - [Smart Placement](https://developers.cloudflare.com/workers/configuration/smart-placement/), [Queues](https://developers.cloudflare.com/queues/), [Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/), [Durable Objects WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/), [R2](https://developers.cloudflare.com/r2/), [Vectorize](https://developers.cloudflare.com/vectorize/), [Workers Rate Limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/)
-- **Supabase (more)** - [Realtime protocol](https://supabase.com/docs/guides/realtime/protocol), [Broadcast](https://supabase.com/docs/guides/realtime/broadcast), [Database Webhooks](https://supabase.com/docs/guides/database/webhooks), [pg_net](https://supabase.com/docs/guides/database/extensions/pg_net), [Cron / pg_cron](https://supabase.com/docs/guides/cron), [Queues (pgmq)](https://supabase.com/docs/guides/queues), [Edge Functions](https://supabase.com/docs/guides/functions), [Read replicas](https://supabase.com/docs/guides/platform/read-replicas), [Database Functions](https://supabase.com/docs/guides/database/functions), [Serverless drivers from Workers](https://supabase.com/docs/guides/database/connecting-to-postgres/serverless-drivers), [Edge Function regional invocation](https://supabase.com/docs/guides/functions/regional-invocation), [S3-compatible Storage](https://supabase.com/docs/guides/storage/s3/authentication), [Server-side auth (@supabase/ssr)](https://supabase.com/docs/guides/auth/server-side), [Workers native integration](https://developers.cloudflare.com/workers/databases/third-party-integrations/supabase/), [Foreign Data Wrappers](https://supabase.com/docs/guides/database/extensions/wrappers/overview)
+- **Cloudflare (more)** - [Smart Placement](https://developers.cloudflare.com/workers/configuration/smart-placement/), [Queues](https://developers.cloudflare.com/queues/), [Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/), [Durable Objects WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/), [R2](https://developers.cloudflare.com/r2/), [Vectorize](https://developers.cloudflare.com/vectorize/), [Workers Rate Limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/), [Supabase native integration](https://developers.cloudflare.com/workers/databases/third-party-integrations/supabase/)
+- **Supabase (more)** - [Realtime protocol](https://supabase.com/docs/guides/realtime/protocol), [Broadcast](https://supabase.com/docs/guides/realtime/broadcast), [Database Webhooks](https://supabase.com/docs/guides/database/webhooks), [pg_net](https://supabase.com/docs/guides/database/extensions/pg_net), [Cron / pg_cron](https://supabase.com/docs/guides/cron), [Queues (pgmq)](https://supabase.com/docs/guides/queues), [Edge Functions](https://supabase.com/docs/guides/functions), [Read replicas](https://supabase.com/docs/guides/platform/read-replicas), [Database Functions](https://supabase.com/docs/guides/database/functions), [Serverless drivers from Workers](https://supabase.com/docs/guides/database/connecting-to-postgres/serverless-drivers), [Edge Function regional invocation](https://supabase.com/docs/guides/functions/regional-invocation), [S3-compatible Storage](https://supabase.com/docs/guides/storage/s3/authentication), [Server-side auth (@supabase/ssr)](https://supabase.com/docs/guides/auth/server-side), [Foreign Data Wrappers](https://supabase.com/docs/guides/database/extensions/wrappers/overview)
 - **Compliance / residency** - [DO data location & jurisdictions](https://developers.cloudflare.com/durable-objects/reference/data-location/), [DO data security](https://developers.cloudflare.com/durable-objects/reference/data-security/), [Data Localization Suite](https://developers.cloudflare.com/data-localization/), [Regional Services](https://developers.cloudflare.com/data-localization/regional-services/), [Supabase HIPAA](https://supabase.com/docs/guides/security/hipaa-compliance), [SOC 2](https://supabase.com/docs/guides/security/soc-2-compliance), [Connection logging](https://supabase.com/docs/guides/platform/postgres-connection-logging), [PrivateLink](https://supabase.com/docs/guides/platform/privatelink), [Workers VPC](https://developers.cloudflare.com/workers-vpc/), [VPC Services](https://developers.cloudflare.com/workers-vpc/configuration/vpc-services/), [Hyperdrive to a private database](https://developers.cloudflare.com/hyperdrive/configuration/connect-to-private-database/)
 
 Measured from the Singapore edge to `eu-central-1` (Frankfurt), 2026-07-14. Absolute latencies are distance-dominated; the ratios and path choices generalize (see [Reading the numbers](#reading-the-numbers)).
