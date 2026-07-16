@@ -40,6 +40,29 @@ function rehypeGraphvizIntrinsicSize() {
   return (tree) => walk(tree);
 }
 
+// GFM renders the footnote section under a screen-reader-only
+// <h2 id="footnote-label">Footnotes</h2>. Rename it to "References" and drop the
+// sr-only class so it reads as a real visible section (and shows as "References"
+// in the table of contents), matching the repo's citation convention.
+function rehypeFootnoteLabelToReferences() {
+  const walk = (node) => {
+    if (
+      node.type === "element" &&
+      node.tagName === "h2" &&
+      node.properties &&
+      node.properties.id === "footnote-label"
+    ) {
+      const cls = node.properties.className;
+      if (Array.isArray(cls)) {
+        node.properties.className = cls.filter((c) => c !== "sr-only");
+      }
+      node.children = [{ type: "text", value: "References" }];
+    }
+    node.children?.forEach(walk);
+  };
+  return (tree) => walk(tree);
+}
+
 import react from "@astrojs/react";
 
 // https://astro.build/config
@@ -203,6 +226,8 @@ export default defineConfig({
         }],
         // After rehypeGraphviz: give each diagram an intrinsic (scaled) size.
         rehypeGraphvizIntrinsicSize,
+        // Rename the GFM "Footnotes" section heading to "References".
+        rehypeFootnoteLabelToReferences,
       ],
     }),
     syntaxHighlight: {
