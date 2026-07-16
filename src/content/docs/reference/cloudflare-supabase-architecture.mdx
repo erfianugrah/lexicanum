@@ -6,7 +6,7 @@ author: Erfi Anugrah
 
 import { Aside } from "@astrojs/starlight/components";
 
-Every way a Cloudflare Worker talks to Supabase, which path to use for what, what each one actually costs, and where its data lives.
+Every way a Cloudflare Worker talks to Supabase, which path to use for what, what each one actually costs, and where its data lives.[^cf-supabase-integration]
 
 All numbers below were measured from **Singapore**: a Worker on Cloudflare's edge (`wrangler dev --remote`) against a Supabase project in **Frankfurt (`eu-central-1`)**, 2026-07-14 - a ~10,000 km round trip, so the absolute latencies are **distance-dominated**. The ~210ms floor is mostly the Singapore-to-Frankfurt wire, not stack overhead; read the numbers for their shape, and see [Reading the numbers](#reading-the-numbers) for what generalises and what does not.
 
@@ -138,15 +138,15 @@ the wire is longest.
 The floor is the wire, so the fixes are: remove the round trip, reduce how many you make, or shorten each one. The first two matter most; they draw on both platforms.
 
 - **Remove it - cache / edge verify (Cloudflare).** The Cache API and Hyperdrive cache serve hot reads at ~10ms with no wire at all; edge JWT verify removes the ~207ms `getUser()` round trip. This is the biggest lever and it grows with distance (see the matrix and Auth sections).
-- **Reduce the count - RPC / database functions (Supabase).** The floor is charged *per round trip*, so collapsing several statements into one `.rpc()` to a `plpgsql`/`sql` function pays ~210ms once instead of N times. Push multi-step reads and writes into a function rather than chaining `supabase-js` calls across the wire. Pasteriser's `view_paste(uuid)` collapses a read + a `read_count` bump + a conditional burn-delete (three wire round trips) into one `.rpc()`, and its `SELECT ... FOR UPDATE` also closes a burn-after-reading race that three separate calls could not.
-- **Shorten it - Smart Placement (Cloudflare).** By default a Worker runs nearest the *user*; Smart Placement moves its execution near the origin it talks to most - your Supabase region - when that lowers total latency. A chatty Worker making several sequential DB calls from Singapore to Frankfurt then runs *beside* Frankfurt, so only one user-to-Worker hop crosses the distance and the DB calls are intra-region. Enable per app:
+- **Reduce the count - RPC / database functions (Supabase).** The floor is charged *per round trip*, so collapsing several statements into one `.rpc()` to a `plpgsql`/`sql` function[^sb-db-functions] pays ~210ms once instead of N times. Push multi-step reads and writes into a function rather than chaining `supabase-js` calls across the wire. Pasteriser's `view_paste(uuid)` collapses a read + a `read_count` bump + a conditional burn-delete (three wire round trips) into one `.rpc()`, and its `SELECT ... FOR UPDATE` also closes a burn-after-reading race that three separate calls could not.
+- **Shorten it - Smart Placement (Cloudflare).** By default a Worker runs nearest the *user*; Smart Placement moves its execution near the origin it talks to most - your Supabase region - when that lowers total latency.[^cf-smart-placement] A chatty Worker making several sequential DB calls from Singapore to Frankfurt then runs *beside* Frankfurt, so only one user-to-Worker hop crosses the distance and the DB calls are intra-region. Enable per app:
 
   ```jsonc
   { "placement": { "mode": "smart" } }
   ```
 
   It wins for multi-call Workers and is roughly neutral for single-call ones (you just move where the one hop happens).
-- **Shorten it - read replicas (Supabase).** A read replica in a region near the edge (`ap-southeast-1` for Singapore) serves reads locally while writes stay on the primary. Point read-only paths at the replica; keep writes on the primary.
+- **Shorten it - read replicas (Supabase).** A read replica in a region near the edge (`ap-southeast-1` for Singapore) serves reads locally while writes stay on the primary.[^sb-read-replicas] Point read-only paths at the replica; keep writes on the primary.
 - **Remove the distance - co-locate.** If users, Worker, and DB can share a region, the wire floor drops to single-digit / low-tens of ms and most of this section is moot. Region choice is the cheapest fix when it is available.
 
 <Aside type="note">
@@ -160,7 +160,7 @@ Placement, read replica, co-location). Everything here is attacking the same
 
 ## Data plane: how a Worker reaches the database
 
-There are three ways to reach the database from a Worker.
+There are three ways to reach the database from a Worker.[^sb-connecting-postgres]
 
 ### A. supabase-js over PostgREST (the default)
 
@@ -173,7 +173,7 @@ browser: `createClient(url, key, { auth: { persistSession: false, autoRefreshTok
 
 ### B. Raw Postgres driver
 
-Raw `pg` and `postgres.js` connect from the Workers runtime over its TCP socket API (`connect()` from `cloudflare:sockets`); both Cloudflare and Supabase document driving node-postgres / Postgres.js directly from a Worker. Against the Supavisor pooler the connection needs pooler-specific settings: `prepare: false` for the transaction pooler (it keeps no prepared statements), plus an SSL/pooler workaround on the connection string. With driver defaults the handshake does not complete. For the wire protocol without that tuning, use Hyperdrive (next) - it pools, caches, and targets the direct connection.
+Raw `pg` and `postgres.js` connect from the Workers runtime over its TCP socket API (`connect()` from `cloudflare:sockets`); both Cloudflare and Supabase document driving node-postgres / Postgres.js directly from a Worker.[^sb-serverless-drivers] Against the Supavisor pooler the connection needs pooler-specific settings: `prepare: false` for the transaction pooler (it keeps no prepared statements), plus an SSL/pooler workaround on the connection string. With driver defaults the handshake does not complete. For the wire protocol without that tuning, use Hyperdrive (next) - it pools, caches, and targets the direct connection.
 
 <Aside type="caution">
 Pointed at the Supavisor pooler with default driver settings, both drivers fail, each differently: node-postgres returns `Connection terminated unexpectedly` immediately, postgres.js hangs until timeout (measured). The fix is in the paragraph above.
@@ -181,9 +181,9 @@ Pointed at the Supavisor pooler with default driver settings, both drivers fail,
 
 ### C. Hyperdrive - the managed wire-protocol path
 
-Hyperdrive is Cloudflare's pooler + read cache living in their network. The Worker gets a `connectionString` from a binding and connects with `node-postgres`; Hyperdrive handles the TCP/TLS to Postgres and keeps the real pool warm near the database. It is the managed way to run raw SQL from a Worker - pooled and cache-eligible, faster than REST for writes and cache-eligible reads - without hand-tuning a driver against the pooler.
+Hyperdrive is Cloudflare's pooler + read cache living in their network.[^cf-hyperdrive-supabase] The Worker gets a `connectionString` from a binding and connects with `node-postgres`; Hyperdrive handles the TCP/TLS to Postgres and keeps the real pool warm near the database. It is the managed way to run raw SQL from a Worker - pooled and cache-eligible, faster than REST for writes and cache-eligible reads - without hand-tuning a driver against the pooler.
 
-The win on reads is the **cache**, not the connection. A deterministic read is served from Hyperdrive's cache near the Worker (~10ms). The moment the query is non-cacheable - a `STABLE` or `VOLATILE` function like `now()` (Hyperdrive caches neither), or any write - it drops to the same ~210ms RTT floor as REST. Hyperdrive's pooling buys you the tight write path (~172ms vs 208ms) and a tighter tail, not a shorter wire.
+The win on reads is the **cache**, not the connection.[^cf-hyperdrive-cache] A deterministic read is served from Hyperdrive's cache near the Worker (~10ms). The moment the query is non-cacheable - a `STABLE` or `VOLATILE` function like `now()` (Hyperdrive caches neither), or any write - it drops to the same ~210ms RTT floor as REST. Hyperdrive's pooling buys you the tight write path (~172ms vs 208ms) and a tighter tail, not a shorter wire.
 
 <Aside type="note">
 For a pure read cache you may not need Hyperdrive at all - the Worker **Cache
@@ -256,7 +256,7 @@ const { rows } = await client.query("select id, body from t order by id limit $1
 
 ## Auth: verify at the edge, or round-trip
 
-Supabase issues asymmetric JWTs (ES256 here) with a JWKS endpoint at `<url>/auth/v1/.well-known/jwks.json`. That gives a Worker two options with very different cost:
+Supabase issues asymmetric JWTs (ES256 here) with a JWKS endpoint at `<url>/auth/v1/.well-known/jwks.json`. That gives a Worker two options with very different cost[^sb-auth-jwts]:
 
 - **Verify locally** with `jose` against the cached JWKS - `createRemoteJWKSet` fetches the keys once (~263ms first call) then verifies every subsequent token in **~0ms**, no round-trip. Rejects tampered tokens correctly. Use this for the hot path.
 - **`getUser()`** hits `/auth/v1/user` (~207ms) and is revocation-aware - it fails immediately if the user was signed out or deleted server-side. Use it only where revocation matters (sensitive mutations), not on every request.
@@ -276,7 +276,7 @@ know the token was revoked. That is the whole trade: ~0ms local verify vs a
 
 Keys: the browser gets the **anon** key (public, RLS applies). The Worker holds the **service_role** / `sb_secret_` key as a Wrangler secret and never ships it to the client. On a Hyperdrive/raw-SQL path there is no key at all - the Postgres role is the identity. RLS still applies unless that role has `BYPASSRLS`, but there is no `auth.uid()` for user-scoped policies, so you own authorization in the Worker - which the next section works through in full.
 
-That covers bearer-token auth - a Worker verifying a JWT it was handed. For a Worker or Pages Function that renders authenticated HTML server-side, the session lives in cookies instead: use `@supabase/ssr` with a `getAll` / `setAll` cookie adapter so the SSR client reads and refreshes the session from request/response cookies. Same trust boundary (keys stay server-side), just a cookie transport rather than a bearer header.
+That covers bearer-token auth - a Worker verifying a JWT it was handed. For a Worker or Pages Function that renders authenticated HTML server-side, the session lives in cookies instead: use `@supabase/ssr` with a `getAll` / `setAll` cookie adapter so the SSR client reads and refreshes the session from request/response cookies.[^sb-ssr] Same trust boundary (keys stay server-side), just a cookie transport rather than a bearer header.
 
 ---
 
@@ -305,7 +305,7 @@ With RLS enabled on a `pastes` table (two rows, both owned by user A), the same 
 
 A least-privilege Hyperdrive role sees **nothing** through RLS-enabled tables unless you add policies for it, grant it `BYPASSRLS`, or the table has RLS off (an RLS-disabled table returns every row to any role). Decide deliberately: `BYPASSRLS` makes the Worker the sole authorization gate; policies-for-the-role keeps Postgres enforcing. Either way, never hand a Worker-reachable role `postgres`.
 
-Because the Worker is the single ingress, it is also the single place to throttle: the [Workers Rate Limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/) binding (or a Durable Object counter) caps abuse at the edge before it reaches Supabase - one rate-limit surface instead of one per client path. This is the same reason the browser-direct Realtime shape is a downgrade: it opens a second ingress the Worker cannot see or throttle.
+Because the Worker is the single ingress, it is also the single place to throttle: the Workers Rate Limiting binding[^cf-rate-limiting] (or a Durable Object counter) caps abuse at the edge before it reaches Supabase - one rate-limit surface instead of one per client path. This is the same reason the browser-direct Realtime shape is a downgrade: it opens a second ingress the Worker cannot see or throttle.
 
 The deployment shape this suits is `Browser -> Worker -> Supabase`: the Worker authorizes every request and the browser holds no key. Keep the service key and the Hyperdrive connection string server-side (the Hyperdrive string lives in the config, not in Worker secrets, which is a nice property).
 
@@ -313,7 +313,7 @@ The deployment shape this suits is `Browser -> Worker -> Supabase`: the Worker a
 
 ## Storage
 
-The full round-trip -- create bucket -> upload -> signed URL -> fetch -- runs against the Storage REST API with the service key. The CF-relevant pattern is to **serve Storage objects through a Worker and cache them at the edge**: the Worker mints or proxies a signed URL, fetches the object, and puts it in the Cache API. Objects are effectively immutable per signed URL, so the same ~10ms edge-cache behaviour as the read path applies to a hot object after the first fill.
+The full round-trip - create bucket -> upload -> signed URL -> fetch - runs against the Storage REST API with the service key. The CF-relevant pattern is to **serve Storage objects through a Worker and cache them at the edge**: the Worker mints or proxies a signed URL, fetches the object, and puts it in the Cache API.[^cf-cache-api] Objects are effectively immutable per signed URL, so the same ~10ms edge-cache behaviour as the read path applies to a hot object after the first fill.
 
 ```ts
 // Worker: proxy + edge-cache a private Storage object
@@ -333,16 +333,16 @@ return res;
 
 Order matters: authorize before `cache.match`, and scope the cache key to what the caller may see - a cache hit that skips the auth check would serve the private object to whoever requests the same URL next. And do not put the service key or a bucket-wide token in the browser - the Worker is where the privileged Storage call happens.
 
-Storage also exposes an **S3-compatible endpoint**, reachable from a Worker with a signing client like `aws4fetch`. Use it for multipart uploads of large objects or to point existing S3 tooling at a bucket, where the REST API is awkward.
+Storage also exposes an **S3-compatible endpoint**, reachable from a Worker with a signing client like `aws4fetch`.[^sb-s3-storage] Use it for multipart uploads of large objects or to point existing S3 tooling at a bucket, where the REST API is awkward.
 
 ---
 
 ## Realtime
 
-Realtime is a WebSocket to Supabase, with three modes worth separating:
+Realtime is a WebSocket to Supabase, with three modes worth separating[^sb-realtime-protocol]:
 
-- **Postgres Changes** streams row changes from the WAL to subscribers. It authorizes *per subscriber per event* and is single-threaded, so throughput scales with subscriber count, not compute; at high subscriber counts it becomes the bottleneck (Supabase's [Realtime benchmarks](https://supabase.com/docs/guides/realtime/benchmarks) give a per-database calculator) and Broadcast is the path that scales.
-- **Broadcast** is the general channel: low-latency messages client-to-client over the WebSocket, the REST endpoint, or *from the database* via `realtime.send()` / `realtime.broadcast_changes()` in a trigger. It is the recommended path at scale, and the one a server can reach without holding a socket (a Worker can POST the Broadcast REST endpoint to push).
+- **Postgres Changes** streams row changes from the WAL to subscribers. It authorizes *per subscriber per event* and is single-threaded, so throughput scales with subscriber count, not compute; at high subscriber counts it becomes the bottleneck (Supabase's Realtime benchmarks give a per-database calculator[^sb-realtime-benchmarks]) and Broadcast is the path that scales.
+- **Broadcast** is the general channel: low-latency messages client-to-client over the WebSocket, the REST endpoint, or *from the database* via `realtime.send()` / `realtime.broadcast_changes()` in a trigger. It is the recommended path at scale[^sb-broadcast], and the one a server can reach without holding a socket (a Worker can POST the Broadcast REST endpoint to push).
 - **Presence** tracks shared ephemeral state (who is online, cursors); not for high-frequency updates.
 
 Channels are **public** by default; opt into a private channel with `private: true` to gate it behind RLS policies on `realtime.messages`. A private channel re-sends its JWT on refresh, so keep JWT expiry short.
@@ -350,7 +350,7 @@ Channels are **public** by default; opt into a private channel with `private: tr
 **Where the Worker fits.** A stateless Worker cannot terminate a long-lived socket. Two shapes:
 
 - **Browser-direct** - the browser opens the `wss://<ref>.supabase.co` socket itself with the publishable/anon key and RLS-backed channel authorization. Simplest, and the one surface that legitimately bypasses the Worker - but it exposes the anon key, relaxes the CSP to allow the Supabase host, and is a second surface outside the Worker.
-- **Durable Object relay** - a DO holds ONE server-side subscription and fans out to browsers over a **same-origin** socket. Keeps the browser -> Worker -> Supabase boundary intact (no key in the browser, CSP stays `connect-src 'self'`, one surface), and the hibernatable WebSocket API carries thousands of browser connections cheaply on the *server* side.
+- **Durable Object relay** - a DO holds ONE server-side subscription and fans out to browsers over a **same-origin** socket. Keeps the browser -> Worker -> Supabase boundary intact (no key in the browser, CSP stays `connect-src 'self'`, one surface), and the hibernatable WebSocket API carries thousands of browser connections cheaply on the *server* side.[^cf-do-websockets]
 
 <Aside type="caution">
 The relay's *inbound* browser sockets hibernate; its single *outbound* subscription to Supabase does not: the heartbeat runs on a `setInterval`, and a scheduled timer blocks hibernation outright, so the DO bills continuous duration the whole time it holds the feed. (An outbound socket on its own only defers eviction for ~15 minutes; the heartbeat timer is what makes the billing continuous.) Drop the upstream when the last viewer disconnects so the timer clears and the DO can hibernate.
@@ -451,8 +451,8 @@ and that the socket's origin is allowed.
 
 Everything above is the Worker pulling Supabase (request in, response out). The other direction - the database pushing an event to a Worker - is a separate wire with its own tools, and the one most CF + Supabase designs forget.
 
-- **Database Webhooks** fire on `INSERT` / `UPDATE` / `DELETE` and POST a JSON payload (`type`, `table`, `record`, `old_record`) to any URL - point one at a Worker route. They are a convenience wrapper around a Postgres trigger calling **`pg_net`**, so they are async: the triggering transaction commits first, the HTTP call fires after.
-- **`pg_net`** is the engine underneath - `net.http_post(url, body, headers)` from any function or trigger. Use it directly for conditional or shaped calls (notify only on certain rows, a different Worker per tenant). Constraints: it fires only after commit, tops out around ~200 req/s, speaks `http_get` / `http_post` / `http_delete` only (no PATCH/PUT; POST bodies are JSON), and responses land in an unlogged table for ~6h (lost on crash) - treat it as fire-and-forget.
+- **Database Webhooks** fire on `INSERT` / `UPDATE` / `DELETE` and POST a JSON payload (`type`, `table`, `record`, `old_record`) to any URL - point one at a Worker route. They are a convenience wrapper around a Postgres trigger calling **`pg_net`**, so they are async: the triggering transaction commits first, the HTTP call fires after.[^sb-webhooks]
+- **`pg_net`** is the engine underneath - `net.http_post(url, body, headers)` from any function or trigger. Use it directly for conditional or shaped calls (notify only on certain rows, a different Worker per tenant). Constraints: it fires only after commit, tops out around ~200 req/s, speaks `http_get` / `http_post` / `http_delete` only (no PATCH/PUT; POST bodies are JSON), and responses land in an unlogged table for ~6h (lost on crash) - treat it as fire-and-forget.[^sb-pg-net]
 
 ```dot
 digraph {
@@ -493,14 +493,14 @@ Two rules, because the target is a public Worker URL:
 
 Three schedulers, and the split is *where the work runs*:
 
-- **`pg_cron`** runs SQL on a schedule inside Postgres - zero network hop, transactional with your data. Right for data maintenance. Pasteriser burns expired rows every 5 minutes with `DELETE FROM pastes WHERE id IN (SELECT id FROM pastes WHERE expires_at < now() LIMIT 1000)`; the `LIMIT 1000` is load-bearing - an unbounded `DELETE` takes row locks on every expired row in one long transaction, blocking concurrent *writes* to them and bloating the table (MVCC readers are unaffected), so the bounded batch caps lock-hold and transaction size and the next run continues. Keep jobs to 8 or fewer concurrent, each under 10 minutes.
-- **Cron Triggers** run a *Worker* on a schedule (`scheduled()` handler, UTC, 15-min wall-time). Right for app logic on a timer - external calls, orchestration. If the scheduled work is "run this SQL" it belongs in pg_cron; if it is "do this app thing" it belongs here.
+- **`pg_cron`** runs SQL on a schedule inside Postgres - zero network hop, transactional with your data. Right for data maintenance. Pasteriser burns expired rows every 5 minutes with `DELETE FROM pastes WHERE id IN (SELECT id FROM pastes WHERE expires_at < now() LIMIT 1000)`; the `LIMIT 1000` is load-bearing - an unbounded `DELETE` takes row locks on every expired row in one long transaction, blocking concurrent *writes* to them and bloating the table (MVCC readers are unaffected), so the bounded batch caps lock-hold and transaction size and the next run continues. Keep jobs to 8 or fewer concurrent, each under 10 minutes.[^sb-pg-cron]
+- **Cron Triggers** run a *Worker* on a schedule (`scheduled()` handler, UTC, 15-min wall-time).[^cf-cron-triggers] Right for app logic on a timer - external calls, orchestration. If the scheduled work is "run this SQL" it belongs in pg_cron; if it is "do this app thing" it belongs here.
 - **Workflows** are the durable option when the async work is multi-step and must survive failure: `step.do()` units with per-step retry and state that persists minutes to weeks.
 
 For async writes off the request path, two queues:
 
-- **Cloudflare Queues** - producer and consumer are both Workers; batch, retry per message with `ack()` / `retry()`, dead-letter, no egress charge. Buffer writes to Supabase so a slow write never blocks the user's request, and absorb spikes.
-- **pgmq (Supabase Queues)** - a durable queue inside Postgres, drained by an Edge Function on a `pg_cron` schedule (or a Worker via `pgmq_public`). Use it when the queue must be transactional with your data.
+- **Cloudflare Queues** - producer and consumer are both Workers; batch, retry per message with `ack()` / `retry()`, dead-letter, no egress charge.[^cf-queues] Buffer writes to Supabase so a slow write never blocks the user's request, and absorb spikes.
+- **pgmq (Supabase Queues)** - a durable queue inside Postgres, drained by an Edge Function on a `pg_cron` schedule (or a Worker via `pgmq_public`).[^sb-pgmq] Use it when the queue must be transactional with your data.
 
 Rule of thumb: cross-service, app-level async -> Cloudflare Queues; transactional-with-the-row async -> pgmq. And `pg_cron` can enqueue into `pgmq` for a scheduled producer.
 
@@ -508,9 +508,9 @@ Rule of thumb: cross-service, app-level async -> Cloudflare Queues; transactiona
 
 ## Querying external systems from the database (FDW)
 
-The reverse path above pushes an event out; Foreign Data Wrappers pull the other way, at query time. A wrapper (`supabase/wrappers`, several now Wasm-based) maps an external system - another Postgres, ClickHouse, BigQuery, Snowflake, Stripe, Firebase, an S3 bucket, a REST API - to a foreign table you query with plain SQL. The data stays in the remote system; the foreign table is a live view, so a join against `auth.users` reflects remote state on every query rather than a stale copy (Supabase calls this QETL - query in place instead of moving gigabytes first).
+The reverse path above pushes an event out; Foreign Data Wrappers pull the other way, at query time. A wrapper (`supabase/wrappers`, several now Wasm-based) maps an external system - another Postgres, ClickHouse, BigQuery, Snowflake, Stripe, Firebase, an S3 bucket, a REST API - to a foreign table you query with plain SQL.[^sb-wrappers] The data stays in the remote system; the foreign table is a live view, so a join against `auth.users` reflects remote state on every query rather than a stale copy (Supabase calls this QETL - query in place instead of moving gigabytes first).
 
-The Cloudflare angle: point the S3 wrapper at an **R2 bucket** (R2 speaks the S3 API) and Postgres reads R2 data directly, with no Worker in the path; or read a third-party API (Stripe subscriptions, say) from SQL instead of a Worker round trip. For bulk movement a `pg_cron` job can `insert into warehouse.x select ... from public.x` on a schedule - fine for incremental loads, but a large batch taxes the database and a dedicated ETL tool (Fivetran, Airbyte) is the better call there.
+The Cloudflare angle: point the S3 wrapper at an **R2 bucket** (R2 speaks the S3 API)[^cf-r2] and Postgres reads R2 data directly, with no Worker in the path; or read a third-party API (Stripe subscriptions, say) from SQL instead of a Worker round trip. For bulk movement a `pg_cron` job can `insert into warehouse.x select ... from public.x` on a schedule - fine for incremental loads, but a large batch taxes the database and a dedicated ETL tool (Fivetran, Airbyte) is the better call there.
 
 Two things to get right:
 
@@ -519,12 +519,40 @@ Two things to get right:
 
 ---
 
+## Analytical reads: R2 SQL over Iceberg in R2
+
+The FDW path keeps Postgres in the loop; the inverse is to move cold, append-only, or analytical data *out* of Postgres and query it where it is cheapest to store. R2 Data Catalog turns an R2 bucket into a managed Apache Iceberg catalog behind a standard Iceberg REST interface,[^cf-r2-data-catalog] and R2 SQL is a serverless, read-only query engine over those tables - no Postgres and no Worker in the path, and R2's zero-egress model means the query pays no transfer even when the reader sits in another cloud or region.[^cf-r2-sql]
+
+The shape that pairs with this stack: land events (paste views, audit rows, request logs) as Iceberg tables on R2 - directly, or via Cloudflare Pipelines / Logpush - and keep Postgres for the hot transactional rows. Query the history from a Worker over the HTTP API or from `wrangler r2 sql query`:
+
+```bash
+wrangler r2 sql query <WAREHOUSE> \
+  "SELECT event, count(*) FROM logs.events
+   WHERE ts > '2026-07-01' GROUP BY event ORDER BY 2 DESC LIMIT 20"
+```
+
+It is genuinely SQL - `SELECT` / `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY` / `LIMIT`, JOINs, CTEs, subqueries, window functions, set operations, and exact or approximate aggregates - but it is an analytics engine, not a database.[^cf-r2-sql-ref]
+
+<Aside type="caution">
+R2 SQL is **read-only** (no `INSERT` / `UPDATE` / `DELETE`, no DDL - writes go
+through the Iceberg catalog / Pipelines) and reads **Parquet only**. `OFFSET` is
+unsupported (page with `WHERE` + `ORDER BY` + `LIMIT`), `now()` is quantized to
+10ms UTC, and heavy shapes (multi-way joins on large tables, `COUNT(DISTINCT)`
+across joins) are budget-gated and can be rejected up front - filter with `WHERE`
+and prefer `approx_*` aggregates. Both R2 Data Catalog and R2 SQL are in open
+beta.
+</Aside>
+
+When it fits: high-volume append-only or event data you want to query column-wise and keep out of the primary's storage and egress budget - a lakehouse that other engines (Spark, Snowflake, DuckDB, ClickHouse) can also read through the same Iceberg catalog. When it does not: anything transactional, row-level-secured, or on the hot request path stays in Postgres.
+
+---
+
 ## Edge Functions vs Workers
 
 Both run server-side TypeScript; the difference is *where*, and it maps onto the geography model above.
 
 - A **Cloudflare Worker** runs at the edge nearest the user (or, with Smart Placement, nearest the DB). It has the CF primitives - Cache API, Hyperdrive, Durable Objects, R2, Queues - and it is where this reference assumes your logic lives.
-- A **Supabase Edge Function** (Deno) runs at the edge nearest the *user* by default, like a Worker - so its DB/Auth/Storage calls cross the same wire. You opt into DB co-location explicitly with regional invocation (the `x-region` header / `FunctionRegion`), which makes those calls local at the cost of user distance. Either way it has none of the CF primitives.
+- A **Supabase Edge Function** (Deno) runs at the edge nearest the *user* by default, like a Worker - so its DB/Auth/Storage calls cross the same wire. You opt into DB co-location explicitly with regional invocation (the `x-region` header / `FunctionRegion`)[^sb-regional-invocation], which makes those calls local at the cost of user distance. Either way it has none of the CF primitives.[^sb-edge-functions]
 
 Put logic next to whatever it talks to most. A function that makes many DB calls and little user I/O wants to run in the DB region - a region-pinned Edge Function, or a Worker with Smart Placement pointed at the DB region; a function that is user-facing, needs the Cache API / a Durable Object / R2, or is part of the CF stack is a Worker. They are not exclusive - a Worker at the edge can invoke an Edge Function for the DB-heavy step.
 
@@ -541,7 +569,7 @@ in-handler.
 
 ## Preview branches: a per-PR database, wired to a Worker preview
 
-Supabase branching gives each pull request its own full Supabase project - an isolated Postgres plus Auth, Storage, and its own ref + keys - built by replaying your `supabase/migrations` from the PR. Cloudflare has no equivalent auto-wiring, so the CF-side pattern is: provision the branch, read its connection creds, and `wrangler versions upload` a Worker **preview version** bound to that branch DB. A preview version gets its own preview URL and does **not** roll out to the production route, so `paste.erfi.io` is untouched. On PR close, delete the branch.
+Supabase branching gives each pull request its own full Supabase project - an isolated Postgres plus Auth, Storage, and its own ref + keys - built by replaying your `supabase/migrations` from the PR.[^sb-branching] Cloudflare has no equivalent auto-wiring, so the CF-side pattern is: provision the branch, read its connection creds, and `wrangler versions upload` a Worker **preview version** bound to that branch DB. A preview version gets its own preview URL and does **not** roll out to the production route, so `paste.erfi.io` is untouched. On PR close, delete the branch.
 
 ```dot
 digraph {
@@ -588,13 +616,13 @@ wrangler versions upload \
   --var SUPABASE_SECRET_KEY:"<branch secret key>"
 ```
 
-`versions upload` publishes to a distinct preview URL and never rolls out to the production route. It is this clean because the app's data path is REST (`supabase-js`) - the two vars *are* the whole binding. Read the branch's `ref` (for the URL) and its secret key from the Management API - `GET /v1/branches/{id}` and `GET /v1/projects/{branch-ref}/api-keys?reveal=true` - rather than `supabase branches get`, which needs a linked project a fresh CI checkout does not have.
+`versions upload` publishes to a distinct preview URL and never rolls out to the production route.[^cf-versions-upload] It is this clean because the app's data path is REST (`supabase-js`) - the two vars *are* the whole binding. Read the branch's `ref` (for the URL) and its secret key from the Management API - `GET /v1/branches/{id}` and `GET /v1/projects/{branch-ref}/api-keys?reveal=true` - rather than `supabase branches get`, which needs a linked project a fresh CI checkout does not have.[^sb-create-branch]
 
 **Hyperdrive is a static config pointing at one database**; it is not auto-repointed per branch. A Hyperdrive-backed app therefore needs a Hyperdrive config created *per branch* to run the branch DB over the wire protocol. A config against the branch's (IPv6-only) direct connection carries the full `Worker -> Hyperdrive -> branch DB` path and holds under concurrency - around 66 req/s at p95 ~105ms / p99 ~117ms in a 6-worker test. The catch is lifecycle: a per-branch Hyperdrive config is another CF resource to create on open and delete on close, so unless you specifically need the wire protocol on previews, the REST binding above is the lighter path.
 
 ### The trap: a config failure mislabeled `MIGRATIONS_FAILED`
 
-One branching failure mode is worth flagging in this reference because it masquerades as a data-plane problem. If the **full branch deploy** runs (native auto-branching, or a git-associated branch create) it executes `configure -> migrate -> deploy -> seed`, and the branch status reflects the *whole* deploy. If `config.toml` sets custom Auth (custom SMTP, external OAuth) through `env()` secrets, a preview branch - which does **not** inherit the parent's secrets - fails the **configure** step with a 401, and the branch is mislabeled **`MIGRATIONS_FAILED`** even though every migration is fine. Supply the branch secrets (a `secrets` payload at create, or a dotenvx `supabase/.env.preview`), or use the bare-branch + `db push` route that skips configure entirely.
+One branching failure mode is worth flagging in this reference because it masquerades as a data-plane problem. If the **full branch deploy** runs (native auto-branching, or a git-associated branch create) it executes `configure -> migrate -> deploy -> seed`, and the branch status reflects the *whole* deploy. If `config.toml` sets custom Auth (custom SMTP, external OAuth) through `env()` secrets, a preview branch - which does **not** inherit the parent's secrets - fails the **configure** step with a 401, and the branch is mislabeled **`MIGRATIONS_FAILED`** even though every migration is fine. Supply the branch secrets (a `secrets` payload at create, or a dotenvx `supabase/.env.preview`), or use the bare-branch + `db push` route that skips configure entirely.[^sb-branching-config]
 
 The branch lifecycle, compute sizing, this trap in full (with the evidence matrix and the two-status-fields / IPv6-pooler gotchas), and the complete CI workflow live in the [Supabase preview-branch guide](/guides/supabase-preview-branch-compute/).
 
@@ -607,9 +635,10 @@ For several Supabase features there is a Cloudflare primitive that may fit bette
 | Need | Cloudflare | Supabase | Pick Cloudflare when |
 |---|---|---|---|
 | Object storage | R2 (zero egress) | Storage | Heavy egress or edge serving; Storage for RLS + built-in image transforms on one platform |
-| Vectors / embeddings | Vectorize | `pgvector` | Pure ANN at the edge; pgvector when vectors live beside relational data and RLS |
+| Vectors / embeddings | Vectorize[^cf-vectorize] | `pgvector` | Pure ANN at the edge; pgvector when vectors live beside relational data and RLS |
 | Edge config / cache | KV | a table / Vault | Read-mostly config at the edge with no SQL |
 | Edge SQL | D1 (SQLite) | Postgres | Edge-local, low-write, per-tenant; Postgres for the real relational store |
+| Analytical / columnar query | R2 SQL + Data Catalog (Iceberg)[^cf-r2-sql] | Postgres analytical queries / a warehouse FDW | Big append-only / event data queried column-wise, zero-egress across engines; Postgres for transactional, RLS'd rows |
 | Queue | Queues | pgmq | Cross-service async; pgmq when it must be transactional with the row write |
 | Schedule | Cron Triggers | `pg_cron` | App logic on a timer; pg_cron for in-DB SQL |
 | AI inference | Workers AI | (embeddings via `pgvector`) | Edge inference near the user |
@@ -622,8 +651,8 @@ Frequently combined, not either/or: R2 for the bytes + Postgres for the metadata
 
 The pricing shapes that change an architecture decision:
 
-- **Supabase compute is a per-project floor**, billed hourly whether or not the DB is busy, and *not* covered by the spend cap (paid plans include ~$10/mo of compute credit, about one Micro). A read replica is billed as a full extra database (same compute size + 1.25x disk). Scale-to-zero exists only on the Nano tier and is gated (Supabase for Platforms). "Spin up a project / replica / branch per X" has a standing cost, not a per-request one.
-- **Egress is a unified Supabase quota**, ~$0.09/GB uncached vs ~$0.03/GB cached (Storage's CDN, which is Cloudflare). Serving large objects from Storage bills egress; serving them from **R2 is egress-free** - the main reason to put big / cacheable bytes behind R2 + the Cache API and keep Postgres for metadata.
+- **Supabase compute is a per-project floor**, billed hourly whether or not the DB is busy, and *not* covered by the spend cap (paid plans include ~\$10/mo of compute credit, about one Micro). A read replica is billed as a full extra database (same compute size + 1.25x disk). Scale-to-zero exists only on the Nano tier and is gated (Supabase for Platforms). "Spin up a project / replica / branch per X" has a standing cost, not a per-request one.
+- **Egress is a unified Supabase quota**, ~\$0.09/GB uncached vs ~\$0.03/GB cached (Storage's CDN, which is Cloudflare). Serving large objects from Storage bills egress; serving them from **R2 is egress-free** - the main reason to put big / cacheable bytes behind R2 + the Cache API and keep Postgres for metadata.
 - On the CF side, **Queues and Hyperdrive add no egress charge**, and Hyperdrive's caching / pooling is included in the Workers plan - the levers in "Cutting the round trip" are mostly free.
 
 ---
@@ -632,29 +661,37 @@ The pricing shapes that change an architecture decision:
 
 Latency is not the only reason region matters. *Where* each hop runs and stores data is a separate axis, and this two-provider shape spreads it across Cloudflare and the AWS region under Supabase.
 
-**Where the data sits at rest.**
+### Where the data sits at rest
 
-- **The Supabase project region is fixed at creation** (here `eu-central-1`, Frankfurt, on AWS). A project cannot be moved in place - you clone or migrate, and a clone deliberately keeps data in the same region to preserve residency. Choose the region for your compliance boundary on day one.
-- **Read replicas are full databases in other regions.** Each replica is a copy of your data living in that region - a US replica in front of an EU primary puts EU data on US soil. A replica is a residency decision, not only a latency one.
-- **A Durable Object runs wherever it was first created** unless you constrain it. `env.NS.jurisdiction("eu")` pins a DO's execution and storage to the EU (also `us`, `fedramp`); the Worker still reaches it from anywhere, only the DO's location is fixed. A **location hint** (`weur`, `apac`, ...) is best-effort *latency* placement and NOT a compliance guarantee - jurisdiction is. If a DO carries regulated data (the relay's broadcast payload is your row data), pin its jurisdiction to match the database. Pasteriser pins its relay with `RECENT_FEED.jurisdiction("eu")` to keep even the transient public-feed payload in the database's region - the feed is public and low-sensitivity, but the same one-line pin is exactly what a regulated payload would rely on. The `DurableObjectId` is still logged outside the jurisdiction for billing.
-- **Edge cache is global by default.** A read cached through the Worker Cache API lives in whatever PoP served it. Fine for public data; for anything regulated, do not cache it or constrain where it is stored (below).
+| Surface | Default location | Pin it to a region | Compliance note |
+|---|---|---|---|
+| Supabase project | Region fixed at creation (`eu-central-1`) | Immutable in place; clone or migrate to move (a clone keeps the region) | Choose your compliance boundary on day one |
+| Read replica | The replica's own region | That region *is* the choice | A replica copies data onto that soil (a US replica of an EU primary puts EU data on US soil) - a residency decision, not just latency |
+| Durable Object | Wherever it was first created | `env.NS.jurisdiction("eu")` (also `us`, `fedramp`) | A `location` hint (`weur`, `apac`) is best-effort *latency* placement, NOT a compliance guarantee - jurisdiction is[^cf-do-data-location] |
+| Edge cache (Cache API) | Whatever PoP served the read (global) | Don't cache regulated data | Global by default; fine for public data |
 
-**In transit.**
+If a DO carries regulated data (the relay's broadcast payload is your row data), pin its jurisdiction to match the database. Pasteriser pins its relay with `RECENT_FEED.jurisdiction("eu")` to keep even the transient public-feed payload in the database's region - the feed is public and low-sensitivity, but the same one-line pin is exactly what a regulated payload would rely on. The `DurableObjectId` is still logged outside the jurisdiction for billing.
 
-- Browser -> nearest CF PoP -> Worker -> Supabase. TLS terminates at the PoP nearest the *user*, which may be outside your residency region. **Regional Services** (Data Localization Suite, an Enterprise add-on) forces TLS termination and request processing into a chosen region; configure it on the Worker's custom domain and pair it with the DO jurisdiction so both compute and decryption stay in-region.
-- **By default the Worker -> Supabase hop is public-internet TLS**, whether PostgREST or Hyperdrive to Supabase's public hostname. Supabase **PrivateLink** (AWS PrivateLink) applies to clients *inside* the same AWS network, so it does not by itself cover a Cloudflare Worker.
-- **The hop does not have to stay public - Workers VPC makes the Worker -> database path private** (beta, free during beta), two ways:
-  - a TCP **VPC Service** (`--app-protocol postgresql`) plus **Hyperdrive** (`--service-id`) queries a Postgres that is not on the public Internet over a Cloudflare Tunnel;
-  - a **VPC Network** binding reaches anything behind a Tunnel, **Cloudflare Mesh** (`network_id: "cf1:network"`), or a **Magic WAN** on-ramp (GRE / IPsec / CNI) via `fetch()` / `connect()`.
+### In transit
 
-  The catch for *managed* Supabase: the tunnel or on-ramp must sit in a network that already has private reach to the instance (an AWS VPC consuming Supabase PrivateLink), since you cannot run `cloudflared` inside Supabase's managed network - so this is the direct path for self-hosted Supabase or your own Postgres, and a bridge-VPC exercise for managed. The [Magic WAN interop guide](/guides/magic-wan-interop/) covers the on-ramp side.
-- DO transport is TLS; DO storage is AES-256 at rest (LUKS), with Cloudflare-managed keys.
+| Hop | Default | Make it private / in-region |
+|---|---|---|
+| Browser -> CF PoP -> Worker | TLS terminates at the PoP nearest the *user* (may be outside your region) | Regional Services (Data Localization Suite, Enterprise) pins TLS termination + request processing to a chosen region; pair it with the DO jurisdiction[^cf-regional-services][^cf-data-localization] |
+| Worker -> Supabase | Public-internet TLS (PostgREST or Hyperdrive to the public hostname) | Workers VPC (beta, free during beta): a TCP VPC Service (`--app-protocol postgresql`) + Hyperdrive (`--service-id`), or a VPC Network binding to a Tunnel / Cloudflare Mesh (`network_id: "cf1:network"`) / Magic WAN on-ramp via `fetch()` / `connect()`[^cf-workers-vpc][^cf-vpc-services] |
+| DO transport / storage | TLS in flight; AES-256 at rest (LUKS), CF-managed keys[^cf-do-data-security] | n/a |
 
-**Logs and audit.**
+Supabase **PrivateLink** (AWS PrivateLink) applies to clients *inside* the same AWS network, so it does not by itself cover a Cloudflare Worker.[^sb-privatelink] The catch for *managed* Supabase: a Workers VPC tunnel or on-ramp must sit in a network that already has private reach to the instance (an AWS VPC consuming Supabase PrivateLink), since you cannot run `cloudflared` inside Supabase's managed network - so this is the direct path for self-hosted Supabase or your own Postgres, and a bridge-VPC exercise for managed.[^cf-hyperdrive-private] The [Magic WAN interop guide](/guides/magic-wan-interop/) covers the on-ramp side.
 
-- **Customer Metadata Boundary** (Enterprise) sets the region where Cloudflare stores Customer Logs. Note DO logs and analytics are US-only - under CMB set to `EU` the DO metrics tab does not populate.
-- On Supabase, **Postgres connection logging** is the audit trail for SOC 2 / HIPAA: auto-enabled on High-Compliance (HIPAA) projects, off by default otherwise. **HIPAA** needs a signed BAA, the add-on, and the project marked High Compliance; **PHI must never land in a DO or edge cache** that is not itself in scope.
-- Your own `wrangler tail` output and any broadcast payload can carry row data - treat them as data flows, not just debugging aids.
+### Logs and audit
+
+| Surface | Default | Residency control / note |
+|---|---|---|
+| CF Customer Logs | Stored per Cloudflare's default | Customer Metadata Boundary (Enterprise) sets the storage region |
+| DO logs + analytics | US-only | No EU option - under CMB set to `EU` the DO metrics tab does not populate |
+| Postgres connection logging | Off (auto-on for High-Compliance / HIPAA projects) | The SOC 2 / HIPAA audit trail[^sb-connection-logging][^sb-soc2] |
+| `wrangler tail` + broadcast payload | Carries row data | Treat as a data flow, not just a debugging aid |
+
+**HIPAA** needs a signed BAA, the add-on, and the project marked High Compliance[^sb-hipaa]; **PHI must never land in a DO or edge cache** that is not itself in scope.
 
 **Minimize what you have to protect.** Burn-after-read and TTL expiry are data-minimization controls as much as features: they bound how long content exists and give a clean answer to an erasure request. The less regulated data you persist, and the fewer regions you copy it to, the smaller the compliance surface.
 
@@ -730,12 +767,53 @@ curl 'http://localhost:8799/auth?n=30'
 
 ---
 
-## Sources
-
-- **Cloudflare** - [Hyperdrive for Supabase](https://developers.cloudflare.com/hyperdrive/examples/connect-to-postgres/postgres-database-providers/supabase/), [Hyperdrive query caching](https://developers.cloudflare.com/hyperdrive/configuration/query-caching/), [Workers Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/), [wrangler versions upload](https://developers.cloudflare.com/workers/wrangler/commands/#versions-upload)
-- **Supabase** - [Connecting to Postgres](https://supabase.com/docs/guides/database/connecting-to-postgres), [Auth JWTs](https://supabase.com/docs/guides/auth/jwts), [Branching](https://supabase.com/docs/guides/deployment/branching), [Branching config & secrets](https://supabase.com/docs/guides/deployment/branching/configuration), [Management API: create a branch](https://supabase.com/docs/reference/api/v1-create-a-branch)
-- **Cloudflare (more)** - [Smart Placement](https://developers.cloudflare.com/workers/configuration/smart-placement/), [Queues](https://developers.cloudflare.com/queues/), [Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/), [Durable Objects WebSockets](https://developers.cloudflare.com/durable-objects/best-practices/websockets/), [R2](https://developers.cloudflare.com/r2/), [Vectorize](https://developers.cloudflare.com/vectorize/), [Workers Rate Limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/), [Supabase native integration](https://developers.cloudflare.com/workers/databases/third-party-integrations/supabase/)
-- **Supabase (more)** - [Realtime protocol](https://supabase.com/docs/guides/realtime/protocol), [Broadcast](https://supabase.com/docs/guides/realtime/broadcast), [Database Webhooks](https://supabase.com/docs/guides/database/webhooks), [pg_net](https://supabase.com/docs/guides/database/extensions/pg_net), [Cron / pg_cron](https://supabase.com/docs/guides/cron), [Queues (pgmq)](https://supabase.com/docs/guides/queues), [Edge Functions](https://supabase.com/docs/guides/functions), [Read replicas](https://supabase.com/docs/guides/platform/read-replicas), [Database Functions](https://supabase.com/docs/guides/database/functions), [Serverless drivers from Workers](https://supabase.com/docs/guides/database/connecting-to-postgres/serverless-drivers), [Edge Function regional invocation](https://supabase.com/docs/guides/functions/regional-invocation), [S3-compatible Storage](https://supabase.com/docs/guides/storage/s3/authentication), [Server-side auth (@supabase/ssr)](https://supabase.com/docs/guides/auth/server-side), [Foreign Data Wrappers](https://supabase.com/docs/guides/database/extensions/wrappers/overview)
-- **Compliance / residency** - [DO data location & jurisdictions](https://developers.cloudflare.com/durable-objects/reference/data-location/), [DO data security](https://developers.cloudflare.com/durable-objects/reference/data-security/), [Data Localization Suite](https://developers.cloudflare.com/data-localization/), [Regional Services](https://developers.cloudflare.com/data-localization/regional-services/), [Supabase HIPAA](https://supabase.com/docs/guides/security/hipaa-compliance), [SOC 2](https://supabase.com/docs/guides/security/soc-2-compliance), [Connection logging](https://supabase.com/docs/guides/platform/postgres-connection-logging), [PrivateLink](https://supabase.com/docs/guides/platform/privatelink), [Workers VPC](https://developers.cloudflare.com/workers-vpc/), [VPC Services](https://developers.cloudflare.com/workers-vpc/configuration/vpc-services/), [Hyperdrive to a private database](https://developers.cloudflare.com/hyperdrive/configuration/connect-to-private-database/)
-
 Measured from the Singapore edge to `eu-central-1` (Frankfurt), 2026-07-14. Absolute latencies are distance-dominated; the ratios and path choices generalize (see [Reading the numbers](#reading-the-numbers)).
+
+{/* References: cited inline as [^slug]; the numbered list renders below under "References". */}
+
+[^cf-supabase-integration]: Cloudflare, "Supabase (third-party integrations)," Cloudflare Docs. https://developers.cloudflare.com/workers/databases/third-party-integrations/supabase/
+[^sb-connecting-postgres]: Supabase, "Connecting to your database," Supabase Docs. https://supabase.com/docs/guides/database/connecting-to-postgres
+[^sb-serverless-drivers]: Supabase, "Serverless drivers," Supabase Docs. https://supabase.com/docs/guides/database/connecting-to-postgres/serverless-drivers
+[^cf-hyperdrive-supabase]: Cloudflare, "Connect Hyperdrive to a Supabase Postgres database," Cloudflare Docs. https://developers.cloudflare.com/hyperdrive/examples/connect-to-postgres/postgres-database-providers/supabase/
+[^cf-hyperdrive-cache]: Cloudflare, "Hyperdrive query caching," Cloudflare Docs. https://developers.cloudflare.com/hyperdrive/configuration/query-caching/
+[^cf-cache-api]: Cloudflare, "Cache API," Cloudflare Docs. https://developers.cloudflare.com/workers/runtime-apis/cache/
+[^sb-auth-jwts]: Supabase, "JSON Web Tokens (JWTs)," Supabase Docs. https://supabase.com/docs/guides/auth/jwts
+[^sb-ssr]: Supabase, "Server-side auth (@supabase/ssr)," Supabase Docs. https://supabase.com/docs/guides/auth/server-side
+[^cf-rate-limiting]: Cloudflare, "Rate limiting binding," Cloudflare Docs. https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
+[^sb-s3-storage]: Supabase, "S3 authentication (Storage)," Supabase Docs. https://supabase.com/docs/guides/storage/s3/authentication
+[^sb-realtime-protocol]: Supabase, "Realtime protocol," Supabase Docs. https://supabase.com/docs/guides/realtime/protocol
+[^sb-realtime-benchmarks]: Supabase, "Realtime benchmarks," Supabase Docs. https://supabase.com/docs/guides/realtime/benchmarks
+[^sb-broadcast]: Supabase, "Broadcast," Supabase Docs. https://supabase.com/docs/guides/realtime/broadcast
+[^cf-do-websockets]: Cloudflare, "Durable Objects: use WebSockets," Cloudflare Docs. https://developers.cloudflare.com/durable-objects/best-practices/websockets/
+[^sb-webhooks]: Supabase, "Database Webhooks," Supabase Docs. https://supabase.com/docs/guides/database/webhooks
+[^sb-pg-net]: Supabase, "pg_net," Supabase Docs. https://supabase.com/docs/guides/database/extensions/pg_net
+[^sb-pg-cron]: Supabase, "Cron (pg_cron)," Supabase Docs. https://supabase.com/docs/guides/cron
+[^cf-cron-triggers]: Cloudflare, "Cron Triggers," Cloudflare Docs. https://developers.cloudflare.com/workers/configuration/cron-triggers/
+[^cf-queues]: Cloudflare, "Queues," Cloudflare Docs. https://developers.cloudflare.com/queues/
+[^sb-pgmq]: Supabase, "Queues (pgmq)," Supabase Docs. https://supabase.com/docs/guides/queues
+[^sb-db-functions]: Supabase, "Database Functions," Supabase Docs. https://supabase.com/docs/guides/database/functions
+[^cf-smart-placement]: Cloudflare, "Smart Placement," Cloudflare Docs. https://developers.cloudflare.com/workers/configuration/smart-placement/
+[^sb-read-replicas]: Supabase, "Read replicas," Supabase Docs. https://supabase.com/docs/guides/platform/read-replicas
+[^sb-wrappers]: Supabase, "Foreign Data Wrappers," Supabase Docs. https://supabase.com/docs/guides/database/extensions/wrappers/overview
+[^cf-r2]: Cloudflare, "R2," Cloudflare Docs. https://developers.cloudflare.com/r2/
+[^cf-vectorize]: Cloudflare, "Vectorize," Cloudflare Docs. https://developers.cloudflare.com/vectorize/
+[^sb-edge-functions]: Supabase, "Edge Functions," Supabase Docs. https://supabase.com/docs/guides/functions
+[^sb-regional-invocation]: Supabase, "Edge Functions: regional invocation," Supabase Docs. https://supabase.com/docs/guides/functions/regional-invocation
+[^sb-branching]: Supabase, "Branching," Supabase Docs. https://supabase.com/docs/guides/deployment/branching
+[^sb-branching-config]: Supabase, "Branching configuration and secrets," Supabase Docs. https://supabase.com/docs/guides/deployment/branching/configuration
+[^sb-create-branch]: Supabase, "Management API: create a branch," Supabase Docs. https://supabase.com/docs/reference/api/v1-create-a-branch
+[^cf-versions-upload]: Cloudflare, "wrangler versions upload," Cloudflare Docs. https://developers.cloudflare.com/workers/wrangler/commands/#versions-upload
+[^cf-do-data-location]: Cloudflare, "Durable Objects: data location and jurisdictions," Cloudflare Docs. https://developers.cloudflare.com/durable-objects/reference/data-location/
+[^cf-do-data-security]: Cloudflare, "Durable Objects: data security," Cloudflare Docs. https://developers.cloudflare.com/durable-objects/reference/data-security/
+[^cf-data-localization]: Cloudflare, "Data Localization Suite," Cloudflare Docs. https://developers.cloudflare.com/data-localization/
+[^cf-regional-services]: Cloudflare, "Regional Services," Cloudflare Docs. https://developers.cloudflare.com/data-localization/regional-services/
+[^cf-workers-vpc]: Cloudflare, "Workers VPC," Cloudflare Docs. https://developers.cloudflare.com/workers-vpc/
+[^cf-vpc-services]: Cloudflare, "Workers VPC: VPC Services," Cloudflare Docs. https://developers.cloudflare.com/workers-vpc/configuration/vpc-services/
+[^cf-hyperdrive-private]: Cloudflare, "Connect Hyperdrive to a private database," Cloudflare Docs. https://developers.cloudflare.com/hyperdrive/configuration/connect-to-private-database/
+[^sb-privatelink]: Supabase, "PrivateLink," Supabase Docs. https://supabase.com/docs/guides/platform/privatelink
+[^sb-connection-logging]: Supabase, "Postgres connection logging," Supabase Docs. https://supabase.com/docs/guides/platform/postgres-connection-logging
+[^sb-hipaa]: Supabase, "HIPAA compliance," Supabase Docs. https://supabase.com/docs/guides/security/hipaa-compliance
+[^sb-soc2]: Supabase, "SOC 2 compliance," Supabase Docs. https://supabase.com/docs/guides/security/soc-2-compliance
+[^cf-r2-data-catalog]: Cloudflare, "R2 Data Catalog," Cloudflare Docs. https://developers.cloudflare.com/r2/data-catalog/
+[^cf-r2-sql]: Cloudflare, "R2 SQL," Cloudflare Docs. https://developers.cloudflare.com/r2-sql/
+[^cf-r2-sql-ref]: Cloudflare, "R2 SQL reference," Cloudflare Docs. https://developers.cloudflare.com/r2-sql/sql-reference/
