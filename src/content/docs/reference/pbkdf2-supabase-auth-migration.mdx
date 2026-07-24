@@ -1,0 +1,377 @@
+---
+title: "Migrating PBKDF2 password hashes into Supabase Auth"
+description: Why Supabase Auth cannot import PBKDF2 hashes directly (only bcrypt, Argon2, and Firebase scrypt), and the lazy-migration pattern that moves PBKDF2 users - the canonical case being ASP.NET Core Identity on SQL Server - with no forced reset and without keeping the source system online. Covers the format dispatch, a private-schema credential store, an Edge Function verifier, the ASP.NET Identity hash layout, and the findings from a live check.
+author: Erfi Anugrah
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+How to move password users off a PBKDF2-hashing source system onto Supabase Auth without asking anyone to reset their password, and without running the old auth stack as a verification oracle during the cutover.[^sb-auth0]
+
+<Aside type="note">
+Behaviors below were verified against hosted Supabase Auth (GoTrue) in `ap-southeast-2` on 2026-07-24, then the scratch project was deleted. Format-dispatch and validation rules are read from the GoTrue source and cited as such (asserted); runtime behaviors (the import failure mode, the ASP.NET v3 default PRF, the end-to-end gateway, the rehash non-persistence) are called out as measured, not asserted.
+</Aside>
+
+**TL;DR:**
+
+- Supabase Auth imports exactly three hash formats: **bcrypt, Argon2 (argon2i / argon2id), and Firebase scrypt**. PBKDF2 is not one of them, and there is no pluggable verifier.[^sb-auth0]
+- Trying to import a PBKDF2 hash via `admin.createUser({ password_hash })` does not fail gracefully - it returns **HTTP 500 `unexpected_failure`** (measured), because the non-bcrypt string is handed to `bcrypt.Cost()` and errors.
+- The pattern that works is **lazy migration with a local verifier**: import users passwordless, keep the PBKDF2 parameters in a locked-down `private` table, verify the password yourself in an Edge Function on first login, then set the password (GoTrue rehashes to bcrypt), delete the legacy row, and mint a session - one round trip, invisible to the user.
+- PBKDF2 is a documented standard (RFC 8018)[^rfc8018], so the verifier is a few lines of Deno WebCrypto with no dependencies, and you can decommission the source system at import time instead of keeping it online.
+- If the source is ASP.NET Core Identity, all parameters live inside the hash blob - you only need to confirm the format marker byte.
+
+---
+
+## Why a direct import is impossible
+
+GoTrue selects a password verifier purely from the stored hash's prefix. From `CompareHashAndPassword` (`internal/crypto/password.go`)[^gotrue-password]:
+
+```go
+if strings.HasPrefix(hash, Argon2Prefix) {            // "$argon2"
+    return compareHashAndPasswordArgon2(ctx, hash, password)
+} else if strings.HasPrefix(hash, FirebaseScryptPrefix) { // "$fbscrypt"
+    return compareHashAndPasswordFirebaseScrypt(ctx, hash, password)
+}
+// assume bcrypt
+hashCost, err := bcrypt.Cost([]byte(hash))            // a PBKDF2 string dies here
+if err != nil {
+    return err
+}
+return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+```
+
+The same prefix check runs at **create** time in `NewUserWithPasswordHash`[^gotrue-user]: an imported hash is validated as Argon2, as Firebase scrypt, or (the fallback) as bcrypt via `bcrypt.Cost()`. A PBKDF2 string matches none of the first two and is not a bcrypt hash, so the import is rejected - and the rejection surfaces as an HTTP 500 `unexpected_failure`, not a clean validation error (measured).
+
+The accepted set:
+
+| Prefix | Algorithm | Constraints (enforced in source) |
+| --- | --- | --- |
+| `$argon2i` / `$argon2id` | Argon2 | version 19 only; `data` and `keyid` params rejected; `m <= 1 GiB`, `t <= 20`, `p <= 16`[^gotrue-password] |
+| `$fbscrypt` | Firebase scrypt | `$fbscrypt$v=1,...` convention; version 1 only[^gotrue-password] |
+| anything else | bcrypt | must parse under `bcrypt.Cost()` |
+
+### The Firebase scrypt precedent
+
+The one time Supabase added a fourth verifier, it was Firebase scrypt (issue supabase/auth#1750, PR #1768).[^gotrue-fbscrypt-issue][^gotrue-fbscrypt-pr] The resolution was not to accept arbitrary KDFs but to define a new hardcoded format string and add a dedicated Go verifier. That is the only extension mechanism: a change to GoTrue that adds a prefix. No PBKDF2 convention exists, so for any current project PBKDF2 direct import is off the table.
+
+<Aside type="caution">
+Auth Hooks do not provide an escape hatch. The Password Verification Hook receives `{ user_id, valid }` and runs *after* GoTrue has already computed `valid`[^sb-pw-verify-hook] - it is a post-hoc lockout / notify hook, not a place to plug in a verifier. The verification of a legacy PBKDF2 password must live in code you own.
+</Aside>
+
+---
+
+## Which strategy to pick
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.4; ranksep=0.55;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box, style=rounded];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="Source hash =\nbcrypt or Argon2?", shape=diamond];
+  direct [label="Direct import\nadmin.createUser({ password_hash })"];
+  q2 [label="Raw hashes exportable AND\nKDF is a documented standard\n(e.g. PBKDF2)?", shape=diamond];
+  lazy [label="Lazy migration,\nlocal verifier  (this doc)"];
+  q3 [label="Can the source verify\nfor you during a window?", shape=diamond];
+  dual [label="Dual-system fallback\n(verify via source API)"];
+  reset [label="Forced reset\n(passwordless + reset email)"];
+
+  q1 -> direct [label="yes"];
+  q1 -> q2 [label="no"];
+  q2 -> lazy [label="yes"];
+  q2 -> q3 [label="no"];
+  q3 -> dual [label="yes (black-box KDF)"];
+  q3 -> reset [label="no"];
+}
+```
+
+| Situation | Strategy | Cost |
+| --- | --- | --- |
+| Source is bcrypt or Argon2 | Direct import; users keep their password | None; zero code |
+| PBKDF2 (or any standard KDF) with exportable hashes | **Lazy migration, local verifier** | A small Edge Function; source can be retired immediately |
+| KDF is a black box you cannot reimplement | Dual-system fallback via the source's own verify API | Keep the source online for the window |
+| Hashes unexportable, or any custom login code is unacceptable | Forced reset (passwordless import + reset email) | One reset per user |
+
+PBKDF2 with exported hashes belongs in **lazy migration with a local verifier**. Because PBKDF2 is fully specified, the local verifier is trivial and there is no reason to keep the source auth system online - which makes it strictly preferable to the dual-system fallback for this case.
+
+---
+
+## Architecture
+
+A single Edge Function (`auth-login`) is the app's only login entry point; migration is invisible to the client. The legacy PBKDF2 parameters live in a `private` schema reachable only by the service role through `SECURITY DEFINER` wrappers. On a successful legacy verification the function sets the user's password (GoTrue rehashes to bcrypt), deletes the legacy row, and mints a session server-side.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.8;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  client [label="Client app", shape=box, style=rounded];
+
+  subgraph cluster_fn {
+    label="Edge Function (auth-login)"; style=rounded; fontsize=12; margin=12;
+    verify [label="PBKDF2 verify\n(WebCrypto, constant-time)"];
+  }
+  subgraph cluster_sb {
+    label="Supabase"; style=rounded; fontsize=12; margin=12;
+    gotrue [label="Auth (GoTrue)"];
+    priv   [label="private.legacy_credentials\n(RLS deny-all)"];
+    pg     [label="Postgres", shape=cylinder];
+  }
+
+  client -> verify  [label="POST email + password"];
+  verify -> gotrue  [label="1. signInWithPassword"];
+  verify -> priv    [label="2. get_legacy_cred (service_role rpc)"];
+  verify -> gotrue  [label="3. updateUserById -> bcrypt"];
+  priv   -> pg;
+  gotrue -> pg;
+}
+```
+
+Login decision at the function:
+
+1. Try `signInWithPassword`. If it works, the user is already migrated - return the session (`via: direct`).
+2. Otherwise fetch the legacy PBKDF2 parameters and verify the password locally.
+3. On a match, claim the migration atomically, set the password (bcrypt), and mint a session (`via: migrated`). On a mismatch, return a generic failure without touching the row.
+
+---
+
+## The private credential store
+
+```sql
+create schema if not exists private;
+
+create table if not exists private.legacy_credentials (
+  user_id     uuid primary key references auth.users(id) on delete cascade,
+  format      text not null,            -- 'aspnet_v3' | 'aspnet_v2' | 'custom'
+  prf         text not null,            -- 'SHA-1' | 'SHA-256' | 'SHA-512'
+  iterations  int  not null,
+  salt        bytea not null,
+  subkey      bytea not null,           -- stored derived key to compare against
+  imported_at timestamptz not null default now()
+);
+
+-- RLS on with ZERO policies = deny all. Only the service role (which bypasses
+-- RLS) reaches this, and only through the definer functions below.
+alter table private.legacy_credentials enable row level security;
+
+create or replace function public.get_legacy_cred(p_email text)
+returns table(user_id uuid, format text, prf text, iterations int,
+              salt_b64 text, subkey_b64 text)
+language sql security definer set search_path = '' as $$
+  select lc.user_id, lc.format, lc.prf, lc.iterations,
+         encode(lc.salt,'base64'), encode(lc.subkey,'base64')
+  from private.legacy_credentials lc
+  join auth.users u on u.id = lc.user_id
+  where u.email = lower(p_email);
+$$;
+
+create or replace function public.claim_migration(p_user_id uuid)
+returns boolean language sql security definer set search_path = '' as $$
+  delete from private.legacy_credentials where user_id = p_user_id returning true;
+$$;
+
+revoke execute on function public.get_legacy_cred(text) from public, anon, authenticated;
+revoke execute on function public.claim_migration(uuid) from public, anon, authenticated;
+grant  execute on function public.get_legacy_cred(text) to service_role;
+grant  execute on function public.claim_migration(uuid) to service_role;
+```
+
+<Aside type="note">
+The service role bypasses RLS, but the Data API only serves schemas you list in `db.exposed_schemas`. Keep `private` out of that list. The `SECURITY DEFINER` wrappers (with `search_path = ''` to block search-path hijacking) are what let the function reach `private` through an `rpc` call while the table stays invisible to PostgREST.
+</Aside>
+
+The `claim_migration` delete is the concurrency lock: two racing first-logins both verify, but only one `DELETE ... RETURNING` returns a row. The winner sets the password; the loser sees no row and simply proceeds to sign in.
+
+---
+
+## The login gateway
+
+The public entry point uses `@supabase/server` with `auth: 'none'` (the handler owns authentication) and is deployed `--no-verify-jwt`.[^sb-edge-auth] The verifier parses the ASP.NET Core Identity blob and does a constant-time compare of the derived key.
+
+```ts
+// supabase/functions/auth-login/index.ts
+import { withSupabase } from 'npm:@supabase/server'
+import { createClient } from 'npm:@supabase/supabase-js@2'
+
+const b64 = (s: string) => Uint8Array.from(atob(s), c => c.charCodeAt(0))
+function ctEq(a: Uint8Array, b: Uint8Array) {
+  if (a.length !== b.length) return false
+  let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0
+}
+async function verifyPbkdf2(pw: string, prf: string, iterations: number,
+                            salt: Uint8Array, subkey: Uint8Array) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw),
+                                            'PBKDF2', false, ['deriveBits'])
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: prf, salt, iterations }, key, subkey.length * 8)
+  return ctEq(new Uint8Array(bits), subkey)
+}
+
+const fail = () => new Response(JSON.stringify({ error: 'invalid_credentials' }),
+  { status: 400, headers: { 'content-type': 'application/json' } })
+
+export default {
+  fetch: withSupabase({ auth: 'none' }, async (req, ctx) => {
+    let email = '', password = ''
+    try { ({ email, password } = await req.json()) } catch { return fail() }
+    if (!email || !password) return fail()
+
+    const admin = ctx.supabaseAdmin
+    const anon = createClient(Deno.env.get('SUPABASE_URL')!,
+                              Deno.env.get('SUPABASE_ANON_KEY')!,
+                              { auth: { persistSession: false } })
+
+    // 1. Already migrated -> normal sign in.
+    const first = await anon.auth.signInWithPassword({ email, password })
+    if (first.data?.session) {
+      const s = first.data.session
+      return Response.json({ access_token: s.access_token, refresh_token: s.refresh_token, via: 'direct' })
+    }
+
+    // 2. Pending -> fetch legacy params and verify locally.
+    const { data: creds } = await admin.rpc('get_legacy_cred', { p_email: email })
+    const cred = Array.isArray(creds) ? creds[0] : creds
+    if (!cred) return fail()
+    const ok = await verifyPbkdf2(password, cred.prf, cred.iterations,
+                                  b64(cred.salt_b64), b64(cred.subkey_b64))
+    if (!ok) return fail()
+
+    // 3. Claim atomically (row = lock), set the bcrypt password.
+    const { data: claimed } = await admin.rpc('claim_migration', { p_user_id: cred.user_id })
+    if (claimed) await admin.auth.admin.updateUserById(cred.user_id, { password })
+
+    // 4. Mint a session server-side and return it.
+    const done = await anon.auth.signInWithPassword({ email, password })
+    if (done.data?.session) {
+      const s = done.data.session
+      return Response.json({ access_token: s.access_token, refresh_token: s.refresh_token,
+                             via: claimed ? 'migrated' : 'migrated-concurrent' })
+    }
+    return fail()
+  }),
+}
+```
+
+```bash
+supabase functions deploy auth-login --project-ref <ref> --no-verify-jwt --use-api
+```
+
+<Aside type="caution">
+The skeleton returns 200 / 400 immediately. For production, equalize response shape and timing across all three outcomes (direct, migrated, bad password) and rate-limit by IP and email, so the endpoint is not an oracle for "does this email exist" or "is this user migrated". Setting a plaintext password via `updateUserById` always produces bcrypt at the default cost via `GenerateFromPassword`[^gotrue-password], so a migrated user is a standard Supabase password user with no further action.
+</Aside>
+
+---
+
+## Reading an ASP.NET Core Identity hash
+
+If the source is a SQL Server identity database, the hashes almost certainly come from `Microsoft.AspNetCore.Identity.PasswordHasher<T>`[^aspnet-hasher] and are stored base64-encoded in `AspNetUsers.PasswordHash`. The blob is self-describing: the first byte is a format marker and all parameters follow. You do not need the source team to document iterations or salt length - only to confirm the marker.
+
+**v3** (marker `0x01`):
+
+```
+[0x01][prf: uint32 BE][iterCount: uint32 BE][saltLen: uint32 BE][salt][subkey]
+```
+
+`prf`: `0` = HMAC-SHA1, `1` = HMAC-SHA256, `2` = HMAC-SHA512.
+
+**v2** (marker `0x00`): fixed PBKDF2-HMAC-SHA1, 1000 iterations, 128-bit salt, 256-bit subkey.
+
+<Aside type="note">
+Measured: modern .NET (tested with .NET 10) `IdentityV3` defaults to **HMAC-SHA512** (`prf = 2`), not SHA256 as is commonly assumed. Read the PRF and iteration count from the blob header rather than hardcoding them; the verifier above already does.
+</Aside>
+
+Parser (Node / Deno), returning base64 salt and subkey ready for `decode(..., 'base64')` on insert:
+
+```ts
+function parseAspNetHash(b64hash: string) {
+  const buf = Uint8Array.from(atob(b64hash), c => c.charCodeAt(0))
+  const u32 = (a: Uint8Array, o: number) => ((a[o]<<24)|(a[o+1]<<16)|(a[o+2]<<8)|a[o+3]) >>> 0
+  const tob64 = (u: Uint8Array) => btoa(String.fromCharCode(...u))
+  const PRF: Record<number, string> = { 0: 'SHA-1', 1: 'SHA-256', 2: 'SHA-512' }
+  if (buf[0] === 0x00) {
+    return { format: 'aspnet_v2', prf: 'SHA-1', iterations: 1000,
+             salt_b64: tob64(buf.slice(1, 17)), subkey_b64: tob64(buf.slice(17)) }
+  }
+  if (buf[0] === 0x01) {
+    const prf = PRF[u32(buf, 1)], iterations = u32(buf, 5), saltLen = u32(buf, 9)
+    return { format: 'aspnet_v3', prf, iterations,
+             salt_b64: tob64(buf.slice(13, 13 + saltLen)),
+             subkey_b64: tob64(buf.slice(13 + saltLen)) }
+  }
+  throw new Error(`unknown ASP.NET hash marker 0x${buf[0].toString(16)}`)
+}
+```
+
+Import each user with `admin.createUser({ email, email_confirm: true })` (no password), then insert the parsed parameters into `private.legacy_credentials` keyed by the returned `user.id`. Setting `email_confirm: true` for already-verified accounts skips re-verification. A passwordless `createUser` leaves `encrypted_password` as an empty string (not null), and GoTrue rejects login for an empty hash[^gotrue-user] - which is exactly the pending state you want (measured).
+
+---
+
+## Findings
+
+Separating what the source guarantees from what a live check confirmed.
+
+| Finding | Kind |
+| --- | --- |
+| Only bcrypt / Argon2 / Firebase scrypt import; dispatch is by prefix | Asserted (source)[^gotrue-password] |
+| PBKDF2 import returns HTTP 500 `unexpected_failure`, not a clean 400 | Measured |
+| A real ASP.NET Identity v2 and v3 hash both verify under a Deno WebCrypto PBKDF2 decoder | Measured |
+| .NET `IdentityV3` defaults to HMAC-SHA512, not SHA256 | Measured |
+| Passwordless `createUser` sets `encrypted_password` to an empty string and cannot log in | Measured |
+| End-to-end gateway migrates on correct password, retains the legacy row on wrong password, and the migrated user then signs in through plain `signInWithPassword` | Measured |
+| `updateUserById({ password })` produces bcrypt at the default cost | Measured |
+| The high-cost-bcrypt rehash-on-signin logic exists in `Authenticate` but the cost downgrade was not observed to persist on the hosted platform | Measured; do not rely on it |
+
+---
+
+## Endgame and kill switch
+
+Lazy migration only converts users who log in. Plan the wind-down:
+
+```sql
+create view private.pending_migrations as
+  select count(*) as remaining from private.legacy_credentials;
+```
+
+Run the gateway through a transition window. When `remaining` plateaus, the residue is inactive users: send them a one-time reset email, then `drop schema private cascade` and delete the function. No legacy verifier material is left on the platform.
+
+Gate the legacy branch behind an environment flag (for example `DISABLE_LEGACY_FALLBACK=1`). If the legacy store is ever suspected compromised, flip it: the gateway degrades to migrated-users-only and everyone else goes through password reset.
+
+---
+
+## Security checklist
+
+- `private.legacy_credentials` has RLS enabled with no policies (deny-all), and `private` is not in `db.exposed_schemas`.
+- `get_legacy_cred` / `claim_migration` are `SECURITY DEFINER` with `search_path = ''`, execute revoked from `public` / `anon` / `authenticated`, granted only to `service_role`.
+- The Edge Function uses `auth: 'none'`, is deployed `--no-verify-jwt`, and is the only caller of the definer functions.
+- PBKDF2 comparison is constant-time (`ctEq`), never `===` on derived bytes.
+- Responses are timing- and shape-equalized across direct / migrated / bad-password; the endpoint is rate-limited by IP and email.
+- The exported source-hash file is deleted after load and never committed. Consider encrypting `salt` / `subkey` at rest (Supabase Vault) for defense in depth beyond RLS.
+
+---
+
+## Reproducing
+
+| Claim | How to check | Kind |
+| --- | --- | --- |
+| PBKDF2 rejected on import | `POST /auth/v1/admin/users` with a base64 ASP.NET blob as `password_hash`; observe HTTP 500 | Tested |
+| bcrypt / Argon2 import + original-password sign-in | Import a bcrypt (`python -c "import bcrypt; ..."`) and an argon2id (`argon2` CLI, `-id -t 3 -m 16 -p 1 -e`) hash; sign in | Tested |
+| Verifier interop | Generate a hash with real `PasswordHasher<T>` (`.NET`), decode + verify with the WebCrypto parser above | Tested |
+| Gateway end to end | Passwordless user + inserted legacy row; call the function with right / wrong password; check row deletion and `encrypted_password` prefix | Tested |
+| Argon2 / bcrypt constraints | Read `internal/crypto/password.go` on the pinned GoTrue version | Design (source) |
+
+<Aside type="note">
+Format details can change between GoTrue versions - the accepted-format set, default bcrypt cost, and the rehash behavior are all version-dependent. Re-read `internal/crypto/password.go` and `internal/models/user.go` on the version you are deploying before a production cutover.
+</Aside>
+
+[^sb-auth0]: Supabase, "Migrate from Auth0 to Supabase Auth," Supabase Docs. https://supabase.com/docs/guides/platform/migrating-to-supabase/auth0
+[^gotrue-password]: Supabase, "internal/crypto/password.go (CompareHashAndPassword, ParseArgon2Hash, GenerateFromPassword)," supabase/auth. https://github.com/supabase/auth/blob/master/internal/crypto/password.go
+[^gotrue-user]: Supabase, "internal/models/user.go (NewUserWithPasswordHash, Authenticate, SetPassword)," supabase/auth. https://github.com/supabase/auth/blob/master/internal/models/user.go
+[^gotrue-fbscrypt-issue]: Supabase, "Support importing Firebase scrypt password hashes (issue #1750)," supabase/auth. https://github.com/supabase/auth/issues/1750
+[^gotrue-fbscrypt-pr]: Supabase, "Add Firebase scrypt password verifier (PR #1768)," supabase/auth. https://github.com/supabase/auth/pull/1768
+[^sb-pw-verify-hook]: Supabase, "Password Verification Hook," Supabase Docs. https://supabase.com/docs/guides/auth/auth-hooks/password-verification-hook
+[^sb-edge-auth]: Supabase, "Securing Edge Functions," Supabase Docs. https://supabase.com/docs/guides/functions/auth
+[^aspnet-hasher]: Microsoft, "PasswordHasher`<TUser>` Class," .NET API browser. https://learn.microsoft.com/en-us/dotnet/api/microsoft.aspnetcore.identity.passwordhasher-1
+[^rfc8018]: K. Moriarty, B. Kaliski, A. Rusch, "PKCS #5: Password-Based Cryptography Specification Version 2.1 (RFC 8018)," IETF. https://www.rfc-editor.org/rfc/rfc8018
