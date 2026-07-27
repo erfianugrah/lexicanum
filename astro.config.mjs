@@ -68,6 +68,12 @@ import react from "@astrojs/react";
 // https://astro.build/config
 export default defineConfig({
   site: "https://erfi.dev",
+  // PBKDF2 migration doc was reclassified reference -> guide (it is a
+  // task-sequenced how-to, not setup-independent architecture). Keep the old
+  // published URL alive.
+  redirects: {
+    "/reference/pbkdf2-supabase-auth-migration": "/guides/pbkdf2-supabase-auth-migration",
+  },
   fonts: [
     {
       name: "IBM Plex Sans",
