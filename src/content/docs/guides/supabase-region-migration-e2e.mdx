@@ -95,23 +95,44 @@ the rows that matter most here:
 
 ## Part 1: pick the region, rehearse the move
 
-1. **Choose the region** closest to your users - or to your edge-to-origin
-   path if your app talks to Supabase from a server/Worker rather than
-   browsers.[^sb-regions] After creating the target project, measure before
-   committing: compare `psql` connect time / HTTP TTFB from your app host to
-   the old and new endpoints.
-2. **Rehearse on a throwaway pair** in your two real regions:
+### Choose the region
 
-   ```bash
-   bun start sandbox up --org <your-org-id> \
-     --src-region <current-region> --tgt-region <target-region>
-   # ... drive the full pipeline below against the sandbox ...
-   bun start sandbox down   # deletes both projects + generated files
-   ```
+Closest to your users - or to your edge-to-origin path if your app talks to
+Supabase from a server/Worker rather than browsers.[^sb-regions] The choice
+moves more than the database: Realtime is colocated with the project's
+region, and storage object bytes live in that region's S3 - so every
+subsystem's latency shifts with the move. (Edge Functions are globally
+distributed, but their *distance to the database* follows the DB region.)
 
-   The sandbox seeds an awkward fixture (STORED generated column, IDENTITY
-   sequence, a no-PK table) and prints the drive-through. The pair bills
-   until `sandbox down`.
+Measure before committing, from where your app actually runs:
+
+```bash
+# create the target (or the sandbox pair below), then from your app host:
+time psql 'postgresql://postgres.<ref>:<pw>@aws-0-<region>.pooler.supabase.com:5432/postgres' -c 'select 1'
+# and against the API:
+curl -so /dev/null -w 'TTFB %{time_starttransfer}s\n' \
+  https://<ref>.supabase.co/rest/v1/ -H "apikey: <anon-key>"
+```
+
+Record the same numbers for the old project - that pair is your before/after
+for the validation window in Part 4. Also take a baseline of error rates and
+p95 from your usual monitoring; you will be comparing against it post-move.
+
+### Rehearse on a throwaway pair
+
+```bash
+bun start sandbox up --org <your-org-id> \
+  --src-region <current-region> --tgt-region <target-region>
+# ... drive the full pipeline below against the sandbox ...
+bun start sandbox down   # deletes both projects + generated files
+```
+
+The sandbox seeds an awkward fixture (STORED generated column, IDENTITY
+sequence, a no-PK table) and prints the drive-through. The pair bills until
+`sandbox down`. Two things to harvest from the rehearsal beyond "it works":
+the `config-sync --dry-run` diff - on your real project that diff **is** your
+reconfiguration checklist, read it line by line - and the `watch` copy
+percentages, which calibrate how long your real initial copy will take.
 
 ## Part 2: move the data
 
@@ -236,25 +257,34 @@ the subscription, or the initial copy fails row by row.
 This is the work that makes a region move different from a version upgrade.
 Do it in this order; items 1-3 break loudly if forgotten, 4-7 silently.
 
-1. **App env: URL, keys, AND the pooler hostname.** The session/transaction
-   pooler host embeds the region - `aws-0-eu-west-1.pooler.supabase.com` for a
-   project in eu-west-1 - so editing only the project ref in your connection
-   strings is not enough. The direct host (`db.<ref>.supabase.co`) is
-   region-agnostic but IPv6-only unless the project has the IPv4
-   add-on.[^sb-ipv4]
-2. **OAuth callback URLs contain the project ref.** Every social provider
-   (Google, GitHub, ...) is configured with a callback of the form
-   `https://<ref>.supabase.co/auth/v1/callback`. Update the redirect URLs at
-   each provider *and* the new project's own site URL / redirect URL
-   settings, or social logins break at cutover.[^sb-redirect]
+1. **App env: URL, keys, AND the pooler hostname.** Three values change -
+   `SUPABASE_URL`, the anon key, and the service key - plus the pooler host
+   if you connect via pooler: the host embeds the region
+   (`aws-0-eu-west-1.pooler.supabase.com` for a project in eu-west-1), so
+   editing only the ref in your connection strings is not enough. The direct
+   host (`db.<ref>.supabase.co`) is region-agnostic but IPv6-only unless the
+   project has the IPv4 add-on.[^sb-ipv4]
+2. **OAuth callback URLs contain the project ref.** Every social provider is
+   configured with a callback of the form
+   `https://<ref>.supabase.co/auth/v1/callback`, and the provider rejects
+   anything unregistered - so social logins fail with a redirect-mismatch
+   error the moment you flip the app to the new ref. In each provider's
+   console (Google Cloud > OAuth client > Authorized redirect URIs; GitHub >
+   OAuth Apps > Authorization callback URL; etc.) add the new callback,
+   and in the new project's dashboard (Authentication > URL Configuration)
+   set the site URL and any additional redirect URLs.[^sb-redirect] Remove
+   the old callback at the provider after the validation window.
 3. **Custom domain: re-add + DNS cutover.** Custom domains are DNS-coupled
-   and do not migrate.[^sb-custom-domains] The day before, lower the DNS TTL;
-   in the window, add the custom domain to the new project and flip the
-   CNAME. (Skip if you serve clients on the default `<ref>.supabase.co`
+   and do not migrate.[^sb-custom-domains] The day before, lower the DNS TTL
+   on the record to ~60s. In the window: add the custom domain on the new
+   project (Settings > Custom Domains), complete its TXT verification, wait
+   for it to report ready, then flip the CNAME to the new project. (Skip the
+   whole item if you serve clients on the default `<ref>.supabase.co`
    hostname and update envs instead.)
 4. **Edge Functions: redeploy.** `supabase functions deploy --project-ref
    <new-ref>`; invoke URLs change with the ref. Re-set function secrets (or
-   opt into `configSync.projectSecrets`).
+   opt into `configSync.projectSecrets`). Import maps / `deno.json` are not
+   downloaded by the CLI - re-add those by hand if your functions use them.
 5. **Storage: buckets, then bytes, then visibility.** Nothing storage-related
    arrives by itself - the schema restore excludes the managed `storage`
    schema, so the target starts with **zero buckets** (verified:
@@ -269,22 +299,39 @@ Do it in this order; items 1-3 break loudly if forgotten, 4-7 silently.
    ```sql
    update storage.buckets set public = true where id = '<bucket>';
    ```
+
+   If you drive the S3-compatible endpoint directly (rclone/aws-cli), the S3
+   access keys are per-project - generate a new pair on the target (Settings
+   > Storage > S3) before syncing.
 6. **Cron jobs: re-create after cutover.** The schema restore carries your
    job *functions* but not `cron.schedule(...)` rows (schedules are data, not
    DDL), so nothing double-fires - but nothing fires at all until you re-add
-   the schedules on the target.
+   the schedules on the target. Enumerate the source's jobs before the window
+   so re-adding is transcription, not archaeology:
+
+   ```sql
+   select jobname, schedule, command from cron.job order by jobid;
+   ```
 7. **Plan for session invalidation.** A new project means a new JWT signing
    secret: every user session dies at cutover. Web apps absorb this as a
-   re-login; mobile apps need the new anon key shipped *before* cutover (or a
-   forced upgrade), or your installed base is logged out until they update.
+   re-login. Mobile and distributed clients need the new anon key shipped
+   *before* cutover (or a forced upgrade) - options: ship the new key in an
+   app update ahead of the window and flip the backend endpoint at cutover,
+   dual-read both projects briefly (only viable for read-mostly apps), or
+   accept that the installed base re-logs-in on next open.
 
 ## Part 4: validation window and decommission
 
 - Keep the **old project paused, not deleted**, for a few days as a safety
   net. Never re-enable writes on it - that is split-brain.
-- Watch error rates, auth success, and p95 latency against your pre-move
-  baseline.
-- Then **delete the old project** - it bills until you do.
+- Watch, against your Part 1 baseline: error rates, auth success (email and
+  each social provider), Realtime connection counts, and p95 latency from
+  your app host. `sbshift verify` doubles as a post-move advisor-lint health
+  check on the new project.
+- Re-run the Part 1 latency measurements - the move was for these numbers;
+  confirm they actually improved.
+- Then **delete the old project** - it bills until you do. Remove the old
+  OAuth callbacks at the providers and the old DNS records.
 
 ## Measured run (2026-07-30)
 
@@ -327,6 +374,16 @@ this table is the region-move surface:
   key rollouts - enumerate them before the window, not during it.
 - **The pooler hostname is per-region.** `aws-0-<region>.pooler.supabase.com`
   - connection strings need the ref *and* the region updated.
+- **Realtime and storage move with the DB region.** Both are colocated with
+  the project - their latency to your users shifts with the move, which is
+  usually the point. Edge Functions stay globally distributed; what changes
+  is their round-trip to the database.
+- **S3 access keys are per-project.** Any rclone/aws-cli/S3-API tooling
+  needs a freshly generated pair on the target before the byte sync.
+- **The `config-sync --dry-run` diff is your reconfiguration checklist.**
+  Run it early (even weeks ahead, read-only) and turn every section it
+  prints into a to-do item; secrets stay redacted, so plan the credential
+  re-entry separately.
 - **Drop the custom-domain TTL the day before**, or your DNS cutover inherits
   hours of stale caching.
 - **Storage fails two different ways on this track.** Before the push, the
