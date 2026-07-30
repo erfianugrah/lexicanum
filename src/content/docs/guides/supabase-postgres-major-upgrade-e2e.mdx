@@ -497,6 +497,66 @@ which also means no double-firing while both projects are live), and any
 `pg_db_role_setting` and are invisible to the Management API endpoints
 `config-sync` reads (`doctor` diffs them and warns).
 
+### The same pipeline by hand
+
+Everything sbshift automates above is plain Postgres + Management API calls.
+If you cannot (or do not want to) run the tooling, the manual equivalent of
+steps 3-6:
+
+```bash
+# schema + roles + auth users (steps 3's manual fallback, in full)
+supabase db dump --db-url "$SRC" -f roles.sql --role-only
+supabase db dump --db-url "$SRC" -f schema.sql
+supabase db dump --db-url "$SRC" -f auth.sql --data-only --schema auth --use-copy \
+  -x auth.schema_migrations   # SELECT-only for postgres on managed targets
+psql -d "$TGT" -f roles.sql        # errors on pre-existing roles are expected
+psql --single-transaction -v ON_ERROR_STOP=1 -d "$TGT" -f schema.sql
+psql --single-transaction -v ON_ERROR_STOP=1 -d "$TGT" \
+  -c 'SET session_replication_role = replica' -f auth.sql
+```
+
+```sql
+-- source: publication over the tables to move (enumerate; FOR ALL TABLES
+-- needs superuser)
+create publication upgrade_move for table public.t1, public.t2;
+
+-- target: subscription (creates its slot on the source, takes a consistent
+-- initial copy, then streams WAL)
+create subscription upgrade_move_sub
+  connection 'host=db.<src-ref>.supabase.co port=5432 dbname=postgres user=postgres password=<pw> sslmode=require'
+  publication upgrade_move
+  with (slot_name = 'upgrade_move_slot', copy_data = true);
+
+-- target: watch until every table is ready (i -> d -> s -> r)
+select c.relname, r.srsubstate
+from pg_subscription_rel r
+join pg_subscription s on s.oid = r.srsubid
+join pg_class c on c.oid = r.srrelid;
+
+-- cutover: STOP WRITES, then confirm the lag has drained on the source
+select application_name, write_lag, flush_lag, replay_lag
+from pg_stat_replication;
+
+-- target: resync every owned sequence (sequence VALUES do not replicate)
+select setval('public.items_id_seq', (select max(id) from public.items));
+
+-- teardown
+drop subscription upgrade_move_sub;                    -- on the target
+drop publication upgrade_move;                         -- on the source
+select pg_drop_replication_slot('upgrade_move_slot');  -- on the source, if the slot remains
+```
+
+What you give up by hand: the gates (readiness audit, wal_level/grant/
+replica-identity preflight), the WAL-bloat watchdog while the subscription
+is live, the chunked-checksum reconcile (a manual `count(*)` per table is
+not a proof of identical data), the quiescence check, and the config copy -
+transcribe the settings pages or script the Management API endpoints from
+the [three-ways matrix](#every-task-three-ways). If you can take the full
+copy time as downtime instead, plain dump/restore to a new PG 17 project
+skips the replication machinery entirely - the region guide's [Variant
+A](/guides/supabase-region-migration-e2e/#variant-a-dump-and-restore-simple-downtime--copy-time)
+writes it out; the reconfiguration burden is identical.
+
 ### Measured run (2026-07-30)
 
 Full pipeline against a throwaway cross-region pair (eu-central-1 ->
@@ -519,8 +579,8 @@ split; projects deleted after):
 
 A second pass the same day seeded the repointing surface (pg_cron job, public
 bucket, auth user, project secret, custom role, config change) and exercised
-the `config-sync` **apply** path live; results and the two bugs it flushed
-out are tabulated in the [region-migration guide's measured
+the `config-sync` **apply** path live; results are tabulated in the
+[region-migration guide's measured
 run](/guides/supabase-region-migration-e2e/#measured-run-2026-07-30).
 
 Timing caveat: 3,000 small rows copy in seconds. At real sizes the initial
