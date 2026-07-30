@@ -10,8 +10,10 @@ Move a Supabase project from one region to another with near-zero downtime:
 
 1. **Rehearse** on a throwaway sbshift sandbox pair created in your two real
    regions.
-2. **Move**: create the target project, replicate the database with logical
-   replication, cut over with a write-stop measured in seconds.
+2. **Move**: create the target project, then either dump/restore (simple,
+   downtime = copy time) or replicate with logical replication and cut over
+   (write-stop measured in seconds) - both variants in full, by hand and
+   automated, in Part 2.
 3. **Repoint**: the region-specific part - app env, OAuth callbacks, custom
    domain, Edge Functions, storage bytes.
 
@@ -60,9 +62,9 @@ digraph move {
 | **sbshift logical replication** (this guide) | seconds (lag drain) | medium, scriptable | production apps; any DB too big for a dump window |
 | **dump / restore** | minutes to hours | low | small DBs, staging, a maintenance window you already have |
 
-Dump/restore is `supabase db dump` + `psql` restore + a storage sync + the
-same repointing work; you skip the replication machinery but take the full
-copy time as downtime. Everything in Part 3 below applies to both paths.
+Both paths are written out in full in Part 2 - Variant A (dump/restore) and
+Variant B (replication), each with the sbshift commands and the by-hand
+equivalent. The repointing work in Part 3 applies to both.
 
 A region move is also your chance to upgrade the Postgres major version for
 free - a new project lands on the platform default major (17 as of 2026-07),
@@ -111,12 +113,53 @@ the rows that matter most here:
    sequence, a no-PK table) and prints the drive-through. The pair bills
    until `sandbox down`.
 
-## Part 2: replicate and cut over
+## Part 2: move the data
 
-The replication pipeline is identical to the upgrade guide's Path B -
-every step, its gate, and its failure modes are explained there ([full
+Two variants. **Variant A** is the simplest thing that works and takes the
+full copy time as downtime. **Variant B** is the near-zero-downtime path -
+the app keeps writing to the source until a write-stop measured in seconds.
+Both land at the same place; Part 3's repointing checklist applies to either.
+
+### Variant A: dump and restore (simple, downtime = copy time)
+
+```bash
+# 1. create the target in the NEW region; new projects default to PG 17
+supabase projects create <name> --org-id <your-org-id> \
+  --region <target-region> --db-password "$(openssl rand -base64 24)"
+export SRC='postgresql://postgres.<src-ref>:<pw>@aws-0-<src-region>.pooler.supabase.com:5432/postgres'
+export TGT='postgresql://postgres.<tgt-ref>:<pw>@aws-0-<tgt-region>.pooler.supabase.com:5432/postgres'
+
+# 2. roles + schema + auth users (no downtime yet - nothing is writing yet)
+supabase db dump --db-url "$SRC" -f roles.sql --role-only
+supabase db dump --db-url "$SRC" -f schema.sql
+supabase db dump --db-url "$SRC" -f auth.sql --data-only --schema auth --use-copy \
+  -x auth.schema_migrations   # SELECT-only for postgres on managed targets
+
+psql -d "$TGT" -f roles.sql        # errors on pre-existing roles are expected
+psql --single-transaction -v ON_ERROR_STOP=1 -d "$TGT" -f schema.sql
+psql --single-transaction -v ON_ERROR_STOP=1 -d "$TGT" \
+  -c 'SET session_replication_role = replica' -f auth.sql
+
+# 3. STOP WRITES on the source - the downtime window starts here
+supabase db dump --db-url "$SRC" -f data.sql --data-only --use-copy
+psql --single-transaction -v ON_ERROR_STOP=1 -d "$TGT" \
+  -c 'SET session_replication_role = replica' -f data.sql
+```
+
+Sequence values come with the data dump at their write-stop state, so no
+resync is needed (contrast with Variant B, where they must be resynced by
+hand). `session_replication_role = replica` defers triggers/FK enforcement
+during the load - required for the auth rows and for any FK-ordered restore.
+Then: storage bytes (Part 3 item 5), config + secrets (the matrix above),
+cron jobs (Part 3 item 6), and the repoint (Part 3). Downtime ends when the
+app points at the new project.
+
+### Variant B: replicate and cut over (near-zero downtime)
+
+The replication pipeline is identical to the upgrade guide's Path B - every
+step, its gate, and its failure modes are explained there ([full
 step-by-step](/guides/supabase-postgres-major-upgrade-e2e/#path-b-cut-over-to-a-new-pg-17-project-with-sbshift)).
-The condensed sequence:
+The sbshift drive-through:
 
 ```bash
 # 1. create the target in the NEW region; new projects default to PG 17
@@ -145,6 +188,48 @@ bun start provision    # match compute size; preview unless --confirm
 bun start verify       # advisor health gate on the target
 bun start teardown
 ```
+
+The same pipeline **by hand** - exactly what sbshift automates above:
+
+```sql
+-- source: publication over the tables to move (enumerate; FOR ALL TABLES
+-- needs superuser)
+create publication region_move for table public.t1, public.t2;
+
+-- target: subscription (creates its slot on the source, takes a consistent
+-- initial copy, then streams WAL)
+create subscription region_move_sub
+  connection 'host=db.<src-ref>.supabase.co port=5432 dbname=postgres user=postgres password=<pw> sslmode=require'
+  publication region_move
+  with (slot_name = 'region_move_slot', copy_data = true);
+
+-- target: watch until every table is ready (i -> d -> s -> r)
+select c.relname, r.srsubstate
+from pg_subscription_rel r
+join pg_subscription s on s.oid = r.srsubid
+join pg_class c on c.oid = r.srrelid;
+
+-- cutover: STOP WRITES, then confirm the lag has drained on the source
+select application_name, write_lag, flush_lag, replay_lag
+from pg_stat_replication;
+
+-- target: resync every owned sequence (sequence VALUES do not replicate)
+select setval('public.items_id_seq', (select max(id) from public.items));
+
+-- teardown
+drop subscription region_move_sub;                    -- on the target
+drop publication region_move;                         -- on the source
+select pg_drop_replication_slot('region_move_slot');  -- on the source, if the slot remains
+```
+
+The prerequisites the tooling checks for you when doing it by hand:
+`wal_level = logical` (on by default on Supabase), the CREATE SUBSCRIPTION
+privilege on the target's postgres role (granted on Supabase), and replica
+identity on every published table - a primary key is enough; a table without
+one needs `alter table <t> replica identity full` or deletes/updates will
+not replicate. Schema, roles, extensions, and auth users must already exist
+on the target (same dump/restore as Variant A steps 2) **before** creating
+the subscription, or the initial copy fails row by row.
 
 ## Part 3: repoint - the region-specific checklist
 
@@ -220,13 +305,6 @@ this table is the region-move surface:
 | storage push to a bucket-less target | bucket auto-created **private**; public URL returned 400 "Bucket not found" until `public = true` was restored |
 | anon keys, source vs target | different ref-scoped JWTs - old-project tokens cannot validate on the new project |
 | `provision` preview | no-op when the target already matches the (default) source infra |
-
-Two sbshift bugs were found and fixed by this run (both verified live after
-the fix): the auth-data dump now excludes `auth.schema_migrations` (the one
-auth table where managed targets grant the postgres role SELECT only -
-copying it failed with `permission denied for table schema_migrations`), and
-`config-sync` no longer PATCHes plan-gated auth hook families when they are
-disabled (an HTTP 402 even with `enabled: false`).
 
 ## Verification
 
