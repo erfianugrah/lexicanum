@@ -1,0 +1,263 @@
+---
+title: Migrate a Supabase project to another region, end to end
+description: Move a Supabase project to a different region with near-zero downtime using sbshift logical replication - why the dashboard upgrade and clone flows can never change a project's region, the condensed replicate-then-cutover pipeline, and the region-move-specific repointing work (OAuth callback URLs, region-specific pooler hostnames, custom-domain DNS, Edge Function redeploys) that the replication does not do for you.
+author: "Erfi Anugrah"
+---
+
+## What you will do
+
+Move a Supabase project from one region to another with near-zero downtime:
+
+1. **Rehearse** on a throwaway sbshift sandbox pair created in your two real
+   regions.
+2. **Move**: create the target project, replicate the database with logical
+   replication, cut over with a write-stop measured in seconds.
+3. **Repoint**: the region-specific part - app env, OAuth callbacks, custom
+   domain, Edge Functions, storage bytes.
+
+Prerequisites: sbshift[^sbshift] (Bun, no build step), the `supabase` CLI,
+`psql`/`pg_dump`, and a `SUPABASE_ACCESS_TOKEN`. The pipeline below was validated live on 2026-07-30
+against a throwaway cross-region pair (eu-central-1 -> eu-west-1); the full
+measured-output table lives in the [Postgres upgrade
+guide](/guides/supabase-postgres-major-upgrade-e2e/#measured-run-2026-07-30),
+whose Part 3 is the same pipeline run as an *upgrade* path.
+
+## Why a region move always means a new project
+
+Region is chosen at project creation and never changes - and neither
+dashboard flow can help: the in-place upgrade swaps the instance under the
+*same* project in the *same* region, and Restore to a New Project clones into
+the same region as the source.[^sb-clone] So a region move is always: **new
+project in the target region + move the data + repoint the app**.
+
+Because it is a new project, the standard new-project reconfiguration applies
+in full - new ref, new API keys, new JWT secret (all existing sessions
+invalidate), SMTP, Data API schema exposure, Edge Functions, Realtime
+settings. That list is enumerated, with measured behaviour, in the
+[carries-over table](/guides/supabase-postgres-major-upgrade-e2e/#what-carries-over-and-what-does-not)
+of the upgrade guide. This guide covers only what is *additional* when the
+new project is in a different region.
+
+```dot
+digraph move {
+  rankdir=LR;
+  bgcolor="transparent";
+  node [shape=box, style=rounded];
+  edge [fontsize=10];
+  app [label="your app"];
+  old [label="old project\nregion A\n(source of truth until cutover)"];
+  new [label="new project\nregion B"];
+  app -> old [label="writes until\ncutover"];
+  old -> new [label="logical replication:\nconsistent copy + WAL stream"];
+  app -> new [style=dashed, label="repoint at cutover"];
+}
+```
+
+## Pick your path
+
+| Path | Downtime | Effort | When to pick |
+|---|---|---|---|
+| **sbshift logical replication** (this guide) | seconds (lag drain) | medium, scriptable | production apps; any DB too big for a dump window |
+| **dump / restore** | minutes to hours | low | small DBs, staging, a maintenance window you already have |
+
+Dump/restore is `supabase db dump` + `psql` restore + a storage sync + the
+same repointing work; you skip the replication machinery but take the full
+copy time as downtime. Everything in Part 3 below applies to both paths.
+
+A region move is also your chance to upgrade the Postgres major version for
+free - a new project lands on the platform default major (17 as of 2026-07),
+so the same pipeline doubles as the upgrade. The [upgrade
+guide](/guides/supabase-postgres-major-upgrade-e2e/) covers the
+version-specific blockers (deprecated extensions, md5 roles) if you take
+that combination.
+
+## Part 1: pick the region, rehearse the move
+
+1. **Choose the region** closest to your users - or to your edge-to-origin
+   path if your app talks to Supabase from a server/Worker rather than
+   browsers.[^sb-regions] After creating the target project, measure before
+   committing: compare `psql` connect time / HTTP TTFB from your app host to
+   the old and new endpoints.
+2. **Rehearse on a throwaway pair** in your two real regions:
+
+   ```bash
+   bun start sandbox up --org <your-org-id> \
+     --src-region <current-region> --tgt-region <target-region>
+   # ... drive the full pipeline below against the sandbox ...
+   bun start sandbox down   # deletes both projects + generated files
+   ```
+
+   The sandbox seeds an awkward fixture (STORED generated column, IDENTITY
+   sequence, a no-PK table) and prints the drive-through. The pair bills
+   until `sandbox down`.
+
+## Part 2: replicate and cut over
+
+The replication pipeline is identical to the upgrade guide's Part 3 - every
+step, its gate, and its failure modes are explained there ([full
+step-by-step](/guides/supabase-postgres-major-upgrade-e2e/#part-3-near-zero-downtime-cutover-with-sbshift)).
+The condensed sequence:
+
+```bash
+# 1. create the target in the NEW region; new projects default to PG 17
+supabase projects create <name> --org-id <your-org-id> \
+  --region <target-region> --db-password "$(openssl rand -base64 24)"
+
+# 2. migrate.config.yaml: refs, enumerated table list, watchdog threshold
+#    .env: SOURCE/TARGET_DB_URL (+ SOURCE_REPLICATION_URL for the IPv6 split)
+
+# 3. restore what replication does not carry (roles, schema, extensions, auth rows)
+bun start bootstrap --with-auth-data --confirm
+
+# 4. gates - do not proceed past a NOT READY
+bun start doctor
+bun start preflight
+
+# 5. replicate; the app keeps writing to the source throughout
+bun start replicate
+bun start watch
+
+# 6. cutover window (the only downtime): STOP source writes first
+bun start reconcile    # must print RECONCILE PASSED
+bun start cutover      # drains lag to 0, resyncs sequences, drops subscription
+bun start config-sync --dry-run && bun start config-sync
+bun start provision    # match compute size; preview unless --confirm
+bun start verify       # advisor health gate on the target
+bun start teardown
+```
+
+## Part 3: repoint - the region-specific checklist
+
+This is the work that makes a region move different from a version upgrade.
+Do it in this order; items 1-3 break loudly if forgotten, 4-7 silently.
+
+1. **App env: URL, keys, AND the pooler hostname.** The session/transaction
+   pooler host embeds the region - `aws-0-eu-west-1.pooler.supabase.com` for a
+   project in eu-west-1 - so editing only the project ref in your connection
+   strings is not enough. The direct host (`db.<ref>.supabase.co`) is
+   region-agnostic but IPv6-only unless the project has the IPv4
+   add-on.[^sb-ipv4]
+2. **OAuth callback URLs contain the project ref.** Every social provider
+   (Google, GitHub, ...) is configured with a callback of the form
+   `https://<ref>.supabase.co/auth/v1/callback`. Update the redirect URLs at
+   each provider *and* the new project's own site URL / redirect URL
+   settings, or social logins break at cutover.[^sb-redirect]
+3. **Custom domain: re-add + DNS cutover.** Custom domains are DNS-coupled
+   and do not migrate.[^sb-custom-domains] The day before, lower the DNS TTL;
+   in the window, add the custom domain to the new project and flip the
+   CNAME. (Skip if you serve clients on the default `<ref>.supabase.co`
+   hostname and update envs instead.)
+4. **Edge Functions: redeploy.** `supabase functions deploy --project-ref
+   <new-ref>`; invoke URLs change with the ref. Re-set function secrets (or
+   opt into `configSync.projectSecrets`).
+5. **Storage: buckets, then bytes, then visibility.** Nothing storage-related
+   arrives by itself - the schema restore excludes the managed `storage`
+   schema, so the target starts with **zero buckets** (verified:
+   `storage.buckets` empty after bootstrap). The flow: download the source
+   objects, push them with `bun start storage <localDir>` (or the S3-sync
+   procedure in the [upgrade guide's storage
+   section](/guides/supabase-postgres-major-upgrade-e2e/#storage-metadata-copies-bytes-do-not)),
+   then restore bucket *visibility* - the push auto-creates the bucket but
+   lands it **private** even when the source bucket was public (verified), so
+   public object URLs fail until you flip it back:
+
+   ```sql
+   update storage.buckets set public = true where id = '<bucket>';
+   ```
+6. **Cron jobs: re-create after cutover.** The schema restore carries your
+   job *functions* but not `cron.schedule(...)` rows (schedules are data, not
+   DDL), so nothing double-fires - but nothing fires at all until you re-add
+   the schedules on the target.
+7. **Plan for session invalidation.** A new project means a new JWT signing
+   secret: every user session dies at cutover. Web apps absorb this as a
+   re-login; mobile apps need the new anon key shipped *before* cutover (or a
+   forced upgrade), or your installed base is logged out until they update.
+
+## Part 4: validation window and decommission
+
+- Keep the **old project paused, not deleted**, for a few days as a safety
+  net. Never re-enable writes on it - that is split-brain.
+- Watch error rates, auth success, and p95 latency against your pre-move
+  baseline.
+- Then **delete the old project** - it bills until you do.
+
+## Measured run (2026-07-30)
+
+A sandbox pair (eu-central-1 -> eu-west-1) seeded with the repointing-surface
+cases: a pg_cron job, a public storage bucket + object, an auth user, a
+project secret, a custom login role, and a PostgREST config change. The
+replication-core numbers are the [upgrade guide's measured
+table](/guides/supabase-postgres-major-upgrade-e2e/#measured-run-2026-07-30);
+this table is the region-move surface:
+
+| Check | Observed |
+|---|---|
+| `cron.job` on target after bootstrap | **0 rows** - schedules do not carry; re-create post-cutover |
+| `storage.buckets` on target after bootstrap | **0 rows** - bucket metadata does not arrive at all |
+| auth user after `bootstrap --with-auth-data` | present on the target |
+| custom login role after bootstrap | present, `rolpassword` NULL - must re-password |
+| `config-sync` apply (write path) | Realtime / Pooler / PostgREST / Storage / project secrets all applied; `max_rows=777` and the test secret confirmed on the target via the Management API |
+| storage push to a bucket-less target | bucket auto-created **private**; public URL returned 400 "Bucket not found" until `public = true` was restored |
+| anon keys, source vs target | different ref-scoped JWTs - old-project tokens cannot validate on the new project |
+| `provision` preview | no-op when the target already matches the (default) source infra |
+
+Two sbshift bugs were found and fixed by this run (both verified live after
+the fix): the auth-data dump now excludes `auth.schema_migrations` (the one
+auth table where managed targets grant the postgres role SELECT only -
+copying it failed with `permission denied for table schema_migrations`), and
+`config-sync` no longer PATCHes plan-gated auth hook families when they are
+disabled (an HTTP 402 even with `enabled: false`).
+
+## Verification
+
+| Check | How | Expected |
+|---|---|---|
+| Data identical pre-cutover | `sbshift reconcile` | `RECONCILE PASSED` |
+| Sequence resync | post-cutover `insert ... returning id` on a serial/IDENTITY table | next value, no PK collision |
+| Latency actually improved | `psql` connect time / TTFB from your app host, old vs new | improvement toward your users |
+| Email login | sign in on the new project | works (user exists, password hash carried) |
+| Social login | one OAuth provider end to end | works after callback update |
+| Storage | GET a synced object via the new ref's **public** URL | 200 (404 = bytes not synced; 400 "Bucket not found" = visibility not restored) |
+| Edge Function | invoke on the new ref | 200 |
+| Cron | `select * from cron.job;` on the target | schedules re-added |
+| Billing | dashboard | old project deleted at window end |
+
+## Gotchas and lessons learned
+
+- **The replication is the easy part; the repointing is the move.** OAuth
+  callbacks, the region-specific pooler hostname, custom-domain DNS, mobile
+  key rollouts - enumerate them before the window, not during it.
+- **The pooler hostname is per-region.** `aws-0-<region>.pooler.supabase.com`
+  - connection strings need the ref *and* the region updated.
+- **Drop the custom-domain TTL the day before**, or your DNS cutover inherits
+  hours of stale caching.
+- **Storage fails two different ways on this track.** Before the push, the
+  dashboard listing is *empty* (no bucket metadata at all - unlike the clone
+  track, where the listing looks complete but bytes 404). After the push,
+  bytes are there but public URLs still fail with 400 "Bucket not found"
+  until visibility is restored. Test a GET on the public path, not the
+  listing and not an authenticated GET.
+- **Do not confuse "paused" with "free".** The old project bills until
+  deleted; pausing only stops compute serving.
+- **Bucket metadata does not arrive at all on this track** (unlike the clone
+  track, which copies it): buckets exist on the target only after you push
+  objects or recreate them.
+- **Public buckets come back private.** The storage push auto-creates the
+  bucket with `public = false`; restore visibility explicitly or your public
+  object URLs fail (verified: 400 "Bucket not found" until flipped).
+- **If `bootstrap` fails mid-way, re-running it re-plans the schema
+  restore** against tables that now exist. Recover by running the auth-data
+  dump/restore commands it printed (they are in the preview output) rather
+  than re-applying the whole schema.
+- **Sandbox rehearsal is nearly free and takes under 15 minutes** end to end
+  (measured 2026-07-30, including project provisioning) - there is no reason
+  to learn the pipeline against your production data.
+
+## References
+
+[^sbshift]: sbshift, "Postgres-to-Postgres logical-replication migrator," GitHub. https://github.com/erfianugrah/sbshift
+[^sb-clone]: Supabase, "Restore to a new project," Supabase Docs. https://supabase.com/docs/guides/platform/clone-project
+[^sb-regions]: Supabase, "Regions," Supabase Docs. https://supabase.com/docs/guides/platform/regions
+[^sb-ipv4]: Supabase, "IPv4 Address," Supabase Docs. https://supabase.com/docs/guides/platform/ipv4-address
+[^sb-redirect]: Supabase, "Redirect URLs," Supabase Docs. https://supabase.com/docs/guides/auth/redirect-urls
+[^sb-custom-domains]: Supabase, "Custom Domains," Supabase Docs. https://supabase.com/docs/guides/platform/custom-domains
