@@ -1,6 +1,6 @@
 ---
 title: Upgrade a Supabase project to a new Postgres major version, end to end
-description: A two-track runbook for a Postgres major upgrade on Supabase - rehearse on a Restore-to-a-New-Project clone first, then run the in-place production upgrade - with an empirically validated table of exactly what carries over to a clone and what does not (storage bytes, schema exposure, SMTP, pg_cron jobs, extensions), the storage rclone/s3-sync fix, and the full pre/during/post checklist.
+description: A three-track runbook for a Postgres major upgrade on Supabase - rehearse on a Restore-to-a-New-Project clone or a Docker pg_upgrade lab, run the in-place production upgrade, or cut over to a new PG 17 project via logical replication with sbshift - with an empirically validated table of exactly what carries over to a clone and what does not (storage bytes, schema exposure, SMTP, pg_cron jobs, extensions), the storage rclone/s3-sync fix, and the full pre/during/post checklist.
 author: "Erfi Anugrah"
 ---
 
@@ -16,18 +16,20 @@ with minimal risk, in two tracks:
 
 A third option exists for the large-database case where even the in-place
 upgrade's downtime window is unacceptable: **logical replication to a new
-PG 17 project** (schema dump pre-step, replicate/watch, checksum reconcile,
-write-stop cutover). Near-zero downtime and the only cross-region path, but
-it lands on a *new* project - new ref, new API keys, new JWT secret, the
-same reconfiguration burden as the clone column below. Shown in the diagram
-for completeness; the step-by-step here covers the two dashboard tracks.
+PG 17 project** with [sbshift](https://github.com/erfianugrah/sbshift)
+(schema dump pre-step, replicate/watch, checksum reconcile, write-stop
+cutover). Near-zero downtime and the only cross-region path, but it lands on
+a *new* project - new ref, new API keys, new JWT secret, the same
+reconfiguration burden as the clone column below. That is **Part 3**; Parts
+1-2 cover the two dashboard tracks.
 
 Prerequisites: a paid plan (physical backups enabled; PITR recommended), the
 Supabase dashboard, and optionally `rclone` or `aws-cli` if your rehearsal
 needs real storage files. Behaviour in this guide was validated against the
 live platform on 2026-07-29 (clone from PITR, then byte-level and config-level
-checks on the clone); anything not re-verifiable by you in an hour is marked
-as such.
+checks on the clone) and 2026-07-30 (full sbshift pipeline against a throwaway
+cross-region pair, plus a Docker pg_upgrade lab); anything not re-verifiable by
+you in an hour is marked as such.
 
 The most important thing to understand before starting: **the clone flow and
 the in-place upgrade are completely different animals.** A clone is a *new
@@ -187,6 +189,41 @@ flow, the documented one-liner is
 `supabase db dump --data-only --linked > supabase/seed.sql` - branches run
 `seed.sql` once at creation.[^sb-cli-workflows][^sb-branching]
 
+### A Docker-only rehearsal alternative: the sbshift upgrade lab
+
+The clone rehearsal previews the *blocker list* and the *platform* time
+estimate, but it cannot tell you how long the `pg_upgrade` step itself takes
+on data shaped like yours, and it costs a mirrored-compute project while it
+exists. [sbshift](https://github.com/erfianugrah/sbshift)'s upgrade rehearsal
+runs the whole thing locally in Docker, for \$0, with no project at all:
+
+```bash
+bun start upgrade doctor --to 17              # read-only blocker audit of the source
+bun start upgrade capture --out-dir capture   # dump roles + schema + data
+bun start upgrade lab --capture-dir capture --runs 3 --keep
+bun start upgrade verify                      # prove the upgraded cluster is data-identical
+```
+
+`upgrade lab` loads your captured data (or a synthetic fixture via
+`--seed-gib`) into a PG 15 container, snapshots the data directory, then runs
+`pg_upgrade --link` to PG 17 N times from a fresh snapshot each time, followed
+by post-upgrade `ANALYZE`, and emits a timing report. `upgrade verify`
+chunked-checksums the pre-upgrade source against the upgraded cluster.
+
+Measured 2026-07-30 on a 0.23 GiB fixture (this machine, 15 -> 17, 3 runs):
+`pg_upgrade --link` itself took **3.7s per run** (+ ~1.2s analyze, ~4-6s
+initdb/prep). The lesson generalises: at real database sizes `pg_upgrade
+--link` is rarely the bottleneck - the Supabase in-place upgrade's downtime is
+dominated by the *disk copy* that precedes it (GP3 default ~100 Mbps, so ~1
+minute per GB of disk), which is why the dashboard estimate scales with disk
+size.[^sb-upgrading] The lab also accepts `--prod-bytes <n>` to fold that
+copy-time estimate into its report.
+
+Use the lab when you want the blocker audit + a timing feel without creating
+anything billable; use the clone when you need to validate your *app* against
+the real platform. They complement each other - the lab has no Data API, no
+Auth, no storage.
+
 ## Part 2: production upgrade (in-place)
 
 Everything in the reconfiguration list above is **irrelevant here** - the
@@ -244,6 +281,221 @@ brought back online automatically.[^sb-upgrading]
       done.
 - [ ] Delete the rehearsal clone - it bills at mirrored compute until you do.
 
+## Part 3: near-zero-downtime cutover with sbshift
+
+Pick this track when the in-place window (disk-copy minutes per GB) is too
+long, or when the upgrade doubles as a region move. If a region move is the
+*primary* goal, the [region-migration guide](/guides/supabase-region-migration-e2e/)
+covers the region-specific repointing work (OAuth callbacks, custom-domain
+DNS, region-specific pooler hostnames) on top of this same pipeline. What you
+trade: the
+target is a **new project**, so every row in the clone column of the
+carries-over table applies - new ref, new keys, new JWT secret (existing
+sessions invalidate), plus the Auth/Realtime/Edge-Function reconfiguration.
+You are buying a downtime window measured in the seconds it takes to drain
+replication lag, at the price of the full new-project reconfiguration.
+
+How it works: native Postgres logical replication, orchestrated by
+[sbshift](https://github.com/erfianugrah/sbshift). A publication +
+replication slot on the source, a subscription on the new PG 17 project; the
+subscription takes a consistent initial copy of your data tables, then
+streams WAL to stay caught up while the app keeps writing to the source.
+When you are ready: stop writes, prove the two databases are byte-identical
+with a chunked checksum, drain the last lag, resync sequences, repoint the
+app.[^sbshift]
+
+Prerequisites: Bun (sbshift runs from source, no build step), `psql` /
+`pg_dump`, the `supabase` CLI, and a personal access token
+(`SUPABASE_ACCESS_TOKEN`) for project creation and the config copy.
+
+### Connectivity: direct vs pooler, and the IPv6 question
+
+Logical replication needs a **direct** connection
+(`db.<ref>.supabase.co:5432`); the pooler cannot stream WAL. Direct hosts are
+IPv6-only unless the project has the IPv4 add-on.[^sb-ipv4] Decide where
+sbshift runs before anything else:
+
+- **IPv6-capable host** (e.g. a small VM in the target region): point both
+  URLs at the direct hosts. Simplest.
+- **IPv4 add-on** on both projects for the migration window: same config,
+  run from anywhere; remove it after.
+- **Split** (works from a plain IPv4 laptop): `SOURCE_DB_URL` /
+  `TARGET_DB_URL` point at the IPv4 **session pooler** (used for dumps,
+  admin, reconcile) and `SOURCE_REPLICATION_URL` points at the source
+  *direct* host. The subscription connection is dialed by the **target's
+  walreceiver** over Supabase's internal network, so your box never needs an
+  IPv6 route. This is the configuration the measured run below used.
+
+### Step 0: rehearse on a throwaway pair
+
+```bash
+bun start sandbox up --org <org-id>   # creates + seeds a throwaway src/tgt pair
+# ... drive every step below against it ...
+bun start sandbox down                 # deletes both projects + generated files
+```
+
+The sandbox seeds an awkward fixture on purpose (STORED tsvector generated
+column, IDENTITY sequence, a no-PK table) and writes a ready-made
+`migrate.sandbox.yaml` + `.env.sandbox`. Steps 1-7 below are exactly its
+printed drive-through - run them against the sandbox once before touching
+production config. Every drive-through command takes the sandbox config + env
+files, e.g. `bun start -c migrate.sandbox.yaml --env-file .env.sandbox doctor`.
+The pair bills until `sandbox down` deletes it.
+
+e.g. `bun start sandbox up --org <your-org-id>` provisions
+`sbshift-sandbox-src` (eu-central-1) + `sbshift-sandbox-tgt` (eu-west-1) -
+the measured run below was provisioned exactly this way, in ~3 minutes.
+
+### Step 1: stage config + env
+
+`migrate.config.yaml`: source/target refs, the **enumerated** table list
+(never `FOR ALL TABLES` - it needs superuser), publication/slot/subscription
+names, the reconcile table list, and the WAL watchdog threshold
+(`watchdog.maxRetainedWalMb`). `.env`: the connection strings +
+`SUPABASE_ACCESS_TOKEN`.
+
+### Step 2: create the target project
+
+```bash
+supabase projects create <name> --org-id <org> --region <target-region> \
+  --db-password "$(openssl rand -base64 24)"
+```
+
+New projects land on the current platform default major (17 as of 2026-07),
+which is what makes this track an upgrade path. Put the new ref in the config
+and its pooler/direct strings in `.env`. e.g. for a PG 15 production in
+eu-central-1 moving to eu-west-1:
+
+```bash
+supabase projects create my-app-pg17 \
+  --org-id <your-org-id> --region eu-west-1 \
+  --db-password "$(openssl rand -base64 24)"
+```
+
+### Step 3: restore what replication does not carry
+
+Logical replication moves **table rows only** - no DDL, roles, sequences,
+extensions, or the managed `auth`/`storage` schemas:
+
+```bash
+bun start bootstrap --with-auth-data --confirm
+```
+
+`bootstrap` enables non-default extensions and restores roles + schema onto
+the target in one pass; `--with-auth-data` also loads the auth-schema rows
+(with triggers deferred via `session_replication_role = replica`). The auth
+part is **not optional** when any replicated table has an FK into
+`auth.users` - the initial copy is FK-rejected row by row otherwise, and
+`doctor` flags that cross-schema FK explicitly. Manual fallback: `supabase
+db dump` for roles/schema/auth + a single-transaction `psql` restore -
+excluding `auth.schema_migrations` from the auth data dump (it is SELECT-only
+for the postgres role on managed targets; the restore fails on it otherwise).
+
+### Step 4: the gates - doctor + preflight
+
+```bash
+bun start doctor      # fail-closed readiness audit of BOTH ends
+bun start preflight   # hard gate: wal_level, grants, replica identity
+```
+
+Do not proceed past a `NOT READY`. In the measured run `doctor` exited 1
+with exactly the 5 missing target tables before bootstrap, and reported
+`READY (with warnings)` - 29 pass / 4 warn / 0 fail - after it.
+
+### Step 5: replicate + watch
+
+```bash
+bun start replicate   # publication + slot + subscription; initial copy starts
+bun start watch       # polls until every table is srsubstate='r'
+```
+
+The app keeps writing to the source throughout - that is the point of the
+track. `watch` aborts on its own if the slot bloats source WAL past the
+watchdog threshold (the #1 logical-replication outage mode) or the slot's
+`wal_status` flips to `lost`.
+
+### Step 6: cutover (the only downtime)
+
+```bash
+# 1. STOP application writes to the source (read-only / maintenance page).
+bun start reconcile   # must print RECONCILE PASSED
+bun start cutover     # drains lag to 0, resyncs sequences, drops subscription
+# 2. Repoint the app at the new project (URL + keys). Never re-enable
+#    writes on the source.
+```
+
+`reconcile` chunked-checksums every replicated table on both ends.
+`cutover` samples the source WAL LSN twice and warns loudly if it is still
+advancing (writes not actually stopped), waits for lag to reach zero, then
+`setval()`s every sequence owned by a replicated column - sequences do not
+replicate, and the schema restore only carried their dump-time values, so
+rows inserted after bootstrap would otherwise collide on the next
+serial/IDENTITY insert.
+
+### Step 7: copy non-data config, verify, tear down
+
+```bash
+bun start config-sync --dry-run   # review the diff first
+bun start config-sync             # Auth/Realtime/PostgREST/Storage/pooler settings
+bun start provision               # preview matching billable infra (compute size!)
+bun start verify                  # Supabase advisors on the target, as a health gate
+bun start teardown                # drop subscription -> slot -> publication
+```
+
+Secrets are stripped by default - re-enter SMTP/OAuth credentials on the
+target. The JWT signing secret and API keys are **never** copied (they are
+not on any synced endpoint), so users re-login after cutover. Leave the old
+project paused, not deleted, for a few days as a safety net.
+
+Storage and Edge Functions, if you have them, transfer separately here:
+`bun start storage <localDir>` for object bytes (buckets do not arrive with
+the schema restore, and the push re-creates them **private** - restore
+visibility) and `supabase functions deploy --project-ref <new-ref>`. The
+[region-migration guide](/guides/supabase-region-migration-e2e/) details both
+transfers plus the wider repointing checklist (OAuth callbacks, custom
+domains) that a new project on this track needs too.
+
+Two things the schema restore deliberately leaves behind, to re-apply by
+hand after cutover: `cron.schedule(...)` job rows (job schedules are data,
+not DDL - the target will not fire your pg_cron jobs until you re-add them,
+which also means no double-firing while both projects are live), and any
+`ALTER ROLE ... SET` / `ALTER DATABASE ... SET` GUC overrides, which live in
+`pg_db_role_setting` and are invisible to the Management API endpoints
+`config-sync` reads (`doctor` diffs them and warns).
+
+### Measured run (2026-07-30)
+
+Full pipeline against a throwaway cross-region pair (eu-central-1 ->
+eu-west-1, driven from a non-IPv6 box via the pooler + replication-URL
+split; projects deleted after):
+
+| Step | Observed |
+|---|---|
+| `sandbox up` | pair ACTIVE_HEALTHY in ~3 min; seeded 3,000 documents (~2 KB each) + 300 IDENTITY items |
+| `doctor` (pre-bootstrap) | exit 1: 24 pass / 4 warn / 5 fail - the 5 fails were exactly the missing target tables |
+| `bootstrap --confirm` | extensions + roles + schema restored in one pass |
+| `doctor` (post-bootstrap) | `READY (with warnings)`: 29 pass / 4 warn / 0 fail (warnings: subscriber worker-count GUCs, fine at this size) |
+| `replicate` + `watch` | publication + slot + subscription created; 5/5 tables synced in under 5s at this size |
+| `reconcile` | `RECONCILE PASSED` - source == target row counts and hashes on all tables |
+| `cutover` | WAL-quiescent check passed, lag 0.0 KB, `sequence public.items_id_seq set to 300`, subscription dropped |
+| post-cutover insert | `insert into items ... returning id` -> **301**, no PK collision |
+| `config-sync --dry-run` | per-section diffs (Realtime, Database Pooler, PostgREST, Storage); secrets stripped |
+| `verify` | advisor gate fired correctly (`rls_disabled_in_public` on the intentionally RLS-less sandbox fixture) |
+| total wall time | under 15 minutes including project provisioning and `sandbox down` |
+
+A second pass the same day seeded the repointing surface (pg_cron job, public
+bucket, auth user, project secret, custom role, config change) and exercised
+the `config-sync` **apply** path live; results and the two bugs it flushed
+out are tabulated in the [region-migration guide's measured
+run](/guides/supabase-region-migration-e2e/#measured-run-2026-07-30).
+
+Timing caveat: 3,000 small rows copy in seconds. At real sizes the initial
+copy is the long pole, and a STORED generated column is the measured
+throughput killer (~7x slower copy, ~11 MiB/s vs ~80 MiB/s in sbshift's
+scale rehearsal) - `watch` shows live per-table copy %, so calibrate your
+window from that, and set `maxRetainedWalMb` generous enough to hold a full
+copy's worth of WAL on the source.
+
 ## Verification
 
 | Check | How | Expected |
@@ -257,6 +509,10 @@ brought back online automatically.[^sb-upgrading]
 | Prod post-upgrade | `show server_version` via psql | target version |
 | Prod identity | API URL, keys, JWT secret | unchanged |
 | Replica recreated | app env holds new replica string | reads flowing |
+| Replication caught up (sbshift track) | `sbshift watch` (or `status --require-synced`) | every table `srsubstate='r'` |
+| Data identical pre-cutover | `sbshift reconcile` | `RECONCILE PASSED` |
+| Sequence resync | post-cutover `insert ... returning id` on a serial/IDENTITY table | next value, no PK collision |
+| Target health gate | `sbshift verify` | no advisor lints at/above your `--fail-on` level |
 
 ## Gotchas and lessons learned
 
@@ -282,6 +538,23 @@ brought back online automatically.[^sb-upgrading]
 - **Restore-to-new-project is dashboard-only** - there is no Management API
   or CLI path for it as of 2026-07 (the API only restores in place).
   Re-verify before scripting around it.
+- **Sequences do not replicate (sbshift track).** The schema restore carries
+  their dump-time values, so every row inserted on the source between
+  bootstrap and cutover would collide on the next serial/IDENTITY insert
+  without a resync - `cutover` `setval()`s every owned sequence (verified:
+  id 301 after 300 seeded rows).
+- **pg_cron does not double-fire on the sbshift track** (unlike the clone
+  track): `cron.schedule(...)` rows are data, not DDL, so they are simply
+  absent on the target until you re-add them after cutover. The risk is
+  forgotten jobs, not duplicate ones.
+- **A STORED generated column is the copy bottleneck** - measured ~7x slower
+  initial copy (~11 MiB/s vs ~80 MiB/s in sbshift's scale rehearsal).
+  `watch` shows live per-table copy %; calibrate your window from that, not
+  from row counts.
+- **`config-sync` is blind to `pg_db_role_setting`.** `ALTER ROLE ... SET` /
+  `ALTER DATABASE ... SET` overrides (`statement_timeout`, `auto_explain.*`,
+  ...) are not on the Management API endpoints it reads. `doctor` diffs them
+  between source and target and warns; re-apply by hand.
 
 ## References
 
@@ -292,3 +565,5 @@ brought back online automatically.[^sb-upgrading]
 [^sb-branching]: Supabase, "Working with branches - Seeding behavior," Supabase Docs. https://supabase.com/docs/guides/deployment/branching/working-with-branches
 [^sb-compute-disk]: Supabase, "Compute and Disk," Supabase Docs. https://supabase.com/docs/guides/platform/compute-and-disk
 [^sb-custom-schemas]: Supabase, "Using Custom Schemas," Supabase Docs. https://supabase.com/docs/guides/api/using-custom-schemas
+[^sbshift]: sbshift, "Postgres-to-Postgres logical-replication migrator," GitHub. https://github.com/erfianugrah/sbshift
+[^sb-ipv4]: Supabase, "IPv4 Address," Supabase Docs. https://supabase.com/docs/guides/platform/ipv4-address
