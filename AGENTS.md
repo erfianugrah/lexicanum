@@ -55,6 +55,9 @@ Guide:
 ```
 frontmatter
 Lede (what you'll build + prerequisites)
+Constants preamble - if measurement-heavy: the fixed facts every later claim
+  depends on (hardware/IDs, physics, event IDs, GUIDs, expected numbers),
+  as tables, before any steps (see usb4-10gbe-windows-tuning)
 Architecture overview + Component Versions + diagram
 Part 1..N / Step 1..N (sequential, each independently verifiable)
 Verification
@@ -98,6 +101,16 @@ Cite the source path when answering from docs.erfi.io in chat, too.
 
 ## House style
 
+- **Voice: plain and subtractive.** State the fact with its number; never an
+  adjective doing a number's job. No slogan contrasts ("measurements instead of
+  folklore"), no rating your own points ("the big win", "the nasty one", "the
+  trap that bites last", "lock it in"), no "not X, it's Y" constructions.
+  Order steps so the important one is first; don't announce which matters. Dry
+  wit is fine sparingly and in passing ("learned the hard way") - never a bit
+  you build up to. When a step has a measured delta, give the delta and the
+  command that reproduces it; that IS the persuasion.
+- **Spelling: American -ize** (normalize, organize, optimize). The corpus
+  convention; note it diverges from British -ise used in email/reply writing.
 - **Headings: sentence case.** Capitalize only the first word and proper nouns /
   product names / acronyms. Keep: Cloudflare, Supabase, Hyperdrive, Postgres,
   Traefik, Vaultwarden, Grafana, Prometheus, Docker, Nix, Go, VyOS, KEDA, etc.;
@@ -124,6 +137,18 @@ Cite the source path when answering from docs.erfi.io in chat, too.
   Without `bgcolor="transparent"` Graphviz emits a white graph polygon and the
   diagram renders as a white card with low-contrast text in dark mode. Never set
   color/fill/fontcolor attributes on individual nodes or edges.
+
+## Conformance
+
+Docs written before 2026-07 predate parts of this contract: several guides
+lack a Verification or Gotchas section, and older prose contains em/en-dashes
+and other non-ASCII punctuation (the ASCII rule and its guard are newer).
+Do not treat the oldest docs as exemplars - the exemplars are
+`reference/cloudflare-supabase-architecture.mdx` and
+`guides/usb4-10gbe-windows-tuning.mdx`. New docs must conform fully. When
+making a substantial edit to an older doc, bring the touched sections into
+conformance (heading case, ASCII punctuation, section skeleton); a wholesale
+rewrite just for style is not required.
 
 ## Verify before done
 
