@@ -85,9 +85,23 @@ The lifecycle, measured:
 The dashboard flow calls undocumented `/platform` routes (`POST /platform/projects/{ref}/privatelink/associations/aws-account`). Measured: those routes reject Personal Access Tokens categorically - 401 "JWT could not be decoded", even for an owner-role `sbp_` PAT, on the association POST, the status GET, and entitlements. They want a dashboard session JWT. Net effect for automation: project + settings are fully API-driven, but the association itself is one dashboard click per AWS account; everything downstream (RAM accept, endpoint, DNS) is AWS-side and automatable.
 </Aside>
 
-<Aside type="note" title="Beta gating is two-layered, asserted">
-On a fresh Team org the PrivateLink section did not appear at all until the org had both a per-org feature flag and a server-side entitlement granted (asserted from Studio source + observed behaviour; the public docs mention no allowlist). If the section is missing on a Team org, that is why - ask support. Also from Studio source: eu-central-2 is excluded from PrivateLink.
+<Aside type="note" title="Where the PrivateLink section lives">
+Project > Settings > Integrations > AWS PrivateLink.[^sb-privatelink] It is a project-level page - nothing appears under organisation settings, which is how "the UI is missing on my Team org" reports happen (learned the hard way: an earlier draft of this doc claimed allowlist gating; the section was simply being looked for one level up). If the section is genuinely absent from project settings on a Team org, support is the path. One unrelated asserted note from Studio source, untested: eu-central-2 is excluded from PrivateLink.
 </Aside>
+
+## Managing it with Terraform
+
+Everything except one dashboard click is infrastructure-as-code, split across two providers. The supabase provider covers the project control plane over PAT-authenticated `/v1`; the AWS provider covers the entire consumer side. The gap is the association itself, as above.
+
+| Layer | Resource / mechanism | Notes from the lab |
+|---|---|---|
+| Project + settings | `supabase_project`, `supabase_settings` (provider ~> 1.10) | Network restrictions go in as `network = jsonencode({ restrictions = [...] })` - shape verified, applies clean, survives toggling |
+| PrivateLink association | none - no provider resource, `/platform` rejects PATs | Dashboard click per AWS account; a gated `restapi_object` exists in the lab but stays off by default |
+| RAM share | CLI, not declarative | `aws_ram_resource_share_accepter` cannot work here: the resource configuration is invisible until accepted, so accept-then-lookup is orchestration (a `make arns` step), not a resource |
+| Endpoint | `aws_vpc_endpoint` with `vpc_endpoint_type = "Resource"` + `resource_configuration_arn` | No `dns_entry` output (provider ~> 6.0); SG with both 5432 and 6543 |
+| DNS | `aws_route53_zone` + apex A record from `data.aws_network_interface` ENI IPs | Two-pass apply: `for_each` over the endpoint's ENI IDs fails at plan while they are unknown - apply the endpoint first, then the rest resolves against real IDs |
+
+The supabase provider has no privatelink resource at all, so do not go looking for it; the REST-shaped gap is exactly the one dashboard step. Full working module: the supabase-lab repo referenced under Reproducing.
 
 ## DNS and TLS: verify-full through the endpoint
 
@@ -149,13 +163,16 @@ PrivateLink covers direct Postgres and PgBouncer only; API, Auth, Storage, and R
 
 ## Gotchas
 
-- **Security group: 5432 only in the official walkthrough.** Add 6543 or the pooler path silently dies at the SG.[^sb-privatelink]
-- **Association automation stops at the dashboard.** PATs get 401 on the `/platform` routes (measured); budget one click per AWS account.
-- **RAM acceptance before ARN lookup.** PENDING invitations hide the resource configuration from `list-resources` (measured).
-- **Resource endpoints: no API-visible DNS name** (measured). PHZ with ENI IPs, TTL 60.
-- **IPv6-only public direct.** No add-on, no IPv4 direct connection - and the add-on is not dual-stack at the DNS level.[^sb-ipv4]
-- **Default `supabase link` goes public.** `--skip-pooler` or `--db-url` for anything over the endpoint.[^sb-cli]
-- **PostgREST root needs service_role.** Probe a table, not `/rest/v1/`.
+Each with the failure mode you will actually see, the wrong path it sends you down, and the worst case worth assuming.
+
+- **Security group: 5432 only in the official walkthrough.** The endpoint serves both direct Postgres (5432) and PgBouncer (6543) - the guide's compatibility section says so - but its security-group step opens 5432 only.[^sb-privatelink] SGs drop rather than refuse, so with a verbatim walkthrough SG the 6543 path dies silently: `psql ... :5432` works, `psql ... :6543` hangs to client timeout with no ICMP error, no Postgres error, and no log you own. The wrong debug path: the asymmetry (direct fine, pooler timing out) looks like a Lattice or pooler-platform problem, so you go spelunking in endpoint config and Supavisor status instead of the one-line SG gap. Worst case: you ship the private path for direct connections, the app's pooler config fails over to the public Supavisor without anyone noticing, and the "private" deployment has been egressing DB traffic over the internet for weeks. Fix: one more inbound rule, TCP 6543, same source as 5432. Measured: the 6543 matrix test only passed after the second rule was added.
+- **Association automation stops at the dashboard.** The association lives behind undocumented `/platform` routes that authenticate with a dashboard session JWT, not the Management API's PAT scheme. The failure mode: your pipeline 401s with "JWT could not be decoded" - which reads as a token problem, so you rotate the PAT, re-check org roles, burn an hour (a Developer-role 403 on project create is a *different* error and a red herring here). The tell: every `/v1` call succeeds with the same token while every `/platform` call 401s. Worst case worth assuming: the click is permanent - N AWS accounts means N dashboard visits and N RAM shares to track, so write the association runbook as an ops procedure, not a pipeline stage. What is automatable: everything downstream (RAM accept, endpoint, DNS) is AWS-side. Measured: owner-role PAT rejected on the association POST, the status GET, and entitlements; the published `/v1` spec has no PrivateLink route at all (re-verified against the current spec).
+- **RAM acceptance before ARN lookup.** The shared resource configuration does not exist in your account's view until the share is accepted - `list-resources` returns empty while the invitation is PENDING (measured). The failure mode: automation that looks up the ARN first sees nothing and fails or, worse, retries into a race. The structural trap: a declarative `aws_ram_resource_share_accepter` deadlocks, because the phase that could apply it needs the ARNs that only acceptance produces. Worst case: a re-run against an empty lookup quietly plans an endpoint replacement, your ENI IPs change, and every client in the VPC breaks at once. Fix: orchestrated accept-then-lookup (the lab's `make arns`), with the produced `arns.tfvars` gating phase 2.
+- **Resource endpoints expose no API-visible DNS name.** Gateway and Interface endpoints hand you `dns_entry`; Resource-type endpoints do not (measured on AWS provider ~> 6.0 - the attribute comes back empty/unavailable). The failure mode: outputs and docs that assume `dns_entry` stall, and hand-built CNAMEs point at names that were never assigned. Worst case: the endpoint gets replaced (new ENIs, new IPs) and your hard-coded DNS or stale PHZ record points at dead addresses - every private client times out simultaneously, and TTL is the only thing between you and a long outage. Fix: PHZ apex A record carrying the ENI IPs at TTL 60, refreshed by the same apply that manages the endpoint; treat endpoint replacement as a DNS event.
+- **IPv6-only public direct.** Without the IPv4 add-on, `db.<ref>.supabase.co` publishes only an AAAA record, so an IPv4-only client has no public-direct path at all.[^sb-ipv4] The failure mode is confusing because everything else works: the pooler is IPv4, the Data API is IPv4, so "the project is reachable" while `psql` direct reports it cannot translate the hostname or hangs, depending on the stack. Worst case: you buy the add-on expecting dual-stack and discover it swaps the DNS answer to A-only at the record level - now your IPv6-native clients are the broken ones. Fix: Supavisor session mode for IPv4-only networks (free), the add-on only if public direct is genuinely required, and under PrivateLink neither matters - the endpoint already provides in-VPC IPv4 on both ports.
+- **Default `supabase link` goes public.** A plain `supabase link` stores the shared-pooler (public Supavisor) connection.[^sb-cli] The failure mode: `db push` works fine all through development because public access is open, then the day you apply network restrictions the migration pipeline breaks - in CI, at deploy time, with a connection error that points at the pooler, not at your link config. Worst case: you believed migrations ran over the private path while they were egressing via NAT the whole time, and the lockout review signed off on it. Fix: `supabase link --skip-pooler` (direct via the PHZ) or `db push --db-url`, and prove it by running the migration once with restrictions already closed. Measured: default link succeeded via public Supavisor (T08); `--skip-pooler` and `--db-url` both ran over the endpoint (T09, T10).
+- **PostgREST root requires service_role.** On the current platform, `/rest/v1/` (the OpenAPI root) answers anon keys with 401 "Only the `service_role` API key can be used for this endpoint" (measured, on- and off-VPC). The failure mode: a health check or reachability probe against the root gets 401 with an "Invalid API key" body, which reads as key misconfiguration - so you rotate keys and re-check RLS while the project is fine. Worst case: monitoring pages you for a healthy project, or worse, someone "fixes" the probe by putting the service_role key into a client-side health check and ships it. Fix: probe a real table with the anon key - and decide deliberately, because a table created by migration gets `anon` SELECT via default privileges with no RLS, while dashboard-created tables get RLS enabled.
+- **Prepared statements on transaction mode: stale advice.** The old "transaction mode breaks prepared statements" rule is no longer true - `PREPARE`/`EXECUTE` succeeded on 6543 (measured). The failure mode here is the reverse: cargo-culted `prepare: false` and session-mode workarounds that cost you transaction-mode pooling benefits for no current reason. Worst case: a pooler-mode decision made on folklore, unexamined for years. Fix: re-test against your actual pooler before carrying the workaround forward.
 
 ## Decision guide
 
@@ -197,7 +214,7 @@ Every measured claim above comes out of a disposable OpenTofu lab (supabase-lab)
 | Prepared statements OK on transaction mode | tested | `PREPARE`/`EXECUTE` on 6543 |
 | PostgREST root requires service_role | tested | anon vs root path, on- and off-VPC |
 | `/platform` association API rejects PATs | tested | owner-role PAT against POST/GET/entitlements |
-| Flag + entitlement gating; eu-central-2 excluded | asserted | Studio source + observed dashboard behaviour |
+| eu-central-2 excluded from PrivateLink | asserted, untested | Studio source |
 | Resource endpoint exposes no `dns_entry` | tested (AWS provider ~> 6.0) | outputs fallback + console cross-check |
 | Lambda-over-endpoint path | design-only | `enable_lambda` scaffolded, not run |
 
