@@ -1,0 +1,426 @@
+---
+title: Tuning a USB4 10GbE adapter on Windows
+description: Install, stabilize, and tune a bus-powered USB4/Thunderbolt 10GbE adapter (Alpine Ridge + Marvell AQC113) on Windows - kill RTD3 link flapping, fix the single-flow TX cap with jumbo frames and driver knobs, align L2/L3 MTU across the link, and catch config drift with an assertion script.
+author: "Erfi Anugrah"
+---
+
+A bus-powered USB4 10GbE adapter is the only sane way to get 10G onto a small-form-factor board with no free PCIe slot. It is also a stack of four vendor firmwares (host TB controller, cable, adapter TB controller, NIC) that Windows power management treats as optional. This guide takes one such adapter from "flaps off the bus every 60 seconds" to a stable 9.6+ Gbps. Each step includes the measurement that justifies it and the command to reproduce that measurement.
+
+Prerequisites: admin PowerShell on the Windows box, a Linux router or second host to test against, and iperf3 on both ends. Everything here was measured on the rig in the constants table over two days in July 2026; where a number comes from a different setup, it says so.
+
+## Constants (read this first)
+
+Everything that follows is a consequence of these fixed facts. If your symptoms contradict them, your problem is elsewhere.
+
+### The rig (measured example)
+
+| Piece | Detail |
+|---|---|
+| Adapter | xikeStor SKN-U410GT, USB4 -> 10GBASE-T, bus-powered |
+| Adapter internals | Intel JHL6340 (Alpine Ridge TB3, NVM 46:0) + Marvell AQC113 |
+| Host board | ASUS ROG Strix X670E-I (AM5), 2x Type-C via onboard Intel JHL8540 (Maple Ridge) |
+| Host TB controller PCI ID | `PCI\VEN_8086&DEV_1137` (NHI) |
+| NIC PCI ID | `PCI\VEN_1D6A&DEV_04C0` (= AQC113) |
+| OS | Windows 10 Pro 22H2 (build 19045) |
+| Final driver | Marvell AQtion 3.1.11.0 |
+| Router (test peer) | NixOS, Intel X710 (i40e), VLAN trunk |
+
+### Physics of the tunnel
+
+| Constant | Value | Why it matters |
+|---|---|---|
+| TB link | dual-lane 40G (2x 20G) | PCIe tunnel enumerated gen3 x4 (~32 GT/s) - verified via `DEVPKEY_PciDevice_CurrentLinkSpeed=3`, `CurrentLinkWidth=4`. x2 would mean a 20G single-lane train. |
+| RX direction | NIC DMA-**writes** to host RAM | Posted transactions: fire-and-forget, no round trip. This is why receive hits line rate with zero tuning. |
+| TX direction | NIC DMA-**reads** from host RAM | Non-posted: every packet's data fetch is a latency round trip across the tunnel. TX is **per-packet-cost bound**, not bandwidth bound. |
+| Consequence | single-flow TX caps ~2.2-2.9 Gbps at 1500 MTU | No CPU, interrupt, TCP-window, or driver-setting change fixes this at 1500 MTU. Fewer, bigger packets is the fix. |
+| 40G "headroom" | irrelevant to the cap | USB4's 40Gbps is line bandwidth; the constraint is per-transaction latency, and it was never bandwidth. |
+
+### MTU numbering (L2 vs L3)
+
+| Where | Convention | "Jumbo" value |
+|---|---|---|
+| Windows NIC property "Jumbo Packet" | **L2 frame** | `9014` (means L3 payload 9000, same as Intel's 1514 = 1500) |
+| Windows `NlMtu` (IP MTU) | L3 | 9000 (derived from the 9014 frame) |
+| Linux `ip link` / systemd `MTUBytes` | L3 | 9000 to match the Windows host |
+| Trunk/parent interface | L2-ish headroom | 9014, so the 4-byte VLAN tag fits over a 9000 child |
+
+TCP between mismatched hosts self-heals via MSS negotiation, so a mismatch here is invisible in every TCP test. UDP has no negotiation and **black-holes silently**. Part 5 shows the boundary test.
+
+### nhi event IDs (System log, provider `nhi`)
+
+| ID | Meaning |
+|---|---|
+| 9002 | Thunderbolt device connected |
+| 9003 | Thunderbolt device disconnected |
+| 9007 | Driver entered RTD3 (runtime power-gated the host router) |
+| 9008 | Driver exit RTD3 |
+
+A healthy boot shows one 9001/9002 pair. Any 9003 outside a deliberate unplug/reboot is a flap.
+
+### powercfg GUIDs (stable across Windows 10/11)
+
+| Setting | Subgroup GUID | Setting GUID | Tuned value |
+|---|---|---|---|
+| USB selective suspend | `2a737441-1930-4402-8d77-b2bebba308a3` | `48e6b7a6-50f5-4782-a5d4-53bb8f07e226` | 0 (Disabled), AC + DC |
+| PCI Express Link State Power Management | `501a4d13-42af-4429-9fd1-a8218c268e20` | `ee12f906-d277-404b-b6da-e5fa1a576df5` | 0 (Off), AC + DC |
+
+### The numbers to expect
+
+Measured on the rig above, iperf3 against the router, admin segment at jumbo:
+
+| Config | TX 1 flow | TX 4 flows | RX 1 flow |
+|---|---|---|---|
+| Day-one defaults, 1500 MTU | 2.2-2.9 (sawtooth) | 8.60 | 9.40 |
+| + jumbo 9014 | 4.33 | 9.56 | - |
+| + Interrupt Moderation Rate = Disabled | 5.38 | - | - |
+| + CTCP congestion provider | 8.0-8.3 | 9.7 | 9.9 |
+
+The single-flow remainder (~85% of the ~9.9 jumbo goodput ceiling) is the tunnel DMA-read latency itself. The only real fix for that last bit is a native-PCIe NIC; everything software-side is exhausted by the end of this guide. Note 9.7 Gbps multi-flow exceeds the classic "9.4 line rate" figure because that figure assumes 1500-byte frames; at 9014 the L2 overhead fraction shrinks and the goodput ceiling rises to ~9.9.
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR;
+  node [shape=box, style=rounded];
+  host [label="Windows box\n(Maple Ridge USB4 host)"];
+  cable [label="TB4 cable\n(certified, 40G)", shape=note];
+  adapter [label="USB4 adapter\nJHL6340 + AQC113"];
+  sw [label="10G switch"];
+  rtr [label="Router\ntrunk: MTU 9014\nadmin VLAN: MTU 9000"];
+  host -> cable [dir=none, label="PCIe tunnel\ngen3 x4"];
+  cable -> adapter [dir=none];
+  adapter -> sw [label="10GBASE-T"];
+  sw -> rtr [label="trunk"];
+}
+```
+
+| Component | Version at time of writing |
+|---|---|
+| Marvell AQtion Windows driver | 3.1.11.0 (3.1.10.0 also fine - measured perf-equivalent) |
+| AQC113 firmware | 1.5.38+ flashable, Windows-only updater[^flohs-aqc113-fw] |
+| iperf3 | 3.x (Cygwin build on Windows - fine for relative A/B, cross-check absolute numbers with ntttcp[^ms-perf-tools]) |
+| Adapter BIOS-side knobs | none: this board exposes no RTD3 disable and no PCIe ASPM option |
+
+## Part 1: install the driver
+
+Windows has no inbox driver for Marvell AQtion chips. On first plug-in you get an "Ethernet Controller" (`PCI\VEN_1D6A&DEV_04C0`) with problem code 28, and both Device Manager "search automatically" and Windows Update fail for the bare `SUBSYS_00011D6A` ID.
+
+1. Download the Marvell AQtion driver (3.1.x covers DEV_04C0) from the adapter vendor's download page or the Marvell WHQL pack. The station-drivers Marvell LAN section tracks releases and firmwares.
+2. Install via Device Manager -> Update driver -> Browse my computer, or `pnputil /add-driver <inf> /install`.
+3. Verify: "Marvell AQtion 10Gbit Network Adapter" appears under Network adapters.
+
+:::note
+A second unclaimed PCI function (another "Ethernet Controller", status Unknown, **no** problem code) remains after install. That is normal for this chip - ignore it or disable it.
+:::
+
+Pull an address and confirm the link: `Get-NetAdapter` should show Status `Up`, LinkSpeed `10 Gbps`.
+
+## Part 2: stop the RTD3 flap
+
+Symptom: the NIC works briefly after driver install, then vanishes from Network Connections while Thunderbolt Control Center still shows "Connected". The System event log (provider `nhi`) shows a ~60-second loop: `9008` (exit RTD3) -> `9003` (disconnect) -> `9002` (reconnect) -> `9007` (entered RTD3) -> quiet -> repeat.
+
+Mechanism: Windows runtime power-gates the Thunderbolt host router (RTD3), and the adapter's Alpine Ridge controller does not survive the transition - instead of sleeping and resuming it falls off the bus, ripping the PCIe tunnel (and the NIC behind it) down with it. The same 4-event loop is a documented Windows issue class across Thunderbolt docks and eGPUs; the standard remediations are selective-suspend disablement and the Device Manager power checkboxes.
+
+Fix, in order of measured contribution:
+
+### Step 1: swap the cable
+
+The stock cable was the single largest flapping source on this rig. Use a certified 40G TB4 cable, preferably the shortest that reaches. Cheap USB-C charge cables enumerate fine and then flap exactly like this.
+
+### Step 2: disable the power levers (admin PowerShell)
+
+```powershell
+# USB selective suspend = Disabled (AC + DC)
+powercfg /setacvalueindex scheme_current 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0
+powercfg /setdcvalueindex scheme_current 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0
+# PCI Express -> Link State Power Management = Off (AC + DC)
+powercfg /setacvalueindex scheme_current 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 0
+powercfg /setdcvalueindex scheme_current 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 0
+powercfg /setactive scheme_current
+```
+
+`scheme_current` applies to whatever plan is active **right now**. If you later switch power plans (e.g. Balanced -> High performance), the new plan has its own copy of these settings and reverts to defaults. Re-run the script after any plan change, or run it under each plan you use. (This exact drift happened here; the assertion script in Part 6 now catches it.)
+
+### Step 3: Device Manager power checkboxes
+
+System devices -> "Thunderbolt(TM) Controller - 1137" -> Power Management -> **uncheck** "Allow the computer to turn off this device to save power". Repeat for USB Root Hub entries and for the Marvell adapter itself. PowerShell equivalent for the NIC:
+
+```powershell
+# expect AllowComputerToTurnOffDevice = Disabled
+Get-NetAdapterPowerManagement -Name 'Ethernet'
+```
+
+### Step 4: reboot with the adapter plugged in
+
+A replug after step 2 is not enough - the driver can log one last RTD3 entry and fail to re-enumerate the PCIe NIC behind the tunnel. Reboot.
+
+### Step 5: verify the flap is dead
+
+```powershell
+# since boot: expect a 9001/9002 pair, zero 9003
+Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='nhi'; StartTime=(Get-Date).Date} | Sort-Object TimeCreated | Select-Object TimeCreated,Id
+```
+
+The honest validation is an **overnight idle** window: RTD3 arms when the link is quiet, so a load soak never exercises it. On this rig: zero 9003 events after the cable swap + power settings, including idle.
+
+## Part 3: measure correctly
+
+Before tuning anything, set up the measurement rig: server placement, a scoped firewall rule, and a second tool to cross-check absolute numbers. Two traps in this section produced wrong conclusions on this rig before the setup was fixed.
+
+### Server placement and firewall
+
+Run the iperf3 **server on the Windows box** and the client on the router/Linux peer. That keeps the router's input chain out of the way and makes `-R` mean "Windows transmits".
+
+```powershell
+# once, admin - then scope it to your segment (example: 192.168.10.0/24)
+New-NetFirewallRule -DisplayName "iperf3" -Direction Inbound -Protocol TCP -LocalPort 5201 -Action Allow
+Set-NetFirewallRule -DisplayName 'iperf3' -RemoteAddress 192.168.10.0/24
+iperf3 -s
+```
+
+```bash
+# on the Linux peer (Windows at 192.168.10.2)
+iperf3 -c 192.168.10.2 -P 4 -t 15        # Windows receives
+iperf3 -c 192.168.10.2 -P 4 -t 15 -R     # Windows transmits
+```
+
+### Cross-check the tool
+
+Microsoft's own guidance is to test TCP throughput with ntttcp or ctsTraffic, not iperf3[^ms-perf-tools] - the Cygwin iperf3 build has a send-path ceiling on Windows (it emitted only 3.5 Gbps of a `-b 10G` UDP stream here) and a historical SO_SNDBUF autotuning bug. Use iperf3 for relative A/B comparisons, but confirm any absolute cap with a native sender before blaming hardware. Here, ntttcp reproduced the same 2.4 Gbps single-flow TX, which exonerated iperf3.
+
+### A/B discipline (the two traps that produce wrong conclusions)
+
+1. **Run-order/thermal drift**: the first run after idle reads ~0.3-0.5 Gbps high on this adapter. Collect 3+ spaced samples and compare settled bands. An apparent driver regression (3.1.11 "slower" than 3.1.10) dissolved under a proper rollback A/B - the drivers were perf-equivalent.
+2. **Cold-boot inflation**: any config that requires a reboot (e.g. Hyper-V off) gets a fresh-boot first sample, which is inflated by definition. Compare settled-vs-settled only.
+
+Operational iperf3 gotchas, learned the hard way:
+
+- `ssh host 'iperf3 ... | tee file'` block-buffers stdout (pipe, not tty) - you see nothing until exit. Use `ssh -t` plus `stdbuf -oL`.
+- Killing the local ssh does **not** kill the remote iperf3 client; it goes zombie and leaves the server "busy running a test". Clean up with `pkill -x iperf3` on the server side.
+- Run the server in a visible window. `-D` (daemon) made it unkillable from a normal shell and invisible when it died mid-soak.
+
+### Localize loss before tuning
+
+During retransmit-heavy TX runs, take deltas on every node in the path: router NIC (`ethtool -S`, watch `rx_missed_errors`), switch port counters (RX/TX discards, FCS), Windows NIC discard counters. On this rig every external node was provably clean; the "loss" was **spurious retransmits** - tunnel completion/ACK-return jitter makes Windows TCP declare loss on merely-late packets and clamp cwnd. That is the sawtooth. You cannot fix a clamp with a bigger pipe; you fix it by changing what the sender pays per packet (Part 4) and how it reacts to jitter (CTCP, below).
+
+## Part 4: the tuning ladder
+
+Apply in order, re-measuring after each step with the same 15-second, 1-flow and 4-flow TX tests. Expected deltas are from the constants table.
+
+### Step 1: Energy-Efficient Ethernet = Disabled
+
+NIC advanced property. EEE on this link produced a 1.3-2.9 Gbps sawtooth; disabling it stabilized the intervals at a steady ~2.7-2.9. It does not raise the cap, it removes noise - and it is a known AQtion instability source, so keep it off regardless.[^archimago-aqc]
+
+### Step 2: jumbo frames
+
+NIC advanced property "Jumbo Packet" = `9014 Bytes`, then raise the router side (Part 5). Measured delta: 2.2 -> 4.33 Gbps single-flow, 8.6 -> 9.56 four-flow - the largest of any step. It works because the TX path pays a fixed cost per packet; 9014-byte frames cut packet rate ~6x for the same bytes. Multi-flow then spreads the remainder across RSS queues (4 queues, 4 cores) - which is also why the aggregate scales linearly with flow count while a single flow stays capped.
+
+Vendor corroboration: QNAP's setup docs for their Thunderbolt 3 10GbE adapter (same Thunderbolt-to-AQC recipe) walk through setting MTU 9000 on every OS,[^qnap-qna] and the long-running AQC community tuning guides settle on jumbo + EEE off + RSC off as the stable configuration.[^archimago-aqc]
+
+Driver quirks when setting it programmatically:
+
+- Marvell: the display value is the string `9014 Bytes` - `Set-NetAdapterAdvancedProperty` accepts it.
+- Intel I225 (if you also tune the onboard NIC): the property has **no** enum; pass the raw string `9014`, not the `9014 Bytes` label, or the cmdlet fails.
+
+### Step 3: Interrupt Moderation Rate = Disabled
+
+4.33 -> 5.38 Gbps (+24%). Counterintuitive: batching completions (Extreme/High moderation) adds delay per completion, and completion latency is the currency on this path. Note this rig first tested the wrong direction (Adaptive -> Extreme): interrupts dropped 90k -> 23k/s and throughput did not move, because interrupt rate was never the cap. Disable moderation outright; CPU headroom on any modern box absorbs it.
+
+### Step 4: congestion provider = CTCP
+
+```powershell
+netsh int tcp set supplemental template=internet congestionprovider=ctcp
+# revert:
+# netsh int tcp set supplemental template=internet congestionprovider=cubic
+```
+
+5.38 -> ~8.0-8.3 Gbps (+54%). Windows 10's default CUBIC is loss-based and bails hard on every spurious-retransmit hiccup; CTCP's delay-based component rides through tunnel jitter on a low-RTT LAN. This and the pacing change below are host-global TCP settings, not NIC properties - they affect every interface on the box.
+
+### Step 5: pacing profile = always
+
+```powershell
+netsh int tcp set global pacingprofile=always
+```
+
+Marginal but kept: raised the worst-second floor (6.3 -> 6.9). It is a `set global` parameter, not `set supplemental`, and not exposed via `Set-NetTCPSetting` on Windows 10 19045.
+
+### Exonerated (leave at defaults)
+
+LSO V2, RSC, receive/transmit buffers, flow control, RSS, Windows power plan (Balanced vs High performance), Kernel DMA Protection, Hyper-V root-partition tax (under ~0.4 Gbps), RFC 1323 timestamps. Each was toggled and measured; none moved the number. RSC is worth disabling anyway on AQtion per community reports of episodic disconnects[^archimago-rsc] - harmless here.
+
+:::caution
+Never install per-packet shapers (ROG GameFirst, cFosSpeed-class filter drivers) on this box. WFP/filter drivers sit in the TX path and do per-packet processing - exactly the cost this whole guide is minimizing. Check what is bound with `Get-NetAdapterBinding`.
+:::
+
+## Part 5: align MTU across the link (L2 vs L3)
+
+Windows "Jumbo Packet = 9014" numbers the **L2 frame**, so the adapter's `NlMtu` is **9000**. Linux `mtu`/`MTUBytes` is the **L3** size. If you set the router VLAN to 9014 to "match" the Windows value, the router can emit L3 packets of 9001-9014 bytes that exceed the adapter's max frame - and UDP in that band drops **silently**, while TCP never notices (MSS derives from each side's own MTU, so every TCP test passes).
+
+### The boundary test
+
+Do not use ping for this if ICMP echo is firewall-blocked inbound (baseline 1472 failing makes the test inconclusive). Use iperf3 UDP with a fixed datagram length: `-l N` produces an L3 packet of N+28 bytes.
+
+```powershell
+# Windows: iperf3 -s
+```
+
+```bash
+iperf3 -c 192.168.10.2 -u -b 3G -l 8972 -t 5   # L3 9000: must PASS
+iperf3 -c 192.168.10.2 -u -b 3G -l 8973 -t 5   # L3 9001: 0 received = black hole
+```
+
+Pre-fix on this rig: `-l 8973` delivered 0 datagrams (silent L2 drop at the adapter); `-l 8972` passed. Judge pass/fail by "datagrams arrive at all" - at high `-b` rates the Cygwin receiver drops some legal-size datagrams too.
+
+### Fix and persistence
+
+Set the router VLAN child to L3 9000, keep the trunk parent at 9014 for tag headroom. On systemd-networkd (NixOS shown, pattern generalizes):
+
+```nix
+# trunk parent
+MTUBytes = 9014
+# per-VLAN children
+MTUBytes = vlan.mtu or 1500   # admin = 9000, everything else 1500
+```
+
+:::caution
+The `or 1500` default is load-bearing. VLAN children inherit the parent MTU, so raising a trunk to 9014 without pinning every child flips **every** VLAN to jumbo - and then big frames toward 1500-MTU hosts (servers, IoT) black-hole, because UDP has no MSS negotiation to save you. Jumbo belongs on exactly the one segment whose hosts you control.
+:::
+
+Windows persists the 9014 frame setting in the driver property; verify after reboot with `Get-NetIPInterface` (NlMtu 9000).
+
+## Part 6: drift detection
+
+The Windows side of this setup is a dozen imperative settings scattered across driver properties, powercfg, Device Manager checkboxes, and netsh. Nothing re-applies them automatically, and several things silently reset them: driver updates, power-plan switches, Windows feature updates, and, hardest to spot, **replugging into the other Type-C port**, which creates a brand-new adapter instance with INF defaults (jumbo off, IMR adaptive) and silently degrades you back to 2.2 Gbps.
+
+Write your end state down as assertions. This script is the one from the rig, generalized; save it as `verify-10g.ps1` and edit the expected remote-address range:
+
+```powershell
+# verify-10g.ps1 - assert the 10G USB4 NIC + power + TCP config matches the
+# tuned end state. Exit 0 = all pass, 1 = at least one FAIL.
+$script:failures = 0
+
+function Assert-Equal($name, $actual, $expected) {
+    if ("$actual" -eq "$expected") {
+        Write-Host ("PASS  {0,-46} = {1}" -f $name, $actual)
+    } else {
+        Write-Host ("FAIL  {0,-46} = {1}  (expected {2})" -f $name, $actual, $expected) -ForegroundColor Red
+        $script:failures++
+    }
+}
+function Info($name, $value) { Write-Host ("INFO  {0,-46} = {1}" -f $name, $value) }
+
+# --- Adapter identity: match by description, NOT Name. Replugging into the
+# other Type-C port creates a NEW instance ("Ethernet 2") with INF defaults. ---
+$nic = Get-NetAdapter | Where-Object { $_.InterfaceDescription -match 'Marvell AQtion' } | Select-Object -First 1
+if (-not $nic) {
+    Write-Host "FAIL  Marvell AQtion adapter not found (cable plugged?)" -ForegroundColor Red
+    exit 1
+}
+Info 'Adapter name' $nic.Name
+Info 'Driver version' $nic.DriverVersion
+Assert-Equal 'Adapter status' $nic.Status 'Up'
+Assert-Equal 'Link speed' $nic.LinkSpeed '10 Gbps'
+
+$props = @{}
+Get-NetAdapterAdvancedProperty -Name $nic.Name | ForEach-Object { $props[$_.DisplayName] = $_.DisplayValue }
+
+# --- Correctness-critical properties (a wrong value here silently degrades) ---
+Assert-Equal 'Jumbo Packet'                 $props['Jumbo Packet']                  '9014 Bytes'
+Assert-Equal 'Energy-Efficient Ethernet'    $props['Energy-Efficient Ethernet']   'Disabled'
+Assert-Equal 'Large Send Offload V2 (IPv4)' $props['Large Send Offload V2 (IPv4)'] 'Enabled'
+Assert-Equal 'Large Send Offload V2 (IPv6)' $props['Large Send Offload V2 (IPv6)'] 'Enabled'
+Assert-Equal 'Recv Segment Coalescing (IPv4)' $props['Recv Segment Coalescing (IPv4)'] 'Disabled'
+Assert-Equal 'Recv Segment Coalescing (IPv6)' $props['Recv Segment Coalescing (IPv6)'] 'Disabled'
+Assert-Equal 'Receive Side Scaling'         $props['Receive Side Scaling']        'Enabled'
+
+# --- IP MTU: Windows Jumbo Packet numbers the L2 frame, so 9014 => NlMtu 9000.
+# The router VLAN must match THIS value (Linux mtu is L3). ---
+$nlmtu = (Get-NetIPInterface -InterfaceAlias $nic.Name -AddressFamily IPv4).NlMtu
+Assert-Equal 'NlMtu (IP MTU, L3)' $nlmtu '9000'
+
+# --- Power management (RTD3 blockers) ---
+$pm = Get-NetAdapterPowerManagement -Name $nic.Name
+Assert-Equal 'AllowComputerToTurnOffDevice' $pm.AllowComputerToTurnOffDevice 'Disabled'
+
+$scheme = (powercfg /getactivescheme) -replace '.*GUID: ([0-9a-f-]+).*', '$1'
+Info 'Active power scheme GUID' $scheme
+$usb = powercfg /query scheme_current 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226
+Assert-Equal 'USB selective suspend AC' (($usb | Select-String 'Current AC').ToString() -replace '.*: ', '') '0x00000000'
+Assert-Equal 'USB selective suspend DC' (($usb | Select-String 'Current DC').ToString() -replace '.*: ', '') '0x00000000'
+$pcie = powercfg /query scheme_current 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5
+Assert-Equal 'PCIe LSPM AC' (($pcie | Select-String 'Current AC').ToString() -replace '.*: ', '') '0x00000000'
+Assert-Equal 'PCIe LSPM DC' (($pcie | Select-String 'Current DC').ToString() -replace '.*: ', '') '0x00000000'
+
+# --- TCP globals (tuned end state) ---
+$g = netsh int tcp show global
+Assert-Equal 'TCP Auto-Tuning'    (($g | Select-String 'Auto-Tuning').ToString() -replace '.*: ', '').Trim()    'normal'
+Assert-Equal 'TCP Pacing Profile' (($g | Select-String 'Pacing Profile').ToString() -replace '.*: ', '').Trim() 'always'
+$s = netsh int tcp show supplemental
+Assert-Equal 'Congestion provider' (($s | Select-String 'Congestion Control Provider').ToString() -replace '.*: ', '').Trim() 'ctcp'
+
+# --- iperf3 firewall rule: must be scoped to your segment or disabled ---
+$iperfRule = Get-NetFirewallRule -DisplayName 'iperf3' -ErrorAction SilentlyContinue
+if ($iperfRule -and $iperfRule.Enabled -eq 'True') {
+    $ra = ($iperfRule | Get-NetFirewallAddressFilter).RemoteAddress
+    if ($ra -notin @('192.168.10.0/24', '192.168.10.0/255.255.255.0')) {
+        Write-Host ("FAIL  {0,-46} = {1}  (expected 192.168.10.0/24)" -f 'iperf3 rule RemoteAddress', $ra) -ForegroundColor Red
+        $script:failures++
+    } else {
+        Write-Host ("PASS  {0,-46} = {1}" -f 'iperf3 rule RemoteAddress', $ra)
+    }
+} else {
+    Info 'iperf3 firewall rule' 'absent or disabled (OK)'
+}
+
+# --- Report-only ---
+$os = Get-CimInstance Win32_OperatingSystem
+Info 'OS' ("{0} build {1}" -f $os.Caption, $os.BuildNumber)
+Info 'Interrupt Moderation Rate' $props['Interrupt Moderation Rate']
+
+# nhi 9003 = RTD3 flap canary. Any in the last 24h of IDLE time = regression.
+$nhi = @(Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='nhi'; StartTime=(Get-Date).AddHours(-24)} -ErrorAction SilentlyContinue)
+Info 'nhi events (last 24h)' $nhi.Count
+
+Write-Host ''
+if ($script:failures -gt 0) { Write-Host "$($script:failures) assertion(s) FAILED" -ForegroundColor Red; exit 1 }
+Write-Host 'All assertions passed' -ForegroundColor Green
+exit 0
+```
+
+Run it after **any** of: driver update, power-plan switch, Type-C port replug, Windows feature update, BIOS update. Matching by `InterfaceDescription` means a replug-induced new instance fails loudly instead of silently degrading.
+
+## Verification
+
+The end state, all measured on the rig:
+
+| Check | How | Expected |
+|---|---|---|
+| Flap-free | nhi events since boot | 9001/9002 pair only, zero 9003 (incl. overnight idle) |
+| TX 1-flow | `iperf3 -c <win> -t 15 -R` | ~7.9-8.3 Gbps |
+| TX 4-flow | `iperf3 -c <win> -P 4 -t 15 -R` | ~9.6-9.7 Gbps |
+| RX 1-flow | `iperf3 -c <win> -t 15` | ~9.9 Gbps |
+| MTU boundary | `-l 8972` pass, `-l 8973` black-hole gone after fix | both deliver (post-fix) |
+| Soak | `iperf3 -c <win> -P 4 -t 3600 -i 60 --bidir` | flat intervals, zero dropouts, zero nhi events |
+| Drift | `verify-10g.ps1` | exit 0 |
+
+The 1-hour soak on this rig moved 3.77 TB receive + 3.52 TB transmit with zero nhi connect/disconnect events and no throughput dropouts in any of the 60 one-minute intervals.
+
+## Gotchas and lessons learned
+
+- **Swap the cable first.** A bad cable produces a clean-looking RTD3-correlated flap loop that sends you into power-settings debugging for hours, and it is the cheapest elimination step.
+- **WSL2 never sees Thunderbolt or PCIe** - no `/sys/bus/thunderbolt`, no boltctl, empty lspci. All adapter diagnostics run on the Windows side; from WSL use `powershell.exe -NoProfile -Command "..."` interop (Get-NetAdapter, Get-PnpDevice, Get-WinEvent all work non-elevated).
+- **RX fast / TX slow is expected on this topology.** Posted DMA writes vs non-posted DMA reads, so an untuned 1500-MTU single-flow TX cap means the tunnel is working as designed. If a future native-PCIe NIC does full-rate single-flow TX at 1500 MTU with zero tuning, that is the control experiment that proves the diagnosis.
+- **Check which host controller you actually have before downloading vendor tools.** This AM5 board's USB4 is Intel Maple Ridge (`VEN_8086&DEV_1137`), not the ASMedia ASM4242 that most AM5 boards and the board vendor's own FAQ assume - the ASM4242 firmware tools error out with "Can't find any ASM4242 controller".
+- **AQC113 firmware is flashable** (1.5.38+), the updater is Windows-only and requires the 3.1.11 driver; the release notes contain real fixes relevant behind USB4 (hot-plug at 10G/full-duplex, link-change interrupts, datapath stuck after hot-reset).[^flohs-aqc113-fw] It was not needed for the numbers here.
+- **A/B before blaming a driver.** First-run-after-idle reads 0.3-0.5 Gbps high; an apparent 3.1.11 regression was run-order drift, disproven by a rollback A/B. Keep a `pnputil /export-driver` backup and a System Restore point before any driver swap.
+- **pnputil's "in use" error can be bogus.** After a vendor driver pack carpet-bombs the driver store, `/delete-driver` may refuse every package claiming devices use them, with zero device-node references. The fix is `/uninstall` (strips the INF from nodes, then deletes), `/force` as fallback. Verify independently before believing the error.
+- **Real workloads mostly dodge the single-flow cap.** SMB Multichannel and robocopy /MT spread across RSS queues and pull near line rate today. The single-flow number matters for single-connection apps and as a diagnostic, less for daily use.
+- **Wake-on-LAN over Thunderbolt is unlikely.** A bus-powered TB device generally cannot wake the host from S5; if WoL matters, keep it on an onboard NIC.
+- **Jumbo is a segment-scoped decision.** TCP mismatches self-heal; UDP black-holes. Pin every VLAN child explicitly, keep jumbo on the one segment whose hosts you control, and remember it whenever something "works small, hangs big".
+
+[^ms-perf-tools]: Microsoft, "Overview of TCP/IP performance," Microsoft Learn. https://learn.microsoft.com/en-us/troubleshoot/windows-server/networking/overview-of-tcpip-performance
+[^archimago-aqc]: Archimago, "Aquantia/Marvell AQC107 10GbE Network Cards: Driver and Firmware updates and improving stability," Archimago's Musings. http://archimago.blogspot.com/2022/10/aquantiamarvell-aqc107-10gbe-network.html
+[^archimago-rsc]: Archimago, "Windows Server 2019 update, RSC performance issues with Aquantia 10GbE AQC107," Archimago's Musings. http://archimago.blogspot.com/2020/05/musings-windows-server-2019-update-rsc.html
+[^flohs-aqc113-fw]: Florian Ehrle, "Firmware Update for the Marvell / Aquantia AQC113 Controller," flohs blog. https://blog.florianehrle.de/en/2026/05/26/mini-pc-server-7-firmware-update-for-the-marvell-aquantia-aqc113-controller/
+[^qnap-qna]: QNAP, "QNA-T310G1T Thunderbolt 3 to 10GbE adapter," QNAP product page. https://www.qnap.com/en/product/qna-t310g1t
