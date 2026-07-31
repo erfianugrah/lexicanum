@@ -1,0 +1,212 @@
+---
+title: "AWS PrivateLink to Supabase: an architecture reference"
+description: How Supabase PrivateLink (VPC Lattice) actually behaves once built - the endpoint anatomy, DNS and verify-full TLS through a private hosted zone, the CLI migration paths that work over it, the self-service public-lockout story, measured latency and throughput vs the public pooler, the pooler client ceiling, and restart downtime windows - validated end to end on throwaway infra, not asserted from docs.
+author: Erfi Anugrah
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Supabase PrivateLink puts your database traffic on AWS VPC Lattice instead of the public internet: Supabase shares a Lattice Resource Configuration per project into your AWS account, and you attach it to a VPC endpoint in your own VPC.[^sb-privatelink] This is what it actually does once built, with numbers.
+
+Everything below marked **measured** was validated on 2026-07-31 on a throwaway Team-plan org: a **micro** Supabase project in **ap-southeast-1**, an in-VPC **t3.micro** runner with no public IP (SSM-only), and an OpenTofu lab that builds and destroys the whole shape in minutes (VPC, endpoint, private hosted zone, runner, test suite). Claims about platform internals that were not re-tested are marked **asserted** and linked to their source.
+
+**TL;DR:**
+
+- **The private path is boring in the good way.** Direct Postgres (5432) and the project pooler (6543, transaction mode) both work through the endpoint with `sslmode=verify-full`, provided you give the endpoint the project's hostname via a Route53 private hosted zone (PHZ). The endpoint cert carries exactly one name: `db.<ref>.supabase.co`.
+- **The private pooler path is faster than the public one.** pgbench select-only, 4 clients: 3350 tps through the endpoint's 6543 vs 2258 tps through public Supavisor - about 1.5x. Connect latency is a wash in-region (~30ms p50 either way).
+- **`supabase link --skip-pooler` is the load-bearing CLI flag.** A default `link` targets the public shared pooler, which is exactly what PrivateLink designs close off. With `--skip-pooler`, `db push` runs over the endpoint.
+- **You can close public DB access yourself, today.** DB network restrictions narrowed to a break-glass /32 block the public direct and public pooler paths while the endpoint keeps serving. The guide currently says "contact support to disable public connectivity" - restrictions get you the same lockout for database traffic self-service.[^sb-netrestrict]
+- **Everything that is not the database socket stays public.** API, Auth, Storage, Realtime keep working over the public internet by design.[^sb-privatelink] The Data API is not a PrivateLink path.
+- **The pooler ceiling is real and exact:** first connection refusal at exactly 200 concurrent clients on micro, matching the published tier limit.[^sb-compute]
+- **Restart downtime over the endpoint:** 49-131s across three measured API-triggered restarts.
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.8;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_vpc {
+    label="Your VPC (same region)"; style=rounded; fontsize=12; margin=12;
+    runner  [label="App / Lambda /\nmigration runner"];
+    phz     [label="Route53 PHZ\ndb.<ref>.supabase.co -> ENI IPs"];
+    vpce    [label="VPC endpoint\n(type: Resource)"];
+  }
+  subgraph cluster_sb {
+    label="Supabase"; style=rounded; fontsize=12; margin=12;
+    rc      [label="Lattice Resource\nConfiguration"];
+    pg      [label="Postgres :5432", shape=cylinder];
+    pgb     [label="PgBouncer :6543\n(transaction mode)"];
+    api     [label="Data API / Auth /\nStorage / Realtime"];
+    supavr  [label="Shared pooler\n(Supavisor, public)"];
+  }
+
+  runner -> phz    [label="resolve", style=dashed];
+  phz    -> vpce   [style=dashed];
+  runner -> vpce   [label="5432 / 6543"];
+  vpce   -> rc;
+  rc     -> pg;
+  rc     -> pgb;
+  runner -> api    [label="HTTPS (public)", style=dashed];
+  runner -> supavr [label="6543 (public)", style=dashed];
+  supavr -> pg     [style=dashed];
+}
+```
+
+The PHZ is the only piece the official walkthrough does not give you: it overrides `db.<ref>.supabase.co` inside your VPC so the endpoint presents a certificate your clients already trust. Dashed edges are public-internet paths - they keep working unless you close them.
+
+## Which connection path do I pick
+
+| Path | Reachable via | Measured p50 connect | Measured pgbench (4 clients) | Pick when |
+|---|---|---|---|---|
+| Private 5432 (direct) | Endpoint | 37ms | 3810 tps @ 1.05ms | Migrations, `pg_dump`, single sessions, anything wanting session state |
+| Private 6543 (PgBouncer) | Endpoint | 31ms | 3350 tps @ 1.19ms | App servers in the VPC; highest concurrent-client count on the private path |
+| Public Supavisor 6543 | Internet | 31ms | 2258 tps @ 1.77ms | IPv4-only networks with no PrivateLink; free on every tier[^sb-connect] |
+| Public direct 5432 | Internet | n/a from an IPv4-only VPC | n/a | IPv6-capable networks, or with the IPv4 add-on[^sb-ipv4] |
+| Data API (HTTPS) | Internet only | p50 18.6ms warm | n/a | PostgREST/Auth/Storage clients; never a PrivateLink path |
+
+One row is deliberately "n/a": the public direct endpoint is IPv6-only unless you buy the IPv4 add-on (~\$4/mo), so an IPv4-only VPC has no public-direct path at all.[^sb-ipv4] Under PrivateLink this stops mattering - the endpoint already gives you in-VPC IPv4 on both ports, which makes the add-on moot for the VPC case.
+
+## What the endpoint actually is
+
+PrivateLink is an **organisation-level** configuration: for each project, Supabase creates a VPC Lattice Resource Configuration and shares it to your AWS account(s) via AWS Resource Access Manager (RAM).[^sb-privatelink][^aws-ram] You consume it one of two ways: a VPC endpoint of type **Resource**, or an association to an existing Lattice service network.[^sb-privatelink][^aws-lattice]
+
+The lifecycle, measured:
+
+1. **Add the AWS account in the dashboard** (Settings > Integrations > AWS PrivateLink). Status goes CREATING -> READY in about 2 minutes.
+2. **Accept the RAM share.** The share name is `sspl-<ref>-<random>`; the resource configuration is `<org>-<ref>-rc`.[^sb-privatelink] Acceptance is a hard ordering requirement: `aws ram list-resources` shows nothing while the invitation is PENDING (measured). Any automation must accept first, then look up the ARN - a declarative `aws_ram_resource_share_accepter` deadlocks on this.
+3. **Create the endpoint.** Type `Resource`, IPv4, one ENI per subnet, security group allowing **both 5432 and 6543** inbound. The official walkthrough's security-group step only opens 5432 (measured doc gap) - 6543 is the PgBouncer port and half the point.
+4. **DNS is on you.** A Resource-type endpoint does not expose a usable `dns_entry` via the AWS API (measured on provider ~> 6.0); the reliable handle is the ENI private IPs. Put them in a PHZ A record for `db.<ref>.supabase.co` at TTL 60 (the zone apex cannot be a CNAME, so the apex carries the IPs directly).
+
+<Aside type="caution" title="The association API rejects PATs">
+The dashboard flow calls undocumented `/platform` routes (`POST /platform/projects/{ref}/privatelink/associations/aws-account`). Measured: those routes reject Personal Access Tokens categorically - 401 "JWT could not be decoded", even for an owner-role `sbp_` PAT, on the association POST, the status GET, and entitlements. They want a dashboard session JWT. Net effect for automation: project + settings are fully API-driven, but the association itself is one dashboard click per AWS account; everything downstream (RAM accept, endpoint, DNS) is AWS-side and automatable.
+</Aside>
+
+<Aside type="note" title="Beta gating is two-layered, asserted">
+On a fresh Team org the PrivateLink section did not appear at all until the org had both a per-org feature flag and a server-side entitlement granted (asserted from Studio source + observed behaviour; the public docs mention no allowlist). If the section is missing on a Team org, that is why - ask support. Also from Studio source: eu-central-2 is excluded from PrivateLink.
+</Aside>
+
+## DNS and TLS: verify-full through the endpoint
+
+The endpoint terminates TLS with the project's own certificate. Measured via `openssl s_client -starttls postgres` against the endpoint:
+
+- Chain of 3 certificates; leaf subject and **single SAN** are exactly `db.<ref>.supabase.co`.
+- `sslmode=verify-full` against the **PHZ name**: PASS.
+- `sslmode=verify-full` with `host=<PHZ name> hostaddr=<ENI IP>` (no DNS dependency): PASS.
+- `sslmode=verify-full` against the **raw endpoint IP**: fails by design (hostname mismatch). There is no IP SAN; an IP-based connection string can never do better than `verify-ca`.
+
+So the production pattern is: PHZ for `db.<ref>.supabase.co` in every VPC that consumes the endpoint, extract the chain once (lab used STARTTLS; production guidance is the dashboard CA download), and clients use the normal project hostname with `sslmode=verify-full`. Connection strings do not change between public and private clients - only the DNS answer does.
+
+## CLI and migration paths
+
+Measured with the Supabase CLI on the in-VPC runner:
+
+| Flow | Result | Path taken |
+|---|---|---|
+| `supabase link` + `db push` (defaults) | works, but wrong path | default link targets the **public shared pooler** - useless in a locked-down design |
+| `supabase link --skip-pooler` + `db push` | **works over the endpoint** | direct connection via PHZ |
+| `supabase db push --db-url postgres://...@db.<ref>.supabase.co:5432/...` | works over the endpoint | no link, no Management API on the DB path |
+
+`--skip-pooler` is the flag that makes CLI migrations PrivateLink-correct;[^sb-cli] without it, closing public access breaks your migration pipeline on the same day you close it.
+
+A stale assumption to unlearn, measured: **prepared statements now work on the transaction-mode pooler** (`PREPARE`/`EXECUTE` succeeded on 6543). The old "transaction mode breaks prepared statements" advice predates current Supavisor/PgBouncer behaviour - re-test before cargo-culting `prepare: false` everywhere.
+
+## Closing public access
+
+The end state most PrivateLink adopters want is: database reachable **only** through the endpoint. Measured sequence:
+
+1. Apply DB network restrictions narrowed to a single break-glass /32.[^sb-netrestrict]
+2. Public direct (5432) and public Supavisor (6543) both stop connecting - restrictions cover pooled and direct routes.[^sb-netrestrict]
+3. The endpoint path is unaffected - the full connection matrix kept passing with restrictions in force.
+
+That is the full lockout story for database traffic, self-service, no support ticket. The official guide still routes this through "contact support to disable public connectivity";[^sb-privatelink] restrictions achieve the socket-level equivalent today, reversible in one API call. What the support action does beyond socket refusal is untested - if the requirement is public ingress *removed* rather than *refused*, the ticket is still the path.
+
+Mind the scope: restrictions govern the **database** ports. The Data API stays reachable (it should - it is HTTP, and it is not a PrivateLink path). "Fully private" therefore means "private database socket", not "private project".
+
+## What stays public: the Data API
+
+PrivateLink covers direct Postgres and PgBouncer only; API, Auth, Storage, and Realtime keep operating over the public internet.[^sb-privatelink] Measured from inside the VPC (traffic egresses via NAT):
+
+- Data API warm serial (n=120, c=1, anon key, single-row select): **p50 18.6ms, p95 23.6ms**, ~50 rps single-threaded. Cold request: 490ms total, dominated by a 449ms first-hit TTFB (schema cache warm-up); TLS handshake 34ms of it.
+- **PostgREST's root `/rest/v1/` requires the service_role key** on the current platform: an anon key gets 401 with "Only the `service_role` API key can be used for this endpoint" (verified from off-VPC too). An anon-key reachability probe needs a real table.
+- For probe tables: SQL-created tables get `anon` SELECT via default privileges and no RLS; dashboard-created tables get RLS enabled. A health-check table created by migration is anonymously readable by default - decide which you want.
+
+## Capacity and failure behavior
+
+**Pooler client ceiling.** Ramping concurrent clients holding a transaction open against 6543 (transaction mode, micro): clean at 100/150/180, **first connection refusal at exactly 200** - the published micro tier limit, to the client.[^sb-compute] Size serverless concurrency caps against this number, not against "we'll see".
+
+**Restart downtime.** Three API-triggered project restarts,[^sb-api-restart] probed with `select 1` every 2s over the endpoint: down windows of **49s, 72s, and 131s**. Plan around the worst sample, not the median of three - and treat "restart drops the private path too" as expected: the endpoint stays up, the database behind it does not.
+
+## Reading the numbers
+
+- **In-region is the cheat code.** Connect p50 of ~30ms on every path is one region's wire plus TLS; the throughput gap (1.5x) between private PgBouncer and public Supavisor is the interesting signal, not the absolute tps. A t3.micro runner and micro compute bound both ends; bigger tiers move the absolutes.
+- **The ceiling is a tier table,** not a PrivateLink property - 200 is micro.[^sb-compute] The endpoint itself did not add a measurable refusal below the platform limit.
+- **Restart windows vary 3x** across identical runs. The number to quote is a range, and the mechanism (API-triggered restart) matters.
+- **Beta.** PrivateLink is beta, Team and Enterprise only, and the setup flow "may evolve".[^sb-privatelink] Re-run the matrix before quoting these numbers at GA.
+
+## Gotchas
+
+- **Security group: 5432 only in the official walkthrough.** Add 6543 or the pooler path silently dies at the SG.[^sb-privatelink]
+- **Association automation stops at the dashboard.** PATs get 401 on the `/platform` routes (measured); budget one click per AWS account.
+- **RAM acceptance before ARN lookup.** PENDING invitations hide the resource configuration from `list-resources` (measured).
+- **Resource endpoints: no API-visible DNS name** (measured). PHZ with ENI IPs, TTL 60.
+- **IPv6-only public direct.** No add-on, no IPv4 direct connection - and the add-on is not dual-stack at the DNS level.[^sb-ipv4]
+- **Default `supabase link` goes public.** `--skip-pooler` or `--db-url` for anything over the endpoint.[^sb-cli]
+- **PostgREST root needs service_role.** Probe a table, not `/rest/v1/`.
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  start [label="DB clients in your AWS VPC?"];
+  pl    [label="PrivateLink endpoint\n5432 direct / 6543 pooled"];
+  pub   [label="Public paths"];
+  v6    [label="IPv6 or IPv4 add-on:\ndirect 5432"];
+  supa  [label="Supavisor 6543\n(IPv4, free)"];
+  http  [label="Data API only?\nStay on HTTPS - no PrivateLink path exists"];
+
+  start -> pl   [label="yes (Team/Ent)"];
+  start -> pub  [label="no / other clouds"];
+  start -> http [label="no DB socket needed"];
+  pub   -> v6   [label="need direct"];
+  pub   -> supa [label="IPv4-only"];
+}
+```
+
+## Reproducing
+
+Every measured claim above comes out of a disposable OpenTofu lab (supabase-lab): one directory builds the project, association, RAM accept, endpoint, PHZ, and runner; `make suite` then runs the TLS matrix, connect/pgbench benches, the ceiling probe, and an API-triggered restart measurement over SSM, and renders a single evidence report; `make destroy` tears it all down the same day. The suite is the reproducible form of this doc's numbers - region and tier are variables, so re-running it against your own target shape is a same-afternoon job.
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| 5432 + 6543 through the endpoint, verify-full | tested | psql matrix via PHZ name, hostaddr split, raw-IP negative |
+| Cert = `db.<ref>.supabase.co`, 3-cert chain | tested | `openssl s_client -starttls postgres` on the endpoint |
+| Private pooler ~1.5x public Supavisor throughput | tested | pgbench select-only, 4 clients, 15s, both paths |
+| Ceiling: refusal at 200 concurrent (micro) | tested | pgbench ramp 100 -> 250 holding `pg_sleep` |
+| Restart window 49-131s | tested | 3 API-triggered restarts, 2s psql probe over endpoint |
+| Restrictions lockout, endpoint survives | tested | restrictions -> /32, re-run matrix + public-path negative |
+| `link --skip-pooler` over the endpoint | tested | CLI link + db push via PHZ |
+| Prepared statements OK on transaction mode | tested | `PREPARE`/`EXECUTE` on 6543 |
+| PostgREST root requires service_role | tested | anon vs root path, on- and off-VPC |
+| `/platform` association API rejects PATs | tested | owner-role PAT against POST/GET/entitlements |
+| Flag + entitlement gating; eu-central-2 excluded | asserted | Studio source + observed dashboard behaviour |
+| Resource endpoint exposes no `dns_entry` | tested (AWS provider ~> 6.0) | outputs fallback + console cross-check |
+| Lambda-over-endpoint path | design-only | `enable_lambda` scaffolded, not run |
+
+[^sb-privatelink]: Supabase, "PrivateLink," Supabase Docs. https://supabase.com/docs/guides/platform/privatelink
+[^sb-connect]: Supabase, "Connecting to Postgres," Supabase Docs. https://supabase.com/docs/guides/database/connecting-to-postgres
+[^sb-ipv4]: Supabase, "IPv4 Address," Supabase Docs. https://supabase.com/docs/guides/platform/ipv4-address
+[^sb-netrestrict]: Supabase, "Network Restrictions," Supabase Docs. https://supabase.com/docs/guides/platform/network-restrictions
+[^sb-cli]: Supabase, "supabase link," Supabase CLI Reference. https://supabase.com/docs/reference/cli/supabase-link
+[^sb-api-restart]: Supabase, "Restart a project," Supabase Management API Reference. https://supabase.com/docs/reference/api/v1-restart-a-project
+[^sb-compute]: Supabase, "Compute Add-ons," Supabase Docs. https://supabase.com/docs/guides/platform/compute-add-ons
+[^aws-lattice]: AWS, "Resource configurations in VPC Lattice," Amazon VPC Lattice User Guide. https://docs.aws.amazon.com/vpc-lattice/latest/ug/resource-configurations.html
+[^aws-ram]: AWS, "What is AWS Resource Access Manager?," AWS RAM User Guide. https://docs.aws.amazon.com/ram/latest/userguide/what-is.html
