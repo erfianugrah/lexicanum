@@ -109,8 +109,21 @@ Cite the source path when answering from docs.erfi.io in chat, too.
 - Arrows in prose: `->` (renders literally; SmartyPants leaves it alone).
 - Never ` -- ` in prose (SmartyPants turns it into an en-dash). Use ` - `.
 - Literal `$` -> `\$` (see Pipeline facts).
-- Diagrams: `dot` (graphviz) for architecture, already themed; Mermaid also
-  available.
+- Diagrams: `dot` (graphviz) for architecture; Mermaid also available. Theming is
+  NOT automatic - custom.css maps black text/strokes to `currentColor` and gives
+  nodes/clusters neutral fills, but only if the dot source carries NO colors and
+  opts out of the graph background. Every `dot` fence must start with the house
+  boilerplate (copy from `reference/caching.mdx`):
+  ```
+  digraph {
+    rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+    fontname="Helvetica,Arial,sans-serif";
+    node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+    edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  ```
+  Without `bgcolor="transparent"` Graphviz emits a white graph polygon and the
+  diagram renders as a white card with low-contrast text in dark mode. Never set
+  color/fill/fontcolor attributes on individual nodes or edges.
 
 ## Verify before done
 
