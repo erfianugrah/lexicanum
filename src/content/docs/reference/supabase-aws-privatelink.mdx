@@ -8,7 +8,7 @@ import { Aside } from "@astrojs/starlight/components";
 
 Supabase PrivateLink puts your database traffic on AWS VPC Lattice instead of the public internet: Supabase shares a Lattice Resource Configuration per project into your AWS account, and you attach it to a VPC endpoint in your own VPC.[^sb-privatelink] This is what it actually does once built, with numbers.
 
-Everything below marked **measured** was validated on 2026-07-31 on a throwaway Team-plan org: a **micro** Supabase project in **ap-southeast-1**, an in-VPC **t3.micro** runner with no public IP, reachable only through AWS Systems Manager (SSM), and an OpenTofu lab that builds and destroys the whole shape in minutes (VPC, endpoint, private hosted zone, runner, test suite). Claims about platform internals that were not re-tested are marked **asserted** and linked to their source.
+Everything below marked **measured** was validated on 2026-07-31 on a throwaway Team-plan org: a **micro** Supabase project in **ap-southeast-1**, an in-VPC **t3.micro** runner with no public IP, reachable only through AWS Systems Manager (SSM), and an OpenTofu lab that builds and destroys the whole shape in minutes (VPC, endpoint, private hosted zone, runner, test suite). Claims about platform internals that were not re-tested are marked **asserted** and linked to their source. The HTTP-tier lockdown numbers (Data API and Realtime toggles) come from a second rig, 2026-08-02: a bare micro project with no VPC at all, since those levers are project configuration rather than network topology.
 
 **TL;DR:**
 
@@ -148,6 +148,22 @@ PrivateLink covers direct Postgres and PgBouncer only; API, Auth, Storage, and R
 - **PostgREST's root `/rest/v1/` requires the service_role key** on the current platform: an anon key gets 401 with "Only the `service_role` API key can be used for this endpoint" (verified from off-VPC too). An anon-key reachability probe needs a real table.
 - For probe tables: SQL-created tables get `anon` SELECT via default privileges and no row-level security (RLS); dashboard-created tables get RLS enabled. A health-check table created by migration is anonymously readable by default - decide which you want.
 
+### Turning them off is not the same as making them private
+
+None of these surfaces can be moved onto PrivateLink, so the only remaining question is whether they can be switched off. Measured on a bare micro project, three consecutive runs, 2026-08:
+
+| Surface | Lever | With the lever applied | Expressible in IaC |
+|---|---|---|---|
+| Data API | Dashboard: Integrations > Data API > Enable Data API off[^sb-securing-api] | Docs: no auto-generated REST endpoint responds, regardless of grants or RLS[^sb-securing-api] | No - the Management API PostgREST config has no `enabled` field[^sb-api-postgrest] |
+| Realtime | `private_only` on the Realtime config[^sb-api-realtime][^sb-realtime-authz] | Anon WebSocket still connects; the public-channel join is refused | Yes (HTTP 204, ~9s to effect) |
+| Auth, Storage | none | - | - |
+
+The Realtime result is the one to read carefully. Flipping `private_only` to true took effect in 9s in every run, and the refusal lands at channel join, not at the socket: the handshake still completes (89ms) and `phx_join` on a non-private channel returns `{"status":"error","response":{"reason":"PrivateOnly: This project only allows private channels"}}`. It is an authorization control. The endpoint stays internet-reachable and keeps answering, so the toggle changes what a connected client may do rather than removing a surface.
+
+<Aside type="caution" title="Emptying db_schema does not disable the Data API">
+The Management API exposes only `db_schema`, `max_rows`, `db_extra_search_path` and `db_pool` on the PostgREST config,[^sb-api-postgrest] and setting `db_schema` to an empty string is accepted (HTTP 200), so it reads as the Dashboard toggle in script form. It is not. Measured: within 6-8s an anon read returns `503 PGRST002 "Could not query the database for the schema cache. Retrying."`; `/graphql/v1` returns 503 with it, because pg_graphql rides the same process; and the state is steady rather than a restart blip - identical samples every 10s for 120s. `/rest/v1/` keeps answering 401 throughout, so the hostname and its gateway are still there. That is a wedged PostgREST, which a caller and a monitoring system both read as an outage. Restoring the schema list recovers in 1-2s. Disabling the Data API remains a Dashboard action, in the same category as creating the PrivateLink association.
+</Aside>
+
 ## Capacity and failure behavior
 
 **The pooler queues before it refuses.** Ramping concurrent clients against 6543 (transaction mode, micro), the first thing you hit is not a ceiling but a queue: at 150 clients PgBouncer accepts every connection and emits `NOTICE: No server connection available in postgres backend, client being queued`, and only a subset of transactions complete inside the client timeout. Refusal is a separate, later regime - `FATAL: no more connections allowed (max_client_conn)`[^pgbouncer-config]. **Do not quote a precise ceiling from this.** Isolated probes on a quiet system put the first refusal at the 174th, 213th, 213th and 287th concurrent client across three micro projects, against a published figure of 200.[^sb-compute] Size against the published number; what is stable, and what matters for serverless concurrency, is the ordering: overshoot appears as queue latency and client timeouts first, refusals second.
@@ -198,6 +214,8 @@ Two things fall out of that table. The endpoint path costs a fifth of the servic
 - **Public direct is IPv6-only without the add-on.** `db.<ref>.supabase.co` publishes only an AAAA (IPv6) record unless you buy IPv4 (~\$4/mo), so an IPv4-only client has no public-direct path while the pooler and Data API still answer - a confusing failure shape.[^sb-ipv4] Supavisor session mode is the free IPv4 answer; under PrivateLink the endpoint already provides in-VPC IPv4 on both ports, so neither matters.
 - **Default `supabase link` goes public.** A plain link stores the shared-pooler connection, so `db push` works right up to the day you close public access and the migration pipeline breaks at deploy time.[^sb-cli] Use `link --skip-pooler` (direct via the PHZ) or `db push --db-url`, and prove it once with restrictions already closed (measured: T08 vs T09/T10).
 - **PostgREST's root requires service_role.** `/rest/v1/` answers anon keys with 401 "Only the `service_role` API key can be used for this endpoint" (measured on- and off-VPC), which reads as key misconfiguration. Probe a real table with the anon key - and note SQL-created tables get `anon` SELECT via default privileges with no RLS, while dashboard-created tables get RLS enabled.
+- **Emptying `db_schema` wedges PostgREST instead of disabling it.** The Management API takes the write (HTTP 200) and the Data API stops serving, but as a steady `503 PGRST002` schema-cache retry loop that also takes `/graphql/v1` down and leaves the root answering 401 (measured, 120s hold). Disabling the Data API is a Dashboard action; write the Dashboard step into the runbook rather than emulating it through the config.
+- **`private_only` is an authorization control, not a network one.** The anon WebSocket handshake still completes with it enabled; only the public-channel join is refused (measured, ~9s to effect). Counting it as attack-surface reduction overstates it - the Realtime endpoint remains reachable from the internet.
 - **"Transaction mode breaks prepared statements" is stale.** `PREPARE`/`EXECUTE` succeeded on 6543 (measured), so cargo-culted `prepare: false` costs transaction-mode pooling for no current reason. Re-test against your actual pooler before carrying the workaround forward.
 
 ## Decision guide
@@ -244,6 +262,10 @@ Every measured claim above comes out of a disposable OpenTofu lab (supabase-lab)
 | Resource endpoint exposes no `dns_entry` | tested (AWS provider ~> 6.0) | outputs fallback + console cross-check |
 | Lambda in private subnets -> endpoint, 5432 and 6543 | tested, single sample | VPC-attached Lambda; cold connect 698ms / 218ms (one invocation - cold-start dominated, do not treat as a distribution), prepared statements OK on both |
 | Realtime over the endpoint | not applicable, tested | WebSocket handshake completes from in-VPC against the API hostname (72ms) via NAT; the endpoint does not serve it |
+| Data API disable has no Management API lever | tested | No `enabled` field on the PostgREST config; `db_schema: ""` is accepted but produces a steady `503 PGRST002` retry loop (120s hold, `/graphql/v1` 503 with it, root still 401). Restore 1-2s |
+| Realtime `private_only` enforced at channel join | tested, three runs | PATCH 204, ~9s to effect; handshake still completes, `phx_join` on a public channel returns `PrivateOnly: This project only allows private channels` |
+| The Dashboard Data API toggle's actual off-state | doc-cited, not tested | The toggle needs a Dashboard session; only the Management API path was measured, and it is not equivalent |
+| Data API off with the private path in use | not tested | The observed mechanism is HTTP-tier only, so the database socket is expected to be unaffected - unverified |
 | Read replicas behind PrivateLink | doc-cited, not tested | Replicas have their own database endpoints; PrivateLink for a replica goes through an account rep, not self-serve |
 | Reaching the endpoint from another VPC (peering / AWS Transit Gateway / Direct Connect) | doc-cited, not tested | Resource endpoints are per-VPC; multi-VPC means an endpoint each or a Lattice service network association |
 | Service-network consumption path | untested | Only the Resource-endpoint path was built; the association path costs 5x per resource-hour |
@@ -268,5 +290,9 @@ A caution on the numbers above: most are one sample per project. The ceiling cla
 [^sb-cli]: Supabase, "supabase link," Supabase CLI Reference. https://supabase.com/docs/reference/cli/supabase-link
 [^sb-api-restart]: Supabase, "Restart a project," Supabase Management API Reference. https://supabase.com/docs/reference/api/v1-restart-a-project
 [^sb-compute]: Supabase, "Compute Add-ons," Supabase Docs. https://supabase.com/docs/guides/platform/compute-add-ons
+[^sb-securing-api]: Supabase, "Securing your API," Supabase Docs. https://supabase.com/docs/guides/api/securing-your-api
+[^sb-realtime-authz]: Supabase, "Realtime Authorization," Supabase Docs. https://supabase.com/docs/guides/realtime/authorization
+[^sb-api-postgrest]: Supabase, "Update PostgREST service config," Supabase Management API Reference. https://supabase.com/docs/reference/api/v1-update-postgrest-service-config
+[^sb-api-realtime]: Supabase, "Update Realtime config," Supabase Management API Reference. https://supabase.com/docs/reference/api/v1-update-realtime-config
 [^aws-lattice]: AWS, "Resource configurations in VPC Lattice," Amazon VPC Lattice User Guide. https://docs.aws.amazon.com/vpc-lattice/latest/ug/resource-configurations.html
 [^aws-ram]: AWS, "What is AWS Resource Access Manager?," AWS RAM User Guide. https://docs.aws.amazon.com/ram/latest/userguide/what-is.html
