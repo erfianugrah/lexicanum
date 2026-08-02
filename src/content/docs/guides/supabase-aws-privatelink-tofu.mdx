@@ -14,7 +14,7 @@ The working repo this guide is extracted from is [supabase-lab](https://github.c
 
 ## Architecture
 
-Supabase creates a VPC Lattice Resource Configuration for the project and shares it to your AWS account over RAM. You accept the share, put a Resource-type VPC endpoint in front of it, and point the project's real hostname at the endpoint's ENI IPs inside a private hosted zone - so clients keep their normal connection string and `verify-full` still matches the certificate.
+Supabase creates a VPC Lattice Resource Configuration[^aws-lattice] for the project and shares it to your AWS account over AWS Resource Access Manager (RAM)[^aws-ram]. You accept the share, put a Resource-type virtual private cloud (VPC) endpoint in front of it, and point the project's real hostname at the endpoint's elastic network interface (ENI) addresses inside a Route53 private hosted zone (PHZ) - so clients keep their normal connection string and `verify-full` still matches the certificate.
 
 ```dot
 digraph {
@@ -50,7 +50,7 @@ digraph {
 }
 ```
 
-The Data API, Auth, Storage, and Realtime are HTTP services on a different hostname and are not carried by this path - they stay public by design. PrivateLink covers the database socket only.
+The Data API, Auth, Storage, and Realtime are HTTP services on a different hostname and are not carried by this path - they stay public by design.[^sb-privatelink] PrivateLink covers the database socket only.
 
 ## Component versions
 
@@ -63,7 +63,7 @@ What the run below was executed with. Provider majors are pinned in `providers.t
 | supabase/supabase | 1.10.1 (`~> 1.10`) |
 | mastercard/restapi | 3.0.0 (association resource, gated off) |
 | hashicorp/archive | 2.8.0 (Lambda probe zip) |
-| Runner AMI | Amazon Linux 2023 (`al2023-ami-2023.*-x86_64`, latest at apply) |
+| Runner machine image (AMI) | Amazon Linux 2023 (`al2023-ami-2023.*-x86_64`, latest at apply) |
 | Runner tooling | psql 16.14, Supabase CLI 2.110.0 |
 | Region / compute | ap-southeast-1, micro |
 
@@ -82,7 +82,7 @@ Fix these before any steps; every later command depends on them.
 
 ## Step 1: project and settings via the supabase provider
 
-The supabase provider (~> 1.10) covers the whole project control plane over PAT-authenticated `/v1` - including network restrictions, which you want as code from day one:
+The supabase provider (~> 1.10) covers the whole project control plane over `/v1`, authenticated with a personal access token (PAT)[^tf-supabase] - including network restrictions[^sb-netrestrict], which you want as code from day one:
 
 ```hcl
 resource "supabase_project" "lab" {
@@ -105,10 +105,10 @@ Apply and record the project ref (`tofu output` the `supabase_project.lab.id`). 
 
 ## Step 2: the association - the one dashboard click
 
-Adding your AWS account to the project is what makes Supabase create the VPC Lattice Resource Configuration and send the RAM share. It is also the only step that is not automatable: the undocumented `/platform` routes it uses reject PATs categorically (401 "JWT could not be decoded", even owner-role tokens) - they want a dashboard session JWT.
+Adding your AWS account to the project is what makes Supabase create the VPC Lattice Resource Configuration and send the RAM share. It is also the only step that is not automatable: the undocumented `/platform` routes it uses reject personal access tokens (PATs) categorically (401 "JSON Web Token could not be decoded", even owner-role tokens) - they want a dashboard session JWT.
 
 1. Project > **Settings > Integrations > AWS PrivateLink** (project-level page; nothing appears under organization settings).
-2. **Add Account**, enter your AWS account ID and a description.
+2. **Add Account**, enter your AWS account identifier and a description.
 3. Wait for status CREATING -> **READY** (~2 minutes measured).
 
 A `restapi_object` for this exists in the lab behind `var.send_association = false`, kept as documentation of the endpoint shape; it cannot authenticate with a PAT.
@@ -137,7 +137,7 @@ Write both ARNs into an `arns.tfvars`; its presence gates phase 2. The lab's `ma
 
 ## Step 4: endpoint + security group (two-pass apply)
 
-Two rules that bite if skipped: the security group needs **both** 5432 and 6543 inbound (the official walkthrough shows 5432 only; with a verbatim SG the pooler path drops silently - direct works, pooler times out), and the apply is **two-pass** because the ENI data source keys off the endpoint's network interface IDs, which are unknown at plan time (`for_each` over unknown keys = plan error).
+Two rules that bite if skipped: the security group (SG) needs **both** 5432 and 6543 inbound[^sb-privatelink] (the official walkthrough shows 5432 only; with a verbatim SG the pooler path drops silently - direct works, pooler times out), and the apply is **two-pass** because the ENI data source keys off the endpoint's network interface IDs, which are unknown at plan time (`for_each` over unknown keys = plan error).
 
 ```hcl
 resource "aws_security_group" "endpoint" {
@@ -181,7 +181,7 @@ Apply with `-target=aws_vpc_endpoint.supabase` first, then apply the rest.
 
 ## Step 5: private hosted zone for verify-full
 
-A Resource-type endpoint exposes no usable `dns_entry` (provider ~> 6.0), and the endpoint certificate names exactly `db.<ref>.supabase.co` - so the DNS handle is the ENI private IPs, published inside the VPC under the real project hostname:
+A Resource-type endpoint exposes no usable `dns_entry` (provider ~> 6.0)[^tf-aws-vpce], and the endpoint certificate names exactly `db.<ref>.supabase.co` - so the DNS handle is the ENI private IPs, published inside the VPC under the real project hostname:
 
 ```hcl
 data "aws_network_interface" "endpoint" {
@@ -207,7 +207,7 @@ Clients keep their normal connection string; only the DNS answer changes.
 
 ## Step 6: verify the private path
 
-From any host in the VPC (the lab uses an SSM-only t3.micro):
+From any host in the VPC (the lab uses a t3.micro reachable only through AWS Systems Manager, SSM):
 
 ```sh
 # extract the presented chain once (STARTTLS); 3 certs expected
@@ -255,12 +255,12 @@ The lab's `make suite` is the full verification battery, runnable against any de
 Each with the symptom you will actually see; the [reference](/reference/supabase-aws-privatelink/#gotchas) carries the same list with the measured evidence inline.
 
 - **SG 5432-only walkthrough.** The guide's SG step opens 5432 only, but the endpoint also serves PgBouncer on 6543. SGs drop rather than refuse, so the symptom is `psql :5432` works while `psql :6543` hangs to timeout - which looks like a Lattice/platform problem, not a one-line SG gap. Worst case: the app silently falls back to the public pooler and your "private" deployment egresses DB traffic for weeks. Add 6543 inbound, same source as 5432.
-- **RAM accept before ARN lookup.** A PENDING invitation hides the resource configuration from `list-resources`, so lookup-first automation sees empty results or races. A declarative `aws_ram_resource_share_accepter` deadlocks structurally: the phase that could apply it needs the ARNs that only acceptance produces. Orchestrate accept-then-lookup instead.
+- **RAM accept before Amazon Resource Name (ARN) lookup.** A PENDING invitation hides the resource configuration from `list-resources`, so lookup-first automation sees empty results or races. A declarative `aws_ram_resource_share_accepter` deadlocks structurally: the phase that could apply it needs the ARNs that only acceptance produces. Orchestrate accept-then-lookup instead.
 - **Two-pass apply.** The ENI data source keys off the endpoint's network interface IDs - unknown at plan time, and `for_each` over unknown keys is a plan error. Apply the endpoint first, then everything else. Skipping the target means a plan failure, not a slow apply.
-- **No `dns_entry` on Resource endpoints.** The attribute comes back empty (provider ~> 6.0). PHZ apex A with ENI IPs, TTL 60. Worst case to design for: endpoint replacement changes the ENI IPs - treat replacement as a DNS event or every private client times out at once.
-- **Association is a dashboard click.** `/platform` routes 401 PATs with "JWT could not be decoded" while the same token works on `/v1` - reads as a token problem, is actually a credential-type problem (session JWT vs PAT). Assume the click is permanent: N accounts = N clicks, so write it as an ops procedure. Project Settings > Integrations, not org settings - looking one level up is how "the UI is missing" reports happen.
+- **No `dns_entry` on Resource endpoints.** The attribute comes back empty (provider ~> 6.0). PHZ apex A record with the ENI addresses at a 60-second time to live (TTL). Worst case to design for: endpoint replacement changes the ENI IPs - treat replacement as a DNS event or every private client times out at once.
+- **Association is a dashboard click.** `/platform` routes 401 PATs with "JSON Web Token (JWT) could not be decoded" while the same token works on `/v1` - reads as a token problem, is actually a credential-type problem (session JWT vs PAT). Assume the click is permanent: N accounts = N clicks, so write it as an ops procedure. Project Settings > Integrations, not org settings - looking one level up is how "the UI is missing" reports happen.
 - **Public direct is IPv6-only.** Without the add-on there is no public A record at all; the confusing symptom is "pooler and API work, direct psql cannot resolve/hangs". Moot under PrivateLink - the endpoint provides in-VPC IPv4 on both ports.
-- **`supabase link` defaults to public.** Migrations work all through development, then break in CI the day you close public access - with an error pointing at the pooler, not your link config. Use `--skip-pooler` or `--db-url`, and prove it by running one migration with restrictions already closed.
+- **`supabase link` defaults to public.**[^sb-cli] Migrations work all through development, then break in continuous integration (CI) the day you close public access - with an error pointing at the pooler, not your link config. Use `--skip-pooler` or `--db-url`, and prove it by running one migration with restrictions already closed.
 - **Prepared statements work on transaction mode now** (measured). The stale advice costs you in reverse: `prepare: false` workarounds and session-mode detours for no current reason. Re-test before carrying them forward.
 - **The pooler queues before it refuses.** Below the client ceiling you do not get errors, you get `NOTICE: No server connection available in postgres backend, client being queued` and transactions that miss their timeout. Refusal (`FATAL: no more connections allowed (max_client_conn)`) is a later regime - measured at the 213th concurrent client on micro against a published figure of 200. Size concurrency for the queueing symptom, not the refusal.
 - **`pgbench` is not in the `postgresql16` package.** It ships in `postgresql16-contrib`; without it the benchmark phases fail with exit 127 and a suite that greps for numbers will happily record zeros. Install contrib in the image, not by hand on a live runner.
@@ -272,7 +272,15 @@ Each with the symptom you will actually see; the [reference](/reference/supabase
 |---|---|
 | `experiments/privatelink-aws/supabase.tf` | step 1 + the gated `restapi_object` (step 2) |
 | `experiments/privatelink-aws/lattice.tf` | SG, endpoint, PHZ (steps 4-5) |
-| `experiments/privatelink-aws/vpc.tf` / `runner.tf` | VPC, NAT, SSM-only runner |
+| `experiments/privatelink-aws/vpc.tf` / `runner.tf` | VPC, network address translation (NAT) gateway, SSM-only runner |
 | `experiments/privatelink-aws/Makefile` | `phase1 arns phase2 suite restrict destroy suite-clean` orchestration |
 | `experiments/privatelink-aws/runner/suite/` | the verification battery (step Verification) |
 | `experiments/privatelink-aws/RUNLOG.md` | per-run findings incl. measured numbers and errata |
+
+[^sb-privatelink]: Supabase, "PrivateLink," Supabase Docs. https://supabase.com/docs/guides/platform/privatelink
+[^sb-cli]: Supabase, "supabase link," Supabase CLI Reference. https://supabase.com/docs/reference/cli/supabase-link
+[^sb-netrestrict]: Supabase, "Network Restrictions," Supabase Docs. https://supabase.com/docs/guides/platform/network-restrictions
+[^aws-ram]: AWS, "What is AWS Resource Access Manager?," AWS RAM User Guide. https://docs.aws.amazon.com/ram/latest/userguide/what-is.html
+[^aws-lattice]: AWS, "Resource configurations in VPC Lattice," Amazon VPC Lattice User Guide. https://docs.aws.amazon.com/vpc-lattice/latest/ug/resource-configuration.html
+[^tf-aws-vpce]: HashiCorp, "aws_vpc_endpoint," Terraform AWS Provider Registry. https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_endpoint
+[^tf-supabase]: Supabase, "supabase provider," Terraform Registry. https://registry.terraform.io/providers/supabase/supabase/latest/docs
