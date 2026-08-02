@@ -150,13 +150,13 @@ PrivateLink covers direct Postgres and PgBouncer only; API, Auth, Storage, and R
 
 ## Capacity and failure behavior
 
-**The pooler queues before it refuses.** Ramping concurrent clients against 6543 (transaction mode, micro), the first thing you hit is not a ceiling but a queue: at 150 and 190 clients PgBouncer accepts every connection and emits `NOTICE: No server connection available in postgres backend, client being queued`, and only a subset of transactions complete inside the client timeout. Refusal is a separate, later regime - `FATAL: no more connections allowed (max_client_conn)` - measured on a quiet system with instant queries at the **213th concurrent client**, against a published micro figure of 200.[^sb-compute] For sizing serverless concurrency this ordering is the point: overshoot shows up as latency and timeouts first, refusals second, so a cap set at the published number is reasonable but will not be the symptom you actually see.
+**The pooler queues before it refuses.** Ramping concurrent clients against 6543 (transaction mode, micro), the first thing you hit is not a ceiling but a queue: at 150 clients PgBouncer accepts every connection and emits `NOTICE: No server connection available in postgres backend, client being queued`, and only a subset of transactions complete inside the client timeout. Refusal is a separate, later regime - `FATAL: no more connections allowed (max_client_conn)`. **Do not quote a precise ceiling from this.** Isolated probes on a quiet system put the first refusal at the 213th concurrent client on one micro project and the 287th on another, against a published figure of 200.[^sb-compute] Size against the published number; what is stable, and what matters for serverless concurrency, is the ordering: overshoot appears as queue latency and client timeouts first, refusals second.
 
-<Aside type="caution" title="An earlier version of this section was wrong">
-It claimed "first connection refusal at exactly 200", from a ramp that ran `pgbench -c N -j N` on a 2-vCPU runner - one thread per client, so a failure at high N could equally have been the client exhausting itself, and the result quietly agreed with the documented figure. Re-run with a pinned thread count, a quiet system, and the server's own error text captured, the boundary moved to 213 and the dominant behaviour turned out to be queueing. Confirmation to a published number is not verification.
+<Aside type="caution" title="This section has been wrong twice">
+First it claimed "refusal at exactly 200", from a ramp running `pgbench -c N -j N` on a 2-vCPU runner - a failure at high N could equally have been the client dying, and the answer quietly agreed with the documented figure. Re-measured, it became "213". Re-measured again on a second project, 287. What survived both is the shape (queue, then refuse) and the mechanism (`max_client_conn`, server-side); the integer never was reproducible enough to publish. Measurement order matters too: a ceiling probe run after a load ramp reports garbage, because the previous step's held connections still occupy the budget.
 </Aside>
 
-**Restart downtime.** Three API-triggered project restarts,[^sb-api-restart] probed with `select 1` every 2s over the endpoint: down windows of **49s, 72s, and 131s**. A fourth restart probed through a Lambda on 6543 (5s granularity) gave **93s**, and the failure mode there matters more than the number: connections fail with `timeout expired`, not a refusal, so a function with a 30s timeout burns the whole budget per attempt. Plan around the worst sample, and treat "restart drops the private path too" as expected: the endpoint stays up, the database behind it does not.
+**Restart downtime.** Three API-triggered project restarts,[^sb-api-restart] probed with `select 1` every 2s over the endpoint: down windows of **49s, 72s, and 131s**. Two further restarts probed through a Lambda on 6543 gave **93s** and **59s**, and the failure mode there matters more than the number: connections fail with `timeout expired`, not a refusal, so a function with a 30s timeout burns the whole budget per attempt. Plan around the worst sample, and treat "restart drops the private path too" as expected: the endpoint stays up, the database behind it does not.
 
 **Endpoint replacement churns the ENI IPs.** Measured: replacing the endpoint moved them from `10.42.1.93 / 10.42.2.139` to `10.42.1.203 / 10.42.2.170`, and clients recovered only once the same apply refreshed the private hosted zone record. Replacement is also a two-pass operation - a single apply fails on the ENI data source's `for_each` over not-yet-known interface IDs.
 
@@ -186,7 +186,7 @@ Two things fall out of that table. The endpoint path costs a fifth of the servic
 
 - **Connect p50 is 31-37ms across the three reachable paths in-region** - one region's wire plus TLS; the throughput gap (1.5x) between private PgBouncer and public Supavisor is the interesting signal, not the absolute tps. A t3.micro runner and micro compute bound both ends; bigger tiers move the absolutes. Public-direct was not measurable at all: without the IPv4 add-on there is no A record to connect to.
 - **The ceiling is a tier property,** not a PrivateLink one, and it arrives as queueing before refusal.[^sb-compute] The endpoint added no measurable refusal below the platform limit.
-- **Restart windows vary 3x** across identical runs (49s / 72s / 131s by psql probe, 93s through a Lambda). The number to quote is a range, and the mechanism (API-triggered restart) matters.
+- **Restart windows vary 3x** across identical runs (49s / 72s / 131s by psql probe, 93s and 59s through a Lambda). The number to quote is a range, and the mechanism (API-triggered restart) matters.
 - **Beta.** PrivateLink is beta, Team and Enterprise only, and the setup flow "may evolve".[^sb-privatelink] Re-run the matrix before quoting these numbers at GA.
 
 ## Gotchas
@@ -233,8 +233,8 @@ Every measured claim above comes out of a disposable OpenTofu lab (supabase-lab)
 | 5432 + 6543 through the endpoint, verify-full | tested | psql matrix via PHZ name, hostaddr split, raw-IP negative |
 | Cert = `db.<ref>.supabase.co`, 3-cert chain | tested | `openssl s_client -starttls postgres` on the endpoint |
 | Private pooler ~1.5x public Supavisor throughput | tested | pgbench select-only, 4 clients, 15s, both paths |
-| Ceiling: refusal at 200 concurrent (micro) | tested | pgbench ramp 100 -> 250 holding `pg_sleep` |
-| Restart window 49-131s | tested | 3 API-triggered restarts, 2s psql probe over endpoint |
+| Ceiling: queues before refusing; `max_client_conn` boundary not reproducible (213 and 287 on two micro projects) | tested | pgbench `-j 8`, isolated probe on a quiet system, server error text captured |
+| Restart window 49-131s (psql), 59-93s (Lambda on 6543) | tested | 5 API-triggered restarts; Lambda failures are `timeout expired`, not refusals |
 | Restrictions lockout, endpoint survives | tested | restrictions -> /32, re-run matrix + public-path negative |
 | `link --skip-pooler` over the endpoint | tested | CLI link + db push via PHZ |
 | Prepared statements OK on transaction mode | tested | `PREPARE`/`EXECUTE` on 6543 |
@@ -242,8 +242,8 @@ Every measured claim above comes out of a disposable OpenTofu lab (supabase-lab)
 | `/platform` association API rejects PATs | tested | owner-role PAT against POST/GET/entitlements |
 | eu-central-2 excluded from PrivateLink | asserted, untested | Studio source |
 | Resource endpoint exposes no `dns_entry` | tested (AWS provider ~> 6.0) | outputs fallback + console cross-check |
-| Lambda-over-endpoint path | design-only | `enable_lambda` scaffolded, not run |
-| Realtime over the endpoint | not applicable, untested | Realtime is HTTP/WebSocket on the API hostname, outside the database socket PrivateLink carries |
+| Lambda in private subnets -> endpoint, 5432 and 6543 | tested | VPC-attached Lambda; cold connect 698ms / 218ms, prepared statements OK on both |
+| Realtime over the endpoint | not applicable, tested | WebSocket handshake completes from in-VPC against the API hostname (72ms) via NAT; the endpoint does not serve it |
 | Read replicas behind PrivateLink | doc-cited, not tested | Replicas have their own database endpoints; PrivateLink for a replica goes through an account rep, not self-serve |
 | Reaching the endpoint from another VPC (peering / TGW / Direct Connect) | doc-cited, not tested | Resource endpoints are per-VPC; multi-VPC means an endpoint each or a Lattice service network association |
 | Service-network consumption path | untested | Only the Resource-endpoint path was built; the association path costs 5x per resource-hour |
