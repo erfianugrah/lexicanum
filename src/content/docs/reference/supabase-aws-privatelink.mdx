@@ -140,7 +140,7 @@ That is the full lockout story for database traffic, self-service, no support ti
 
 Mind the scope: restrictions govern the **database** ports. The Data API stays reachable (it should - it is HTTP, and it is not a PrivateLink path). "Fully private" therefore means "private database socket", not "private project".
 
-## What stays public: the Data API
+## What stays public: the Data API, Auth, Storage, Realtime
 
 PrivateLink covers direct Postgres and PgBouncer only; API, Auth, Storage, and Realtime keep operating over the public internet.[^sb-privatelink] Measured from inside the VPC (traffic egresses via NAT):
 
@@ -150,15 +150,36 @@ PrivateLink covers direct Postgres and PgBouncer only; API, Auth, Storage, and R
 
 ## Capacity and failure behavior
 
-**Pooler client ceiling.** Ramping concurrent clients holding a transaction open against 6543 (transaction mode, micro): clean at 100/150/180, **first connection refusal at exactly 200** - the published micro tier limit, to the client.[^sb-compute] Size serverless concurrency caps against this number, not against "we'll see".
+**The pooler queues before it refuses.** Ramping concurrent clients against 6543 (transaction mode, micro), the first thing you hit is not a ceiling but a queue: at 150 and 190 clients PgBouncer accepts every connection and emits `NOTICE: No server connection available in postgres backend, client being queued`, and only a subset of transactions complete inside the client timeout. Refusal is a separate, later regime - `FATAL: no more connections allowed (max_client_conn)` - measured on a quiet system with instant queries at the **213th concurrent client**, against a published micro figure of 200.[^sb-compute] For sizing serverless concurrency this ordering is the point: overshoot shows up as latency and timeouts first, refusals second, so a cap set at the published number is reasonable but will not be the symptom you actually see.
 
-**Restart downtime.** Three API-triggered project restarts,[^sb-api-restart] probed with `select 1` every 2s over the endpoint: down windows of **49s, 72s, and 131s**. Plan around the worst sample, not the median of three - and treat "restart drops the private path too" as expected: the endpoint stays up, the database behind it does not.
+<Aside type="caution" title="An earlier version of this section was wrong">
+It claimed "first connection refusal at exactly 200", from a ramp that ran `pgbench -c N -j N` on a 2-vCPU runner - one thread per client, so a failure at high N could equally have been the client exhausting itself, and the result quietly agreed with the documented figure. Re-run with a pinned thread count, a quiet system, and the server's own error text captured, the boundary moved to 213 and the dominant behaviour turned out to be queueing. Confirmation to a published number is not verification.
+</Aside>
+
+**Restart downtime.** Three API-triggered project restarts,[^sb-api-restart] probed with `select 1` every 2s over the endpoint: down windows of **49s, 72s, and 131s**. A fourth restart probed through a Lambda on 6543 (5s granularity) gave **93s**, and the failure mode there matters more than the number: connections fail with `timeout expired`, not a refusal, so a function with a 30s timeout burns the whole budget per attempt. Plan around the worst sample, and treat "restart drops the private path too" as expected: the endpoint stays up, the database behind it does not.
+
+**Endpoint replacement churns the ENI IPs.** Measured: replacing the endpoint moved them from `10.42.1.93 / 10.42.2.139` to `10.42.1.203 / 10.42.2.170`, and clients recovered only once the same apply refreshed the private hosted zone record. Replacement is also a two-pass operation - a single apply fails on the ENI data source's `for_each` over not-yet-known interface IDs.
+
+## Cost
+
+Published us-east-1 rates, 2026-07 - rates vary by region, so treat these as shape rather than a quote.
+
+| Line item | Rate | Notes |
+|---|---|---|
+| Resource endpoint | \$0.02 per resource-hour[^aws-pl-pricing] | Per provisioned endpoint; partial hours bill as full hours |
+| Data through the endpoint | \$0.01/GB first 1 PB, \$0.006 next 4 PB, \$0.004 beyond[^aws-pl-pricing] | Same tiers as interface endpoints |
+| Service-network association (the other consumption path) | \$0.10 per resource-hour[^aws-lattice-pricing] | The VPC association itself is free; the per-resource hour is 5x the endpoint path |
+| Route53 private hosted zone | \$0.50/zone/month | One zone per project hostname |
+| NAT gateway, if the subnet needs egress | ~\$0.045/hour + per-GB | Needed for the Management API (`supabase link`), not for the database path |
+| Supabase IPv4 add-on | ~\$4/month | Moot under PrivateLink - the endpoint is already in-VPC IPv4 |
+
+Two things fall out of that table. The endpoint path costs a fifth of the service-network path per resource-hour, so "attach it to my existing Lattice service network" is a materially more expensive default than it looks. And at any real volume the hourly charges stop mattering: 1 TB/month through the endpoint is ~\$10, against ~\$15 of endpoint-hours.
 
 ## Reading the numbers
 
-- **Connect p50 is ~30ms on every path in-region** - one region's wire plus TLS; the throughput gap (1.5x) between private PgBouncer and public Supavisor is the interesting signal, not the absolute tps. A t3.micro runner and micro compute bound both ends; bigger tiers move the absolutes.
-- **The ceiling is a tier table,** not a PrivateLink property - 200 is micro.[^sb-compute] The endpoint itself did not add a measurable refusal below the platform limit.
-- **Restart windows vary 3x** across identical runs. The number to quote is a range, and the mechanism (API-triggered restart) matters.
+- **Connect p50 is 31-37ms across the three reachable paths in-region** - one region's wire plus TLS; the throughput gap (1.5x) between private PgBouncer and public Supavisor is the interesting signal, not the absolute tps. A t3.micro runner and micro compute bound both ends; bigger tiers move the absolutes. Public-direct was not measurable at all: without the IPv4 add-on there is no A record to connect to.
+- **The ceiling is a tier property,** not a PrivateLink one, and it arrives as queueing before refusal.[^sb-compute] The endpoint added no measurable refusal below the platform limit.
+- **Restart windows vary 3x** across identical runs (49s / 72s / 131s by psql probe, 93s through a Lambda). The number to quote is a range, and the mechanism (API-triggered restart) matters.
 - **Beta.** PrivateLink is beta, Team and Enterprise only, and the setup flow "may evolve".[^sb-privatelink] Re-run the matrix before quoting these numbers at GA.
 
 ## Gotchas
@@ -215,7 +236,18 @@ Every measured claim above comes out of a disposable OpenTofu lab (supabase-lab)
 | eu-central-2 excluded from PrivateLink | asserted, untested | Studio source |
 | Resource endpoint exposes no `dns_entry` | tested (AWS provider ~> 6.0) | outputs fallback + console cross-check |
 | Lambda-over-endpoint path | design-only | `enable_lambda` scaffolded, not run |
+| Realtime over the endpoint | not applicable, untested | Realtime is HTTP/WebSocket on the API hostname, outside the database socket PrivateLink carries |
+| Read replicas behind PrivateLink | untested | Each replica is a distinct endpoint host; whether it gets its own resource configuration was not exercised |
+| Reaching the endpoint from another VPC (peering / TGW / Direct Connect) | untested | Resource endpoints are per-VPC; a second VPC needs its own endpoint or a service-network association |
+| Service-network consumption path | untested | Only the Resource-endpoint path was built; the association path costs 5x per resource-hour |
+| Association DELETE (removing an AWS account) | asserted, untested | Shape from Studio source; the lab deleted the project instead |
+| Endpoint replacement churns ENI IPs | asserted, untested | Argued from how ENIs are allocated, not exercised with a `-replace` |
+| Single-AZ ENI failure behavior | untested | Two ENIs exist; neither was removed to observe client behavior |
+| PgBouncer stability over long idle/bursty periods | out of scope | A known failure shape for serverless workloads needs a multi-day soak, not an afternoon |
+| IPv6-first VPC enablement | untested | The lab VPC is IPv4-only; a dualstack endpoint was not attempted |
 
+[^aws-pl-pricing]: Amazon Web Services, "AWS PrivateLink pricing," AWS. https://aws.amazon.com/privatelink/pricing/
+[^aws-lattice-pricing]: Amazon Web Services, "Amazon VPC Lattice pricing," AWS. https://aws.amazon.com/vpc/lattice/pricing/
 [^sb-privatelink]: Supabase, "PrivateLink," Supabase Docs. https://supabase.com/docs/guides/platform/privatelink
 [^sb-connect]: Supabase, "Connecting to Postgres," Supabase Docs. https://supabase.com/docs/guides/database/connecting-to-postgres
 [^sb-ipv4]: Supabase, "IPv4 Address," Supabase Docs. https://supabase.com/docs/guides/platform/ipv4-address
