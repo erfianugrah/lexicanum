@@ -12,6 +12,7 @@
 #                       (org ids, throwaway project refs). Unset = loud SKIP,
 #                       never a vacuous PASS.
 set -u
+shopt -s lastpipe 2>/dev/null || true
 cd "$(dirname "$0")/.." || exit 2
 
 CHECK_LINKS=0
@@ -120,6 +121,100 @@ if [ "$CHECK_LINKS" = 1 ]; then
            https://supabase.com/docs/guides/platform/custom-domains; do
     chk "200: $u" sh -c "curl -so /dev/null -w '%{http_code}' '$u' | grep -q 200"
   done
+fi
+
+# ---------------------------------------------------------------- new doc set
+CG=src/content/docs/guides/supabase-org-consolidation.mdx
+SG=src/content/docs/guides/supabase-shared-tenancy-and-promotion.mdx
+MR=src/content/docs/reference/supabase-multitenant-platform.mdx
+CH=dist/guides/supabase-org-consolidation/index.html
+SH=dist/guides/supabase-shared-tenancy-and-promotion/index.html
+MH=dist/reference/supabase-multitenant-platform/index.html
+
+has_section() { grep -qE "^#{2,3} .*$2" "$1"; }
+dot_fences_ok() { # every dot fence transparent; no per-element colors
+  local f="$1"
+  awk '/^```dot/{d=1;n++;t=0;next} /^```$/{if(d){if(!t){bad=1}};d=0;next}
+       d&&/bgcolor="transparent"/{t=1}
+       d&&/(fontcolor|fillcolor)=|color="#|style=filled/{bad=1}
+       END{exit (bad?1:0)}' "$f"
+}
+evidence_provenance() { # $1 = mdx, $2 = sidecar json
+  local mdx="$1" side="$2" lab labdir id st appear
+  [ -f "$side" ] || return 0
+  lab=$(jq -r '.lab' "$side"); labdir="$HOME/${lab%%:*}/${lab#*:}"
+  [ -f "$labdir/claims.json" ] || { echo "  no ledger at $labdir" >&2; return 1; }
+  while IFS=$'\t' read -r id appear; do
+    st=$(jq -r --arg i "$id" '.claims[]|select(.id==$i)|.status' "$labdir/claims.json")
+    [ "$st" = "empirically-proven" ] || { echo "  $id status=${st:-MISSING}" >&2; return 1; }
+    grep -qF "$appear" "$mdx" || { echo "  $id: '$appear' absent from doc" >&2; return 1; }
+  done < <(jq -r '.rows[]|"\(.claim)\t\(.must_appear)"' "$side")
+}
+
+echo "=== 7. New doc set: source mechanics ==="
+for DOC in "$CG" "$SG" "$MR"; do
+  n=$(basename "$DOC" .mdx)
+  if [ ! -f "$DOC" ]; then skp "$n: not written yet"; continue; fi
+  chk "$n: no smart punctuation" no_pcre '[\x{2013}\x{2014}\x{2018}\x{2019}\x{201C}\x{201D}\x{2026}]' "$DOC"
+  chk "$n: footnotes balanced both ways" footnotes_balanced "$DOC"
+  chk "$n: no unescaped \$ in prose" bash scripts/prose-dollar.sh "$DOC"
+  chk "$n: dot fences transparent + uncolored" dot_fences_ok "$DOC"
+  case "$DOC" in
+    "$MR") for s in "TL;DR|Decision" "Verified" "design-only"; do
+             chk "$n: reference section /$s/" has_section "$DOC" "$s"; done ;;
+    *)     for s in "Verification" "Gotchas"; do
+             chk "$n: guide section /$s/" has_section "$DOC" "$s"; done ;;
+  esac
+done
+
+echo "=== 8. New doc set: built HTML ==="
+for HTML in "$CH" "$SH" "$MH"; do
+  n=$(basename "$(dirname "$HTML")")
+  if [ ! -f "$HTML" ]; then skp "$n: not built yet"; continue; fi
+  chk "$n: no literal [^ left"        no_fixed '[^' "$HTML"
+  chk "$n: zero katex spans"          no_fixed 'class="katex' "$HTML"
+done
+[ -f "$CH" ] && chk "consolidation html: renders every source footnote def" footnote_defs_match_src "$CH" "$CG"
+[ -f "$SH" ] && chk "shared-tenancy html: renders every source footnote def" footnote_defs_match_src "$SH" "$SG"
+[ -f "$MH" ] && chk "multitenant html: renders every source footnote def"    footnote_defs_match_src "$MH" "$MR"
+
+echo "=== 9. New doc set: cross-links ==="
+declare -A XLINK=(
+  ["$CH"]="supabase-multitenant-platform supabase-region-migration-e2e"
+  ["$SH"]="supabase-multitenant-platform"
+  ["$MH"]="supabase-shared-tenancy-and-promotion supabase-org-consolidation"
+  ["$RH"]="supabase-org-consolidation"
+)
+for src in "${!XLINK[@]}"; do
+  [ -f "$src" ] || { skp "xlink from $(basename "$(dirname "$src")") (not built)"; continue; }
+  for tgt in ${XLINK[$src]}; do
+    # a link to a doc that is not written yet is pending work, not a regression
+    if [ ! -d "dist/guides/$tgt" ] && [ ! -d "dist/reference/$tgt" ]; then
+      skp "$(basename "$(dirname "$src")") -> $tgt (target not built yet)"; continue
+    fi
+    chk "$(basename "$(dirname "$src")") -> $tgt" grep -q "$tgt" "$src"
+  done
+done
+
+echo "=== 10. Evidence provenance (claims trace to a green ledger row) ==="
+found_sidecar=0
+for DOC in "$CG" "$SG" "$MR"; do
+  side="${DOC%.mdx}.evidence.json"
+  [ -f "$side" ] || continue
+  found_sidecar=1
+  chk "$(basename "$DOC" .mdx): every claim empirically-proven + present" evidence_provenance "$DOC" "$side"
+done
+[ "$found_sidecar" = 0 ] && skp "evidence provenance (no .evidence.json sidecars yet)"
+
+echo "=== 11. Identifier hygiene is MANDATORY for this doc set ==="
+if [ -z "${BANNED_IDENTIFIERS:-}" ]; then
+  if [ -f "$CG" ] || [ -f "$SG" ]; then
+    printf 'FAIL  BANNED_IDENTIFIERS unset - MANDATORY once the tenancy docs exist\n'; fail=$((fail+1))
+  else
+    skp "BANNED_IDENTIFIERS unset (becomes a hard FAIL once the tenancy docs land)"
+  fi
+else
+  printf 'PASS  BANNED_IDENTIFIERS is set (%s entries)\n' "$(echo $BANNED_IDENTIFIERS | wc -w)"; pass=$((pass+1))
 fi
 
 echo
