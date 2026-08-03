@@ -8,9 +8,15 @@ and every edit. Build with `bun run build`; dev with `bun dev` (localhost:4321).
 
 - `gfm: true` in `astro.config.mjs` -> GFM footnotes render. The citation system
   is built on them.
-- `remark-math` + `rehype-katex` are ON. A literal `$` in prose is parsed as math.
+- `remark-math` + `rehype-katex` are ON. A literal `$` in **prose** is parsed as math.
   ALWAYS escape it as `\$` (e.g. `~\$10/mo`). An unescaped pair silently renders
-  garbled math.
+  garbled math. Three places are exempt and must NOT be escaped (verified against
+  built output 2026-08-03): YAML frontmatter, which is not math-processed and where a
+  `\$` would emit a literal backslash into `og:description`; fenced code, including
+  fences indented inside list items; and inline `` `code` `` spans. `scripts/prose-dollar.sh`
+  models exactly this. A doc that uses math deliberately opts out with
+  `{/* prose-dollar: math-intentional */}` on its own line - `guides/magic-wan-interop`
+  does, for MTU/MSS arithmetic.
 - A custom rehype pass (`rehypeFootnoteLabelToReferences`) renames the GFM
   "Footnotes" heading to a visible **References** section. Do not rename it back.
 - `src/styles/custom.css` styles `.footnotes` dense (small type, tight leading).
@@ -153,7 +159,12 @@ rewrite just for style is not required.
 ## Verify before done
 
 Run `bun run build` and confirm:
-- `24 page(s) built` (or current count), exit 0.
+- the current page count (32 as of 2026-08-03), exit 0. Treat a DROP as the signal:
+  a doc with `draft: true` does not build, and the count is the cheapest way to notice.
+- `bash scripts/verify-docs.sh` reports 0 failed AND 0 unexpected skips. It reads its
+  banned-identifier list from `BANNED_IDENTIFIERS_FILE` (default
+  `~/.config/lexicanum/banned-identifiers`) rather than the environment, so account
+  ids never reach shell history or CI logs.
 - For a doc you edited with citations: every `[^slug]` resolves (no literal `[^`
   left in the rendered HTML), and the References list item count == distinct slugs.
 - No new KaTeX spans from stray `$` (`grep -c 'class="katex' dist/.../index.html`).
@@ -162,3 +173,28 @@ Run `bun run build` and confirm:
 
 Reference: `docs/plans/2026-07-16-doc-structure-and-citations.md` (the plan + the
 "what's already done well" catalog).
+
+## Evidence sidecars (docs that publish measured numbers)
+
+A doc making measured claims carries `<doc>.evidence.json` beside its `.mdx`:
+
+```json
+{
+  "lab": "<repo>:labs/<lab-name>",
+  "rows": [
+    { "claim": "A12", "must_appear": "project-claim" },
+    { "claim": "A11", "must_appear": "returns 404", "expect": "refuted" }
+  ]
+}
+```
+
+`verify-docs.sh` asserts that each claim id exists in that lab's `claims.json`, that
+its status matches `expect` (default `empirically-proven`), and that `must_appear` is
+present in the prose (whitespace-normalized, so wrapped lines match). A number that
+loses its ledger backing fails the build.
+
+The point is that a "measured" badge stays checkable when the lab lives in a private
+repo the reader cannot open. Reader-facing, keep the plain-prose "How it was checked"
+column in the evidence table; the claim ids are internal traceability only. Set
+`expect` deliberately when citing a refuted claim - a doc may legitimately state a
+refutation, but it should not happen by accident.
