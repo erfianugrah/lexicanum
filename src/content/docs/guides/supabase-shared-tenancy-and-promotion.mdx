@@ -63,7 +63,7 @@ from that run, and their error bar is the poll interval, not a stopwatch.
 | Required token algorithm | asymmetric only; symmetric JWTs are rejected |
 | Required token header | a `kid` identifying the key |
 | Required token claim | `role`, valued `authenticated` for ordinary end users |
-| JWKS refresh | cached in project config, re-checked periodically; allow up to 30 minutes for a rotation |
+| JWKS refresh | cached in project config; **measured: a trusting project did not accept new-key tokens within 20 minutes of a rotation, and honoured a revoked key for 15** - see [Rotating the hub's key](#rotating-the-hubs-key-is-a-maintenance-window) |
 
 ## The identity decision comes first
 
@@ -494,6 +494,51 @@ Not exercised, and worth knowing before running this against anything real: MFA
 factors, OAuth and SAML identities (this was email and password only), and retiring
 the source user on the hub afterwards.
 
+## Rotating the hub's key is a maintenance window
+
+Every project that trusts the hub caches the hub's key set. That cache is the whole
+story, and it makes rotation slow in both directions.
+
+| Step | Measured |
+|---|---|
+| Create a standby signing key | rate limited on a fresh project - `Please wait until <ISO8601>`, 144 s and 127 s across two runs |
+| `PATCH standby -> in_use` | previous key moves to `previously_used` automatically |
+| Hub starts issuing new-`kid` tokens | within 5 s |
+| **Trusting project accepts a new-key token** | **never within 20 minutes** - 401 on all 80 polls |
+| Old token after rotation | still accepted |
+| **Old token after that key is `revoked`** | **still accepted for 15 minutes** - 200 on all 60 polls |
+
+The mechanism is visible in the API while it happens: the integration's
+`resolved_at` stays frozen at its pre-rotation value with only the old `kid` in
+`resolved_jwks`.
+
+Two consequences, and the second is the one that matters.
+
+**New sessions break first.** Anyone who signs in or refreshes after the rotation
+gets a token no trusting project will accept, while everyone holding an older token
+carries on. That is the opposite of the usual rollout shape, where new code paths
+fail and old ones keep working - here the *fresh* credential is the broken one.
+
+**Revocation does not revoke.** Supabase's signing-keys documentation says
+asymmetric revocation "is automatic via the key discovery endpoint", which is true
+of the issuing project and false of a third-party consumer inside its cache window.
+During an incident the hub can rotate and revoke in seconds, and for the next half
+hour every trusting project will accept the compromised key and reject its
+replacement.
+
+<Aside type="caution">
+The obvious fix does not work. There is no `PATCH` on the third-party-auth endpoint,
+so `DELETE` + re-`POST` is the only lever - and the re-created integration reported
+`resolved: true` while caching the OLD key again, because the hub's own
+`/auth/v1/.well-known/jwks.json` was still advertising only that key minutes after
+the rotation. Two lags are stacked: the issuer's JWKS publication and the consumer's
+cache. Forcing the consumer to re-resolve buys nothing while the issuer still
+publishes the old key set.
+</Aside>
+
+Plan a hub rotation as a scheduled window with sessions drained, or avoid the hub
+pattern where key rotation has to be fast. Nothing measured here makes it quick.
+
 ## What this does not settle
 
 Stated plainly, because the architecture is only partly demonstrated.
@@ -510,8 +555,11 @@ Stated plainly, because the architecture is only partly demonstrated.
 - **The unexercised parts of the identity migration.** The copy is measured for
   email and password. MFA factors, OAuth and SAML identities, and retiring the source
   user on the hub are not.
-- **Key rotation.** Untested, and on the hub pattern the blast radius is every project
-  trusting it.
+- **The rotation anomaly.** In one of two runs the old token started failing before
+  its key was revoked, while that key was still the only one the trusting project had
+  cached. The other run behaved as expected. Only status codes were captured, so no
+  mechanism is offered; settling it needs the JWKS body per step and the PostgREST
+  error code rather than the HTTP status.
 - **The `role` claim specifically.** Only tested with an anon bearer, which fails on
   grants rather than on the claim. A clean test needs the hub to mint a token with a
   non-`authenticated` role via a custom access token hook.
@@ -531,6 +579,9 @@ Stated plainly, because the architecture is only partly demonstrated.
 | Verification needs the issuer to be alive | Deleted the hub, then kept reading at the dedicated project with a live token | Measured - no. HTTP 200 for the whole window, `resolved_jwks` still present, while refresh at the hub went `410 Gone` |
 | The cost of losing the hub | Read `exp - iat` and the hub's `jwt_exp` | Measured - 3600 s, so one hour to lockout on defaults |
 | The coupling can be removed by copying `auth.users` | Copied one row to a project with NO integration configured, then logged in there | Measured - login succeeds, `iss` is the new project, the claim survives, RLS holds, and it refreshes its own tokens |
+| A rotation on the hub propagates promptly | Rotated to a new ES256 key, then polled a new-key token against the trusting project for 20 minutes | Measured - no. 401 on 80/80 polls, with the integration's `resolved_at` frozen pre-rotation |
+| Revoking a key stops trusting projects accepting it | Marked the old key `revoked`, then polled its token for 15 minutes | Measured - no. 200 on 60/60 polls |
+| Re-creating the integration clears the stale cache | `DELETE` + re-`POST`, then polled at 500 ms | Measured - no. Cached the old `kid` again; the hub's own JWKS was still advertising only that key |
 | The tenant's live session can be ported | Copied users, identities, sessions and refresh_tokens in FK order, resynced the sequence, presented the OLD refresh token | Measured - accepted, new token issued by the new project. Zero re-logins |
 | Scale-to-zero on Nano removes the premise for this architecture | Platform documentation; access is granted per account | Documented, not tested |
 | OAuth tokens carry a `client_id` claim usable in RLS | Platform documentation | Documented, not tested |
