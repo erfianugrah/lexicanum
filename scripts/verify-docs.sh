@@ -31,6 +31,15 @@ no_fixed() { ! grep -qF "$1" "$2"; }   # file must NOT contain fixed string $1
 no_fixed_r() { ! grep -rqF "$1" "$2"; } # tree $2 must NOT contain fixed string $1
 one_references_h2() { test "$(grep -o '<h2[^>]*>References' "$1" | wc -l)" -eq 1; }
 footnote_defs_eq() { test "$(grep -o 'id="user-content-fn-[a-z0-9-]*"' "$1" | sort -u | wc -l)" -eq "$2"; }
+# every footnote DEFINED in the source renders as a definition in the HTML.
+# Derived from the source rather than hardcoded so adding a citation does not
+# require bumping a magic number here (the old failure mode: dbf6752 added
+# [^sb-connect] and CI failed on the next commit).
+footnote_defs_match_src() {
+  local html="$1" doc="$2" n
+  n=$(grep -cE '^\[\^[a-z0-9-]+\]:' "$doc")
+  test "$n" -gt 0 && footnote_defs_eq "$html" "$n"
+}
 footnotes_balanced() { # every used [^slug] defined AND every defined slug cited
   local doc="$1" s used defined
   used=$(grep -v '^\[\^[a-z0-9-]*\]:' "$doc" | grep -o '\[\^[a-z0-9-]*\]' | sort -u | tr -d '[]^')
@@ -71,8 +80,8 @@ for HTML in "$UH" "$RH"; do
   chk "$n: exactly one References h2"    one_references_h2 "$HTML"
   chk "$n: three-ways matrix anchor"     grep -q 'id="every-task-three-ways"' "$HTML"
 done
-chk "upgrade html: 9 footnote definitions" footnote_defs_eq "$UH" 9
-chk "region html: 6 footnote definitions"  footnote_defs_eq "$RH" 6
+chk "upgrade html: renders every source footnote definition" footnote_defs_match_src "$UH" "$UG"
+chk "region html: renders every source footnote definition"  footnote_defs_match_src "$RH" "$RG"
 chk "upgrade html: path-b anchor"          grep -q 'id="path-b-cut-over-to-a-new-pg-17-project-with-sbshift"' "$UH"
 chk "upgrade html: lab subsection anchor"  grep -q 'id="optional-rehearse-pg_upgrade-itself-in-docker-sbshift-upgrade-lab"' "$UH"
 chk "upgrade html: matrix has 3 method columns" \
