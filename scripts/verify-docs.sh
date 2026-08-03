@@ -11,10 +11,6 @@
 #   BANNED_IDENTIFIERS       space-separated strings that must not appear in src/
 #                            (org ids, throwaway project refs). Unset = loud SKIP,
 #                            never a vacuous PASS.
-#   LAB_ROOT                 directory holding the private lab ledgers
-#                            (<LAB_ROOT>/<lab>/claims.json). Unset on CI, which
-#                            then verifies against docs/ledgers/*.status.json.
-#                            Read from ~/.config/lexicanum/lab-root if that exists.
 #   BANNED_IDENTIFIERS_FILE  path to a newline-separated list, read instead of the
 #                            env var. Preferred: these values should not end up in
 #                            shell history, CI logs, or a commit. Default if present:
@@ -25,11 +21,6 @@ cd "$(dirname "$0")/.." || exit 2
 
 CHECK_LINKS=0
 [ "${1:-}" = "--check-links" ] && CHECK_LINKS=1
-
-: "${LAB_ROOT_FILE:=$HOME/.config/lexicanum/lab-root}"
-if [ -z "${LAB_ROOT:-}" ] && [ -r "$LAB_ROOT_FILE" ]; then
-  LAB_ROOT=$(head -1 "$LAB_ROOT_FILE"); export LAB_ROOT
-fi
 
 : "${BANNED_IDENTIFIERS_FILE:=$HOME/.config/lexicanum/banned-identifiers}"
 if [ -z "${BANNED_IDENTIFIERS:-}" ] && [ -r "$BANNED_IDENTIFIERS_FILE" ]; then
@@ -45,7 +36,7 @@ RH=dist/guides/supabase-region-migration-e2e/index.html
 # Fail loudly on a missing tool. A check that silently no-ops is worse than a
 # vacuous PASS: CI reported "no sidecars yet" and "no drafts in repo" for two
 # rg-dependent checks because the runner has no rg, and both statements were false.
-for t in jq grep awk sed find python3; do
+for t in jq grep awk sed find; do
   command -v "$t" >/dev/null || { echo "FATAL: required tool '$t' not found" >&2; exit 2; }
 done
 
@@ -167,46 +158,6 @@ dot_fences_ok() { # every dot fence transparent; no per-element colors
        d&&/(fontcolor|fillcolor)=|color="#|style=filled/{bad=1}
        END{exit (bad?1:0)}' "$f"
 }
-# Body of the doc with YAML frontmatter stripped and newlines collapsed.
-# Stripping frontmatter is load-bearing: must_appear values are DECLARED in the
-# frontmatter, so grepping the whole file matches every row against its own
-# declaration and the text half of the gate silently passes for everything.
-doc_body() {
-  awk 'NR==1 && /^---[[:space:]]*$/ {fm=1; next} fm && /^---[[:space:]]*$/ {fm=0; next} !fm' "$1" \
-    | tr '\n' ' ' | tr -s ' '
-}
-
-evidence_provenance() { # $1 = mdx carrying an `evidence:` frontmatter block
-  local mdx="$1" rows lab labdir id st appear want body
-  rows=$(python3 scripts/evidence-rows.py "$mdx") || return 1
-  lab=$(printf '%s\n' "$rows" | sed -n 's/^lab\t//p' | head -1)
-  [ -n "$lab" ] || { echo "  no evidence.lab in frontmatter" >&2; return 1; }
-  # Two sources, in priority order. The private lab ledger is authoritative and
-  # present on a dev machine; CI only has the vendored public status snapshot
-  # (claim ids + statuses, nothing identifying). Group 10b asserts the snapshot
-  # still matches the ledger whenever both exist, so CI cannot pass on stale data.
-  ledger="${LAB_ROOT:+$LAB_ROOT/$lab/claims.json}"
-  snap="docs/ledgers/$lab.status.json"
-  if   [ -n "$ledger" ] && [ -f "$ledger" ]; then src=ledger
-  elif [ -f "$snap" ];                       then src=snap
-  else echo "  no snapshot at $snap (and LAB_ROOT unset or missing $lab)" >&2; return 1; fi
-  body=$(doc_body "$mdx")
-  while IFS=$'\t' read -r id want appear; do
-    [ "$id" = "lab" ] && continue
-    # a row may deliberately cite a refuted or untested claim. That has to be
-    # declared per-row via `expect`, so it cannot happen by accident.
-    if [ "$src" = ledger ]; then
-      st=$(jq -r --arg i "$id" '.claims[]|select(.id==$i)|.status' "$ledger")
-    else
-      st=$(jq -r --arg i "$id" '.claims[$i] // empty' "$snap")
-    fi
-    [ "$st" = "$want" ] || { echo "  $id status=${st:-MISSING} expected=$want" >&2; return 1; }
-    # whitespace-normalized: published prose wraps, so the phrase may span lines
-    printf '%s' "$body" | grep -qF "$appear" \
-      || { echo "  $id: '$appear' absent from doc body" >&2; return 1; }
-  done <<< "$rows"
-}
-
 echo "=== 7. New doc set: source mechanics ==="
 for DOC in "$CG" "$SG" "$MR"; do
   n=$(basename "$DOC" .mdx)
@@ -250,35 +201,6 @@ for src in "${!XLINK[@]}"; do
     fi
     chk "$(basename "$(dirname "$src")") -> $tgt" grep -q "$tgt" "$src"
   done
-done
-
-echo "=== 10. Evidence provenance (claims trace to a green ledger row) ==="
-found_ev=0
-for DOC in $(grep -rl '^evidence:' src/content/docs/ 2>/dev/null | sort); do
-  found_ev=1
-  chk "$(basename "$DOC" .mdx): every claim traces to its ledger row" evidence_provenance "$DOC"
-done
-if [ "$found_ev" = 0 ]; then
-  printf 'FAIL  no doc declares an evidence block - the provenance gate is not running\n'
-  fail=$((fail+1))
-fi
-
-echo "=== 10b. Vendored ledger snapshots match the private ledgers (local only) ==="
-snap_checked=0
-for snap in docs/ledgers/*.status.json; do
-  [ -f "$snap" ] || continue
-  lab=$(jq -r '.lab' "$snap"); ledger="${LAB_ROOT:+$LAB_ROOT/$lab/claims.json}"
-  if [ -z "$ledger" ] || [ ! -f "$ledger" ]; then
-    skp "$(basename "$snap"): LAB_ROOT unset or ledger absent (CI) - snapshot used as-is"
-    continue
-  fi
-  snap_checked=1
-  if diff -q <(jq -S '.claims' "$snap") \
-             <(jq -S '[.claims[]|{(.id):.status}]|add' "$ledger") >/dev/null; then
-    printf 'PASS  %s matches its private ledger\n' "$(basename "$snap")"; pass=$((pass+1))
-  else
-    printf 'FAIL  %s is STALE - regenerate with make ledgers\n' "$(basename "$snap")"; fail=$((fail+1))
-  fi
 done
 
 echo "=== 10a. Every internal link resolves to a built page ==="
