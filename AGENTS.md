@@ -109,6 +109,10 @@ claim, and a References list renders at the bottom. Mechanism:
 - A footnote DEFINITION with no matching inline `[^slug]` does NOT render. Every
   reference must be cited inline at least once.
 - Do NOT keep a separate "Sources" section. The References list IS the sources.
+- Links in an evidence / "How it was checked" table stay INLINE, even in a reference
+  doc. There the link IS the evidence rather than prose-flow attribution, and
+  footnoting it puts the proof one hop away from the claim it supports.
+  `reference/supabase-multitenant-platform` is the case that established this.
 
 **Guides**: keep links inline in the step where they're used (flow beats
 attribution in a how-to). Add a References footnote list only if the guide is
@@ -196,9 +200,6 @@ Run `bun run build` and confirm:
 - No new KaTeX spans from stray `$` (`grep -c 'class="katex' dist/.../index.html`).
 - Casing-only heading edits do not change anchors (slugs are lowercased), so
   internal `#anchor` links stay valid.
-
-Reference: `docs/plans/2026-07-16-doc-structure-and-citations.md` (the plan + the
-"what's already done well" catalog).
 
 ## Docs that publish measured numbers
 
