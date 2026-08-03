@@ -7,12 +7,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p docs/ledgers
+: "${LAB_ROOT:=$(head -1 "$HOME/.config/lexicanum/lab-root" 2>/dev/null || true)}"
+[ -n "$LAB_ROOT" ] || { echo "LAB_ROOT unset (and ~/.config/lexicanum/lab-root absent)" >&2; exit 2; }
+
 for lab in supabase-org-topology supabase-hand-rolled-sfp; do
-  src="$HOME/erfibase/labs/$lab/claims.json"
+  src="$LAB_ROOT/$lab/claims.json"
   [ -f "$src" ] || { echo "  skip $lab (private ledger not present)"; continue; }
-  jq -S --arg lab "erfibase:labs/$lab" --arg gen "$(date -u +%F)" '
+  jq -S --arg lab "$lab" --arg gen "$(date -u +%F)" '
     { lab: $lab, generated: $gen,
-      note: "Public status snapshot of a private lab ledger. Claim ids and statuses only.",
+      note: "Public status snapshot of a lab ledger held in a separate private repo. Claim ids and statuses only - no notes, evidence paths, or identifiers.",
       claims: (.claims | map({(.id): .status}) | add) }' "$src" > "docs/ledgers/$lab.status.json"
   echo "  $lab: $(jq '.claims|length' "docs/ledgers/$lab.status.json") claims"
 done
