@@ -93,7 +93,7 @@ Owns:
 Does NOT own the why. Cost reasoning, tier comparison and "should I do this at all"
 stay in the reference.
 
-### 4. `reference/supabase-multitenant-platform.mdx` - UPDATE
+### 4. `reference/supabase-multitenant-platform.mdx` - DEFERRED (see closure plan below)
 
 Written 2026-07-09 with an honest "Still design-only (not yet tested)" section. Two
 of its four untested items are now tested.
@@ -112,28 +112,46 @@ of its four untested items are now tested.
 - Leave "the gateway" and "scale / noisy-neighbour" in design-only. They are still
   untested and the doc's credibility rests on that section staying honest.
 
-Update last, since it depends on what the two guides end up owning.
+DEFERRED 2026-08-03. Publishing is gated on the doc being a complete, demonstrated
+architecture, and it is not one yet. See "Closing the multi-tenant reference" below
+for the plan. It stays `draft: true` until then, which means **the two new guides must
+not link to it** - see the amended cross-link graph.
 
 ## Cross-link graph
 
-```
-reference/supabase-multitenant-platform
-  -> guides/supabase-shared-tenancy-and-promotion   (how to build it)
-  -> guides/supabase-org-consolidation              (if project-per-tenant is right after all)
+While the reference stays draft, links INTO it would resolve to nothing on the live
+site. So the shipping graph is:
 
+```
 guides/supabase-org-consolidation
-  -> reference/supabase-multitenant-platform        (when project-per-client is the wrong shape)
   -> guides/supabase-region-migration-e2e           (if you also change region)
+  -> guides/supabase-shared-tenancy-and-promotion   (if project-per-client is the wrong shape)
 
 guides/supabase-shared-tenancy-and-promotion
-  -> reference/supabase-multitenant-platform        (the why, the cost model)
+  -> guides/supabase-org-consolidation              (if you want a project per tenant after all)
 
 guides/supabase-region-migration-e2e
   -> guides/supabase-org-consolidation              (org change is NOT a region migration)
 ```
 
+The shared-tenancy guide therefore carries a compressed "why" inline - roughly a
+paragraph and the idle-cost number - instead of delegating it to the reference. Keep
+it short; when the reference publishes, that paragraph shrinks to a link.
+
+Re-added when the reference publishes:
+
+```
+reference/supabase-multitenant-platform
+  -> guides/supabase-shared-tenancy-and-promotion   (how to build it)
+  -> guides/supabase-org-consolidation              (if project-per-tenant is right after all)
+guides/supabase-shared-tenancy-and-promotion
+  -> reference/supabase-multitenant-platform        (the why, the cost model)
+```
+
 Every arrow gets a checked anchor in the verifier - the existing harness already
-does this for the upgrade/region pair and it caught real breakage.
+does this for the upgrade/region pair and it caught real breakage. A new check also
+asserts that no PUBLISHED doc links to a DRAFT one, so the deferred reference cannot
+be linked by accident.
 
 ## Provenance: two kinds of claim, two mechanisms
 
@@ -241,7 +259,7 @@ Then once across the whole set:
 
 ## Acceptance criteria
 
-- `bun run build` exits 0 and reports 33 pages (34 if the reference is un-drafted).
+- `bun run build` exits 0 and reports 33 pages (the reference stays draft).
 - `verify-docs.sh` reports 0 failed and 0 skipped.
 - `--check-links` reports 0 failed.
 - Every measured number in all four docs traces to an `empirically-proven` ledger row
@@ -276,8 +294,8 @@ deliberately, not a side effect of editing it. Until it is un-drafted, every
 dist-based check against it SKIPs, so the harness reports drafts explicitly rather
 than silently passing.
 
-**Page count is 31, not the 24 in AGENTS.md.** Target after this work: 33 with the
-two guides, 34 if the reference is un-drafted. The AGENTS.md "Verify before done"
+**Page count is 31, not the 24 in AGENTS.md.** Target after this work: 33. The
+reference stays draft, so it does not count. The AGENTS.md "Verify before done"
 number is stale and should be updated to say "current count" rather than a literal.
 
 **`prose-dollar.sh` had a frontmatter false positive.** It flagged the multitenant
@@ -310,3 +328,70 @@ Still to wire once the docs exist:
 - Add the new docs' footnote URLs to the opt-in `--check-links` group.
 - Set `BANNED_IDENTIFIERS` in CI. Group 11 turns its absence into a hard FAIL the
   moment either new guide lands, so this cannot be forgotten silently.
+
+## Closing the multi-tenant reference (deferred workstream)
+
+The publishing bar: the doc only ships if everything in it is demonstrated. Assessed
+2026-08-03 against what the labs proved, it is not there.
+
+### The gap, split by whether effort closes it
+
+| SfP capability | hand-rolled status | closable |
+|---|---|---|
+| Hard isolation for every tenant, including free | Tier S free tenants share one instance, isolated by RLS only | **No - structural** |
+| Native per-tenant backup / PITR | Tier S has none; a filtered dump you build | yes, with work |
+| Noisy-neighbour protection | none in Tier S; untested at any scale | partly |
+| Managed control plane | you build and run gateway + registry | yes, but it is a project |
+| Stable facade / ref-hiding | gateway not built | yes |
+| Key rotation | untested; hub-as-IdP makes it fleet-wide | yes, cheaply |
+
+The first row does not yield to effort. SfP gives every tenant a real project that
+sleeps; Tier S gives free tenants a row-level slice of a shared instance. No amount of
+building makes those equivalent. So "complete workaround for SfP" is not a bar this
+doc can ever clear, and chasing it would mean never publishing.
+
+### The chosen shape: narrow the claim, prove all of it
+
+Rewrite the doc to claim what it can demonstrate: how to avoid paying a per-idle-tenant
+compute floor for free/trial users, with promotion on conversion. Not an SfP
+replacement - a segment optimization, gated on physical isolation not being a product
+requirement. The existing "What you are trading away" and "Decision" sections already
+say this; the change is to stop the architecture diagram promising components that do
+not exist.
+
+Work required, in order:
+
+1. **Test whether ref-discovery replaces the gateway.** The hub-as-IdP result already
+   removed the gateway's hardest job - it does not need to rewrite tokens, because the
+   same token is valid on both tiers. What remains is ref-hiding and key injection. A
+   client that fetches its current project ref and publishable key from a small
+   discovery endpoint may not need a proxy at all, which turns the gateway from a
+   data-path component into a config lookup. Half-day lab: stand up a discovery
+   endpoint, move a tenant S -> D, confirm the client picks up the new placement on
+   next fetch with no re-auth and no proxy. If it holds, the gateway leaves the
+   architecture and the doc gets materially smaller and fully proven.
+2. **If it does not hold, build the minimum gateway** and test ref-hiding + key
+   injection end to end. Larger; reassess before starting.
+3. **Per-tenant backup for Tier S.** Filtered dump of one tenant's rows plus its
+   storage objects, restored into a fresh project. This is the same machinery as
+   promotion, so it may already be proven by the promotion test - check before
+   building anything.
+4. **Rotation.** Rotate the hub's signing key and measure how long tenant projects
+   keep accepting the old one. Docs say allow up to 30 minutes. Cheap to test and it
+   is the sharpest operational risk in the hub pattern, because the blast radius is
+   every project trusting that hub.
+5. **Scale.** N tenants and enough load to say something about contention. This one
+   sets its own bar - decide what claim is worth making before spending time. It is
+   legitimate to publish saying scale is untested, provided the doc says so, because
+   that is a limitation rather than a missing component.
+
+Items 1-4 are lab-sized. Item 5 is open-ended and should not block publishing as long
+as it stays honestly labelled in the design-only section.
+
+### Publishing checklist
+
+- Architecture diagram contains only components that exist and are tested.
+- "Still design-only" retains anything unproven, scale included.
+- Every measured number has a sidecar evidence row pointing at a green ledger claim.
+- `draft: true` removed, page count becomes 34, and the deferred cross-links above are
+  re-added in both directions.
