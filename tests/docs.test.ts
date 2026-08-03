@@ -11,29 +11,11 @@
  * than being noticed on the published page.
  */
 import { describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
-import { mathRiskLines, parseMdx, smartPunctLines, splitTables, type Doc } from "./lib/mdx";
+import { existsSync, readFileSync } from "node:fs";
+import { mathRiskLines, smartPunctLines, splitTables } from "./lib/mdx";
+import { builtPath, CHECK_BUILT, collectDocs } from "./lib/corpus";
 
-const ROOT = new URL("..", import.meta.url).pathname;
-const DOCS = join(ROOT, "src/content/docs");
-const DIST = join(ROOT, "dist");
-
-function collect(): Doc[] {
-  const out: Doc[] = [];
-  for (const dir of ["guides", "reference"]) {
-    const d = join(DOCS, dir);
-    if (!existsSync(d)) continue;
-    for (const f of readdirSync(d)) {
-      if (!f.endsWith(".mdx") && !f.endsWith(".md")) continue;
-      const p = join(d, f);
-      out.push(parseMdx(`${dir}/${f}`, readFileSync(p, "utf8")));
-    }
-  }
-  return out;
-}
-
-const docs = collect();
+const docs = collectDocs();
 
 test("the corpus is non-empty", () => {
   // Guards against the whole suite passing vacuously because a path changed.
@@ -122,18 +104,14 @@ describe("cross-document", () => {
   });
 });
 
-// dist-dependent assertions. Skipped rather than failed when there is no build,
-// but the skip says so instead of reporting nothing to check.
-// Gated on CHECK_BUILT, not merely on dist/ existing: in the pre-build pass dist/
-// holds the PREVIOUS build, so these would grade stale HTML - passing when the
-// current source is broken, or failing on a page this run is about to create.
-const built = existsSync(DIST) && !!process.env.CHECK_BUILT;
-describe.skipIf(!built)("built output", () => {
+// Dist-dependent assertions. See CHECK_BUILT in lib/corpus.ts for why they are
+// gated on more than dist/ existing.
+describe.skipIf(!CHECK_BUILT)("built output", () => {
   const pages = docs
     .filter((d) => !d.isDraft)
     .map((d) => ({
       doc: d,
-      html: join(DIST, `${d.path.replace(/\.(mdx|md)$/, "")}/index.html`),
+      html: builtPath(d.path),
     }));
 
   test("every non-draft doc produced a page", () => {

@@ -13,14 +13,13 @@
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { COLLECTIONS, DOCS } from "./lib/corpus";
 
-const ROOT = new URL("..", import.meta.url).pathname;
-const DOCS = join(ROOT, "src/content/docs");
 const ENABLED = process.env.CHECK_LINKS === "1";
 
 function urls(): Map<string, string[]> {
   const byUrl = new Map<string, string[]>();
-  for (const dir of ["guides", "reference"]) {
+  for (const dir of COLLECTIONS) {
     const d = join(DOCS, dir);
     if (!existsSync(d)) continue;
     for (const f of readdirSync(d)) {

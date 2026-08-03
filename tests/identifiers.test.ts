@@ -14,8 +14,8 @@ import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { ROOT } from "./lib/corpus";
 
-const ROOT = new URL("..", import.meta.url).pathname;
 const SRC = join(ROOT, "src");
 const DEFAULT_FILE = join(homedir(), ".config/lexicanum/banned-identifiers");
 
