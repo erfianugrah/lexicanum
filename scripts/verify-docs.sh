@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+#
+# Scope note: structural doc checks - tables, footnotes, punctuation, math risk,
+# internal links, draft links - moved to tests/ and run inside `bun run build`,
+# where the parsing they rest on is itself unit-tested. Four of those checks were
+# wrong when written as text matching here, and two passed vacuously for weeks.
+# What stays below is environment-shaped rather than structure-shaped: identifier
+# hygiene against a secret list, guide-specific content assertions, and external
+# link reachability.
 # Regression checks for the sbshift e2e guides: doc mechanics + built HTML.
 # Ported from the 2026-07-30 ad-hoc verification harness (lessons:
 # ~/.local/share/harness/HARNESS-NOTES.md). Needs dist/ - run `bun run build`
