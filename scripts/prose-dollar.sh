@@ -9,6 +9,6 @@ awk '
   NR==1 && /^---[[:space:]]*$/ {fm=1; next}
   fm && /^---[[:space:]]*$/     {fm=0; next}
   fm                           {next}
-  /^```/                       {f=!f; next}
+  /^[[:space:]]*```/           {f=!f; next}   # indented fences occur inside list items
   !f
 ' "$1" | grep -qP '(?<!\\)\$' && exit 1 || exit 0

@@ -261,7 +261,8 @@ the subscription, or the initial copy fails row by row.
 ## Part 3: repoint - the region-specific checklist
 
 This is the work that makes a region move different from a version upgrade.
-Do it in this order; items 1-3 break loudly if forgotten, 4-7 silently.
+Do it in this order; items 1-3 break loudly if forgotten, 4-8 silently. Item 8 is
+the only one that becomes unrecoverable, so read it before you start Part 2.
 
 1. **App env: URL, keys, AND the pooler hostname.** Three values change -
    `SUPABASE_URL`, the anon key, and the service key - plus the pooler host
@@ -329,6 +330,36 @@ Do it in this order; items 1-3 break loudly if forgotten, 4-7 silently.
    dual-read both projects briefly (only viable for read-mostly apps), or
    accept that the installed base re-logs-in on next open.
 
+   Passwords themselves survive: `auth.users` carries bcrypt hashes and they
+   verify unchanged on the target, so nobody resets a password. Only sessions
+   die.
+8. **Vault secrets: move the encryption root key, or lose them.** Rows in
+   `vault.secrets` are ciphertext, and a new project is created with its own
+   encryption root key. Restore the rows without the key and every secret is
+   unreadable - `vault.decrypted_secrets` fails with
+   `ERROR: 22000 pgsodium_crypto_aead_det_decrypt_by_id: invalid ciphertext`.
+   The dump succeeds, the restore succeeds, and the failure only surfaces the
+   first time something reads a secret.[^sb-vault]
+
+   Read the source key and set it on the target **before you decommission
+   anything**:
+
+   ```bash
+   curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+     "https://api.supabase.com/v1/projects/<source-ref>/pgsodium"
+   # -> {"root_key":"<64 hex chars>"}
+   ```
+
+   Then apply that value to the target project's pgsodium config before
+   restoring `vault.secrets`. Verify by selecting one secret back out through
+   `vault.decrypted_secrets` on the target and comparing it to the source.
+
+   The window closes permanently. Once the source project is deleted, the same
+   endpoint returns `400 {"message":"Resource has been removed"}` and the key
+   is gone with it - there is no recovery path, because the ciphertext is all
+   you have left. If you have no Vault secrets, confirm it rather than assume:
+   `select count(*) from vault.secrets;`
+
 ## Part 4: validation window and decommission
 
 - Keep the **old project paused, not deleted**, for a few days as a safety
@@ -339,6 +370,10 @@ Do it in this order; items 1-3 break loudly if forgotten, 4-7 silently.
   check on the new project.
 - Re-run the Part 1 latency measurements - the move was for these numbers;
   confirm they actually improved.
+- Before deleting, confirm anything encrypted actually decrypts on the target:
+  `select name, decrypted_secret from vault.decrypted_secrets;` should return
+  plaintext, not an error. Deleting the source destroys its encryption root key
+  (Part 3, item 8), so this check has to pass first.
 - Then **delete the old project** - it bills until you do. Remove the old
   OAuth callbacks at the providers and the old DNS records.
 
@@ -370,6 +405,7 @@ this table is the region-move surface:
 | Sequence resync | post-cutover `insert ... returning id` on a serial/IDENTITY table | next value, no PK collision |
 | Latency actually improved | `psql` connect time / TTFB from your app host, old vs new | improvement toward your users |
 | Email login | sign in on the new project | works (user exists, password hash carried) |
+| Vault secrets | `select name, decrypted_secret from vault.decrypted_secrets;` on the target | plaintext for every row, no `invalid ciphertext` error |
 | Social login | one OAuth provider end to end | works after callback update |
 | Storage | GET a synced object via the new ref's **public** URL | 200 (404 = bytes not synced; 400 "Bucket not found" = visibility not restored) |
 | Edge Function | invoke on the new ref | 200 |
@@ -378,6 +414,33 @@ this table is the region-move surface:
 
 ## Gotchas and lessons learned
 
+- **A dump-and-restore silently destroys Vault secrets.** Both halves succeed -
+  `pg_dump` copies `vault.secrets` and the restore accepts it - because the
+  rows are just ciphertext. The new project holds a different encryption root
+  key, so the first read is where it surfaces, and by then the source may be
+  gone. Move the root key first (Part 3, item 8) and verify a decrypt on the
+  target before deleting anything. This is the one item in the whole move with
+  no recovery path.
+- **Hand-built `auth.users` rows make GoTrue return `Database error querying
+  schema`.** Only bites the manual path - `sbshift bootstrap --with-auth-data`
+  handles it. Eight varchar token columns default to empty string rather than
+  NULL, and an insert that leaves them NULL fails the driver's scan, so every
+  login on the target 500s while the row looks correct in `psql`. Fix:
+
+  ```sql
+  update auth.users set
+    confirmation_token         = coalesce(confirmation_token, ''),
+    recovery_token             = coalesce(recovery_token, ''),
+    email_change               = coalesce(email_change, ''),
+    email_change_token_new     = coalesce(email_change_token_new, ''),
+    email_change_token_current = coalesce(email_change_token_current, ''),
+    phone_change               = coalesce(phone_change, ''),
+    phone_change_token         = coalesce(phone_change_token, ''),
+    reauthentication_token     = coalesce(reauthentication_token, '');
+  ```
+
+  The bcrypt hash itself ports fine, so once the columns are fixed the original
+  password works.
 - **Enumerate the repointing surface before the window, not during it.**
   OAuth callbacks, the region-specific pooler hostname, custom-domain DNS
   and mobile key rollouts are each a separate system with its own deploy
@@ -427,3 +490,4 @@ this table is the region-move surface:
 [^sb-connect]: Supabase, "Connect to your database," Supabase Docs. https://supabase.com/docs/guides/database/connecting-to-postgres
 [^sb-redirect]: Supabase, "Redirect URLs," Supabase Docs. https://supabase.com/docs/guides/auth/redirect-urls
 [^sb-custom-domains]: Supabase, "Custom Domains," Supabase Docs. https://supabase.com/docs/guides/platform/custom-domains
+[^sb-vault]: Supabase, "Supabase Vault," Supabase Docs. https://supabase.com/docs/guides/database/vault

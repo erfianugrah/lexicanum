@@ -147,7 +147,9 @@ evidence_provenance() { # $1 = mdx, $2 = sidecar json
   while IFS=$'\t' read -r id appear; do
     st=$(jq -r --arg i "$id" '.claims[]|select(.id==$i)|.status' "$labdir/claims.json")
     [ "$st" = "empirically-proven" ] || { echo "  $id status=${st:-MISSING}" >&2; return 1; }
-    grep -qF "$appear" "$mdx" || { echo "  $id: '$appear' absent from doc" >&2; return 1; }
+    # whitespace-normalized: published prose wraps, so the phrase may span lines
+    tr '\n' ' ' < "$mdx" | tr -s ' ' | grep -qF "$appear" \
+      || { echo "  $id: '$appear' absent from doc" >&2; return 1; }
   done < <(jq -r '.rows[]|"\(.claim)\t\(.must_appear)"' "$side")
 }
 
@@ -198,13 +200,28 @@ done
 
 echo "=== 10. Evidence provenance (claims trace to a green ledger row) ==="
 found_sidecar=0
-for DOC in "$CG" "$SG" "$MR"; do
-  side="${DOC%.mdx}.evidence.json"
-  [ -f "$side" ] || continue
+for side in $(rg --files src/content/docs -g '*.evidence.json' 2>/dev/null | sort); do
+  DOC="${side%.evidence.json}.mdx"
+  [ -f "$DOC" ] || { printf 'FAIL  orphan sidecar with no doc: %s\n' "$side"; fail=$((fail+1)); continue; }
   found_sidecar=1
   chk "$(basename "$DOC" .mdx): every claim empirically-proven + present" evidence_provenance "$DOC" "$side"
 done
 [ "$found_sidecar" = 0 ] && skp "evidence provenance (no .evidence.json sidecars yet)"
+
+echo "=== 11a. No published doc links to a draft doc ==="
+drafts=$(rg -l '^draft: true' src/content/docs/ 2>/dev/null | sed 's|.*/||;s|\.mdx$||')
+if [ -z "$drafts" ]; then
+  skp "draft-link check (no drafts in repo)"
+else
+  for d in $drafts; do
+    # a published page must not reference a draft page's URL
+    if rg -q -- "/$d" dist --glob 'index.html' 2>/dev/null; then
+      printf 'FAIL  a published page links to draft doc: %s\n' "$d"; fail=$((fail+1))
+    else
+      printf 'PASS  no published page links to draft doc: %s\n' "$d"; pass=$((pass+1))
+    fi
+  done
+fi
 
 echo "=== 11. Identifier hygiene is MANDATORY for this doc set ==="
 if [ -z "${BANNED_IDENTIFIERS:-}" ]; then
