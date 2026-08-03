@@ -8,9 +8,9 @@ import { Aside } from "@astrojs/starlight/components";
 
 Build a private network path from an AWS VPC to a Supabase project: a VPC Lattice Resource endpoint serving direct Postgres (5432) and the project pooler (6543), TLS `verify-full` via a private hosted zone, Supabase CLI migrations over the endpoint, and public database access closed at the end. The measured behaviour behind each step - latency, ceilings, restart windows, the tested-vs-asserted split - lives in the companion [reference](/reference/supabase-aws-privatelink/); this is the build sequence.
 
-**Prerequisites:** a Team or Enterprise Supabase org; an AWS account in the same region as the project; a Supabase Personal Access Token; OpenTofu >= 1.6; the AWS CLI; a VPC with private subnets (the lab builds its own). PrivateLink is same-region only.
+**Prerequisites:** a Team or Enterprise Supabase org; an AWS account in the same region as the project; a Supabase Personal Access Token; OpenTofu >= 1.6; the AWS CLI; a VPC with private subnets (the lab builds its own). PrivateLink is same-region only, it is beta rather than generally available, and not every region is eligible - `eu-central-2` is excluded.[^sb-privatelink] Confirm your region before building anything around it.
 
-The working repo this guide is extracted from is [supabase-lab](https://github.com/erfianugrah/supabase-lab) - every step below ran green there on 2026-07-31 before being written down.
+The working repo this guide is extracted from is [supabase-lab](https://github.com/erfianugrah/supabase-lab) - every step below ran green there on 2026-07-31 before being written down, and later runs through 2026-08-02 added the Lambda path, the typed test harness, and the IPv6 answer.
 
 ## Architecture
 
@@ -133,7 +133,7 @@ aws ram list-resources --resource-owner OTHER-ACCOUNTS \
   --query 'resources[0].arn' --output text   # -> resource_configuration_arn
 ```
 
-Write both ARNs into an `arns.tfvars`; its presence gates phase 2. The lab's `make arns` does exactly this, including the PENDING-accept and a `--no-paginate` (the RAM API returns a phantom trailing page).
+Write both ARNs into an `arns.tfvars`; its presence gates phase 2. The lab's `make arns` does exactly this, including the PENDING-accept, a `--no-paginate` (the RAM API returns a phantom trailing page), and a short poll after acceptance - the resource configuration is not visible to `list-resources` for a few seconds after the invitation flips to ACCEPTED, so accept-then-immediately-look-up still races.
 
 ## Step 4: endpoint + security group (two-pass apply)
 
@@ -177,7 +177,11 @@ resource "aws_vpc_endpoint" "supabase" {
 }
 ```
 
-Apply with `-target=aws_vpc_endpoint.supabase` first, then apply the rest.
+Apply with `-target=aws_vpc_endpoint.supabase` first, then apply the rest. Targeting is a debugging tool everywhere else; here it is the only way past the unknown-IDs plan error.
+
+<Aside type="note" title="ip_address_type is a create-time decision">
+A Resource endpoint can be created `dualstack` in an IPv6-enabled VPC, but an existing IPv4 endpoint cannot be converted: `ModifyVpcEndpoint` rejects it with `InvalidParameter: Modifying IpAddressType to DUALSTACK is not supported` (measured). If IPv6 clients are plausible, build the VPC and the endpoint dualstack from the start - the alternative is replacing the endpoint later, which churns the ENI addresses and is a DNS event for every private client.
+</Aside>
 
 ## Step 5: private hosted zone for verify-full
 
@@ -232,10 +236,13 @@ If 5432 passes and 6543 times out, that asymmetry is the missing SG rule from st
 Narrow the restrictions to a break-glass /32 - public direct and public Supavisor both stop connecting while the endpoint keeps serving (restrictions cover pooled and direct routes):
 
 ```sh
-tofu apply -var 'public_access_cidrs=["x.x.x.x/32"]'   # network = jsonencode({ restrictions = ... })
+tofu plan -var 'public_access_cidrs=["x.x.x.x/32"]' -out=tfplan   # network = jsonencode({ restrictions = ... })
+tofu apply tfplan
 ```
 
-Verify from outside the VPC: `psql` to `db.<ref>.supabase.co` and to `aws-0-<region>.pooler.supabase.com` both refuse; inside the VPC, step 6 still passes. Note the scope: this locks the database socket. The Data API (PostgREST/Auth/Storage) is HTTP and stays public by design - PrivateLink does not cover it. Switching those surfaces off is a separate exercise with its own limits: the Data API toggle is a Dashboard action with no Management API equivalent, and emptying PostgREST's `db_schema` to fake one wedges the service instead of disabling it. See [what stays public](/reference/supabase-aws-privatelink/#turning-them-off-is-not-the-same-as-making-them-private) for the measurements. And if the requirement is public ingress *removed* rather than *refused*, that remains a support-ticket action; what it does beyond socket refusal is untested here.
+Plan to a file and apply the file, so what lands is what you read - and never commit that file (see below).
+
+Verify from outside the VPC: `psql` to `db.<ref>.supabase.co` and to `aws-0-<region>.pooler.supabase.com` both refuse; inside the VPC, step 6 still passes. Note the scope: this locks the database socket. The Data API (PostgREST/Auth/Storage) is HTTP and stays public by design - PrivateLink does not cover it. Switching those surfaces off has its own limits: the Data API toggle is a Dashboard action with no Management API equivalent, and emptying PostgREST's `db_schema` to fake one wedges the service into a `503` retry loop. See [what the off switches do](/reference/supabase-aws-privatelink/#what-the-off-switches-do) for the measurements. And if the requirement is public ingress *removed* rather than *refused*, that remains a support-ticket action; what it does beyond socket refusal is untested here.
 
 ## Step 8: migrations over the endpoint
 
@@ -246,9 +253,25 @@ supabase link --project-ref <ref> --skip-pooler   # then: supabase db push
 supabase db push --db-url "postgres://postgres:<pw>@db.<ref>.supabase.co:5432/postgres"
 ```
 
+## Running it: credentials, state, and teardown
+
+**Put the AWS credentials in the provider block, or deliberately leave them empty.** Provider-block credentials are the highest-precedence entry in the AWS chain - verified by putting bogus keys in the block and watching them beat valid environment variables. A stale `AWS_ACCESS_KEY_ID` inherited from the shell otherwise fails every call with `InvalidClientTokenId`. Source them from the encrypted tfvars and export the same two values for any `aws` CLI orchestration in your Makefile, so both halves agree on one source of truth. Empty values fall through to the ambient chain (profile / SSO / env) and also neutralize an inherited stale pair.
+
+**Never commit a plan file.** `tfplan` is a zip archive embedding tfstate, which includes every variable value - so a committed plan publishes the database password and the PAT regardless of how carefully the tfvars are encrypted. Gitignore `tfplan`, `*.tfplan`, `tfplan-*`. The same reasoning covers test-evidence directories: they capture hostnames, ENI addresses, and project refs.
+
+**Secrets that reach an in-VPC runner should not travel in the command payload.** The lab passes the database password and PAT inside an SSM `send-command` payload, which is fine for a same-day throwaway and wrong for a real environment: SSM retains command parameters for about 30 days, readable via `aws ssm list-commands` and CloudTrail. Put them in Parameter Store SecureString or Secrets Manager and read them with the instance role instead.
+
+**Out-of-band edits get reverted by the next apply.** Setting a Lambda environment variable by CLI, outside the config, survived exactly until the next full apply, which silently restored the config's version and left the probe authenticating with an empty password. If a value has to exist at runtime, it belongs in the configuration.
+
+**Teardown is slower than it looks when a VPC-attached Lambda is involved.** Lambda's ENIs sit in `available` for tens of minutes after the function is gone, and tofu just retries the subnet delete meanwhile - 21 minutes and still blocked, in one measured teardown. Deleting the detached ENIs directly unblocks it immediately. Manage the function's CloudWatch log group as a resource too, or destroy leaves it behind.
+
+**Anything the orchestration creates outside tofu will survive `destroy`.** In the lab that is the S3 bucket the test suite stages its binary and artifacts through: `make destroy` reports state 0 while the bucket is still there, which is why there is a separate `make suite-clean`. Check for these before calling a teardown verified.
+
 ## Verification
 
-The lab's `make suite` is the full verification battery, runnable against any deployment of this guide: a typed test harness that ships as one binary to the in-VPC runner and also runs orchestrator-side tests. It covers the TLS matrix (verify-full/verify-ca/host-hostaddr split/raw-IP negative), 30 cold connects and pgbench per path, a pooler ceiling probe that distinguishes queueing from `max_client_conn` refusal, a Data API probe (anon key against a real table - PostgREST's root requires service_role), Realtime over a real WebSocket client, the CLI migration paths, a Lambda probe on both ports, and destructive tests behind `--destructive` (API-triggered restart measured through a Lambda, endpoint replacement, single-ENI failure). It renders a single markdown evidence report; see the [reference](/reference/supabase-aws-privatelink/) for the numbers and for which of them are reproducible.
+The lab's `make suite` is the full verification battery, runnable against any deployment of this guide: a typed test harness that ships as one binary to the in-VPC runner and also runs orchestrator-side tests. It covers the TLS matrix (verify-full/verify-ca/host-hostaddr split/raw-IP negative), 30 cold connects and pgbench per path, a pooler ceiling probe that distinguishes queueing from `max_client_conn` refusal, a Data API probe (anon key against a real table - PostgREST's root requires service_role), Realtime over a real WebSocket client, the CLI migration paths, a Lambda probe on both ports, and destructive tests behind `--destructive` (API-triggered restart measured through a Lambda, endpoint replacement, single-ENI failure, and the HTTP-tier config flips).
+
+Two conventions in the harness carry over to any suite that measures someone else's platform. A test is one file declaring where it runs and which capabilities it needs, so it self-skips with a reason when the infrastructure is absent - which is how the Data API and Realtime tests got answered on a bare project with no VPC at all. And every fault-injection test has a baseline gate: if the control path does not work *before* the fault is injected, the test returns skip and asserts nothing. Two tests here once reported the exact opposite of the truth because their baseline had silently failed and the post-fault failure looked like a result. It renders a single markdown evidence report; see the [reference](/reference/supabase-aws-privatelink/) for the numbers and for which of them are reproducible.
 
 ## Gotchas and lessons learned
 
@@ -262,7 +285,7 @@ Each with the symptom you will actually see; the [reference](/reference/supabase
 - **Public direct is IPv6-only.** Without the add-on there is no public A record at all; the confusing symptom is "pooler and API work, direct psql cannot resolve/hangs". Moot under PrivateLink - the endpoint provides in-VPC IPv4 on both ports.
 - **`supabase link` defaults to public.**[^sb-cli] Migrations work all through development, then break in continuous integration (CI) the day you close public access - with an error pointing at the pooler, not your link config. Use `--skip-pooler` or `--db-url`, and prove it by running one migration with restrictions already closed.
 - **Prepared statements work on transaction mode now** (measured). The stale advice costs you in reverse: `prepare: false` workarounds and session-mode detours for no current reason. Re-test before carrying them forward.
-- **The pooler queues before it refuses.** Below the client ceiling you do not get errors, you get `NOTICE: No server connection available in postgres backend, client being queued` and transactions that miss their timeout. Refusal (`FATAL: no more connections allowed (max_client_conn)`) is a later regime - measured at the 213th concurrent client on micro against a published figure of 200. Size concurrency for the queueing symptom, not the refusal.
+- **The pooler queues before it refuses.** Below the client ceiling you do not get errors, you get `NOTICE: No server connection available in postgres backend, client being queued` and transactions that miss their timeout. Refusal (`FATAL: no more connections allowed (max_client_conn)`) is a later regime, and the boundary is not a number you can carry: four isolated probes on quiet systems put the first refusal at 174, 213, 213 and 287 concurrent clients on micro, against a published figure of 200. Size against the published limit, and design for the queueing symptom rather than the refusal.
 - **`pgbench` is not in the `postgresql16` package.** It ships in `postgresql16-contrib`; without it the benchmark phases fail with exit 127 and a suite that greps for numbers will happily record zeros. Install contrib in the image, not by hand on a live runner.
 - **Endpoint replacement is a two-pass apply too,** for the same `for_each`-over-unknown reason as step 4 - and it churns the ENI IPs, so the PHZ record must be refreshed by the same run or every private client is pointed at dead addresses.
 
@@ -273,8 +296,11 @@ Each with the symptom you will actually see; the [reference](/reference/supabase
 | `experiments/privatelink-aws/supabase.tf` | step 1 + the gated `restapi_object` (step 2) |
 | `experiments/privatelink-aws/lattice.tf` | SG, endpoint, PHZ (steps 4-5) |
 | `experiments/privatelink-aws/vpc.tf` / `runner.tf` | VPC, network address translation (NAT) gateway, SSM-only runner |
+| `experiments/privatelink-aws/lambda.tf` | the VPC-attached Lambda probe (`enable_lambda`), incl. its log group so destroy is complete |
 | `experiments/privatelink-aws/Makefile` | `phase1 arns phase2 suite restrict destroy suite-clean` orchestration |
-| `experiments/privatelink-aws/runner/suite/` | the verification battery (step Verification) |
+| `experiments/privatelink-aws/suite.sh` | ships the compiled harness to the runner over SSM, pulls artifacts from S3, renders the report |
+| `harness/` | the typed test harness: test contract, planner, runner, report renderer (shared, experiment-agnostic) |
+| `experiments/privatelink-aws/tests/` | the test modules - one file per test; the build generates the registry |
 | `experiments/privatelink-aws/RUNLOG.md` | per-run findings incl. measured numbers and errata |
 
 [^sb-privatelink]: Supabase, "PrivateLink," Supabase Docs. https://supabase.com/docs/guides/platform/privatelink
