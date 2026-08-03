@@ -13,10 +13,12 @@ and every edit. Build with `bun run build`; dev with `bun dev` (localhost:4321).
   garbled math. Three places are exempt and must NOT be escaped (verified against
   built output 2026-08-03): YAML frontmatter, which is not math-processed and where a
   `\$` would emit a literal backslash into `og:description`; fenced code, including
-  fences indented inside list items; and inline `` `code` `` spans. `scripts/prose-dollar.sh`
-  models exactly this. A doc that uses math deliberately opts out with
-  `{/* prose-dollar: math-intentional */}` on its own line - `guides/magic-wan-interop`
-  does, for MTU/MSS arithmetic.
+  fences indented inside list items; and inline `` `code` `` spans. `mathRiskLines()`
+  in `tests/lib/mdx.ts` models exactly this. A doc that uses math deliberately opts
+  out with `{/* prose-dollar: math-intentional */}` on its own line -
+  `guides/magic-wan-interop` does, for MTU/MSS arithmetic. The marker name is
+  historical: it outlived the `prose-dollar.sh` that read it, and renaming it across
+  the corpus would be churn for nothing.
 - A custom rehype pass (`rehypeFootnoteLabelToReferences`) renames the GFM
   "Footnotes" heading to a visible **References** section. Do not rename it back.
 - `src/styles/custom.css` styles `.footnotes` dense (small type, tight leading).
@@ -170,15 +172,25 @@ rewrite just for style is not required.
 Run `bun run build` and confirm:
 - the current page count (32 as of 2026-08-03), exit 0. Treat a DROP as the signal:
   a doc with `draft: true` does not build, and the count is the cheapest way to notice.
-- `bun test` is green. Structural doc checks (split tables, footnote balance,
-  smart punctuation, math-risk dollars, internal links, draft links, built-page
-  assertions) live in `tests/` and run inside `bun run build`, so a defect fails the
-  build. The parser they share is unit-tested in `tests/lib/mdx.test.ts` against the
-  real defects that produced it - add a case there when you fix a new one.
-- `bash scripts/verify-docs.sh` reports 0 failed AND 0 unexpected skips. It reads its
-  banned-identifier list from `BANNED_IDENTIFIERS_FILE` (default
-  `~/.config/lexicanum/banned-identifiers`) rather than the environment, so account
-  ids never reach shell history or CI logs.
+- `bun test` is green. ALL doc checks live in `tests/` and run inside `bun run build`,
+  so a defect fails the build instead of appearing on the page. There is no verify
+  script any more - `scripts/` is gone, and its checks are either here or were found
+  to be vacuous.
+  - `tests/docs.test.ts` - corpus-wide structure: split tables, footnote balance,
+    smart punctuation, math-risk dollars, internal links, draft links, dot-fence
+    style, built-page assertions.
+  - `tests/pins.test.ts` - per-doc pins: corrections that must not regress, claims
+    that must not creep back, required sections, and the anchors other docs link to.
+    Adding a pin is a row in the table.
+  - `tests/identifiers.test.ts` - banned identifiers, read from `BANNED_IDENTIFIERS`
+    or `BANNED_IDENTIFIERS_FILE` (default `~/.config/lexicanum/banned-identifiers`)
+    so account ids never reach shell history or CI logs. An absent list FAILS; the
+    bash version reported PASS for weeks with the list unset.
+  - `tests/links.test.ts` - external reachability, opt-in via
+    `bun run verify:docs:links`. Never gates the build: someone else's 503 is not a
+    defect here.
+  - The parser they share is unit-tested in `tests/lib/mdx.test.ts` against the real
+    defects that produced it - add a case there when you fix a new one.
 - For a doc you edited with citations: every `[^slug]` resolves (no literal `[^`
   left in the rendered HTML), and the References list item count == distinct slugs.
 - No new KaTeX spans from stray `$` (`grep -c 'class="katex' dist/.../index.html`).
