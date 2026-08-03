@@ -75,6 +75,22 @@ describe.each(docs.map((d) => [d.path, d] as const))("%s", (_path, doc) => {
     expect(doc.frontmatter.title ?? "").not.toBe("");
     expect(doc.frontmatter.description ?? "").not.toBe("");
   });
+
+  test("every dot fence is transparent and uncoloured", () => {
+    // House style: graphviz diagrams inherit the page theme instead of carrying
+    // their own palette, which is what makes them legible in both colour modes.
+    // Asserted corpus-wide rather than for a handful of named docs - all 51 dot
+    // fences already comply, so a new coloured one is a new defect, not legacy.
+    const bad: string[] = [];
+    for (const f of doc.fences.filter((f) => f.lang.startsWith("dot"))) {
+      const problems: string[] = [];
+      if (!f.body.includes('bgcolor="transparent"')) problems.push("no bgcolor=transparent");
+      const colour = f.body.match(/(?:fontcolor|fillcolor)=|color="#|style=filled/);
+      if (colour) problems.push(`hardcoded colour: ${colour[0]}`);
+      if (problems.length) bad.push(`line ${f.startLine}: ${problems.join(", ")}`);
+    }
+    expect(bad).toEqual([]);
+  });
 });
 
 describe("cross-document", () => {
