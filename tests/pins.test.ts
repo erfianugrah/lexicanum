@@ -64,6 +64,12 @@ const pins: Pin[] = [
       "what-carries-over-and-what-does-not",
       "storage-metadata-copies-bytes-do-not",
       "every-task-three-ways",
+      // Pinned after an edit split this heading in two, leaving "## Gotchas" plus a
+      // stray " and lessons learned" paragraph. Nothing in the suite noticed,
+      // because a section-presence regex for /Gotchas/ still matched the wreckage.
+      // The SLUG is the sensitive part - it changes the moment the text does.
+      "gotchas-and-lessons-learned",
+      "what-carries-over-and-what-does-not",
     ],
     linksTo: [REGION],
     htmlContains: ["Manual checklist", "UI / API", "sbshift", "https://github.com/erfianugrah/sbshift"],
@@ -154,9 +160,12 @@ describe.each(pins.map((p) => [p.doc, p] as const))("%s", (_name, pin) => {
     expect(missing).toEqual([]);
   });
 
-  // Anchors and rendered assertions need the build. A draft has no page, and
-  // that is legitimate rather than a failure.
-  const built = isDraft ? undefined : html(pin.doc);
+  // Anchors and rendered assertions need the build - and specifically THIS build.
+  // In the pre-build pass dist/ still holds the previous run's HTML, so these
+  // assertions are meaningless there and are gated on CHECK_BUILT, which only the
+  // post-build pass sets. A draft has no page, which is legitimate rather than a
+  // failure.
+  const built = isDraft || !process.env.CHECK_BUILT ? undefined : html(pin.doc);
 
   test.skipIf(!built)("keeps the anchors other docs link to", () => {
     const missing = (pin.anchors ?? []).filter((a) => !built!.includes(`id="${a}"`));

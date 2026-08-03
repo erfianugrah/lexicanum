@@ -124,7 +124,10 @@ describe("cross-document", () => {
 
 // dist-dependent assertions. Skipped rather than failed when there is no build,
 // but the skip says so instead of reporting nothing to check.
-const built = existsSync(DIST);
+// Gated on CHECK_BUILT, not merely on dist/ existing: in the pre-build pass dist/
+// holds the PREVIOUS build, so these would grade stale HTML - passing when the
+// current source is broken, or failing on a page this run is about to create.
+const built = existsSync(DIST) && !!process.env.CHECK_BUILT;
 describe.skipIf(!built)("built output", () => {
   const pages = docs
     .filter((d) => !d.isDraft)
