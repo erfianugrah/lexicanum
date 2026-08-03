@@ -49,7 +49,9 @@ footnote_defs_eq() { test "$(grep -o 'id="user-content-fn-[a-z0-9-]*"' "$1" | so
 footnote_defs_match_src() {
   local html="$1" doc="$2" n
   n=$(grep -cE '^\[\^[a-z0-9-]+\]:' "$doc")
-  test "$n" -gt 0 && footnote_defs_eq "$html" "$n"
+  # AGENTS.md: guides carry inline links and add footnotes only when reference-heavy,
+  # so zero definitions is legitimate. It is only a failure if the HTML invents some.
+  if [ "$n" -eq 0 ]; then footnote_defs_eq "$html" 0; else footnote_defs_eq "$html" "$n"; fi
 }
 footnotes_balanced() { # every used [^slug] defined AND every defined slug cited
   local doc="$1" s used defined
@@ -150,17 +152,19 @@ dot_fences_ok() { # every dot fence transparent; no per-element colors
        END{exit (bad?1:0)}' "$f"
 }
 evidence_provenance() { # $1 = mdx, $2 = sidecar json
-  local mdx="$1" side="$2" lab labdir id st appear
+  local mdx="$1" side="$2" lab labdir id st appear want
   [ -f "$side" ] || return 0
   lab=$(jq -r '.lab' "$side"); labdir="$HOME/${lab%%:*}/${lab#*:}"
   [ -f "$labdir/claims.json" ] || { echo "  no ledger at $labdir" >&2; return 1; }
-  while IFS=$'\t' read -r id appear; do
+  while IFS=$'\t' read -r id want appear; do
+    # a row may deliberately cite a refuted claim (the doc states the refutation).
+    # That has to be declared per-row via "expect", so it cannot happen by accident.
     st=$(jq -r --arg i "$id" '.claims[]|select(.id==$i)|.status' "$labdir/claims.json")
-    [ "$st" = "empirically-proven" ] || { echo "  $id status=${st:-MISSING}" >&2; return 1; }
+    [ "$st" = "$want" ] || { echo "  $id status=${st:-MISSING} expected=$want" >&2; return 1; }
     # whitespace-normalized: published prose wraps, so the phrase may span lines
     tr '\n' ' ' < "$mdx" | tr -s ' ' | grep -qF "$appear" \
       || { echo "  $id: '$appear' absent from doc" >&2; return 1; }
-  done < <(jq -r '.rows[]|"\(.claim)\t\(.must_appear)"' "$side")
+  done < <(jq -r '.rows[]|"\(.claim)\t\(.expect // "empirically-proven")\t\(.must_appear)"' "$side")
 }
 
 echo "=== 7. New doc set: source mechanics ==="
