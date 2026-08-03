@@ -8,15 +8,25 @@
 #   --check-links   also curl every external URL the guides cite (network;
 #                   kept out of gating CI on purpose - flaky by nature)
 # Env:
-#   BANNED_IDENTIFIERS  space-separated strings that must not appear in src/
-#                       (org ids, throwaway project refs). Unset = loud SKIP,
-#                       never a vacuous PASS.
+#   BANNED_IDENTIFIERS       space-separated strings that must not appear in src/
+#                            (org ids, throwaway project refs). Unset = loud SKIP,
+#                            never a vacuous PASS.
+#   BANNED_IDENTIFIERS_FILE  path to a newline-separated list, read instead of the
+#                            env var. Preferred: these values should not end up in
+#                            shell history, CI logs, or a commit. Default if present:
+#                            ~/.config/lexicanum/banned-identifiers
 set -u
 shopt -s lastpipe 2>/dev/null || true
 cd "$(dirname "$0")/.." || exit 2
 
 CHECK_LINKS=0
 [ "${1:-}" = "--check-links" ] && CHECK_LINKS=1
+
+: "${BANNED_IDENTIFIERS_FILE:=$HOME/.config/lexicanum/banned-identifiers}"
+if [ -z "${BANNED_IDENTIFIERS:-}" ] && [ -r "$BANNED_IDENTIFIERS_FILE" ]; then
+  BANNED_IDENTIFIERS=$(grep -vE '^\s*(#|$)' "$BANNED_IDENTIFIERS_FILE" | tr '\n' ' ')
+  export BANNED_IDENTIFIERS
+fi
 
 UG=src/content/docs/guides/supabase-postgres-major-upgrade-e2e.mdx
 RG=src/content/docs/guides/supabase-region-migration-e2e.mdx
