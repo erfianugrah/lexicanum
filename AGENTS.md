@@ -23,6 +23,15 @@ and every edit. Build with `bun run build`; dev with `bun dev` (localhost:4321).
 - Sidebar auto-generates from directory: `guides/` and `reference/`. No manual
   sidebar entries.
 
+## Two traps in this repo
+
+- **Do not assert "zero KaTeX spans" site-wide.** `guides/magic-wan-interop` renders
+  MTU/MSS arithmetic as real LaTeX on purpose. Math checks are per-doc, and a doc that
+  means it opts out with `{/* prose-dollar: math-intentional */}`.
+- **A `dist/` path can exist with no source file.** `astro.config.mjs` declares
+  redirects, and Astro emits a stub page at the old URL. Do not infer that a doc
+  exists from a built directory, and do not treat an unmatched one as a stale artifact.
+
 ## Doc taxonomy
 
 Two types, matching the two folders.
@@ -161,6 +170,11 @@ rewrite just for style is not required.
 Run `bun run build` and confirm:
 - the current page count (32 as of 2026-08-03), exit 0. Treat a DROP as the signal:
   a doc with `draft: true` does not build, and the count is the cheapest way to notice.
+- `bun test` is green. Structural doc checks (split tables, footnote balance,
+  smart punctuation, math-risk dollars, internal links, draft links, built-page
+  assertions) live in `tests/` and run inside `bun run build`, so a defect fails the
+  build. The parser they share is unit-tested in `tests/lib/mdx.test.ts` against the
+  real defects that produced it - add a case there when you fix a new one.
 - `bash scripts/verify-docs.sh` reports 0 failed AND 0 unexpected skips. It reads its
   banned-identifier list from `BANNED_IDENTIFIERS_FILE` (default
   `~/.config/lexicanum/banned-identifiers`) rather than the environment, so account
