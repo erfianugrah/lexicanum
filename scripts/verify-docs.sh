@@ -11,6 +11,10 @@
 #   BANNED_IDENTIFIERS       space-separated strings that must not appear in src/
 #                            (org ids, throwaway project refs). Unset = loud SKIP,
 #                            never a vacuous PASS.
+#   LAB_ROOT                 directory holding the private lab ledgers
+#                            (<LAB_ROOT>/<lab>/claims.json). Unset on CI, which
+#                            then verifies against docs/ledgers/*.status.json.
+#                            Read from ~/.config/lexicanum/lab-root if that exists.
 #   BANNED_IDENTIFIERS_FILE  path to a newline-separated list, read instead of the
 #                            env var. Preferred: these values should not end up in
 #                            shell history, CI logs, or a commit. Default if present:
@@ -21,6 +25,11 @@ cd "$(dirname "$0")/.." || exit 2
 
 CHECK_LINKS=0
 [ "${1:-}" = "--check-links" ] && CHECK_LINKS=1
+
+: "${LAB_ROOT_FILE:=$HOME/.config/lexicanum/lab-root}"
+if [ -z "${LAB_ROOT:-}" ] && [ -r "$LAB_ROOT_FILE" ]; then
+  LAB_ROOT=$(head -1 "$LAB_ROOT_FILE"); export LAB_ROOT
+fi
 
 : "${BANNED_IDENTIFIERS_FILE:=$HOME/.config/lexicanum/banned-identifiers}"
 if [ -z "${BANNED_IDENTIFIERS:-}" ] && [ -r "$BANNED_IDENTIFIERS_FILE" ]; then
@@ -176,12 +185,11 @@ evidence_provenance() { # $1 = mdx carrying an `evidence:` frontmatter block
   # present on a dev machine; CI only has the vendored public status snapshot
   # (claim ids + statuses, nothing identifying). Group 10b asserts the snapshot
   # still matches the ledger whenever both exist, so CI cannot pass on stale data.
-  labdir="$HOME/${lab%%:*}/${lab#*:}"
-  ledger="$labdir/claims.json"
-  snap="docs/ledgers/$(basename "${lab#*:}").status.json"
-  if   [ -f "$ledger" ]; then src=ledger
-  elif [ -f "$snap" ];   then src=snap
-  else echo "  no ledger at $labdir and no snapshot at $snap" >&2; return 1; fi
+  ledger="${LAB_ROOT:+$LAB_ROOT/$lab/claims.json}"
+  snap="docs/ledgers/$lab.status.json"
+  if   [ -n "$ledger" ] && [ -f "$ledger" ]; then src=ledger
+  elif [ -f "$snap" ];                       then src=snap
+  else echo "  no snapshot at $snap (and LAB_ROOT unset or missing $lab)" >&2; return 1; fi
   body=$(doc_body "$mdx")
   while IFS=$'\t' read -r id want appear; do
     [ "$id" = "lab" ] && continue
@@ -259,9 +267,9 @@ echo "=== 10b. Vendored ledger snapshots match the private ledgers (local only) 
 snap_checked=0
 for snap in docs/ledgers/*.status.json; do
   [ -f "$snap" ] || continue
-  lab=$(jq -r '.lab' "$snap"); ledger="$HOME/${lab%%:*}/${lab#*:}/claims.json"
-  if [ ! -f "$ledger" ]; then
-    skp "$(basename "$snap"): private ledger not present (CI) - snapshot used as-is"
+  lab=$(jq -r '.lab' "$snap"); ledger="${LAB_ROOT:+$LAB_ROOT/$lab/claims.json}"
+  if [ -z "$ledger" ] || [ ! -f "$ledger" ]; then
+    skp "$(basename "$snap"): LAB_ROOT unset or ledger absent (CI) - snapshot used as-is"
     continue
   fi
   snap_checked=1

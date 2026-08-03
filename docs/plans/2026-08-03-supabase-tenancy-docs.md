@@ -7,7 +7,7 @@ extension of `scripts/verify-docs.sh` to gate all four.
 
 ## Where this comes from
 
-Two empirical labs run 2026-08-03 in the private `erfibase` repo:
+Two empirical labs run 2026-08-03, held in a separate private repo:
 
 | lab | claims | outcome |
 |---|---|---|
@@ -172,7 +172,7 @@ avoid. So the mapping lives beside the doc, not inside it:
 ```
 src/content/docs/guides/supabase-org-consolidation.evidence.json
 {
-  "lab": "erfibase:labs/supabase-org-topology",
+  "lab": "supabase-org-topology",
   "rows": [
     { "claim": "A12", "must_appear": "project-claim" },
     { "claim": "A13", "must_appear": "75.2" }
