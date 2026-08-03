@@ -17,12 +17,7 @@
  * table; the assertions are generic over it.
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-
-const ROOT = new URL("..", import.meta.url).pathname;
-const DOCS = join(ROOT, "src/content/docs");
-const DIST = join(ROOT, "dist");
+import { CHECK_BUILT, readBuilt, readSource } from "./lib/corpus";
 
 interface Pin {
   /** Path under src/content/docs, without extension. */
@@ -78,7 +73,7 @@ const pins: Pin[] = [
     doc: REGION,
     mustContain: [
       "fails two different ways",
-      "400 'Bucket not found' = visibility not restored".replace(/'/g, '"'),
+      '400 "Bucket not found" = visibility not restored',
       "schedules do not carry",
       "bucket metadata does not arrive at all",
       "max_rows=777",
@@ -118,20 +113,8 @@ const pins: Pin[] = [
   },
 ];
 
-const source = (doc: string) => {
-  for (const ext of [".mdx", ".md"]) {
-    const p = join(DOCS, `${doc}${ext}`);
-    if (existsSync(p)) return { path: p, text: readFileSync(p, "utf8") };
-  }
-  return undefined;
-};
-const html = (doc: string) => {
-  const p = join(DIST, doc, "index.html");
-  return existsSync(p) ? readFileSync(p, "utf8") : undefined;
-};
-
 describe.each(pins.map((p) => [p.doc, p] as const))("%s", (_name, pin) => {
-  const src = source(pin.doc);
+  const src = readSource(pin.doc);
   const isDraft = /^draft:\s*true/m.test(src?.text ?? "");
 
   test("the pinned doc exists", () => {
@@ -140,39 +123,36 @@ describe.each(pins.map((p) => [p.doc, p] as const))("%s", (_name, pin) => {
     expect(src, `no source found for ${pin.doc}`).toBeDefined();
   });
 
-  test.skipIf(!src)("contains every pinned correction", () => {
+  test.skipIf(!src || !pin.mustContain?.length)("contains every pinned correction", () => {
     const missing = (pin.mustContain ?? []).filter((s) => !src!.text.includes(s));
     expect(missing).toEqual([]);
   });
 
-  test.skipIf(!src)("does not reintroduce a removed claim", () => {
+  test.skipIf(!src || !pin.mustNotContain?.length)("does not reintroduce a removed claim", () => {
     const back = (pin.mustNotContain ?? []).filter((s) => src!.text.includes(s));
     expect(back).toEqual([]);
   });
 
-  test.skipIf(!src)("has the sections its doc type requires", () => {
+  test.skipIf(!src || !pin.sections?.length)("has the sections its doc type requires", () => {
     const missing = (pin.sections ?? []).filter((re) => !re.test(src!.text)).map(String);
     expect(missing).toEqual([]);
   });
 
-  test.skipIf(!src)("links to the docs it is supposed to link to", () => {
+  test.skipIf(!src || !pin.linksTo?.length)("links to the docs it is supposed to link to", () => {
     const missing = (pin.linksTo ?? []).filter((t) => !src!.text.includes(`/${t}`));
     expect(missing).toEqual([]);
   });
 
-  // Anchors and rendered assertions need the build - and specifically THIS build.
-  // In the pre-build pass dist/ still holds the previous run's HTML, so these
-  // assertions are meaningless there and are gated on CHECK_BUILT, which only the
-  // post-build pass sets. A draft has no page, which is legitimate rather than a
-  // failure.
-  const built = isDraft || !process.env.CHECK_BUILT ? undefined : html(pin.doc);
+  // A draft has no page, which is legitimate rather than a failure. readBuilt
+  // returns undefined outside the post-build pass (see CHECK_BUILT in lib/corpus).
+  const built = isDraft ? undefined : readBuilt(pin.doc);
 
-  test.skipIf(!built)("keeps the anchors other docs link to", () => {
+  test.skipIf(!built || !pin.anchors?.length)("keeps the anchors other docs link to", () => {
     const missing = (pin.anchors ?? []).filter((a) => !built!.includes(`id="${a}"`));
     expect(missing).toEqual([]);
   });
 
-  test.skipIf(!built)("renders the pinned html content", () => {
+  test.skipIf(!built || !pin.htmlContains?.length)("renders the pinned html content", () => {
     const missing = (pin.htmlContains ?? []).filter((s) => !built!.includes(s));
     expect(missing).toEqual([]);
   });
