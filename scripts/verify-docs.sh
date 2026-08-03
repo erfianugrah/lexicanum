@@ -33,6 +33,13 @@ RG=src/content/docs/guides/supabase-region-migration-e2e.mdx
 UH=dist/guides/supabase-postgres-major-upgrade-e2e/index.html
 RH=dist/guides/supabase-region-migration-e2e/index.html
 
+# Fail loudly on a missing tool. A check that silently no-ops is worse than a
+# vacuous PASS: CI reported "no sidecars yet" and "no drafts in repo" for two
+# rg-dependent checks because the runner has no rg, and both statements were false.
+for t in jq grep awk sed find python3; do
+  command -v "$t" >/dev/null || { echo "FATAL: required tool '$t' not found" >&2; exit 2; }
+done
+
 pass=0; fail=0; skip=0
 chk() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then printf 'PASS  %s\n' "$d"; pass=$((pass+1)); else printf 'FAIL  %s\n' "$d"; fail=$((fail+1)); fi; }
 skp() { printf 'SKIP  %s\n' "$1"; skip=$((skip+1)); }
@@ -151,20 +158,33 @@ dot_fences_ok() { # every dot fence transparent; no per-element colors
        d&&/(fontcolor|fillcolor)=|color="#|style=filled/{bad=1}
        END{exit (bad?1:0)}' "$f"
 }
-evidence_provenance() { # $1 = mdx, $2 = sidecar json
-  local mdx="$1" side="$2" lab labdir id st appear want
-  [ -f "$side" ] || return 0
-  lab=$(jq -r '.lab' "$side"); labdir="$HOME/${lab%%:*}/${lab#*:}"
+# Body of the doc with YAML frontmatter stripped and newlines collapsed.
+# Stripping frontmatter is load-bearing: must_appear values are DECLARED in the
+# frontmatter, so grepping the whole file matches every row against its own
+# declaration and the text half of the gate silently passes for everything.
+doc_body() {
+  awk 'NR==1 && /^---[[:space:]]*$/ {fm=1; next} fm && /^---[[:space:]]*$/ {fm=0; next} !fm' "$1" \
+    | tr '\n' ' ' | tr -s ' '
+}
+
+evidence_provenance() { # $1 = mdx carrying an `evidence:` frontmatter block
+  local mdx="$1" rows lab labdir id st appear want body
+  rows=$(python3 scripts/evidence-rows.py "$mdx") || return 1
+  lab=$(printf '%s\n' "$rows" | sed -n 's/^lab\t//p' | head -1)
+  [ -n "$lab" ] || { echo "  no evidence.lab in frontmatter" >&2; return 1; }
+  labdir="$HOME/${lab%%:*}/${lab#*:}"
   [ -f "$labdir/claims.json" ] || { echo "  no ledger at $labdir" >&2; return 1; }
+  body=$(doc_body "$mdx")
   while IFS=$'\t' read -r id want appear; do
-    # a row may deliberately cite a refuted claim (the doc states the refutation).
-    # That has to be declared per-row via "expect", so it cannot happen by accident.
+    [ "$id" = "lab" ] && continue
+    # a row may deliberately cite a refuted or untested claim. That has to be
+    # declared per-row via `expect`, so it cannot happen by accident.
     st=$(jq -r --arg i "$id" '.claims[]|select(.id==$i)|.status' "$labdir/claims.json")
     [ "$st" = "$want" ] || { echo "  $id status=${st:-MISSING} expected=$want" >&2; return 1; }
     # whitespace-normalized: published prose wraps, so the phrase may span lines
-    tr '\n' ' ' < "$mdx" | tr -s ' ' | grep -qF "$appear" \
-      || { echo "  $id: '$appear' absent from doc" >&2; return 1; }
-  done < <(jq -r '.rows[]|"\(.claim)\t\(.expect // "empirically-proven")\t\(.must_appear)"' "$side")
+    printf '%s' "$body" | grep -qF "$appear" \
+      || { echo "  $id: '$appear' absent from doc body" >&2; return 1; }
+  done <<< "$rows"
 }
 
 echo "=== 7. New doc set: source mechanics ==="
@@ -213,14 +233,15 @@ for src in "${!XLINK[@]}"; do
 done
 
 echo "=== 10. Evidence provenance (claims trace to a green ledger row) ==="
-found_sidecar=0
-for side in $(rg --files src/content/docs -g '*.evidence.json' 2>/dev/null | sort); do
-  DOC="${side%.evidence.json}.mdx"
-  [ -f "$DOC" ] || { printf 'FAIL  orphan sidecar with no doc: %s\n' "$side"; fail=$((fail+1)); continue; }
-  found_sidecar=1
-  chk "$(basename "$DOC" .mdx): every claim empirically-proven + present" evidence_provenance "$DOC" "$side"
+found_ev=0
+for DOC in $(grep -rl '^evidence:' src/content/docs/ 2>/dev/null | sort); do
+  found_ev=1
+  chk "$(basename "$DOC" .mdx): every claim traces to its ledger row" evidence_provenance "$DOC"
 done
-[ "$found_sidecar" = 0 ] && skp "evidence provenance (no .evidence.json sidecars yet)"
+if [ "$found_ev" = 0 ]; then
+  printf 'FAIL  no doc declares an evidence block - the provenance gate is not running\n'
+  fail=$((fail+1))
+fi
 
 echo "=== 10a. Every internal link resolves to a built page ==="
 broken=0; checked=0
@@ -239,13 +260,13 @@ if [ "$broken" -eq 0 ]; then
 fi
 
 echo "=== 11a. No published doc links to a draft doc ==="
-drafts=$(rg -l '^draft: true' src/content/docs/ 2>/dev/null | sed 's|.*/||;s|\.mdx$||')
+drafts=$(grep -rl '^draft: true' src/content/docs/ 2>/dev/null | sed 's|.*/||;s|\.mdx$||')
 if [ -z "$drafts" ]; then
   skp "draft-link check (no drafts in repo)"
 else
   for d in $drafts; do
     # a published page must not reference a draft page's URL
-    if rg -q -- "/$d" dist --glob 'index.html' 2>/dev/null; then
+    if find dist -name index.html -exec grep -ql -- "/$d" {} + 2>/dev/null | grep -q .; then
       printf 'FAIL  a published page links to draft doc: %s\n' "$d"; fail=$((fail+1))
     else
       printf 'PASS  no published page links to draft doc: %s\n' "$d"; pass=$((pass+1))
