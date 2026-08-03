@@ -433,10 +433,66 @@ the hub is on the availability critical path for every tenant on every project t
 trusts it, and the blast radius of losing it is one access-token lifetime: an hour on
 defaults, after which nobody can renew and no dedicated project can recover alone.
 
-Three ways out, and this guide implements none of them: keep the hub on the critical
-path deliberately and give it the availability that implies; put issuance in a real
-external IdP so both tiers are verifiers; or migrate the user rows at promotion time
-and accept one re-login in exchange for actual independence.
+Three ways out. Keep the hub on the critical path deliberately and give it the
+availability that implies; put issuance in a real external IdP so both tiers are
+verifiers; or move the tenant's identity into its own project at promotion time. The
+third one is a runbook rather than an architecture change, so it is the one tested
+below - and it costs no re-login at all, which was not the expectation going in.
+
+### Migrating the identity, so the dedicated project issues its own tokens
+
+Unsupported: nothing in Supabase's docs sanctions writing into the `auth` schema.
+Measured on throwaway projects, and smaller than expected.
+
+**Copying one table is enough to break the coupling.** With a single `auth.users` row
+copied and *no third-party-auth integration on the target at all*, the tenant logs in
+at its own project, the token it gets back has `iss` pointing at that project,
+`app_metadata.tenant_id` survives the copy, the RLS read returns its rows, and the
+project refreshes its own tokens. This is identity migration, not federation; the
+trust wiring is what carries a tenant *until* it is promoted, not after.
+
+**Copying four makes it seamless.** Add `auth.identities`, `auth.sessions` and
+`auth.refresh_tokens`, in that order after `auth.users` for the foreign keys, and the
+tenant's *existing* refresh token works against the new project. No re-login anywhere.
+
+```sql
+-- On the target, per table, in FK order: users, identities, sessions, refresh_tokens.
+-- `select *` does NOT work - see the generated-column trap below.
+do $mig$
+declare cols text;
+begin
+  select string_agg(quote_ident(column_name), ',' order by ordinal_position) into cols
+    from information_schema.columns
+   where table_schema = 'auth' and table_name = 'users' and is_generated = 'NEVER';
+  execute format(
+    'insert into auth.users (%s) select %s from json_populate_recordset(null::auth.users, $1::json)',
+    cols, cols) using $j$<rows as json from the source>$j$::json;
+end $mig$;
+
+-- Then, before the tenant's next refresh:
+select setval('auth.refresh_tokens_id_seq',
+              (select coalesce(max(id), 1) from auth.refresh_tokens), true);
+```
+
+Three traps, each of which broke a run:
+
+- **`insert ... select *` cannot work.** `auth.users.confirmed_at` and
+  `auth.identities.email` are `GENERATED ALWAYS`, and Postgres rejects any
+  non-DEFAULT value for them (`428C9`). Enumerating columns from the catalog is also
+  what makes the copy tolerant of the two projects running different auth schema
+  versions, which any pair of projects created months apart will.
+- **The `bigserial` sequence does not follow the rows.** After landing a row with
+  `id = 1` the sequence still reported `last_value = 1, is_called = false`, so the
+  next `nextval()` hands out an id that already exists. GoTrue rotates the refresh
+  token on every use, so this detonates on the tenant's first refresh and looks like
+  session porting being unsupported. It is not; it is a missing `setval`.
+- **A fresh project 500s for a while after it reports healthy.** `500` with
+  `SQLSTATE 57P01` on the first call is Postgres restarting inside the settle window,
+  not an answer. Retry before you believe a failure.
+
+Not exercised, and worth knowing before running this against anything real: MFA
+factors, OAuth and SAML identities (this was email and password only), and retiring
+the source user on the hub afterwards.
 
 ## What this does not settle
 
@@ -451,9 +507,9 @@ Stated plainly, because the architecture is only partly demonstrated.
   Restoring one tenant to a point in time means restoring a copy and filtering, which
   is not the same product as per-project PITR.
 - **The routing layer.** Neither discovery endpoint nor gateway was built.
-- **Recovering from a lost hub.** The coupling is measured above; the mitigations are
-  not built or tested. Migrating `auth.users` between projects in particular is
-  asserted nowhere here.
+- **The unexercised parts of the identity migration.** The copy is measured for
+  email and password. MFA factors, OAuth and SAML identities, and retiring the source
+  user on the hub are not.
 - **Key rotation.** Untested, and on the hub pattern the blast radius is every project
   trusting it.
 - **The `role` claim specifically.** Only tested with an anon bearer, which fails on
@@ -474,6 +530,8 @@ Stated plainly, because the architecture is only partly demonstrated.
 | A promoted tenant can refresh against its own project | Presented the hub's refresh token to the dedicated project, and to the hub as control | Measured - no. `400 refresh_token_not_found` at the dedicated project; the hub issues fine and the result is still accepted there |
 | Verification needs the issuer to be alive | Deleted the hub, then kept reading at the dedicated project with a live token | Measured - no. HTTP 200 for the whole window, `resolved_jwks` still present, while refresh at the hub went `410 Gone` |
 | The cost of losing the hub | Read `exp - iat` and the hub's `jwt_exp` | Measured - 3600 s, so one hour to lockout on defaults |
+| The coupling can be removed by copying `auth.users` | Copied one row to a project with NO integration configured, then logged in there | Measured - login succeeds, `iss` is the new project, the claim survives, RLS holds, and it refreshes its own tokens |
+| The tenant's live session can be ported | Copied users, identities, sessions and refresh_tokens in FK order, resynced the sequence, presented the OLD refresh token | Measured - accepted, new token issued by the new project. Zero re-logins |
 | Scale-to-zero on Nano removes the premise for this architecture | Platform documentation; access is granted per account | Documented, not tested |
 | OAuth tokens carry a `client_id` claim usable in RLS | Platform documentation | Documented, not tested |
 | `custom_jwks` never resolves | Created it, polled the Data API with a valid ES256 token | Measured - `PGRST301` for 7m32s over 31 polls; `jwks_url` worked first try |
