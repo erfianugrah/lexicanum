@@ -160,6 +160,37 @@ describe("MDX comments", () => {
   });
 });
 
+describe("fence extraction", () => {
+  test("language tag, bounds and body are captured", () => {
+    const doc = parseMdx("t.mdx", fm("before\n\n```dot\ndigraph { a -> b }\n```\n\nafter\n"));
+    expect(doc.fences).toHaveLength(1);
+    expect(doc.fences[0]!.lang).toBe("dot");
+    expect(doc.fences[0]!.body).toBe("digraph { a -> b }");
+    // fm() prepends 4 frontmatter lines plus a blank, so "before" is line 6.
+    expect(doc.fences[0]!.startLine).toBe(8);
+    expect(doc.fences[0]!.endLine).toBe(10);
+  });
+
+  test("an indented fence keeps its language, so style checks still see it", () => {
+    // Same defect class as the dollar check: matching /^```dot/ at column zero
+    // silently exempts every fence nested in a list item.
+    const doc = parseMdx("t.mdx", fm("1. step\n\n   ```dot\n   digraph { a }\n   ```\n"));
+    expect(doc.fences.map((f) => f.lang)).toEqual(["dot"]);
+  });
+
+  test("a longer inner marker does not split one fence into two", () => {
+    const doc = parseMdx("t.mdx", fm("````md\n```bash\necho hi\n```\n````\n"));
+    expect(doc.fences).toHaveLength(1);
+    expect(doc.fences[0]!.lang).toBe("md");
+    expect(doc.fences[0]!.body).toContain("echo hi");
+  });
+
+  test("consecutive fences are separate", () => {
+    const doc = parseMdx("t.mdx", fm("```dot\na\n```\n\n```bash\nb\n```\n"));
+    expect(doc.fences.map((f) => f.lang)).toEqual(["dot", "bash"]);
+  });
+});
+
 describe("internal links", () => {
   test("site-internal doc links are extracted", () => {
     const doc = parseMdx("t.mdx", fm("see [x](/guides/foo/) and [y](/reference/bar)\n"));

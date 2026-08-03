@@ -34,6 +34,17 @@ export interface Table {
   rowCount: number;
 }
 
+export interface Fence {
+  /** Info string after the opening marker, e.g. "dot", "bash", "" for none. */
+  lang: string;
+  /** 1-indexed line of the opening marker. */
+  startLine: number;
+  /** 1-indexed line of the closing marker, or the last line if unterminated. */
+  endLine: number;
+  /** Contents between the markers. */
+  body: string;
+}
+
 export interface Doc {
   path: string;
   raw: string;
@@ -43,6 +54,8 @@ export interface Doc {
   /** Body text with frontmatter and fences removed, newlines collapsed. */
   bodyText: string;
   tables: Table[];
+  /** Code fences with their language tag, so style checks can target one kind. */
+  fences: Fence[];
   footnoteRefs: string[];
   footnoteDefs: string[];
   /** Site-internal links, e.g. "/guides/foo". */
@@ -59,6 +72,12 @@ export function parseMdx(path: string, raw: string): Doc {
 
   let inFrontmatter = false;
   let fenceMarker: string | null = null;
+  // Fence bounds are recorded HERE rather than re-derived from the classified
+  // lines, because the "only a marker at least as long as the opener closes it"
+  // rule lives in this loop; a second pass that ignored it split one fence into
+  // three and would have exempted the inner block from style checks.
+  const fences: Fence[] = [];
+  let openFence: { lang: string; start: number; body: string[] } | null = null;
   // MDX comments do not render, so their contents are not prose. One doc
   // documents the citation syntax inside one - `cited inline as [^slug]` - which
   // read as a real footnote reference with no definition.
@@ -101,10 +120,24 @@ export function parseMdx(path: string, raw: string): Doc {
         kind = "fence";
         if (m && (m[1]?.[0] ?? "") === fenceMarker[0] && (m[1]?.length ?? 0) >= fenceMarker.length) {
           fenceMarker = null;
+          if (openFence) {
+            fences.push({
+              lang: openFence.lang,
+              startLine: openFence.start,
+              endLine: n,
+              body: openFence.body.join("\n"),
+            });
+            openFence = null;
+          }
+        } else if (openFence) {
+          // A shorter inner marker is fence CONTENT, not a closer - a ````md
+          // block quoting a ```bash block is one fence, not three.
+          openFence.body.push(raw);
         }
       } else if (m) {
         fenceMarker = m[1] ?? null;
         kind = "fence";
+        openFence = { lang: raw.replace(FENCE, "").trim(), start: n, body: [] };
       } else {
         kind = "prose";
       }
@@ -115,6 +148,15 @@ export function parseMdx(path: string, raw: string): Doc {
       raw,
       kind,
       proseNoCode: kind === "prose" ? raw.replace(/`[^`]*`/g, "") : "",
+    });
+  }
+
+  if (openFence) {
+    fences.push({
+      lang: openFence.lang,
+      startLine: openFence.start,
+      endLine: lines.length,
+      body: openFence.body.join("\n"),
     });
   }
 
@@ -182,6 +224,7 @@ export function parseMdx(path: string, raw: string): Doc {
     isDraft: frontmatter.draft === "true",
     bodyText,
     tables,
+    fences,
     footnoteRefs: [...refs],
     footnoteDefs: defs,
     internalLinks: [...internalLinks],
