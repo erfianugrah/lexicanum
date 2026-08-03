@@ -10,6 +10,11 @@
 #     prose rendered as <code>$SUPABASE_ACCESS_TOKEN</code> with 0 katex spans, while
 #     a bare "$1500 - 24 = 1476$" in guides/magic-wan-interop does render as math.
 # A bare, unescaped $ in prose remains a finding: it pairs with the next one.
+#
+# A doc that uses math ON PURPOSE opts out with a marker on its own line:
+#     {/* prose-dollar: math-intentional */}
+# guides/magic-wan-interop does this - it writes MTU/MSS arithmetic as real LaTeX.
+grep -q 'prose-dollar: math-intentional' "$1" && exit 0
 awk '
   NR==1 && /^---[[:space:]]*$/ {fm=1; next}
   fm && /^---[[:space:]]*$/     {fm=0; next}

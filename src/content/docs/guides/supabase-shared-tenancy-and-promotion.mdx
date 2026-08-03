@@ -1,0 +1,373 @@
+---
+title: Shared-instance tenancy on Supabase, and promoting a tenant out of it
+description: One Supabase project per end-tenant commits you to a compute floor for every idle account. This builds the alternative - many tenants in one project separated by RLS on an external identity claim - and then promotes a paying tenant to its own project without logging anyone out. Includes the JWKS wiring, the promotion runbook, and the isolation and portability tests that back it.
+author: Erfi Anugrah
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+If you give each of your end-users a backend - an app builder, a per-customer
+workspace, a low-code tool - the obvious move is one Supabase project per tenant. It
+isolates cleanly and the Management API provisions one in a call. It also commits you
+to roughly \$10/month of compute for every tenant including the idle ones, and a
+project on a paid plan cannot be paused.
+
+The alternative is to put the free and trial majority in one always-warm project,
+separated by row-level security on an identity claim, and give a tenant its own
+project only when it starts paying. This guide builds that, then moves a tenant out
+of it.
+
+<Aside type="caution">
+This trades physical isolation for cost on the shared tier. Tenants in it share one
+Postgres instance, one compute allocation and one backup schedule; they are separated
+by RLS, not by infrastructure. There is no per-tenant PITR and no noisy-neighbour
+protection. If per-tenant physical isolation is a product or compliance requirement,
+stop here and use a project per tenant -
+[consolidating them into one organization](/guides/supabase-org-consolidation/) is the
+guide you want instead.
+</Aside>
+
+## What you will build
+
+- One **hub** project whose GoTrue issues every tenant's token.
+- One **shared** project holding many tenants, with RLS keyed on a `tenant_id` claim.
+- One **dedicated** project that a promoted tenant moves into.
+- A promotion path that does not invalidate the tenant's existing session.
+
+Prerequisites: a Personal Access Token in `SUPABASE_ACCESS_TOKEN`, `jq`, and the
+Supabase CLI if you want Edge Functions.
+
+## Measurement provenance
+
+Measured 2026-08-03 against live Supabase projects in `ap-southeast-1` on Micro
+compute, Vault 0.3.1, with two tenants and three rows. Claims marked measured in the
+evidence table were executed and captured. **Nothing here measures behaviour at
+scale** - two tenants say nothing about contention, and that limitation is carried
+into the evidence table rather than dropped.
+
+## Constants
+
+| Fact | Value |
+|---|---|
+| Third-party auth endpoint | `POST /v1/projects/{ref}/config/auth/third-party-auth` |
+| Accepted config shapes | `oidc_issuer_url`, `jwks_url`, `custom_jwks` |
+| Shape that actually works | **`jwks_url` or `oidc_issuer_url`** - see the gotcha on `custom_jwks` |
+| A project's public JWKS | `https://<ref>.supabase.co/auth/v1/.well-known/jwks.json` |
+| Required token algorithm | asymmetric only; symmetric JWTs are rejected |
+| Required token header | a `kid` identifying the key |
+| Required token claim | `role`, valued `authenticated` for ordinary end users |
+| JWKS refresh | cached in project config, re-checked periodically; allow up to 30 minutes for a rotation |
+
+## The identity decision comes first
+
+Every tenant's token must stay valid when that tenant moves from the shared project
+to its own. Supabase verifies a token by signature against a JWKS it has been told to
+trust, so if the *issuer* does not change, the tenant's physical placement can.
+
+The documented way to do this is an external provider - Clerk, Auth0, Cognito,
+WorkOS. You do not need one. **A Supabase project already publishes an asymmetric
+JWKS**, so a project can act as the issuer for other projects:
+
+```bash
+curl -s "https://<hub-ref>.supabase.co/auth/v1/.well-known/jwks.json" | jq
+```
+
+Point every other project at that URL and they will all accept tokens the hub issued.
+That removes the external-IdP dependency from the architecture, at the cost of making
+the hub a hard dependency for every project trusting it.
+
+<Aside type="caution">
+The hub's signing key becomes a fleet-wide concern. Rotating it affects every project
+configured to trust it, and the documented propagation allowance is up to 30 minutes.
+Rotation was not tested in this run - if you adopt the hub pattern, test it against
+your own fleet before you need it.
+</Aside>
+
+Use a real external provider instead if you already have one, if you need identity to
+outlive any single Supabase project, or if a fleet-wide rotation blast radius is
+unacceptable. The wiring below is identical either way - only the `jwks_url` changes.
+
+## Part 1: wire the trust
+
+Register the hub's JWKS on the shared project and on every dedicated project:
+
+```bash
+HUB=<hub-ref>
+for REF in <shared-ref> <dedicated-ref>; do
+  curl -s -X POST \
+    -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d "{\"jwks_url\":\"https://$HUB.supabase.co/auth/v1/.well-known/jwks.json\"}" \
+    "https://api.supabase.com/v1/projects/$REF/config/auth/third-party-auth" \
+    | jq -c '{id, type, resolved: (.resolved_jwks != null), resolved_at}'
+done
+```
+
+`resolved` must be `true` and `resolved_at` must be populated. If either is null the
+project will reject every token from that issuer, and the failure surfaces as
+`PGRST301 "No suitable key was found to decode the JWT"` at request time rather than
+at configuration time.
+
+List and remove integrations with:
+
+```bash
+curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  "https://api.supabase.com/v1/projects/$REF/config/auth/third-party-auth" \
+  | jq -c '[.[] | {id, jwks_url, resolved: (.resolved_jwks != null)}]'
+
+curl -s -X DELETE -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  "https://api.supabase.com/v1/projects/$REF/config/auth/third-party-auth/<tpa-id>"
+```
+
+## Part 2: put the tenant id somewhere a tenant cannot change
+
+Create each tenant's user on the hub with `tenant_id` in `app_metadata`. That object
+is writable only through the admin API, so a client cannot alter its own value - a
+tenant cannot promote itself into another tenant's rows by editing a claim.
+
+```bash
+curl -s -X POST "https://$HUB.supabase.co/auth/v1/admin/users" \
+  -H "Authorization: Bearer $HUB_SERVICE_KEY" \
+  -H "apikey: $HUB_SERVICE_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"user@tenant-a.example","password":"...","email_confirm":true,
+       "app_metadata":{"tenant_id":"tenant-a"}}' \
+  | jq -c '{id, email, app_metadata}'
+```
+
+The resulting access token is ES256, carries `role: authenticated`, and holds
+`tenant_id` inside `app_metadata`.
+
+<Aside type="note">
+Do not put `tenant_id` in `user_metadata`. That object IS client-writable, so an RLS
+policy reading it grants every tenant the ability to select its own scope.
+</Aside>
+
+## Part 3: the shared schema
+
+Every tenant-scoped table carries a `tenant_id` and a policy comparing it to the
+claim:
+
+```sql
+create table public.items (
+  id        bigserial primary key,
+  tenant_id text not null,
+  body      text not null
+);
+
+alter table public.items enable row level security;
+
+create policy tenant_isolation on public.items
+  using      (tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id'))
+  with check (tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id'));
+
+grant usage on schema public to authenticated;
+grant select, insert, update, delete on public.items to authenticated;
+grant usage, select on sequence public.items_id_seq to authenticated;
+```
+
+`using` governs reads, `with check` governs writes. Omit `with check` and a tenant can
+insert rows labelled with someone else's `tenant_id`, which it then cannot read - data
+it can create but never see.
+
+Index the discriminator on every tenant-scoped table; every query filters on it:
+
+```sql
+create index on public.items (tenant_id);
+```
+
+## Part 4: prove the isolation before you rely on it
+
+Read as tenant A, then as tenant B, against the shared project's Data API:
+
+```bash
+curl -s "https://<shared-ref>.supabase.co/rest/v1/items?select=tenant_id,body&order=id" \
+  -H "apikey: $SHARED_ANON" -H "Authorization: Bearer $TOKEN_A" | jq -c
+# [{"tenant_id":"tenant-a","body":"a-row-1"},{"tenant_id":"tenant-a","body":"a-row-2"}]
+```
+
+Then the attempt that matters - tenant B asking for tenant A's rows by name:
+
+```bash
+curl -s "https://<shared-ref>.supabase.co/rest/v1/items?select=tenant_id,body&tenant_id=eq.tenant-a" \
+  -H "apikey: $SHARED_ANON" -H "Authorization: Bearer $TOKEN_B" | jq -c
+# []
+```
+
+An empty array, not an error. RLS filters rather than refuses, which is what you want
+- there is no oracle telling B that A exists.
+
+## Part 5: promote a tenant to its own project
+
+The tenant is paying. Give it a dedicated project without disturbing its session.
+
+**1. Provision and wire it.** Create the project, apply the same schema, and register
+the hub's JWKS on it (Part 1). The schema stays identical, RLS included: the policy is
+harmless when the table holds one tenant, and identical schemas mean promotion is a
+data copy rather than a migration.
+
+**2. Confirm the token already works there.** Before moving any data, the tenant's
+existing token should be accepted by the new project and return nothing:
+
+```bash
+curl -s "https://<dedicated-ref>.supabase.co/rest/v1/items?select=tenant_id" \
+  -H "apikey: $DEDICATED_ANON" -H "Authorization: Bearer $TOKEN_A" | jq -c
+# []   <- accepted, no rows yet.  PGRST301 here means the JWKS wiring is wrong.
+```
+
+Distinguishing `[]` from `PGRST301` is the whole check. Do it before the copy, while
+an empty result is still expected.
+
+**3. Copy that tenant's slice.** Filtered dump per tenant-scoped table:
+
+```bash
+for t in items other_table; do
+  psql "$SHARED_DB_URL" -c "\copy (select * from public.$t where tenant_id = 'tenant-a') to stdout" \
+    | psql "$DEDICATED_DB_URL" -c "\copy public.$t from stdin"
+done
+```
+
+Reset sequences afterward, or the first insert on the target collides:
+
+```sql
+select setval('public.items_id_seq', coalesce((select max(id) from public.items), 1));
+```
+
+Storage objects are not in the database. Copy them separately, per tenant prefix.
+
+<Aside type="caution">
+If the shared project uses Vault, its secrets do **not** survive a copy into a new
+project. Each project has its own encryption root key, so ciphertext moved by dump or
+`\copy` decrypts to `ERROR: 22000 ... invalid ciphertext` on the target. Read the
+source key from `GET /v1/projects/{ref}/pgsodium` and apply it to the target before
+copying, and do it while the source still exists - after deletion that endpoint
+returns `400 {"message":"Resource has been removed"}`. Full detail in the
+[region migration guide](/guides/supabase-region-migration-e2e/).
+</Aside>
+
+**4. Repoint.** Update your registry so `tenant-a` resolves to the dedicated ref, and
+verify with the same unchanged token:
+
+```bash
+curl -s "https://<dedicated-ref>.supabase.co/rest/v1/items?select=tenant_id,body&order=id" \
+  -H "apikey: $DEDICATED_ANON" -H "Authorization: Bearer $TOKEN_A" | jq -c
+# [{"tenant_id":"tenant-a","body":"a-row-1"},{"tenant_id":"tenant-a","body":"a-row-2"}]
+```
+
+No re-login, no token reissue, no password reset. The issuer never changed.
+
+**5. Reap.** The rows stay on the shared instance until you remove them - promotion is
+not destructive by itself, so keep them through a validation window, then:
+
+```sql
+delete from public.items where tenant_id = 'tenant-a';
+```
+
+## How clients learn where a tenant lives
+
+A tenant's project ref changes at promotion, and the ref appears in the URL the client
+calls. Two ways to absorb that:
+
+- **A discovery endpoint.** The client asks your control plane for its current ref and
+  publishable key, caches the answer, and re-fetches on failure. A config lookup, not a
+  proxy.
+- **A gateway.** Clients hit one stable host and it forwards to the right project,
+  injecting keys, so they never see a ref at all. More moving parts and it sits in the
+  data path.
+
+The token is valid against both projects either way, which removes the hardest thing a
+gateway would otherwise have to do - it never needs to reissue or rewrite tokens.
+**Neither approach was built or tested in this run.** They are the part of this
+architecture that remains design.
+
+## Verification
+
+Run these against a two-tenant fixture before trusting the setup. The negative
+controls matter more than the positive ones - without them, "the token worked" is
+indistinguishable from the API not checking anything.
+
+| Check | How | Expected |
+|---|---|---|
+| JWKS resolved | `GET /v1/projects/{ref}/config/auth/third-party-auth` | `resolved_jwks` non-null, `resolved_at` set |
+| Token accepted | tenant A's token against the shared Data API | rows, not `PGRST301` |
+| Tenant sees only itself | read `items` as A, then as B | each gets only its own rows |
+| **Cross-tenant read denied** | as B, `?tenant_id=eq.tenant-a` | `[]` |
+| **Wrong signature rejected** | a token signed by an untrusted key | `PGRST301` |
+| Anon is powerless | anon key as bearer | `[]` - grants are `authenticated`-only |
+| Write scope enforced | as B, insert a row with `tenant_id = 'tenant-a'` | rejected by `with check` |
+| Token portable | same token against the dedicated project | accepted (`[]` before copy) |
+| Promotion complete | after the copy, same token, dedicated project | the tenant's rows |
+| Promotion non-destructive | same token, shared project | rows still present until reaped |
+| Vault survives | `select decrypted_secret from vault.decrypted_secrets` on the target | plaintext, no `invalid ciphertext` |
+| Sequences reset | insert on the target | no PK collision |
+
+## Gotchas and lessons learned
+
+- **`custom_jwks` is accepted and never works.** The endpoint takes it, returns 201,
+  and echoes your key material back intact - `kty`, `crv`, `alg`, `use`, `kid`, `x`
+  and `y` all present on a subsequent `GET`. But `resolved_at` stays null and
+  PostgREST never picks the keys up. A valid ES256 token was rejected with `PGRST301`
+  continuously for 7 minutes 9 seconds across 31 polls. Substituting `jwks_url` on the
+  same integration resolved instantly and the equivalent token was accepted on the
+  first request. Use `jwks_url` or `oidc_issuer_url`. The failure mode is bad because
+  everything looks configured.
+- **`PGRST301` means the key, not the claim.** "No suitable key was found to decode
+  the JWT" is a signature-verification failure - unresolved JWKS, wrong `kid`, or a
+  symmetric token. A token that verifies but lacks the right claims fails differently:
+  you get `[]` from RLS, or a permission error from grants. Reading `PGRST301` as an
+  RLS problem sends you to debug policies that are fine.
+- **`tenant_id` belongs in `app_metadata`.** `user_metadata` is client-writable.
+- **`with check` is not optional.** Without it a tenant writes rows it can never read.
+- **Identical schemas on both tiers.** Promotion becomes a data copy. Keep RLS enabled
+  on dedicated projects even with one tenant - it costs nothing and means the two
+  tiers never diverge.
+- **Vault does not survive the copy** unless you move the encryption root key first,
+  and the source must still exist when you do.
+- **The hub is a dependency you are choosing.** Every project trusting its JWKS
+  depends on it being reachable and on its signing key. That is the price of not
+  running an external IdP.
+
+## What this does not settle
+
+Stated plainly, because the architecture is only partly demonstrated.
+
+- **Scale.** Two tenants and three rows. Nothing here supports a claim about
+  contention, per-tenant throughput, or how far one shared instance stretches.
+- **Noisy neighbours.** The shared tier has no per-tenant resource limit. One tenant
+  can consume the instance's CPU, connections or IO. There is no measurement of how
+  bad that gets.
+- **Per-tenant backup and PITR.** The shared instance has one backup schedule.
+  Restoring one tenant to a point in time means restoring a copy and filtering, which
+  is not the same product as per-project PITR.
+- **The routing layer.** Neither discovery endpoint nor gateway was built.
+- **Key rotation.** Untested, and on the hub pattern the blast radius is every project
+  trusting it.
+- **The `role` claim specifically.** Only tested with an anon bearer, which fails on
+  grants rather than on the claim. A clean test needs the hub to mint a token with a
+  non-`authenticated` role via a custom access token hook.
+
+## Evidence
+
+| Claim | How it was checked | Result |
+|---|---|---|
+| A project's own JWKS can be trusted by another project | Registered the hub's `/auth/v1/.well-known/jwks.json` as `jwks_url` on a second project | Measured - resolved immediately |
+| `custom_jwks` never resolves | Created it, polled the Data API with a valid ES256 token | Measured - `PGRST301` for 7m09s over 31 polls; `jwks_url` worked first try |
+| RLS on an external claim isolates tenants | Read `items` as two different tenants | Measured - each saw only its own rows |
+| Cross-tenant read denied | Filtered explicitly for the other tenant's id | Measured - `[]` |
+| A wrong-key token is rejected | Signed with a key the target does not trust | Measured - `PGRST301` |
+| One token validates against two projects | Same unchanged token against both | Measured - accepted by both |
+| Promotion works without re-login | Copied one tenant's rows, re-read with the same token | Measured - rows returned, no re-auth |
+| Promotion is non-destructive | Re-read the shared project after the copy | Measured - rows still present |
+| Vault survives a transfer but not a copy | Cross-referenced from the transfer lab | Measured - decrypts after transfer, `invalid ciphertext` after `pg_dump` |
+| `role` must be `authenticated` | Not isolated - only an anon bearer was tried, which fails on grants | Documented, not tested |
+| Behaviour at scale | Two tenants, three rows | Not tested |
+| Per-tenant isolation, PITR, noisy-neighbour protection on the shared tier | Structural: one instance, row-level separation | Not achievable on this tier by construction |
+
+## Related
+
+- [Consolidating Supabase accounts into one organization](/guides/supabase-org-consolidation/)
+  - if a project per tenant is the right shape after all, this moves them under one
+  organization without a migration.
+- [Migrating a Supabase project to another region](/guides/supabase-region-migration-e2e/)
+  - the dump-and-restore mechanics behind the promotion copy, including the Vault
+  root-key trap in full.

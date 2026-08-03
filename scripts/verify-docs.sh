@@ -222,6 +222,22 @@ for side in $(rg --files src/content/docs -g '*.evidence.json' 2>/dev/null | sor
 done
 [ "$found_sidecar" = 0 ] && skp "evidence provenance (no .evidence.json sidecars yet)"
 
+echo "=== 10a. Every internal link resolves to a built page ==="
+broken=0; checked=0
+for doc in src/content/docs/guides/*.mdx src/content/docs/reference/*.mdx; do
+  grep -q '^draft: true' "$doc" && continue
+  for href in $(grep -oE '\]\(/(guides|reference)/[a-z0-9-]+/' "$doc" | sed 's|^](||;s|/$||' | sort -u); do
+    checked=$((checked+1))
+    if [ ! -f "dist${href}/index.html" ]; then
+      printf 'FAIL  %s links to %s which is not built\n' "$(basename "$doc" .mdx)" "$href"
+      fail=$((fail+1)); broken=$((broken+1))
+    fi
+  done
+done
+if [ "$broken" -eq 0 ]; then
+  printf 'PASS  all %d internal links resolve to built pages\n' "$checked"; pass=$((pass+1))
+fi
+
 echo "=== 11a. No published doc links to a draft doc ==="
 drafts=$(rg -l '^draft: true' src/content/docs/ 2>/dev/null | sed 's|.*/||;s|\.mdx$||')
 if [ -z "$drafts" ]; then
