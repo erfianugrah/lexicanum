@@ -45,13 +45,20 @@ evidence table were executed and captured. **Nothing here measures behaviour at
 scale** - two tenants say nothing about contention, and that limitation is carried
 into the evidence table rather than dropped.
 
+The third-party-auth claims were then re-run the same day on a second, disposable
+project pair created for that purpose: all three configuration shapes side by side,
+and portability under three trust states - unconfigured, trusted, and revoked - with
+the token held byte-identical throughout. Timings quoted for trust propagation come
+from that run, and their error bar is the poll interval, not a stopwatch.
+
 ## Constants
 
 | Fact | Value |
 |---|---|
 | Third-party auth endpoint | `POST /v1/projects/{ref}/config/auth/third-party-auth` |
 | Accepted config shapes | `oidc_issuer_url`, `jwks_url`, `custom_jwks` |
-| Shape that actually works | **`jwks_url` or `oidc_issuer_url`** - see the gotcha on `custom_jwks` |
+| Shapes that resolve | **`oidc_issuer_url` and `jwks_url`**, both on the create response - see the gotcha on `custom_jwks` |
+| Reported `type` | `custom`, for all three shapes - it does not tell you which one created an integration |
 | A project's public JWKS | `https://<ref>.supabase.co/auth/v1/.well-known/jwks.json` |
 | Required token algorithm | asymmetric only; symmetric JWTs are rejected |
 | Required token header | a `kid` identifying the key |
@@ -77,12 +84,14 @@ authorization-code and refresh-token grants):
 curl -s "https://<hub-ref>.supabase.co/auth/v1/.well-known/openid-configuration" | jq
 ```
 
-The wiring below uses the JWKS URL directly, which is what we tested. The discovery
-URL is also accepted as `oidc_issuer_url` and is likely the better choice, since
-discovery resolves `jwks_uri` itself and so survives a key rotation that a hardcoded
-JWKS URL would not - **but we did not test it**, and this guide already contains one
-configuration shape that the API accepts and silently never honours, so treat it as
-untested until you confirm it yourself.
+The wiring below uses the issuer URL as `oidc_issuer_url`, because discovery resolves
+`jwks_uri` itself and so survives a rotation that a hardcoded JWKS URL would not.
+Both shapes were measured on a fresh project pair and both resolve on the create
+response - in tens of milliseconds, to identical key material (same `kid`, same ES256
+key). The choice is which URL you would rather hard-code, not a capability
+difference. Rotation itself is still untested (see the caution below); what is now
+settled is that the issuer form resolves at all, which is the part the third shape
+fails at.
 
 The mechanism underneath is simply that **a Supabase project publishes an asymmetric
 JWKS**:
@@ -108,7 +117,7 @@ unacceptable. The wiring below is identical either way - only the `jwks_url` cha
 
 ## Part 1: wire the trust
 
-Register the hub's JWKS on the shared project and on every dedicated project:
+Register the hub as an issuer on the shared project and on every dedicated project:
 
 ```bash
 HUB=<hub-ref>
@@ -116,11 +125,14 @@ for REF in <shared-ref> <dedicated-ref>; do
   curl -s -X POST \
     -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
     -H 'Content-Type: application/json' \
-    -d "{\"jwks_url\":\"https://$HUB.supabase.co/auth/v1/.well-known/jwks.json\"}" \
+    -d "{\"oidc_issuer_url\":\"https://$HUB.supabase.co/auth/v1\"}" \
     "https://api.supabase.com/v1/projects/$REF/config/auth/third-party-auth" \
     | jq -c '{id, type, resolved: (.resolved_jwks != null), resolved_at}'
 done
 ```
+
+Substitute `{"jwks_url":"https://$HUB.supabase.co/auth/v1/.well-known/jwks.json"}` if
+you prefer to pin the key endpoint; it resolves the same way.
 
 `resolved` must be `true` and `resolved_at` must be populated. If either is null the
 project will reject every token from that issuer, and the failure surfaces as
@@ -132,11 +144,17 @@ List and remove integrations with:
 ```bash
 curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
   "https://api.supabase.com/v1/projects/$REF/config/auth/third-party-auth" \
-  | jq -c '[.[] | {id, jwks_url, resolved: (.resolved_jwks != null)}]'
+  | jq -c '[.[] | {id, oidc_issuer_url, jwks_url, resolved: (.resolved_jwks != null)}]'
 
 curl -s -X DELETE -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
   "https://api.supabase.com/v1/projects/$REF/config/auth/third-party-auth/<tpa-id>"
 ```
+
+The `DELETE` is the de-provisioning control, and it bites quickly: tokens the
+integration was verifying start failing with `PGRST301` under a second after it is
+removed (measured across three repeats). Neither direction is synchronous with the
+API call - a probe fired immediately after either write still sees the old state - so
+treat both as fast, not instant.
 
 ## Part 2: put the tenant id somewhere a tenant cannot change
 
@@ -312,11 +330,13 @@ indistinguishable from the API not checking anything.
 | Tenant sees only itself | read `items` as A, then as B | each gets only its own rows |
 | **Cross-tenant read denied** | as B, `?tenant_id=eq.tenant-a` | `[]` |
 | **Wrong signature rejected** | a token signed by an untrusted key | `PGRST301` |
+| **Untrusted issuer refused** | the tenant's real token against a project with NO integration configured, before wiring it | `PGRST301` |
 | Anon is powerless | anon key as bearer | `[]` - grants are `authenticated`-only |
 | Write scope enforced | as B, insert a row with `tenant_id = 'tenant-a'` | rejected by `with check` |
 | Token portable | same token against the dedicated project | accepted (`[]` before copy) |
 | Promotion complete | after the copy, same token, dedicated project | the tenant's rows |
 | Promotion non-destructive | same token, shared project | rows still present until reaped |
+| **Trust removal takes effect** | `DELETE` the integration, re-read with the same token | `PGRST301` again, within a second |
 | Vault survives | `select decrypted_secret from vault.decrypted_secrets` on the target | plaintext, no `invalid ciphertext` |
 | Sequences reset | insert on the target | no PK collision |
 
@@ -328,8 +348,19 @@ indistinguishable from the API not checking anything.
   PostgREST never picks the keys up. A valid ES256 token was rejected with `PGRST301`
   continuously for 7 minutes 32 seconds across 31 polls. Substituting `jwks_url` on the
   same integration resolved instantly and the equivalent token was accepted on the
-  first request. Use `jwks_url` or `oidc_issuer_url`. The failure mode is bad because
-  everything looks configured.
+  first request. Re-measured on a fresh project pair: still 201, still null at 92
+  seconds, so this is the shape's behaviour and not one project having a bad day. Use
+  `oidc_issuer_url` or `jwks_url`. The failure mode is bad because everything looks
+  configured.
+- **The `type` field is `custom` whichever shape you sent.** It is not a discriminator.
+  To know how an integration was wired, read `oidc_issuer_url`, `jwks_url` and
+  `custom_jwks` themselves - and check `resolved_at` while you are there, because that
+  is the field that distinguishes a working integration from a decorative one.
+- **Order your portability test so acceptance is attributable.** Probe the target with
+  the tenant's real token BEFORE configuring trust, and require a refusal. An anon-key
+  control does not substitute for this: the anon key is signed by a key the target
+  already trusts, so it is stopped by grants and RLS and says nothing about signature
+  validation. Hold the token constant and vary only the target's configuration.
 - **`PGRST301` means the key, not the claim.** "No suitable key was found to decode
   the JWT" is a signature-verification failure - unresolved JWKS, wrong `kid`, or a
   symmetric token. A token that verifies but lacks the right claims fails differently:
@@ -376,7 +407,11 @@ Stated plainly, because the architecture is only partly demonstrated.
 |---|---|---|
 | A project's own JWKS can be trusted by another project | Registered the hub's `/auth/v1/.well-known/jwks.json` as `jwks_url` on a second project | Measured - resolved immediately |
 | A project serves an OIDC discovery document | `GET /auth/v1/.well-known/openid-configuration` on a live project | Measured - 200, full document |
-| `oidc_issuer_url` is the better wiring | Not run | Documented shape, not tested |
+| `oidc_issuer_url` resolves, like `jwks_url` | Created both shapes side by side on a fresh project pair and polled for resolution | Measured - both resolved on the create response, to identical key material; `oidc_issuer_url` in 59ms and 249ms across two runs |
+| The reported `type` identifies the shape | Compared the `type` field across all three shapes | Measured - `custom` for all three; it does not |
+| An untrusted issuer's token is refused | Same tenant token against the target with no integration configured | Measured - `401 PGRST301` |
+| Deleting the integration stops the token | `DELETE`, then re-read with the same token, polling | Measured - `PGRST301` after 587-654ms across three repeats |
+| Trust changes are synchronous with the API call | Probed immediately after create and after delete | Measured - no; the immediate probe sees the old state both ways. Accept landed in 1038-1169ms |
 | Scale-to-zero on Nano removes the premise for this architecture | Platform documentation; access is granted per account | Documented, not tested |
 | OAuth tokens carry a `client_id` claim usable in RLS | Platform documentation | Documented, not tested |
 | `custom_jwks` never resolves | Created it, polled the Data API with a valid ES256 token | Measured - `PGRST301` for 7m32s over 31 polls; `jwks_url` worked first try |
