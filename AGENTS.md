@@ -176,25 +176,38 @@ Reference: `docs/plans/2026-07-16-doc-structure-and-citations.md` (the plan + th
 
 ## Evidence sidecars (docs that publish measured numbers)
 
-A doc making measured claims carries `<doc>.evidence.json` beside its `.mdx`:
+A doc making measured claims declares its provenance in its own frontmatter, so
+the doc and its evidence move, rename and delete as one file. Frontmatter does not
+render, so claim ids stay out of the reader's way while staying checkable:
 
-```json
-{
-  "lab": "<repo>:labs/<lab-name>",
-  "rows": [
-    { "claim": "A12", "must_appear": "project-claim" },
-    { "claim": "A11", "must_appear": "returns 404", "expect": "refuted" }
-  ]
-}
+```yaml
+evidence:
+  lab: supabase-org-topology          # bare lab name, never a repo path
+  rows:
+    - claim: A12
+      must_appear: 'project-claim'
+    - claim: A11
+      must_appear: 'returns 404'
+      expect: refuted                 # declare non-proven statuses explicitly
 ```
 
-`verify-docs.sh` asserts that each claim id exists in that lab's `claims.json`, that
-its status matches `expect` (default `empirically-proven`), and that `must_appear` is
-present in the prose (whitespace-normalized, so wrapped lines match). A number that
-loses its ledger backing fails the build.
+`must_appear` uses single-quoted YAML: a double-quoted scalar processes escapes
+and rejects the `\$` in a value like `\$10/month`.
 
-The point is that a "measured" badge stays checkable when the lab lives in a private
-repo the reader cannot open. Reader-facing, keep the plain-prose "How it was checked"
-column in the evidence table; the claim ids are internal traceability only. Set
-`expect` deliberately when citing a refuted claim - a doc may legitimately state a
-refutation, but it should not happen by accident.
+`verify-docs.sh` asserts that each claim id resolves, that its status matches
+`expect` (default `empirically-proven`), and that `must_appear` appears in the doc
+BODY - frontmatter is stripped first, because `must_appear` is declared there and
+matching the whole file made every row match its own declaration and pass vacuously.
+
+Statuses resolve from two sources. `LAB_ROOT` (or `~/.config/lexicanum/lab-root`)
+points at the private lab ledgers on a dev machine; CI has neither and falls back to
+the public snapshots in `docs/ledgers/`, which carry claim ids and statuses only.
+Group 10b diffs snapshot against ledger whenever both are visible, so a stale
+snapshot fails locally rather than letting CI pass on old data. Regenerate with
+`make ledgers`.
+
+Nothing identifying goes in a public artifact: `lab` is a bare name, never a repo
+path. Reader-facing, keep the plain-prose "How it was checked" column in the evidence
+table; claim ids are traceability only. Set `expect` deliberately when citing a
+refuted or untested claim - a doc may legitimately state a refutation, but it should
+not happen by accident.
