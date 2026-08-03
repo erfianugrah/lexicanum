@@ -174,40 +174,17 @@ Run `bun run build` and confirm:
 Reference: `docs/plans/2026-07-16-doc-structure-and-citations.md` (the plan + the
 "what's already done well" catalog).
 
-## Evidence sidecars (docs that publish measured numbers)
+## Docs that publish measured numbers
 
-A doc making measured claims declares its provenance in its own frontmatter, so
-the doc and its evidence move, rename and delete as one file. Frontmatter does not
-render, so claim ids stay out of the reader's way while staying checkable:
+Cite the method in prose: an evidence table with a "How it was checked" column that
+splits measured from documented-but-not-tested. That split is the contract with the
+reader, and it is maintained by hand.
 
-```yaml
-evidence:
-  lab: supabase-org-topology          # bare lab name, never a repo path
-  rows:
-    - claim: A12
-      must_appear: 'project-claim'
-    - claim: A11
-      must_appear: 'returns 404'
-      expect: refuted                 # declare non-proven statuses explicitly
-```
-
-`must_appear` uses single-quoted YAML: a double-quoted scalar processes escapes
-and rejects the `\$` in a value like `\$10/month`.
-
-`verify-docs.sh` asserts that each claim id resolves, that its status matches
-`expect` (default `empirically-proven`), and that `must_appear` appears in the doc
-BODY - frontmatter is stripped first, because `must_appear` is declared there and
-matching the whole file made every row match its own declaration and pass vacuously.
-
-Statuses resolve from two sources. `LAB_ROOT` (or `~/.config/lexicanum/lab-root`)
-points at the private lab ledgers on a dev machine; CI has neither and falls back to
-the public snapshots in `docs/ledgers/`, which carry claim ids and statuses only.
-Group 10b diffs snapshot against ledger whenever both are visible, so a stale
-snapshot fails locally rather than letting CI pass on old data. Regenerate with
-`make ledgers`.
-
-Nothing identifying goes in a public artifact: `lab` is a bare name, never a repo
-path. Reader-facing, keep the plain-prose "How it was checked" column in the evidence
-table; claim ids are traceability only. Set `expect` deliberately when citing a
-refuted or untested claim - a doc may legitimately state a refutation, but it should
-not happen by accident.
+Resist tooling it. An earlier attempt mapped published claims to ids in a private lab
+ledger, vendored a public status snapshot so CI could resolve them, and added a
+freshness check to police the snapshot. Three mechanisms, and the one doing real work
+- asserting the published text still appears in the doc - never needed any of them.
+The status half was circular in CI: it compared two generated files. If you reach for
+this again, first answer "verified by whom, against what?" - for a private lab and a
+public site, the honest answer is that the author is the guarantor and the evidence
+table is how that is declared.

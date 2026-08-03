@@ -161,36 +161,32 @@ block near the end, format `Vendor, "Page title," Site Name. https://full-url`. 
 reference doc requires these throughout; the guides carry inline links in-step and a
 footnote list only where they make standalone factual claims.
 
-**Measured claims** (what we ran) -> a sidecar evidence map per doc, checked against
-the lab ledgers.
+**Measured claims** (what we ran) -> stated in prose, in an evidence table with a
+"How it was checked" column that splits measured from documented-but-not-tested.
 
-The problem this solves: the labs are in a private repo, so a reader cannot follow a
-claim id, and cluttering public prose with `A12`-style tags helps nobody. But an
-unverifiable "measured" badge is exactly the thing this whole exercise exists to
-avoid. So the mapping lives beside the doc, not inside it:
+This was originally specified as a machine-checked provenance map, and that was
+built, shipped, and then reverted the same day. Recorded here because the failure is
+more instructive than the design:
 
-```
-src/content/docs/guides/supabase-org-consolidation.evidence.json
-{
-  "lab": "supabase-org-topology",
-  "rows": [
-    { "claim": "A12", "must_appear": "project-claim" },
-    { "claim": "A13", "must_appear": "75.2" }
-  ]
-}
-```
+- Claim ids in each doc were mapped to rows in a private lab ledger.
+- CI cannot see a private repo, so a public status snapshot was vendored for it.
+- A snapshot can drift, so a freshness check was added to police it.
 
-The verifier asserts, for every row: the claim id exists in that lab's `claims.json`,
-its status is `empirically-proven`, and `must_appear` is present in the MDX. A number
-published in the doc that no longer has a green ledger row fails the build. A ledger
-row that gets downgraded later fails the build.
+Three mechanisms. The only one doing real work asserted that published text still
+appears in the doc - and that needs no ledger, no snapshot and no freshness check,
+just the doc. Worse, the status half was circular in CI: it compared a file generated
+from the ledger against the doc, so CI was verifying an artifact against another
+artifact the same author produced.
 
-Reader-facing, the evidence table keeps its "How it was checked" column in plain
-prose, as the existing exemplars do. The claim ids are internal traceability.
+The root error was accepting "no doubt" as "CI must prove it mechanically" without
+asking who the doubting party was. With a private lab and a public site, a reader can
+never verify the evidence whatever the tooling does. The guarantor is the author, and
+the evidence table is how that guarantee is declared. Tooling cannot move that
+responsibility, only disguise it.
 
-**Unproven claims stay labeled.** Both labs have `doc-cited-not-tested` rows.
-Anything sourced from those is written as doc-cited, never as measured, and the docs'
-evidence tables keep the tested-vs-design-only split the repo already uses.
+**Unproven claims stay labeled.** Both labs have not-tested rows. Anything sourced
+from those is written as doc-cited, never as measured, and the evidence tables keep
+the tested-vs-not-tested split.
 
 ## Public-repo hygiene
 
