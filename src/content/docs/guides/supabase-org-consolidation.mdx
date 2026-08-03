@@ -1,0 +1,436 @@
+---
+title: Consolidating Supabase accounts into one organization
+description: Folding several Supabase accounts into one organization is a project transfer, not a migration. The claim-token pair on the Management API moves a project between organizations in about two seconds with no downtime, keeping its ref, keys, storage, Edge Functions and auth config. This covers the topology decision, the scripted runbook, what a transfer preserves, and the one direction that does cost you an outage.
+author: Erfi Anugrah
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+You have several Supabase accounts - one per client, or one per project, usually
+because the Free Plan caps you at two active projects. Now you want them under a
+single organization you can bill and administer in one place.
+
+The common assumption is that this means `pg_dump` into fresh projects, plus
+rebuilding auth config. It does not. Moving a project between organizations is a
+first-class operation that keeps the project's ref, URL, API keys, signing keys,
+storage, Edge Functions and auth config exactly as they are, and it runs entirely on
+the public Management API.
+
+This guide covers the topology decision first, because it determines how many
+organizations you end up with, then the runbook.
+
+## Measurement provenance
+
+Numbers here were measured on 2026-08-03 against live Supabase projects in
+`ap-southeast-1` on Micro compute, moving between a Team-plan, a Pro-plan and a
+Free-plan organization. Every measured claim in the evidence table at the end was
+executed and captured; anything sourced from documentation rather than a run is
+labelled as such in that table. Project identifiers are replaced with
+`<source-ref>` and `<target-ref>` throughout.
+
+## Constants
+
+Fixed facts every later step depends on.
+
+| Fact | Value |
+|---|---|
+| Transfer endpoint pair | `POST /v1/projects/{ref}/claim-token`, then `POST /v1/organizations/{slug}/project-claim/{token}` |
+| Dry-run endpoint | `GET /v1/organizations/{slug}/project-claim/{token}` |
+| Claim token lifetime | 1 hour |
+| Measured transfer time | 2.3 s paid to paid, 4.0 s paid to Free |
+| Free Plan project cap | 2 active projects, counted per member across every organization where that member is Owner or Administrator |
+| Pro Plan cost | \$25 per organization per month, plus compute |
+| Micro compute | \$0.01344/hour, about \$10/month |
+| Compute credit | \$10 per paid organization per month |
+| Minimum compute on a paid plan | Micro - Nano is refused at creation |
+| Management API base | `https://api.supabase.com/v1` |
+
+Everything below assumes a Personal Access Token in `$SUPABASE_ACCESS_TOKEN`.
+
+## Decide the topology before you move anything
+
+An organization is a billing and access boundary. It is not a data boundary - every
+project is its own Postgres instance with its own API keys and signing keys, so
+per-client data isolation is the same whether those projects sit in one organization
+or ten.
+
+What the organization does share:
+
+| Shared at the organization level | Consequence |
+|---|---|
+| Billing and invoicing | One invoice covering every client |
+| Usage quotas | Egress, storage and MAU pool across all projects, so one client's spike consumes everyone's allowance |
+| Fair-use restrictions | Applied to the organization, so an overdue invoice affects every project in it |
+| Member roles | Owner and Administrator reach all current *and future* projects |
+| Plan | One plan per organization; projects cannot be on different plans within it |
+
+That last pair is the decision. There is no parent/child organization concept, every
+organization needs at least one Owner, and Owner and Administrator are
+organization-scoped. There is no role meaning "administrator of this one project,
+blind to the others" unless you are on Team or Enterprise.
+
+| Your situation | Topology |
+|---|---|
+| Clients never touch the dashboard; you operate everything and bill centrally | One organization, one project per client |
+| Clients need dashboard access scoped to their own project | Team plan (project-scoped roles) or one organization per client |
+| Clients need separate invoices | One organization per client |
+| A client may take ownership of their project later | One organization per client - though a transfer makes this a one-command change either way |
+| Different clients need different plans | One organization per client; plans do not mix |
+
+Cost drives most readers to a single organization: \$25 per organization per month
+plus roughly \$10 per project of compute, with one \$10 compute credit per
+organization. Three projects on Pro comes to about \$45/month in one organization,
+and about \$75/month split across three.
+
+<Aside type="note">
+Project-scoped roles and the Read-only member role are Team and Enterprise features.
+On Pro, the member roles available are Owner, Administrator and Developer, all
+organization-scoped. Confirmed by reading
+`GET /v1/organizations/{slug}/entitlements` on a Pro and a Team organization.
+</Aside>
+
+## The plan matrix, read from the API
+
+Rather than trusting a pricing page, read the entitlements for an organization
+directly:
+
+```bash
+curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  "https://api.supabase.com/v1/organizations/<slug>/entitlements" | jq
+```
+
+Differences that affect this decision, measured on a Pro and a Team organization:
+
+| Entitlement | Pro | Team |
+|---|---|---|
+| `project_scoped_roles` | false | true |
+| `security.member_roles` | Owner, Administrator, Developer | plus Read-only |
+| `security.audit_logs_days` | 0 | 62 |
+| `log.retention_days` | 7 | 28 |
+| `backup.retention_days` | 7 | 14 |
+| `auth.platform.sso` | false | true |
+| `audit_log_drains` | false | true |
+| `function.max_count` | 500 | 1000 |
+| `project_pausing` | **false** | **false** |
+| `api.members.roles` | **false** | **false** |
+
+Two rows matter beyond the feature comparison. `project_pausing` is false on both
+paid plans - a paid project cannot be paused, so an idle client project bills until
+you delete it or move it to a Free organization. And `api.members.roles` is false on
+both, meaning member and role management has no Management API surface at all; it is
+dashboard-only regardless of plan.
+
+## Why you are on multiple accounts in the first place
+
+The Free Plan cap is per member, not per organization. Creating a third free project
+returns:
+
+```
+The following organization members have reached their maximum limits for the number
+of active free projects within organizations where they are an administrator or
+owner: <member> (2 project limit). To continue, these users will need to either
+delete, pause or upgrade one or more of these projects.
+```
+
+Because the count follows the member across every organization where they are Owner
+or Administrator, making a second organization does not buy two more free projects.
+A second *account* does, which is how agencies end up with one login per client. Once
+the destination organization is on a paid plan this stops applying.
+
+## Part 1: prepare
+
+**Pick the destination organization and put it on a paid plan first.** Transferring
+into a Free organization is both slower and constrained by the two-project cap. If
+the destination is already Pro or Team, both problems disappear.
+
+**Get the operator into both sides.** You need to be Owner of the source
+organization and at least a member of the destination. With separate accounts per
+client, the cheapest path is to invite the account that will own the consolidated
+organization into each source organization as Owner, transfer, then remove the
+temporary membership. Member management is dashboard-only, so this part is clicking.
+
+**Clear the blockers.** A project will not transfer with an active GitHub integration
+connection, a project-scoped role pointing at it, or log drains configured. Remove
+those first.
+
+**Check for name collisions.** Project names must be unique within an organization,
+and a transfer into an organization that already has that name is a conflict you want
+to find before the window, not during it. Rename on the source side beforehand.
+
+**Enumerate what you are moving.**
+
+```bash
+curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  "https://api.supabase.com/v1/projects" \
+  | jq -r '.[] | "\(.ref)\t\(.name)\t\(.region)\t\(.organization_id)\t\(.status)"'
+```
+
+Note the regions. **A transfer cannot change region.** If a project also needs to
+move region, that is a different and much larger operation - see the
+[region migration guide](/guides/supabase-region-migration-e2e/). Do the region move
+first, then transfer the resulting project.
+
+## Part 2: dry-run every project
+
+The `GET` on the claim path is a validator. It tells you the plan pair, whether the
+transfer is valid, and what will change - without moving anything.
+
+```bash
+REF=<source-ref>
+DEST=<destination-org-slug>
+
+TOKEN=$(curl -s -X POST -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  "https://api.supabase.com/v1/projects/$REF/claim-token" | jq -r .token)
+
+curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  "https://api.supabase.com/v1/organizations/$DEST/project-claim/$TOKEN" \
+  | jq '.preview | {source_subscription_plan, target_subscription_plan, valid,
+                    errors: [.errors[]?.key],
+                    warnings: [.warnings[]?.key],
+                    over: .members_exceeding_free_project_limit}'
+```
+
+A valid Free-to-Pro move looks like this:
+
+```json
+{
+  "source_subscription_plan": "free",
+  "target_subscription_plan": "pro",
+  "valid": true,
+  "errors": [],
+  "warnings": ["WARN_COMPUTE_COSTS_INCREASE_IN_TARGET_ORGANIZATION"],
+  "over": []
+}
+```
+
+Warnings and errors worth recognizing:
+
+| Key | Meaning |
+|---|---|
+| `WARN_COMPUTE_COSTS_INCREASE_IN_TARGET_ORGANIZATION` | The destination already has projects, so its compute credit is spent; this project adds about \$10/month |
+| `WARN_TARGET_ORGANIZATION_NOT_ON_USAGE_BILLING` | Destination is not on usage-based billing |
+| `WARN_TARGET_ORGANIZATION_ON_FREE_PLAN_AND_PROJECT_ON_HIGHER_COMPUTE` | The instance will be downgraded to Nano, with downtime - see Part 4 |
+| `INFO_NO_AUTOMATIC_COMPUTE_UPGRADE` | Landing in a paid organization entitles you to a free Micro upgrade, but you have to trigger it |
+| `ERR_TARGET_ORGANIZATION_EXCEEDS_FREE_PROJECT_LIMIT` | `valid` is false; the destination is a Free organization and this would put a member over two projects |
+
+Run this for every project before you move the first one. If you decide not to
+proceed, revoke the token rather than leaving it live for its hour:
+
+```bash
+curl -s -X DELETE -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  "https://api.supabase.com/v1/projects/$REF/claim-token"
+```
+
+## Part 3: transfer
+
+Same token, same path, `POST`:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  "https://api.supabase.com/v1/organizations/$DEST/project-claim/$TOKEN"
+```
+
+Measured at 2.3 s for a paid-to-paid move. Confirm:
+
+```bash
+curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  "https://api.supabase.com/v1/projects/$REF" | jq '{organization_id, status}'
+```
+
+Because ref, URL and keys are unchanged, there is nothing to redeploy and no client
+to repoint. The whole loop scripts cleanly:
+
+```bash
+for REF in <ref-1> <ref-2> <ref-3>; do
+  TOKEN=$(curl -s -X POST -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+    "https://api.supabase.com/v1/projects/$REF/claim-token" | jq -r .token)
+  VALID=$(curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+    "https://api.supabase.com/v1/organizations/$DEST/project-claim/$TOKEN" | jq -r .preview.valid)
+  if [ "$VALID" != "true" ]; then
+    echo "SKIP $REF - preview invalid"
+    curl -s -X DELETE -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+      "https://api.supabase.com/v1/projects/$REF/claim-token" >/dev/null
+    continue
+  fi
+  curl -s -o /dev/null -w "$REF -> %{http_code}\n" -X POST \
+    -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+    "https://api.supabase.com/v1/organizations/$DEST/project-claim/$TOKEN"
+  sleep 15
+done
+```
+
+The `sleep` is rate-limit courtesy. The Management API throttles aggressive polling
+and answers with a Cloudflare HTML interstitial rather than a JSON 429, so a client
+that assumes JSON throws a parse error instead of seeing something retryable.
+
+<Aside type="caution">
+Member and role management, organization deletion, and the usage views are not on
+`/v1`. They live on `api.supabase.com/platform/...`, which the dashboard uses - it
+authenticates with a browser session JWT and its CORS is pinned to the dashboard
+origin, so a Personal Access Token cannot reach it. Treat `/platform` as a dashboard
+implementation detail, not an integration surface: it is undocumented and carries no
+compatibility guarantee. Everything in this guide stays on `/v1`.
+</Aside>
+
+## Part 4: the one direction that costs you downtime
+
+Transfers between paid organizations produced no data-plane interruption
+distinguishable from the ambient noise floor of the probing host, measured by polling
+`/auth/v1/health` every 250 ms across each move.
+
+Moving a project from a paid organization to a **Free** one is different, and the
+cause is not the transfer. A Free organization only offers Nano compute, so the
+instance is resized on arrival:
+
+| Direction | Measured data-plane outage |
+|---|---|
+| Team to Pro | none above the noise floor |
+| Pro to Team | none above the noise floor |
+| Free to Pro | none above the noise floor |
+| Paid to Free | **75.2 s continuous** |
+
+During that window the edge returns HTTP 521 and 525 rather than a clean 503, so
+retry logic keyed on origin 5xx will not classify it correctly. The project reports
+`status: RESIZING` throughout.
+
+<Aside type="caution">
+The control plane goes green before the data plane does. `GET /v1/projects/{ref}`
+reported `ACTIVE_HEALTHY` about 19 seconds before the first successful request to
+`/auth/v1/health`. Automation that gates a cutover on project status alone will send
+traffic into an endpoint that is still failing. Poll the data plane.
+</Aside>
+
+## Part 5: compute after the move
+
+A Free project keeps Nano compute when it lands in a paid organization. It is not
+upgraded automatically, and Nano is not otherwise purchasable there - creating a
+project with Nano on a paid plan is refused with
+`400 {"message":"Minimum instance size on paid plans is Micro"}`.
+
+That matters because the preview says the project adds about \$10/month to the bill,
+which is the Micro rate. You are paying for Micro and running Nano until you act, and
+the upgrade itself is free:
+
+> Transferring the project to a paid organization allows a free upgrade to a Micro
+> compute size. You can manually trigger the upgrade in the Compute & Disk section
+> after the transfer.
+
+The only cost of taking it is the resize downtime. Check what a project is currently
+on:
+
+```bash
+curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  "https://api.supabase.com/v1/projects/$REF/billing/addons" \
+  | jq '{selected: [.selected_addons[]? | {type, name: .variant.name, price: .variant.price.description}]}'
+```
+
+An empty `selected_addons` means Nano. A Micro project shows a `compute_instance`
+add-on at \$0.01344/hour.
+
+## Verification
+
+| Check | How | Expected |
+|---|---|---|
+| Project moved | `GET /v1/projects/{ref}` | `organization_id` is the destination |
+| Ref unchanged | compare before and after | identical - no client repointing |
+| Keys unchanged | `GET /v1/projects/{ref}/api-keys` | all four keys identical (legacy `anon`, legacy `service_role`, `publishable`, `secret`) |
+| Signing keys unchanged | `GET /v1/projects/{ref}/config/auth/signing-keys` | same key ids and algorithms |
+| Auth config unchanged | `GET /v1/projects/{ref}/config/auth` | identical |
+| Data intact | `select count(*)` on a known table | unchanged |
+| Storage intact | fetch a known object through the Storage API | same bytes |
+| Edge Functions intact | invoke a deployed function | same response |
+| Vault intact | `select decrypted_secret from vault.decrypted_secrets` | plaintext, no error |
+| Data plane healthy | `GET https://<ref>.supabase.co/auth/v1/health` | 200 - poll this, not project status |
+| Compute as intended | `GET /v1/projects/{ref}/billing/addons` | Micro add-on present if you took the free upgrade |
+| Source organization empty | `GET /v1/projects` | no projects left under the old organization |
+
+## What a transfer preserves
+
+Captured as a 15-field fingerprint before and after a Team-to-Pro-to-Team round trip.
+The only field that changed was `organization_id`; the round trip returned
+byte-identical on all fifteen.
+
+| Preserved | Not preserved |
+|---|---|
+| Project ref and URL | Organization membership (the point of the exercise) |
+| All four API keys | Your effective rights, which follow your role in the destination |
+| Signing key ids and algorithms | |
+| pgsodium encryption root key | |
+| Auth configuration | |
+| PostgREST configuration | |
+| Database rows and roles | |
+| Storage buckets and object bodies | |
+| Edge Function bodies and secrets | |
+| Region (it cannot be changed) | |
+
+This is the substantive difference from a dump-and-restore. A restore into a fresh
+project gives you a new ref, new keys, new signing keys and a new encryption root key,
+which means repointing every client, re-registering every OAuth callback, and losing
+any Vault secret you did not explicitly carry across. A transfer changes one field.
+
+## Gotchas and lessons learned
+
+- **`/v1/projects/{ref}/transfer` returns 404.** There is no endpoint by that name,
+  which is what leads people to conclude the operation is dashboard-only. The path is
+  the claim-token pair.
+- **Preview before every move, not just the first.** The warning set differs by plan
+  pair. Free-to-Pro warns about cost; paid-to-Free warns about a compute downgrade and
+  its downtime; Pro-to-Team warned about nothing at all.
+- **`ACTIVE_HEALTHY` is not "ready".** About 19 seconds of divergence measured between
+  the control plane reporting healthy and the data plane serving.
+- **A partial SMTP `PATCH` wipes SMTP.** Setting the full block and later patching
+  `smtp_pass` alone left `smtp_host`, `smtp_user` and `smtp_pass` all null on the next
+  read. Send the whole block or none of it. This bites during post-move config
+  cleanup rather than during the transfer itself.
+- **Credential fields in `/config/auth` are neither null nor readable.** Once set,
+  SMTP passwords, OAuth client secrets and the captcha secret read back as a stable
+  64-character hex digest. The same plaintext written to a different project produces
+  a different digest, so the fingerprint is project-scoped: you cannot read a secret
+  out to copy it, and you cannot confirm a copy landed by comparing digests either.
+  Re-enter by hand and verify out of band. Transfers sidestep this entirely, since the
+  configuration never moves.
+- **`jwt_secret` is not exposed** by `GET /v1/projects/{ref}/config/auth`. New projects
+  sign with an ES256 key with the legacy HS256 secret demoted to `previously_used`, so
+  the widely repeated advice to "copy the JWT secret to the new project to keep
+  sessions alive" does not apply to a new project and cannot be scripted on `/v1`
+  anyway. Another thing a transfer makes moot.
+- **Rate limiting arrives as HTML.** Sequential probing earns a Cloudflare
+  interstitial, not a JSON 429. Back off and check the content type.
+- **Organizations can be created on `/v1` but not deleted there.** Cleanup of an
+  emptied source organization is a dashboard action.
+
+## Evidence
+
+Measured 2026-08-03 unless marked otherwise.
+
+| Claim | How it was checked | Result |
+|---|---|---|
+| Transfer runs on the public Management API | Executed the claim-token pair with a PAT, no dashboard involved | Measured - 2.3 s paid to paid |
+| Transfer preserves ref, keys, signing keys, root key, config, data, storage, functions | 15-field fingerprint diffed pre/post across a Team-Pro-Team round trip | Measured - only `organization_id` changed |
+| Paid-to-paid transfer causes no outage | Polled `/auth/v1/health` at 250 ms across three moves | Measured - nothing above the host's ambient failure floor |
+| Paid-to-Free costs about 75 s | Same probe across the move | Measured - 75.2 s continuous, HTTP 521/525 |
+| Control plane leads the data plane | Compared project status against first successful health response | Measured - about 19 s |
+| Free Plan cap is per member across organizations | Created free projects until refused | Measured - verbatim API error |
+| The cap is enforced at transfer time too | Previewed a third project into a Free organization at the cap | Measured - `valid: false`, `ERR_TARGET_ORGANIZATION_EXCEEDS_FREE_PROJECT_LIMIT` |
+| Nano is refused at creation on a paid plan | Attempted it | Measured - `400 Minimum instance size on paid plans is Micro` |
+| A transferred-in Free project keeps Nano | Compared `billing/addons` against a Micro project | Measured - no compute add-on selected |
+| Nano in a paid organization bills at the Micro rate | Read the preview warning | Measured - "will increase by \$10/month" |
+| Micro is \$0.01344/hour | `GET /v1/projects/{ref}/billing/addons` | Measured |
+| Plan matrix (project-scoped roles, Read-only, pausing, API member management) | `GET /v1/organizations/{slug}/entitlements` on a Pro and a Team organization | Measured |
+| Credential fields return a project-scoped digest | Wrote the same secret to two projects and compared | Measured |
+| Partial SMTP `PATCH` clears SMTP | Set the full block, patched one field, re-read | Measured |
+| A GitHub integration blocks transfer | Not run - creating the connection needs the dashboard OAuth flow | Documented, not tested |
+| A project-scoped role blocks transfer | Not run - role assignment has no API surface | Documented, not tested |
+| Quotas pool organization-wide | Not run - usage endpoints are not on `/v1` | Documented, not tested |
+| Fair-use restriction covers all projects in an organization | Not run - deliberately, tripping fair use on a live account is out of scope | Documented, not tested |
+| An organization-scoped role covers future projects | Not run - needs dashboard member management | Documented, not tested |
+| Rights follow your role in the destination organization | Not run - needs a second account | Documented, not tested |
+| Source organization is billed up to the transfer, destination after | Not run - needs two full billing cycles | Documented, not tested |
+
+## Related
+
+- [Migrating a Supabase project to another region](/guides/supabase-region-migration-e2e/)
+  - when the project also has to change region. Do that first, then transfer.
+- [Shared tenancy and tenant promotion](/guides/supabase-shared-tenancy-and-promotion/)
+  - when one project per client is the wrong shape and you want the idle majority to
+  share an instance.
