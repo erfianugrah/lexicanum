@@ -18,8 +18,11 @@ const beoeCache = await getCache();
 // dims scaled up so they read at a generous size), which custom.css then caps
 // by column width and max-height. Aspect ratio is preserved; nothing stretches.
 const DIAGRAM_SCALE = 1.5;
+// The walkers below take hast nodes. They are annotated inline as `any` on
+// purpose: only tagName, properties and children are ever read, and importing
+// hast types into an .mjs config for four callbacks is not worth the ceremony.
 function rehypeGraphvizIntrinsicSize() {
-  const walk = (node) => {
+  const walk = (/** @type {any} */ node) => {
     if (node.type === "element") {
       if (node.tagName === "svg") {
         const p = node.properties || (node.properties = {});
@@ -37,7 +40,7 @@ function rehypeGraphvizIntrinsicSize() {
       node.children?.forEach(walk);
     }
   };
-  return (tree) => walk(tree);
+  return (/** @type {any} */ tree) => walk(tree);
 }
 
 // GFM renders the footnote section under a screen-reader-only
@@ -45,7 +48,7 @@ function rehypeGraphvizIntrinsicSize() {
 // sr-only class so it reads as a real visible section (and shows as "References"
 // in the table of contents), matching the repo's citation convention.
 function rehypeFootnoteLabelToReferences() {
-  const walk = (node) => {
+  const walk = (/** @type {any} */ node) => {
     if (
       node.type === "element" &&
       node.tagName === "h2" &&
@@ -60,7 +63,7 @@ function rehypeFootnoteLabelToReferences() {
     }
     node.children?.forEach(walk);
   };
-  return (tree) => walk(tree);
+  return (/** @type {any} */ tree) => walk(tree);
 }
 
 import react from "@astrojs/react";
@@ -243,13 +246,6 @@ export default defineConfig({
   },
   build: {
     concurrency: 4,
-    measuring: {
-      entryBuilding: true,
-      pageGeneration: true,
-      bundling: true,
-      rendering: true,
-      assetProcessing: true,
-    },
   },
   prefetch: {
     prefetchAll: true,
