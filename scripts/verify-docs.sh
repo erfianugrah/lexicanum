@@ -172,14 +172,26 @@ evidence_provenance() { # $1 = mdx carrying an `evidence:` frontmatter block
   rows=$(python3 scripts/evidence-rows.py "$mdx") || return 1
   lab=$(printf '%s\n' "$rows" | sed -n 's/^lab\t//p' | head -1)
   [ -n "$lab" ] || { echo "  no evidence.lab in frontmatter" >&2; return 1; }
+  # Two sources, in priority order. The private lab ledger is authoritative and
+  # present on a dev machine; CI only has the vendored public status snapshot
+  # (claim ids + statuses, nothing identifying). Group 10b asserts the snapshot
+  # still matches the ledger whenever both exist, so CI cannot pass on stale data.
   labdir="$HOME/${lab%%:*}/${lab#*:}"
-  [ -f "$labdir/claims.json" ] || { echo "  no ledger at $labdir" >&2; return 1; }
+  ledger="$labdir/claims.json"
+  snap="docs/ledgers/$(basename "${lab#*:}").status.json"
+  if   [ -f "$ledger" ]; then src=ledger
+  elif [ -f "$snap" ];   then src=snap
+  else echo "  no ledger at $labdir and no snapshot at $snap" >&2; return 1; fi
   body=$(doc_body "$mdx")
   while IFS=$'\t' read -r id want appear; do
     [ "$id" = "lab" ] && continue
     # a row may deliberately cite a refuted or untested claim. That has to be
     # declared per-row via `expect`, so it cannot happen by accident.
-    st=$(jq -r --arg i "$id" '.claims[]|select(.id==$i)|.status' "$labdir/claims.json")
+    if [ "$src" = ledger ]; then
+      st=$(jq -r --arg i "$id" '.claims[]|select(.id==$i)|.status' "$ledger")
+    else
+      st=$(jq -r --arg i "$id" '.claims[$i] // empty' "$snap")
+    fi
     [ "$st" = "$want" ] || { echo "  $id status=${st:-MISSING} expected=$want" >&2; return 1; }
     # whitespace-normalized: published prose wraps, so the phrase may span lines
     printf '%s' "$body" | grep -qF "$appear" \
@@ -242,6 +254,24 @@ if [ "$found_ev" = 0 ]; then
   printf 'FAIL  no doc declares an evidence block - the provenance gate is not running\n'
   fail=$((fail+1))
 fi
+
+echo "=== 10b. Vendored ledger snapshots match the private ledgers (local only) ==="
+snap_checked=0
+for snap in docs/ledgers/*.status.json; do
+  [ -f "$snap" ] || continue
+  lab=$(jq -r '.lab' "$snap"); ledger="$HOME/${lab%%:*}/${lab#*:}/claims.json"
+  if [ ! -f "$ledger" ]; then
+    skp "$(basename "$snap"): private ledger not present (CI) - snapshot used as-is"
+    continue
+  fi
+  snap_checked=1
+  if diff -q <(jq -S '.claims' "$snap") \
+             <(jq -S '[.claims[]|{(.id):.status}]|add' "$ledger") >/dev/null; then
+    printf 'PASS  %s matches its private ledger\n' "$(basename "$snap")"; pass=$((pass+1))
+  else
+    printf 'FAIL  %s is STALE - regenerate with make ledgers\n' "$(basename "$snap")"; fail=$((fail+1))
+  fi
+done
 
 echo "=== 10a. Every internal link resolves to a built page ==="
 broken=0; checked=0
