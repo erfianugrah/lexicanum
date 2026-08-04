@@ -161,6 +161,12 @@ const pins: Pin[] = [
       "vanity subdomain",
       // Provisioning: healthy is not writable, measured over five projects.
       "131-159 s",
+      // Structure the reference skeleton requires and this doc lacked until it
+      // shipped: an up-front summary and a closing decision diagram. TL;DR is a
+      // bold label here rather than a heading, matching the exemplar, so the
+      // sections regex below cannot see it - pin the literal.
+      "**TL;DR:**",
+      "Where should a tenant live?",
     ],
     mustNotContain: [
       "Gateway (stable facade)",
@@ -173,10 +179,10 @@ const pins: Pin[] = [
       "Create -> healthy = 138 s",
     ],
     sections: [/^#{2,3} .*(TL;DR|Decision)/m, /^#{2,3} .*Verified/m, /^#{2,3} .*design-only/m],
-    // No linksTo: this doc is still a draft and links nowhere yet. The old bash
-    // matrix asserted it linked to two guides and PASSED - by grepping built
-    // HTML, where Starlight renders the whole sidebar on every page, so every
-    // slug matches every page. Five cross-link checks could never fail.
+    // Shipped 2026-08-04. It links to the tenancy guide in two places now, but
+    // linksTo stays off deliberately: the old bash matrix asserted cross-links
+    // by grepping built HTML, where Starlight renders the whole sidebar on
+    // every page, so every slug matched every page. Five cross-link checks could never fail.
   },
 ];
 
