@@ -43,8 +43,40 @@ const TENANCY = "guides/supabase-shared-tenancy-and-promotion";
 const MULTITENANT = "reference/supabase-multitenant-platform";
 const TENANT_MERGE = "guides/supabase-tenant-consolidation";
 const PBKDF2 = "guides/pbkdf2-supabase-auth-migration";
+const DOWNTIME = "reference/supabase-platform-operation-downtime";
 
 const pins: Pin[] = [
+  {
+    doc: DOWNTIME,
+    mustContain: [
+      // The whole point of the page: a single duration is the wrong shape.
+      // If an edit ever softens this into "a restart takes about a minute",
+      // the page has lost its argument.
+      "the paths do not move together",
+      // Every number on the page is unreadable without its sampling interval,
+      // and n=1 is the honest caveat that stops it being read as a SLA.
+      "500 ms",
+      "n=1",
+      // Measured, and the most counter-intuitive result here.
+      "REST and Realtime never failed",
+      // The dwell is a test parameter, not a platform property. Losing this
+      // sentence turns a chosen constant into a published measurement.
+      "artifact of the test",
+      // Verbatim server strings - the reason they are worth logging is that
+      // they differ per operation. Reworded, they stop being greppable.
+      "EADDRNOTALLOWED",
+      "terminating connection due to administrator command",
+      // The upgrade row is absent for a structural reason, not an oversight.
+      "deprecated and typed null",
+    ],
+    mustNotContain: [
+      // duration_estimate_hours is the platform's published estimate. It is
+      // NOT a measured outage, and this page exists to keep that distinction.
+      "measured upgrade window",
+    ],
+    sections: [/^## Evidence$/m, /^## Reading the numbers$/m, /^## TL;DR$/m],
+    anchors: ["the-matrix", "reading-the-numbers", "evidence"],
+  },
   {
     doc: UPGRADE,
     mustContain: [
