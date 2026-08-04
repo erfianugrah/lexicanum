@@ -1,0 +1,430 @@
+---
+title: Consolidating one Supabase project per customer onto a shared project
+description: Merging projects is not tenant promotion run backwards. Two projects provisioned independently collide on every namespace they both allocated from, and the auth tier refuses the whole customer for one shared email address. The supported admin endpoint moves users with their uuid and their password intact, which removes the need to write into the auth schema at all - the runbook, the three ways past a duplicate address, and the isolation checks that pass while isolation is absent.
+author: Erfi Anugrah
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+You gave every end customer their own Supabase project. It was the right call at
+five customers and it is the wrong one at fifty: fifty compute floors, fifty
+migrations to apply, fifty sets of keys. You want one project with a `tenant_id`
+column and Row Level Security.
+
+This guide is the runbook for that move. It assumes you have decided to make it -
+[Shared-instance tenancy on Supabase](/guides/supabase-shared-tenancy-and-promotion/)
+argues the case and covers the opposite direction. Prerequisites: a Personal
+Access Token in `SUPABASE_ACCESS_TOKEN`, the `service_role` key for each
+project, and `jq`.
+
+## Measurement provenance
+
+Measured 2026-08-04 against three throwaway Supabase projects in
+`ap-southeast-1` on Micro compute: two playing per-customer sources, one playing
+the consolidation target. 34 assertions, 33 pass and one failure that is the
+substance of this guide. Claims marked measured in the evidence table were
+executed and captured; the rest are marked.
+
+Three users and three orders per source. **Nothing here measures behaviour at
+scale** - a merge of two customers says nothing about the wall-clock cost of
+merging fifty, and that limitation is carried into the evidence table rather
+than dropped.
+
+## Constants
+
+| Fact | Value |
+|---|---|
+| The uniqueness a user merge must satisfy | `users_email_partial_key`: `UNIQUE (email) WHERE (is_sso_user = false)` |
+| What that index is over | the **raw** `email` column - a plain btree, so it is case-sensitive |
+| Non-generated columns in `auth.users` | 34 (measured; it differs across auth versions, which is why you enumerate rather than hardcode) |
+| Admin create endpoint | `POST /auth/v1/admin/users` |
+| The three fields that make it a migration | `id`, `password_hash`, `app_metadata` |
+| Duplicate address, admin endpoint | `422 email_exists` - **case-insensitive** |
+| Duplicate address, SQL copy | `23505` on `users_email_partial_key` - **case-sensitive** |
+| Cost of one duplicate in a bulk insert | the whole statement: one source contributed **0 of its 2** users |
+| Role behind the Management API query endpoint | `postgres` - RLS does not constrain it |
+| PostgREST preference for testing writes | `return=minimal`; the default reports a permitted write as `403 42501` |
+
+## Merging is not promotion run backwards
+
+Splitting a shared project into a dedicated one cannot produce a conflict: every
+value you carry out was unique in the project it came from. Merging two projects
+that were provisioned independently produces a conflict for every namespace they
+both allocated from, because neither could have known about the other.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_before {
+    label="Before: one project per customer";
+    fontname="Helvetica,Arial,sans-serif"; fontsize=10;
+    a [label="Customer A project\nGoTrue A\norders 1,2,3"];
+    b [label="Customer B project\nGoTrue B\norders 1,2,3"];
+  }
+
+  subgraph cluster_after {
+    label="After: one project, many tenants";
+    fontname="Helvetica,Arial,sans-serif"; fontsize=10;
+    shared [label="Shared project\none GoTrue\ntenant_id on every row\nRLS on every table"];
+  }
+
+  a -> shared [label="email uniqueness\nis now global"];
+  b -> shared [label="order ids\nnow collide"];
+}
+```
+
+Three namespaces collide, in increasing order of how much of the plan they
+change:
+
+| Namespace | Collides on | Fix |
+|---|---|---|
+| Surrogate keys | every `bigserial` both sides allocated from 1 | scope the key: `primary key (tenant_id, id)` |
+| Sequences | the merged table's own sequence still starts at 1 | `setval` past the highest migrated id |
+| Email addresses | one human with an account at two of your customers | a product decision - see [Part 2](#part-2-decide-what-happens-to-a-human-who-exists-twice) |
+
+The first two are mechanical. The third is not, which is why it comes first in
+the runbook.
+
+## Part 1: inventory the collisions before moving anything
+
+Run this on every source project and diff the outputs. It is the only step whose
+result can change the design.
+
+```sql
+-- Addresses. Lower-cased, because the target's index is not, and you want to
+-- find near-duplicates before they become two accounts.
+select lower(email) as email
+  from auth.users
+ where deleted_at is null
+ order by 1;
+
+-- Every surrogate key that will have to survive the merge, and its type.
+select c.relname as table_name, a.attname as column_name, format_type(a.atttypid, null) as type
+  from pg_class c
+  join pg_namespace n on n.oid = c.relnamespace
+  join pg_attribute a on a.attrelid = c.oid
+  join pg_index i on i.indrelid = c.oid and i.indisprimary and a.attnum = any(i.indkey)
+ where n.nspname = 'public' and c.relkind = 'r'
+ order by 1;
+```
+
+Count the overlapping addresses. That number is the size of the only part of
+this migration you cannot automate.
+
+## Part 2: decide what happens to a human who exists twice
+
+The target has one GoTrue. `users_email_partial_key` makes an address unique
+across the whole project, so the same person cannot hold an account at two of
+your customers under one address. Three ways out, and the third is the honest
+one if the overlap is not a rounding error.
+
+| Option | What the person experiences | What it costs you |
+|---|---|---|
+| Leave the second occurrence behind | absent from that customer on the new platform | a re-invite per person, and the customer notices |
+| Rewrite the address (`person+tenant-b@example.com`) | a login string that changed | comms; password resets and magic links now go to the tagged address, and the person has two passwords again |
+| One account, many memberships | one login, a tenant switcher | the model changes: `tenant_id` stops being a scalar claim |
+
+Measured: the rewrite works and costs nothing technically - the row lands and
+the original password still authenticates. It is the human-facing cost that is
+real.
+
+<Aside type="caution">
+If a meaningful number of people hold accounts at two of your customers, the
+scalar `app_metadata.tenant_id` in the shared-tenancy guide is the wrong shape
+and no merge strategy rescues it. What you want instead is a `memberships(user_id,
+tenant_id, role)` table, a per-request active tenant, and RLS that reads a
+membership rather than a claim. Decide this in Part 2, not after Part 5.
+</Aside>
+
+## Part 3: move the users
+
+Do not write into the `auth` schema. It works - the copy carries the uuid, the
+password hash and 34 columns - but it is unsupported, and measured against the
+documented endpoint it buys nothing and loses the case-insensitivity that
+protects you from silently creating two accounts for one person.
+
+`POST /auth/v1/admin/users` takes all three fields that make this a migration
+rather than a re-registration:
+
+```bash
+# On the source: the rows to carry.
+psql "$SOURCE_DB_URL" -At -F$'\t' -c \
+  "select id, email, encrypted_password from auth.users where deleted_at is null" \
+| while IFS=$'\t' read -r id email hash; do
+    curl -sS -o /dev/null -w '%{http_code} '"$email"'\n' \
+      -X POST "https://$SHARED_REF.supabase.co/auth/v1/admin/users" \
+      -H "apikey: $SHARED_SERVICE_ROLE" \
+      -H "Authorization: Bearer $SHARED_SERVICE_ROLE" \
+      -H "Content-Type: application/json" \
+      -d "$(jq -nc --arg id "$id" --arg email "$email" --arg hash "$hash" --arg t "$TENANT" \
+            '{id:$id, email:$email, password_hash:$hash, email_confirm:true,
+              app_metadata:{tenant_id:$t}}')"
+  done
+```
+
+What each field buys, all measured:
+
+- **`password_hash`** takes the source's bcrypt string (`$2a$...`) as-is, and the
+  migrated user logs in at the target with the password they already had. The
+  plaintext is never needed and nobody is sent a reset. Control: the same user
+  created without password material returns `400 invalid_credentials` on login,
+  so the result is attributable to this field and not to something else. This
+  works because both ends are Supabase and the hash is already bcrypt - GoTrue
+  dispatches on the hash prefix and returns HTTP 500 for a format it has no
+  verifier for, which is a different migration entirely:
+  [migrating PBKDF2 password hashes into Supabase Auth](/guides/pbkdf2-supabase-auth-migration/).
+- **`id`** is honoured, so every `user_id` already stored in that customer's data
+  still resolves. Without it you would remap every foreign key.
+- **`app_metadata`** sets the tenant claim at creation. This step has no
+  counterpart in the promotion direction: the source rows carry no `tenant_id` at
+  all, because the project was the tenant.
+
+Two more properties worth knowing before you plan the cutover:
+
+- **The source is untouched.** It still authenticates the same people afterwards,
+  so a consolidation can be abandoned after the first customer.
+- **`auth.identities` is not needed** for password login. A migrated user
+  authenticates with zero identity rows on the target. Social and SSO identities
+  are a separate problem this run did not test.
+
+<Aside type="caution">
+Per user, not per batch. A bulk SQL insert is one statement and therefore atomic:
+in the lab, a source offering two users where one address already existed
+contributed **zero**. One duplicate loses the entire customer's user base, and
+the error tells you about the first conflict only.
+</Aside>
+
+## Part 4: move the data
+
+Keep the customer's identifiers. Order numbers are printed on invoices, quoted
+in support tickets and embedded in URLs, and reassigning them turns a migration
+into a support load.
+
+```sql
+-- Target: the key is scoped to the tenant, so both customers keep 1..n.
+create table public.orders (
+  tenant_id text   not null,
+  id        bigint not null,
+  sku       text   not null,
+  user_id   uuid   references auth.users(id),
+  primary key (tenant_id, id)
+);
+create index on public.orders (tenant_id);
+```
+
+Measured: both sources merge into that shape with ids intact - six rows over
+three distinct ids. The naive version, keeping `id` as the sole primary key,
+refuses the second customer with `23505`.
+
+`user_id` needs no remapping because Part 3 preserved the uuids. Tables keyed by
+`uuid` merge with no special handling at all, which is what makes the collision
+a property of key allocation rather than of merging.
+
+Then the step that is easy to skip, because it does not fail during the
+migration:
+
+```sql
+-- The merged table's sequence still starts at 1, which is a live id for every
+-- tenant you just imported.
+select setval(
+  pg_get_serial_sequence('public.orders', 'id'),
+  (select max(id) from public.orders),
+  true);
+```
+
+Without it the **first write after cutover** fails with `23505`, in production,
+on a table that migrated cleanly.
+
+## Part 5: turn isolation on
+
+Before the merge, isolation was an instance boundary. After it, isolation is a
+predicate on a claim, and the order of these statements decides whether the
+application is briefly blank or briefly wrong.
+
+The claim design itself - why `tenant_id` belongs in `app_metadata` rather than
+`user_metadata`, and what a tenant can do to a claim it can write - is Part 2 of
+[the shared-tenancy guide](/guides/supabase-shared-tenancy-and-promotion/) and
+is not repeated here. What follows is only what changes when the rows already
+exist.
+
+```sql
+-- 1. The column, backfilled and constrained, BEFORE any policy exists.
+alter table public.orders add column if not exists tenant_id text;
+update public.orders set tenant_id = 'tenant-a' where tenant_id is null;
+alter table public.orders alter column tenant_id set not null;
+
+-- 2. RLS and the policy in the same migration. Between them, the table is
+--    deny-all: measured, a tenant gets HTTP 200 and zero rows.
+alter table public.orders enable row level security;
+create policy tenant_isolation on public.orders
+  using      (tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id'))
+  with check (tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id'));
+```
+
+Then find what you missed. Every table that was isolated by the instance
+boundary and is now isolated by nothing:
+
+```sql
+select c.relname
+  from pg_class c
+  join pg_namespace n on n.oid = c.relnamespace
+ where n.nspname = 'public' and c.relkind = 'r' and not c.relrowsecurity
+ order by 1;
+```
+
+Measured: a table left off that list is readable in full by every tenant. One
+missed table is a cross-tenant read, which is why "RLS on every table" is a
+requirement rather than a slogan.
+
+## Verification
+
+Four checks, in the order in which they can lie to you.
+
+**1. The users arrived with their passwords.** Not "the rows are there" - an
+actual login, with the password from before the merge:
+
+```bash
+curl -sS -X POST "https://$SHARED_REF.supabase.co/auth/v1/token?grant_type=password" \
+  -H "apikey: $SHARED_ANON" -H "Content-Type: application/json" \
+  -d '{"email":"person@example.com","password":"<their existing password>"}' \
+| jq '{ok: (.access_token != null), tenant: (.user.app_metadata.tenant_id)}'
+```
+
+Expect `{"ok": true, "tenant": "tenant-a"}`. A `400 invalid_credentials` here
+means `password_hash` was dropped, and every user is facing a reset.
+
+**2. Nobody was split in two.** The target's index is case-sensitive, so ask in
+lower case:
+
+```sql
+select lower(email), count(*)
+  from auth.users
+ group by 1 having count(*) > 1;
+```
+
+Expect zero rows. Any row here is a person whose login lands in one tenant or
+the other depending on the attempt - see the gotcha below.
+
+**3. Isolation holds for a tenant, not for you.** Read through PostgREST with a
+real tenant token, not through the SQL console:
+
+```bash
+curl -sS "https://$SHARED_REF.supabase.co/rest/v1/orders?select=tenant_id&tenant_id=eq.tenant-a" \
+  -H "apikey: $SHARED_ANON" -H "Authorization: Bearer $TENANT_B_TOKEN" | jq length
+```
+
+Expect `0`. Measured: the same query as the console's `postgres` role returns
+every row, because RLS does not constrain it.
+
+**4. The write half.** Ask for `return=minimal` and then count server-side,
+because the default conflates two different outcomes:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -X POST "https://$SHARED_REF.supabase.co/rest/v1/orders" \
+  -H "apikey: $SHARED_ANON" -H "Authorization: Bearer $TENANT_B_TOKEN" \
+  -H "Content-Type: application/json" -H "Prefer: return=minimal" \
+  -d '{"tenant_id":"tenant-a","id":9001,"sku":"forged"}'
+```
+
+Expect `403`, and then confirm no row landed.
+
+## Gotchas and lessons learned
+
+**One duplicate address costs the whole customer.** A bulk insert is one
+statement and therefore atomic. Measured: a source offering two users, one of
+whom already existed, contributed zero. Migrate per user and collect the
+failures.
+
+**A SQL copy admits a case-variant of an address, and the resulting login is
+non-deterministic.** The index is a btree over the raw column, so
+`Person@example.com` lands alongside `person@example.com`. This is not a
+cosmetic duplicate. Over five login attempts at each casing, all returned HTTP
+200, both accounts were reachable from both input strings, and the mapping
+changed mid-sequence:
+
+```
+lower -> f163, f163, f163, ae87, ae87
+upper -> ae87, ae87, f163, f163, f163
+```
+
+Two accounts, two different `tenant_id` claims, and which one the person gets is
+decided per attempt. The admin endpoint normalises case and refuses the second
+with `422 email_exists`, which is the strongest single argument for using it.
+
+**The migration console is not constrained by the policy you are testing.** The
+Management API query endpoint connects as `postgres`. Measured: it returned all
+three rows while the tenant returned zero. Verifying that data landed and
+verifying that isolation works are different questions, and only one of them can
+be answered from the SQL editor.
+
+**PostgREST's default `return=representation` reports a permitted write as
+`403 42501`.** `RETURNING` is filtered by the SELECT policy, so a row a tenant is
+allowed to insert but not allowed to see fails the statement and rolls back.
+Measured against a deliberately open policy: the write was permitted, one row
+landed under `return=minimal`, and the identical write under the default came
+back `403`. Any RLS write test written against PostgREST defaults reports an open
+hole as closed.
+
+**`using` without `with check` is not the hole people think it is.** For a `FOR
+ALL` policy, Postgres reuses the `USING` expression as the check when no `WITH
+CHECK` is given: measured, a forged insert was refused and left zero rows. The
+hole that does exist is `with check (true)`, which someone adds when an insert
+starts failing and the cause is not obvious. Measured: with it, one tenant wrote
+a row attributed to another while every read test kept passing.
+
+**The sequence is the last thing to fail and the first thing to be blamed on
+something else.** It surfaces on the first write after cutover, long after the
+migration has been declared successful.
+
+**Enabling RLS before backfilling `tenant_id` reads as an outage.** Deny-all with
+no policy returns HTTP 200 and an empty array, so the application goes blank
+rather than erroring. Keep the enable and the policy in one migration.
+
+## Evidence
+
+| Claim | How it was checked | Result |
+|---|---|---|
+| Admin create accepts an existing bcrypt hash | `POST /auth/v1/admin/users` with the source's `encrypted_password` as `password_hash` | Measured - HTTP 200, and the user logs in with the original password |
+| That result is attributable to `password_hash` | Control: same create with no password material, then login | Measured - `400 invalid_credentials` |
+| A supplied `id` is honoured | Compared the created user's uuid with the source's | Measured - identical, so stored `user_id` values still resolve |
+| `app_metadata` at creation reaches the token | Decoded the access token after login | Measured - `tenant_id` present |
+| Duplicate address on the admin endpoint | Second create with an existing address | Measured - `422 email_exists` |
+| The admin endpoint normalises case | Create with an upper-case variant of an existing address | Measured - `422 email_exists`, one row for that person |
+| The SQL path does not | Copied the same address upper-cased into `auth.users` | Measured - **accepted**, two rows differing only by case |
+| Which of the two a login reaches | 5 login attempts per casing, comparing the `sub` claim | Measured - both reachable from both inputs, mapping unstable across attempts |
+| One duplicate costs the whole customer | Bulk-copied a source holding one conflicting and one clean user | Measured - `23505`, 0 of 2 landed |
+| `auth.users` copies many-to-one | Catalog-enumerated column copy via `json_populate_recordset` | Measured - 3/3 rows over 34 non-generated columns |
+| Password and uuid survive the SQL path too | Login at the target, uuid comparison | Measured - both hold |
+| Identity rows are not needed for password login | Counted `auth.identities` on the target after a users-only copy | Measured - 0 rows, login still succeeds |
+| The copy is non-destructive | Logged in at the source afterwards | Measured - HTTP 200 |
+| Both sources allocate the same surrogate keys | Read primary keys on two independently seeded sources | Measured - `{1,2,3}` on each |
+| A single-column `id` primary key refuses the second source | Merged both into it | Measured - `23505` on the primary key |
+| `primary key (tenant_id, id)` keeps ids intact | Merged both into it | Measured - 6 rows over 3 distinct ids |
+| `uuid` keys merge with no handling | Merged a uuid-keyed table from both sources | Measured - 4 rows, no collision |
+| The first write after the merge collides | Inserted a new row without resyncing the sequence | Measured - `23505`; `setval` fixes it |
+| RLS with no policy denies the tenant | Read as a tenant between the enable and the policy | Measured - HTTP 200, 0 rows |
+| The query endpoint is not constrained by RLS | Same read via the Management API | Measured - role `postgres`, all rows |
+| Tenant isolation on merged rows | Read as each tenant, and cross-tenant with an explicit filter | Measured - 2 of 3, and `[]` |
+| `FOR ALL` with only `using` governs writes | Forged insert with `return=minimal`, then counted | Measured - refused, 0 rows landed |
+| `with check (true)` is the write hole | Same insert under a permissive check | Measured - accepted, 1 row landed, reads still isolated |
+| `return=representation` masks that | Identical insert under the default preference | Measured - `403 42501` on a permitted write |
+| A table without RLS is readable by every tenant | Read a non-RLS table as the other tenant | Measured - all rows |
+| Social and SSO identity migration | Not exercised - the run was email and password only | Not tested |
+| Wall-clock cost at real customer counts | Two sources, three users and three orders each | Not tested |
+| Storage objects, Edge Functions, cron jobs, webhooks | Out of scope for this run | Not tested |
+
+_All measurements were taken on throwaway projects created and destroyed for this
+guide, on 2026-08-04._
+
+## Related
+
+- [Shared-instance tenancy on Supabase, and promoting a tenant out of it](/guides/supabase-shared-tenancy-and-promotion/)
+  - the opposite direction, and the RLS and claim design this guide consolidates onto.
+- [Consolidating Supabase accounts into one organization](/guides/supabase-org-consolidation/)
+  - the cheaper move, when the projects are fine and only the billing and admin
+  surface needs consolidating.
