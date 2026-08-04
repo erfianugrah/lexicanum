@@ -41,6 +41,8 @@ const REGION = "guides/supabase-region-migration-e2e";
 const CONSOLIDATION = "guides/supabase-org-consolidation";
 const TENANCY = "guides/supabase-shared-tenancy-and-promotion";
 const MULTITENANT = "reference/supabase-multitenant-platform";
+const TENANT_MERGE = "guides/supabase-tenant-consolidation";
+const PBKDF2 = "guides/pbkdf2-supabase-auth-migration";
 
 const pins: Pin[] = [
   {
@@ -102,6 +104,34 @@ const pins: Pin[] = [
     ],
     sections: [/^#{2,3} .*Verification/m, /^#{2,3} .*Gotchas/m],
     linksTo: [CONSOLIDATION, REGION],
+  },
+  {
+    doc: TENANT_MERGE,
+    mustContain: [
+      // The index is over the RAW column, so a SQL copy lands a second row for
+      // one human and the login reaches either of them. This is the finding the
+      // guide exists for and the easiest one to soften into "watch out for
+      // duplicate emails".
+      "users_email_partial_key",
+      "two rows differing only by case",
+      // A bulk insert is one statement: the conflict costs the customer, not the
+      // row. Pinned because the number is what makes it land.
+      "0 of 2",
+      // Without this, an RLS write test reports an open hole as closed.
+      "return=minimal",
+    ],
+    sections: [/^#{2,3} .*Verification/m, /^#{2,3} .*Gotchas/m],
+    // Not MULTITENANT: that link is real but the doc is still a draft, and a pin
+    // should not encode a state another change is in the middle of.
+    linksTo: [TENANCY, PBKDF2],
+  },
+  {
+    doc: PBKDF2,
+    // The bcrypt row of the accepted-set table is what makes a
+    // Supabase-to-Supabase merge cheap, and the 500 applies to formats GoTrue
+    // cannot verify rather than to password_hash as such.
+    mustContain: ["password_hash"],
+    linksTo: [TENANT_MERGE],
   },
   {
     doc: MULTITENANT,
