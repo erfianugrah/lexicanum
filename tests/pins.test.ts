@@ -68,14 +68,20 @@ const pins: Pin[] = [
       "terminating connection due to administrator command",
       // The upgrade row is absent for a structural reason, not an oversight.
       "deprecated and typed null",
+      // The page is one account's observations, not a platform claim. Losing
+      // either of these turns a measurement into an assertion about Supabase.
+      "against my own organization",
+      "not a claim about what anyone else would see",
+      // The topology story predicts the ordering but was never inspected.
+      "inference from the result, not something measured here",
     ],
     mustNotContain: [
       // duration_estimate_hours is the platform's published estimate. It is
       // NOT a measured outage, and this page exists to keep that distinction.
       "measured upgrade window",
     ],
-    sections: [/^## Evidence$/m, /^## Reading the numbers$/m, /^## TL;DR$/m],
-    anchors: ["the-matrix", "reading-the-numbers", "evidence"],
+    sections: [/^## Evidence$/m, /^## Reading the numbers$/m, /^## The hypotheses$/m],
+    anchors: ["the-hypotheses", "reading-the-numbers", "evidence"],
   },
   {
     doc: UPGRADE,
