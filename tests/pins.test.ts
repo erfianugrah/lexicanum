@@ -164,6 +164,13 @@ const pins: Pin[] = [
     ],
     mustNotContain: [
       "Gateway (stable facade)",
+      // A "not yet tested" section listing three struck-through measured items
+      // reads as though the work was never done. The strikethroughs went; the
+      // history is one sentence now.
+      "~~**The gateway**~~",
+      // n=1 at 138 s was superseded by n=5 at 131-159 s, and for a while the
+      // evidence table carried both as separate rows.
+      "Create -> healthy = 138 s",
     ],
     sections: [/^#{2,3} .*(TL;DR|Decision)/m, /^#{2,3} .*Verified/m, /^#{2,3} .*design-only/m],
     // No linksTo: this doc is still a draft and links nowhere yet. The old bash
