@@ -43,12 +43,27 @@ const TENANCY = "guides/supabase-shared-tenancy-and-promotion";
 const MULTITENANT = "reference/supabase-multitenant-platform";
 const TENANT_MERGE = "guides/supabase-tenant-consolidation";
 const PBKDF2 = "guides/pbkdf2-supabase-auth-migration";
-const DOWNTIME = "reference/supabase-platform-operation-downtime";
+const OPCOST = "reference/supabase-platform-operation-cost";
 
 const pins: Pin[] = [
   {
-    doc: DOWNTIME,
+    doc: OPCOST,
     mustContain: [
+      // Absorbed here from the docs that measured them, so the operation-cost
+      // facts live in one place instead of inside whichever doc needed them
+      // first. Provisioning came from the multi-tenant reference (n=5, median
+      // 131 s); the paid-to-Free figure came from the org-consolidation guide,
+      // where the instance is resized to Nano on arrival.
+      "131-159 s",
+      "75.2 s",
+      // The restriction dwell is a chosen test parameter. Naming the caveat
+      // without the value leaves the 62 s window unreconstructable.
+      "60 s",
+      // The probe timeout is 5 s and the sample loop is serial, so a path
+      // failing BY TIMEOUT is sampled far coarser than the nominal interval.
+      // The restart pooler window is the one number this applies to, and the
+      // page argues about resolution, so the limit has to be on the page.
+      "5000",
       // The whole point of the page: a single duration is the wrong shape.
       // If an edit ever softens this into "a restart takes about a minute",
       // the page has lost its argument.
@@ -79,9 +94,30 @@ const pins: Pin[] = [
       // duration_estimate_hours is the platform's published estimate. It is
       // NOT a measured outage, and this page exists to keep that distinction.
       "measured upgrade window",
+      // Corrections checked against the lab that produced the numbers
+      // (~/supabase-lab experiments/platform-downtime). Each of these shipped
+      // and each is contradicted by the harness source or RUNLOG.
+      //
+      // The hypothesis table listed six; the lede and description said five.
+      "and four related ones",
+      "Five hypotheses",
+      // sampler.ts sets t0 at SAMPLING START and dispatches the operation
+      // inside the sampled window, so first-fail is dispatch-relative, not
+      // response-relative. Also over-general: the restriction bit at 1 s while
+      // the restart and both resizes bit at 2-3 s.
+      "2-3 seconds after the API returned",
+      // 207/196 is +5.6 %.
+      "within 5 %",
+      // Auth 131/75 = 1.75x but pooler 207/158 = 1.31x, and that pooler pair is
+      // quoted in the same sentence.
+      "cost roughly twice",
+      // The restriction was run twice (RUNLOG: "zero failed samples, twice"),
+      // so a blanket every-window-is-n=1 undercuts the one repeatability claim
+      // the page actually has.
+      "Every window is",
     ],
-    sections: [/^## Evidence$/m, /^## Reading the numbers$/m, /^## The hypotheses$/m],
-    anchors: ["the-hypotheses", "reading-the-numbers", "evidence"],
+    sections: [/^## Evidence$/m, /^## Reading the numbers$/m],
+    anchors: ["reading-the-numbers", "evidence"],
   },
   {
     doc: UPGRADE,
