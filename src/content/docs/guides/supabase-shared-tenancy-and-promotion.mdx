@@ -338,8 +338,38 @@ calls. Two ways to absorb that:
 
 The token is valid against both projects either way, which removes the hardest thing a
 gateway would otherwise have to do - it never needs to reissue or rewrite tokens.
-**Neither approach was built or tested in this run.** They are the part of this
-architecture that remains design.
+
+**Measured 2026-08-04: the discovery endpoint is enough, and the gateway is not
+needed.** A client that read its `{ref, publishable key}` from a registry at request
+time followed a tenant through a promotion with zero password logins - the refresh
+token it already held minted a session at the dedicated project, and the read
+returned the tenant's rows there. The other tenant, untouched, still resolved to the
+shared project and still read its own row, so the flip is per-tenant. The only hosts
+contacted were the two projects: nothing terminated a request in between.
+
+That leaves ref-hiding as the gateway's last job, and it is a project setting rather
+than a component. A vanity subdomain activates over the Management API and gives the
+tenant a hostname with no project ref in it:
+
+```sh
+curl -sX POST -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"vanity_subdomain":"acme-labs"}' \
+  "https://api.supabase.com/v1/projects/$REF/vanity-subdomain/check-availability"
+# 201 {"available":true}   <- 201, not 200
+curl -sX POST -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"vanity_subdomain":"acme-labs"}' \
+  "https://api.supabase.com/v1/projects/$REF/vanity-subdomain/activate"
+```
+
+Two things about that call. It wants a bare **label**, not a hostname - a dotted
+value is rejected with 400 before availability is evaluated. And the
+[custom domains doc](https://supabase.com/docs/guides/platform/custom-domains) says
+vanity subdomains are configurable "via the CLI only"; the Management API accepts them
+directly.
+
+One caveat the same run surfaced: after the move, the shared project keeps serving the
+tenant's original token. Promotion is a copy, so both placements answer until the
+source identity is retired - see below.
 
 ## Verification
 
@@ -488,11 +518,37 @@ Three traps, each of which broke a run:
   session porting being unsupported. It is not; it is a missing `setval`.
 - **A fresh project 500s for a while after it reports healthy.** `500` with
   `SQLSTATE 57P01` on the first call is Postgres restarting inside the settle window,
-  not an answer. Retry before you believe a failure.
+  not an answer. Retry before you believe a failure. Measured across five projects on
+  2026-08-04: create to `ACTIVE_HEALTHY` took 131-159 s, and all five then refused
+  their first `admin/users` write with `500 unexpected_failure` and accepted the
+  second, one poll later. It is not a race you can get lucky with - budget the retry.
+- **Do not carry the source's `auth.refresh_tokens.id` into a target that has already
+  seen a login.** The `setval` above assumes the target is pristine, which it is for a
+  project provisioned for this promotion. Copy into one that has any prior auth
+  activity and the insert dies on `refresh_tokens_pkey` instead, because the low ids
+  are taken. Either let the target assign the id (the token string is what the client
+  presents, and the `setval` then becomes belt-and-braces) or reconcile the ids
+  yourself. Found on 2026-08-04 by running this copy twice against the same pair.
 
-Not exercised, and worth knowing before running this against anything real: MFA
-factors, OAuth and SAML identities (this was email and password only), and retiring
-the source user on the hub afterwards.
+Two of the three unexercised parts were measured on 2026-08-04, on three runs that
+agreed.
+
+**MFA travels.** A TOTP factor enrolled and verified on the hub arrives at the target
+already `status: verified` when `auth.mfa_factors` is copied alongside the other four
+tables, and the same secret produces a code that verifies there for an `aal2` session.
+Without this the zero-re-login result would have quietly excluded every account that
+had enrolled a factor - the accounts most likely to notice being logged out.
+
+**Retiring the source identity is one call, and it closes both doors.** After
+`DELETE /auth/v1/admin/users/{id}` on the hub, the hub refuses a password grant with
+`invalid_credentials` and the previously issued refresh token with
+`refresh_token_not_found`, while the dedicated project carries on unaffected. Until
+you make that call, two projects can issue for the same tenant. What it does NOT do is
+move the data: the tenant's rows stay on the shared instance, so reaping them is a
+separate, deliberate step.
+
+Still not exercised: OAuth and SAML identities. That needs a real external provider,
+and a lab that fakes one is measuring the fake.
 
 ## Rotating the hub's key is a maintenance window
 
@@ -511,6 +567,17 @@ story, and it makes rotation slow in both directions.
 The mechanism is visible in the API while it happens: the integration's
 `resolved_at` stays frozen at its pre-rotation value with only the old `kid` in
 `resolved_jwks`.
+
+A third run on 2026-08-04, instrumented to re-read both key sets at every probe,
+separates two lags the first runs could only observe stacked. The hub published the
+new `kid` in its own JWKS in about 7 minutes. The trusting project's cached set held
+exactly one `kid` on all 282 probes and never re-resolved at all, across 37 minutes
+after the rotation. So the window is the consumer's cache, not the issuer's
+publication - which is also the second reason the `DELETE` + re-`POST` mitigation
+cannot work: a consumer forced to re-resolve early would have re-cached a key set that
+did not yet list the new key. The same run re-read each key's status immediately before
+each request, so "revoked but still honoured" is now measured on both sides rather
+than inferred from a `PATCH` that returned earlier.
 
 Two consequences, and the second is the one that matters.
 
@@ -551,15 +618,18 @@ Stated plainly, because the architecture is only partly demonstrated.
 - **Per-tenant backup and PITR.** The shared instance has one backup schedule.
   Restoring one tenant to a point in time means restoring a copy and filtering, which
   is not the same product as per-project PITR.
-- **The routing layer.** Neither discovery endpoint nor gateway was built.
-- **The unexercised parts of the identity migration.** The copy is measured for
-  email and password. MFA factors, OAuth and SAML identities, and retiring the source
-  user on the hub are not.
+- ~~**The routing layer.**~~ Measured 2026-08-04. The discovery endpoint carries a
+  promotion with no re-authentication and nothing in the data path, and ref-hiding is
+  a vanity subdomain rather than a proxy. The gateway is not needed.
+- **The unexercised parts of the identity migration.** MFA factors and retiring the
+  source user were measured on 2026-08-04. OAuth and SAML identities were not, and
+  need a real external provider.
 - **The rotation anomaly.** In one of two runs the old token started failing before
   its key was revoked, while that key was still the only one the trusting project had
-  cached. The other run behaved as expected. Only status codes were captured, so no
-  mechanism is offered; settling it needs the JWKS body per step and the PostgREST
-  error code rather than the HTTP status.
+  cached. A third run on 2026-08-04, capturing the JWKS body, the PostgREST error code
+  and each key's status at every probe, did not reproduce it: the old token returned
+  200 on all 140 of its probes. That makes the observation unstable rather than
+  explained - one non-reproduction identifies no mechanism - so it stays here.
 - **The `role` claim specifically.** Only tested with an anon bearer, which fails on
   grants rather than on the claim. A clean test needs the hub to mint a token with a
   non-`authenticated` role via a custom access token hook.
@@ -583,6 +653,13 @@ Stated plainly, because the architecture is only partly demonstrated.
 | Revoking a key stops trusting projects accepting it | Marked the old key `revoked`, then polled its token for 15 minutes | Measured - no. 200 on 60/60 polls |
 | Re-creating the integration clears the stale cache | `DELETE` + re-`POST`, then polled at 500 ms | Measured - no. Cached the old `kid` again; the hub's own JWKS was still advertising only that key |
 | The tenant's live session can be ported | Copied users, identities, sessions and refresh_tokens in FK order, resynced the sequence, presented the OLD refresh token | Measured - accepted, new token issued by the new project. Zero re-logins |
+| A discovery endpoint carries a promotion without a gateway | Client re-read its `{ref, key}` from a registry after the flip and continued with the refresh token it already held | Measured - zero password logins, rows read at the dedicated project, the other tenant unaffected, only the two project hosts contacted |
+| Ref-hiding needs no proxy | `check-availability` then `activate` on the dedicated project | Measured - both 201, hostname carries no ref. Wants a bare label; the docs say CLI-only, the API accepts it |
+| MFA survives promotion | Enrolled and verified a real TOTP factor, copied `auth.mfa_factors`, verified the same secret at the target | Measured - factor arrives `verified`, target session reaches `aal2`. Three runs |
+| Retiring the source identity closes both issuing paths | `DELETE /auth/v1/admin/users/{id}` on the hub, then password grant and old refresh token there, and a login at the target | Measured - `invalid_credentials` and `refresh_token_not_found` at the hub, target unaffected, the tenant's rows still on the hub |
+| The rotation window is the consumer's cache, not the issuer's | Re-read the hub's JWKS and the trusting project's cached set at every probe for 37 minutes | Measured - hub published the new `kid` in about 7 minutes; the consumer never re-resolved, 282 probes |
+| Create to writable, not just healthy | Timed five projects from create to the first `admin/users` write that succeeded | Measured - 131-159 s to `ACTIVE_HEALTHY`; 5 of 5 refused the first write and took the second |
+| Copying `auth.refresh_tokens` ids into a used target | Ran the copy twice against the same project pair | Measured - `refresh_tokens_pkey` collision the second time; let the target assign the id |
 | Scale-to-zero on Nano removes the premise for this architecture | Platform documentation; access is granted per account | Documented, not tested |
 | OAuth tokens carry a `client_id` claim usable in RLS | Platform documentation | Documented, not tested |
 | `custom_jwks` never resolves | Created it, polled the Data API with a valid ES256 token | Measured - `PGRST301` for 7m32s over 31 polls; `jwks_url` worked first try |
