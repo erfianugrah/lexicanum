@@ -76,6 +76,8 @@ export default defineConfig({
   // published URL alive.
   redirects: {
     "/reference/pbkdf2-supabase-auth-migration": "/guides/pbkdf2-supabase-auth-migration",
+    "/reference/supabase-platform-operation-downtime":
+      "/reference/supabase-platform-operation-cost",
   },
   fonts: [
     {
