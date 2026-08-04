@@ -95,17 +95,17 @@ digraph {
 
   client [label="Tenant clients", shape=box, style=rounded];
   idp    [label="External IdP", shape=hexagon];
-  gw     [label="Gateway (stable facade)\n- routes tenant_id -> placement\n- injects project keys\n- clients never see a ref"];
+  disc   [label="Discovery endpoint\n- tenant_id -> {ref, publishable key}\n- read at runtime, not in the request path"];
   cp     [label="Control plane\n- registry: tenant_id -> {tier, placement}\n- drives Management API\n- promotion jobs"];
   tierS  [label="Tier S - shared multi-tenant\nONE always-warm project\nmany tenants, RLS by tenant_id\nmarginal cost per tenant ~= 0", shape=cylinder];
   tierD  [label="Tier D - dedicated projects\none project per paying tenant\nfull isolation + portability\n~10/mo each", shape=cylinder];
 
   client -> idp   [label="authenticate"];
-  client -> gw    [label="request + JWT"];
-  idp    -> gw    [label="JWT (role + tenant_id claim)"];
-  gw     -> cp    [label="resolve placement"];
-  gw     -> tierS [label="free / idle majority"];
-  gw     -> tierD [label="paying tenants"];
+  idp    -> client [label="JWT (role + tenant_id claim)"];
+  client -> disc  [label="resolve placement", style=dashed];
+  disc   -> cp    [label="reads registry", style=dashed];
+  client -> tierS [label="free / idle majority: direct"];
+  client -> tierD [label="paying tenants: direct"];
   tierS  -> tierD [label="promote on conversion", style=dashed];
   cp     -> tierS [label="provision / seed"];
   cp     -> tierD [label="provision / migrate"];
@@ -122,10 +122,20 @@ nothing is idle - the shared instance is always warm and always cheap per tenant
 its own project. Now the \$10/mo is justified by revenue, and it gets hard
 isolation, its own backups, and portability.
 
-**Gateway (stable facade).** Clients hit one stable host; the gateway reads the
-registry and routes to the shared project (with the tenant's scope) or the
-tenant's dedicated ref, injecting the right keys. Clients never see a project
-ref, so moving a tenant between tiers is invisible to them.
+**Placement discovery, not a gateway.** An earlier version of this architecture
+put a gateway in the request path to do two jobs: hide the project ref and inject
+the right key. Both were measured on 2026-08-04 and neither needs a component in
+front of the data plane.
+
+Placement is a lookup the client does at runtime: it asks a discovery endpoint
+for its current `{ref, publishable key}` and then talks to that project
+directly. A tenant moved from the shared project to a dedicated one kept working
+across the move with zero password logins - the refresh token the client already
+held minted a session at the new project, and the only hosts it contacted were
+the two projects themselves. Ref-hiding is a project setting: a vanity subdomain
+gives the tenant a hostname that contains no project ref. So the gateway leaves
+the architecture, and with it the availability and latency cost of terminating
+every tenant request.
 
 **External IdP (the load-bearing choice).** Use one external issuer (Clerk,
 Auth0, WorkOS, or your own) as the stable JWT issuer for every tenant. Each
@@ -140,6 +150,19 @@ changes) without logging anyone out, because the *issuer* never changed.
 project, copy that tenant's slice out of the shared instance (logical
 replication / dump-restore of its rows, roles, storage), repoint the registry,
 reap the old rows.
+
+Three things about that copy are measured rather than assumed. MFA travels: a
+TOTP factor enrolled on the shared project arrives at the destination already
+`verified`, and the same secret produces a code that verifies there for an
+[`aal2` session](https://supabase.com/docs/guides/auth/auth-mfa) - without which "zero re-logins" would quietly exclude
+every account that had enrolled one. Retiring the source identity is a single
+`DELETE /auth/v1/admin/users/{id}` and it closes both issuing paths at the source
+while the destination carries on; the tenant's ROWS stay behind, so reaping them
+is a separate deliberate step. And do not carry the source's
+`auth.refresh_tokens.id`: it is a bigserial, so a destination that has seen any
+prior auth activity already holds the low ids and the copy dies on
+`refresh_tokens_pkey`. Let the destination assign it - the token string is what
+the client presents.
 
 ## Tested: does shared-instance RLS actually isolate tenants?
 
@@ -244,14 +267,26 @@ the shared tier lets you skip:
 
 | Operation | Measured | Method |
 |---|---|---|
-| Create project -> `ACTIVE_HEALTHY` | **138 s** | poll `GET /v1/projects/{ref}` |
+| Create project -> `ACTIVE_HEALTHY` | **131-159 s** (n=5, median 131 s) | poll `GET /v1/projects/{ref}` |
+| `ACTIVE_HEALTHY` -> first write actually succeeds | **+1 poll tick** (5 of 5 refused the first `admin/users` write) | poll, then retry the write |
 | Delete project (API call) | ~2 s | `DELETE /v1/projects/{ref}` |
 | Provisioned size on a paid org | `ci_micro`, \$0.01344/hr | billing addons API |
 | Add a tenant to the **shared** tier | 2 API calls, instant, \$0 marginal | create user + insert row |
 
-That is the contrast in one table: a dedicated tenant is ~2.3 minutes of
-provisioning and \$10/mo forever; a shared tenant is two instant calls and no
+That is the contrast in one table: a dedicated tenant is a bit over two minutes
+of provisioning and \$10/mo forever; a shared tenant is two instant calls and no
 marginal compute.
+
+The second row is the one that bites a control plane. `ACTIVE_HEALTHY` is not
+readiness, and neither is per-service health - in 4 of 5 runs all three services
+reported healthy on the same poll tick as the project status, so the extra call
+bought no warning. Every one of the five then refused its first
+`POST /auth/v1/admin/users` with `500 unexpected_failure` ("Database error
+checking email") and accepted the next attempt. Five of five is not a race you
+get lucky with: provision-then-immediately-create-a-user must retry, because the
+first attempt currently fails every time. The same first-call failure shows up on
+other GoTrue admin endpoints on a young project, so treat the whole admin surface
+that way rather than special-casing one route.
 
 ## Cost and feature comparison
 
@@ -281,9 +316,12 @@ earned (and are paying for) those properties.
 - **Noisy neighbours.** One tenant's heavy query shares CPU/IO with everyone on
   that instance. Size for aggregate load and watch for hot tenants (a signal to
   promote them to Tier D).
-- **You own the control plane.** The gateway, the registry, the external IdP,
-  and the promotion migration are yours to build, run, and keep correct. SfP is
-  managed; this is not.
+- **You own the control plane.** The registry, the discovery endpoint, the
+  external IdP, and the promotion migration are yours to build, run, and keep
+  correct. SfP is managed; this is not. The discovery endpoint is the cheapest
+  of these - it is a read of a mapping, and it is not in the request path, so
+  its failure mode is "clients keep using the placement they cached" rather than
+  "the platform is down".
 - **Per-tenant operations are harder.** "Export just this tenant" or "restore
   just this tenant" are filtered dumps, not a whole-project backup.
 :::
@@ -318,7 +356,10 @@ doc-grounded but **not** yet proven end-to-end:
   copied to a dedicated project and read with the ORIGINAL token, no re-login,
   and the rows remained on the shared instance (promotion is non-destructive by
   itself).
-- **The gateway** (ref-hiding, key injection, placement routing). Not built.
+- ~~**The gateway**~~ (ref-hiding, key injection, placement routing). Measured
+  2026-08-04, and the finding removed it. Placement is a runtime lookup and
+  ref-hiding is a project setting; nothing has to sit in front of the data plane.
+  See the discovery and vanity-subdomain rows below.
 - **Scale / noisy-neighbour.** Everything above used 2 tenants and a handful of
   rows; nothing measures many-tenant contention or the amortization claim under
   load.
@@ -338,7 +379,12 @@ tested the same way.
 | Create -> healthy = 138 s; delete ~2 s | live, timed against Management API |
 | RLS isolation, `with check`, fail-closed, bypass | Proof 1 - Postgres 17, 7/7 pass |
 | Isolation through real PostgREST + GoTrue JWTs | Proof 2 - live project, 6/6 pass |
-| Hub key rotation is survivable | **Refuted 2026-08-03.** A trusting project accepted no new-key token within 20 minutes and honoured a `revoked` key for 15. Re-creating the integration does not help - the issuer's own JWKS lags as well. Rotation is a maintenance window, which is a design input for choosing this pattern at all |
+| Placement discovery replaces the gateway | **Measured 2026-08-04.** A client that reads its `{ref, key}` at runtime followed a tenant from the shared project to a dedicated one with 0 password logins, reading its rows at the destination with the refresh token it already held; the other tenant was unaffected and the only hosts contacted were the two projects. The old placement kept serving until the source identity was retired |
+| Ref-hiding needs no proxy | **Measured 2026-08-04.** `POST /v1/projects/{ref}/vanity-subdomain/check-availability` then `/activate` both returned 201 and the tenant-facing hostname carries no project ref. Note the [custom domains doc](https://supabase.com/docs/guides/platform/custom-domains) says vanity subdomains are configurable "via the CLI only" - the Management API accepts them directly. `check-availability` answers 201, not 200, and wants a bare label rather than a hostname |
+| MFA survives promotion | **Measured 2026-08-04.** A real TOTP factor, enrolled and verified at the source, copies across `verified`, and the same secret reaches `aal2` at the destination |
+| Retiring the source identity closes it | **Measured 2026-08-04.** After `DELETE /auth/v1/admin/users/{id}` the source refuses both the password grant (`invalid_credentials`) and the previously issued refresh token (`refresh_token_not_found`), while the destination is unaffected. The tenant's rows remain on the source |
+| Provisioning: healthy is not writable | **Measured 2026-08-04, n=5.** Create -> `ACTIVE_HEALTHY` 131-159 s; all 5 projects refused their first `admin/users` write with `500 unexpected_failure` and accepted the second, one poll tick later |
+| Hub key rotation is survivable | **Refuted 2026-08-03.** A trusting project accepted no new-key token within 20 minutes and honoured a `revoked` key for 15. Re-creating the integration does not help - the issuer's own JWKS lags as well. Rotation is a maintenance window, which is a design input for choosing this pattern at all. **Re-measured 2026-08-04** with both key sets re-read at every probe: the issuer published the new key in about 7 minutes while the trusting project never re-resolved at all in 37, so the window is the consumer's cache rather than the issuer's publication - which is also why re-creating the integration cannot fix it |
 | A promoted tenant can be made independent | **Measured 2026-08-03.** Copying one `auth.users` row gives the dedicated project its own issuance; adding identities, sessions and refresh_tokens with a sequence resync ports the live session, so promotion costs zero re-logins. Unsupported (writes into the `auth` schema) but tested |
 | A promoted tenant is independent *by default* | **Refuted 2026-08-03.** The dedicated project verifies the hub's tokens but cannot mint them - refresh returns `400 refresh_token_not_found`, and after deleting the hub its already-issued tokens kept working while nothing new could be issued. The hub is on the availability critical path; blast radius is one token lifetime (3600 s default) |
 | A tenant cannot forge its `tenant_id` (`app_metadata` admin-only) | Proof 3 - live project, 3/3 attacks fail; re-measured 2026-08-03 on two fresh projects - `PUT /auth/v1/user` returns `403 Updating app_metadata requires admin privileges`, signup silently drops the field, and an admin write moves the boundary as a positive control |

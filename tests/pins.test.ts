@@ -101,6 +101,23 @@ const pins: Pin[] = [
       "custom_jwks",
       "PGRST301",
       "app_metadata",
+      // Measured 2026-08-04. The gateway left the architecture: placement is a
+      // runtime lookup and ref-hiding is a project setting. A doc that drifts
+      // back to "we would need a proxy" is asserting something disproven.
+      "the discovery endpoint is enough",
+      "vanity-subdomain/activate",
+      // The rotation window belongs to the consumer's cache, not the issuer.
+      // The earlier text let a reader blame publication lag and hope for a fix.
+      "the window is the consumer's cache",
+      // Promotion covers MFA-enrolled accounts, and the source identity has to
+      // be retired explicitly or two projects issue for one tenant.
+      "MFA travels",
+      "refresh_token_not_found",
+    ],
+    mustNotContain: [
+      // Both were true when written and are now measured false.
+      "Neither approach was built or tested in this run",
+      "Neither discovery endpoint nor gateway was built",
     ],
     sections: [/^#{2,3} .*Verification/m, /^#{2,3} .*Gotchas/m],
     linksTo: [CONSOLIDATION, REGION],
@@ -135,6 +152,19 @@ const pins: Pin[] = [
   },
   {
     doc: MULTITENANT,
+    mustContain: [
+      // The gateway was removed from the architecture on 2026-08-04 after the
+      // discovery endpoint carried a promotion with nothing in the data path.
+      // These pins are inert while the doc is a draft (the built page does not
+      // exist, so the pin suite skips it) and become live the moment it ships.
+      "Placement discovery, not a gateway",
+      "vanity subdomain",
+      // Provisioning: healthy is not writable, measured over five projects.
+      "131-159 s",
+    ],
+    mustNotContain: [
+      "Gateway (stable facade)",
+    ],
     sections: [/^#{2,3} .*(TL;DR|Decision)/m, /^#{2,3} .*Verified/m, /^#{2,3} .*design-only/m],
     // No linksTo: this doc is still a draft and links nowhere yet. The old bash
     // matrix asserted it linked to two guides and PASSED - by grepping built
