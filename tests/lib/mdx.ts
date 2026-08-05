@@ -268,3 +268,64 @@ export const SMART_PUNCT = /[\u2013\u2014\u2018\u2019\u201C\u201D\u2026]/;
 export function smartPunctLines(doc: Doc): Line[] {
   return doc.lines.filter((l) => l.kind !== "fence" && SMART_PUNCT.test(l.raw));
 }
+
+/**
+ * Phrasings that mark prose as machine-written, plus the house-style bans from
+ * AGENTS.md that a regex can enforce.
+ *
+ * The list is calibrated against this corpus, not copied from a listicle. Each
+ * entry was checked for existing legitimate use before being included:
+ * "leverage" survives as a noun ("order of leverage against a distant
+ * database"), "unlock" is a QMK keymap feature, "elevated" is a privilege level
+ * and a fraud score, and "essentially" is not "essential". None are banned.
+ *
+ * Matching runs on `proseNoCode`, so fenced code and inline code spans are
+ * exempt. That exemption is load-bearing rather than defensive: ` -- ` is
+ * banned because SmartyPants renders it as an en-dash, which it does not do
+ * inside a fence, and the tenancy reference's RLS policy carries `-- reads` and
+ * `-- writes` as ordinary SQL comments. A fence-blind version of this check
+ * flagged both.
+ */
+export const LLM_MARKERS: RegExp[] = [
+  /\bdelv\w*/i,
+  /\bseamless(ly)?\b/i,
+  /\bcrucial(ly)?\b/i,
+  /\bessential\b/i,
+  /\bcomprehensive\b/i,
+  /\brobust\b/i,
+  /\bsignificantly\b/i,
+  /\bstreamlin\w*/i,
+  /\bempower\w*/i,
+  /\bcutting-edge\b/i,
+  /\bgame[- ]chang\w*/i,
+  /worth noting/i,
+  /important to note/i,
+  /\b(dive|deep dive) into\b/i,
+  /in today's\b/i,
+  /here's the thing/i,
+  /at the end of the day/i,
+  /when it comes to/i,
+  /testament to/i,
+  /harness the power/i,
+  /navigate the complexities/i,
+  /plays a (key|crucial|vital|central) role/i,
+  // AGENTS.md house-style bans: rating your own points, and the SmartyPants
+  // en-dash trap.
+  /the big win/i,
+  /the nasty one/i,
+  /the trap that/i,
+  /lock it in/i,
+  / -- /,
+];
+
+export function markerLines(doc: Doc): { line: Line; marker: string }[] {
+  const out: { line: Line; marker: string }[] = [];
+  for (const l of doc.lines) {
+    if (l.kind !== "prose") continue;
+    for (const re of LLM_MARKERS) {
+      const m = re.exec(l.proseNoCode);
+      if (m) out.push({ line: l, marker: m[0] });
+    }
+  }
+  return out;
+}
