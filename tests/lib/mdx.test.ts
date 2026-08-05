@@ -5,7 +5,7 @@
  * a regression is a concrete regression rather than a hypothetical one.
  */
 import { describe, expect, test } from "bun:test";
-import { mathRiskLines, parseMdx, smartPunctLines, splitTables } from "./mdx";
+import { markerLines, mathRiskLines, parseMdx, smartPunctLines, splitTables } from "./mdx";
 
 const fm = (body: string) => `---\ntitle: t\ndescription: d\n---\n\n${body}`;
 
@@ -210,6 +210,49 @@ describe("smart punctuation", () => {
 
   test("ASCII punctuation is clean", () => {
     expect(smartPunctLines(parseMdx("t.mdx", fm("a - b, \"quoted\", three dots...\n")))).toHaveLength(0);
+  });
+});
+
+describe("machine-written phrasing", () => {
+  test("a banned word in prose is a finding", () => {
+    expect(markerLines(parseMdx("t.mdx", fm("the rollout was seamless\n")))).toHaveLength(1);
+    expect(markerLines(parseMdx("t.mdx", fm("it is crucial to reboot\n")))).toHaveLength(1);
+  });
+
+  // The defect that produced the fence-aware version. AGENTS.md bans " -- " in
+  // prose because SmartyPants renders it as an en-dash, which it does not do
+  // inside a fence. A fence-blind check flagged the tenancy reference's RLS
+  // policy for two ordinary SQL comments.
+  test("a SQL comment inside a fence is not a finding", () => {
+    const doc = parseMdx("t.mdx", fm("```sql\nselect 1 -- reads\n```\n"));
+    expect(markerLines(doc)).toHaveLength(0);
+  });
+
+  test("an inline code span is not a finding", () => {
+    expect(markerLines(parseMdx("t.mdx", fm("pass `--robust` to the CLI\n")))).toHaveLength(0);
+  });
+
+  test(" -- in prose is a finding", () => {
+    expect(markerLines(parseMdx("t.mdx", fm("a -- b\n")))).toHaveLength(1);
+  });
+
+  // Calibration cases. Each of these was checked against the corpus and is
+  // legitimate usage, so banning the root word would produce false positives.
+  test("words with legitimate corpus usage are not banned", () => {
+    const ok = [
+      "order of leverage against a distant database",
+      "the unlock combo is a security feature",
+      "requires an elevated ephemeral ID score",
+      "PKCE essentially replaces something you know",
+      "the branch additionally wants a direct connection",
+    ];
+    for (const line of ok) {
+      expect(markerLines(parseMdx("t.mdx", fm(`${line}\n`)))).toHaveLength(0);
+    }
+  });
+
+  test("a sentence-initial connective is a finding", () => {
+    expect(markerLines(parseMdx("t.mdx", fm("Additionally, the pooler drops.\n")))).toHaveLength(1);
   });
 });
 
