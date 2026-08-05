@@ -165,8 +165,14 @@ const pins: Pin[] = [
   },
   {
     doc: CONSOLIDATION,
+    // Retitled off "Consolidating Supabase accounts...", which read as a
+    // near-twin of the tenant-consolidation guide's title while describing an
+    // unrelated operation. The sidebar sorts by filename so the two were never
+    // adjacent, but both being visible and both opening on "Consolidating" was
+    // enough to confuse the two moves.
+    mustNotContain: ["Consolidating Supabase accounts into one organization"],
     sections: [/^#{2,3} .*Verification/m, /^#{2,3} .*Gotchas/m],
-    linksTo: [REGION, SHARED],
+    linksTo: [REGION, SHARED, MULTITENANT],
   },
   // The 694-line shared-tenancy-and-promotion guide was two guides: building the
   // shared tier, and moving one tenant off it. Its pins split by which half's
@@ -190,8 +196,10 @@ const pins: Pin[] = [
     ],
     sections: [/^#{2,3} .*Verification/m, /^#{2,3} .*Gotchas/m],
     // The two halves must reach each other. A split guide whose halves do not
-    // cross-link is worse than the single doc was.
-    linksTo: [PROMOTION, TENANT_MERGE],
+    // cross-link is worse than the single doc was. MULTITENANT because every
+    // guide in the set has to reach the doc that argues the decision - its
+    // absence is what let a runbook get asked to argue one.
+    linksTo: [PROMOTION, TENANT_MERGE, MULTITENANT],
   },
   {
     doc: PROMOTION,
@@ -215,7 +223,7 @@ const pins: Pin[] = [
       "Neither discovery endpoint nor gateway was built",
     ],
     sections: [/^#{2,3} .*Verification/m, /^#{2,3} .*Gotchas/m],
-    linksTo: [SHARED, REGION],
+    linksTo: [SHARED, REGION, MULTITENANT],
   },
   {
     doc: TENANT_MERGE,
