@@ -78,6 +78,10 @@ export default defineConfig({
     "/reference/pbkdf2-supabase-auth-migration": "/guides/pbkdf2-supabase-auth-migration",
     "/reference/supabase-platform-operation-downtime":
       "/reference/supabase-platform-operation-cost",
+    // Split into one guide per transition. The build half keeps the inbound
+    // links, because that is what almost every caller meant by "the tenancy
+    // guide"; callers that meant promotion were repointed individually.
+    "/guides/supabase-shared-tenancy-and-promotion": "/guides/supabase-shared-tenancy",
   },
   fonts: [
     {
