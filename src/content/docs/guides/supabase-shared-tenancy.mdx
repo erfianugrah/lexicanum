@@ -1,0 +1,382 @@
+---
+title: Running many tenants on one Supabase project
+description: One Supabase project per end-tenant means paying a compute floor for every idle account, and a project on a paid plan cannot be paused. Put the free and trial majority in one always-warm project, separated by RLS on an identity claim the tenant cannot write, with a hub project whose issuer every other project trusts - the trust wiring, the shared schema, and the isolation tests that prove the separation holds.
+author: Erfi Anugrah
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+If you give each of your end-users a backend - an app builder, a per-customer
+workspace, a low-code tool - the obvious move is one Supabase project per tenant. It
+isolates cleanly and the Management API provisions one in a call. It also commits you
+to roughly \$10/month of compute for every tenant including the idle ones, and a
+project on a paid plan cannot be paused.
+
+The alternative is to put the free and trial majority in one always-warm project,
+separated by row-level security on an identity claim, and give a tenant its own
+project only when it starts paying. This guide builds that.
+[Promoting a tenant to its own Supabase project](/guides/supabase-tenant-promotion/)
+is the runbook for the move itself, once one converts.
+
+<Aside type="caution">
+This trades physical isolation for cost on the shared tier. Tenants in it share one
+Postgres instance, one compute allocation and one backup schedule; they are separated
+by RLS, not by infrastructure. There is no per-tenant PITR and no noisy-neighbour
+protection. If per-tenant physical isolation is a product or compliance requirement,
+stop here and use a project per tenant -
+[consolidating them into one organization](/guides/supabase-org-consolidation/) is the
+guide you want instead.
+</Aside>
+
+## What you will build
+
+- One **hub** project whose GoTrue issues every tenant's token.
+- One **shared** project holding many tenants, with RLS keyed on a `tenant_id` claim.
+
+Prerequisites: a Personal Access Token in `SUPABASE_ACCESS_TOKEN`, `jq`, and the
+Supabase CLI if you want Edge Functions.
+
+## Measurement provenance
+
+Measured 2026-08-03 against live Supabase projects in `ap-southeast-1` on Micro
+compute, Vault 0.3.1, with two tenants and three rows. Claims marked measured in the
+evidence table were executed and captured. **Nothing here measures behaviour at
+scale** - two tenants say nothing about contention, and that limitation is carried
+into the evidence table rather than dropped.
+
+The third-party-auth claims were then re-run the same day on a second, disposable
+project pair created for that purpose: all three configuration shapes side by side,
+and portability under three trust states - unconfigured, trusted, and revoked - with
+the token held byte-identical throughout. Timings quoted for trust propagation come
+from that run, and their error bar is the poll interval, not a stopwatch.
+
+## Constants
+
+| Fact | Value |
+|---|---|
+| Third-party auth endpoint | `POST /v1/projects/{ref}/config/auth/third-party-auth` |
+| Accepted config shapes | `oidc_issuer_url`, `jwks_url`, `custom_jwks` |
+| Shapes that resolve | **`oidc_issuer_url` and `jwks_url`**, both on the create response - see the gotcha on `custom_jwks` |
+| Reported `type` | `custom`, for all three shapes - it does not tell you which one created an integration |
+| A project's public JWKS | `https://<ref>.supabase.co/auth/v1/.well-known/jwks.json` |
+| Required token algorithm | asymmetric only; symmetric JWTs are rejected |
+| Required token header | a `kid` identifying the key |
+| Required token claim | `role`, valued `authenticated` for ordinary end users |
+
+JWKS caching also governs how a hub key rotation propagates - see
+[rotating the hub's key](/guides/supabase-tenant-promotion/#rotating-the-hubs-key-is-a-maintenance-window)
+in the promotion guide for the measured propagation window.
+
+## The identity decision comes first
+
+Every tenant's token must stay valid when that tenant moves from the shared project
+to its own. Supabase verifies a token by signature against a JWKS it has been told to
+trust, so if the *issuer* does not change, the tenant's physical placement can.
+
+The third-party auth guides pair Supabase with an external provider - Clerk, Auth0,
+Cognito, WorkOS. You do not need a third party, because Supabase Auth can itself act
+as an [OAuth 2.1 and OpenID Connect identity
+provider](https://supabase.com/docs/guides/auth/oauth-server): "allows other
+applications and services to use your Supabase project as their authentication
+provider". Every project serves a full discovery document (verified: HTTP 200, with
+`issuer`, `jwks_uri`, `authorization_endpoint`, `token_endpoint`, and the
+authorization-code and refresh-token grants):
+
+```bash
+curl -s "https://<hub-ref>.supabase.co/auth/v1/.well-known/openid-configuration" | jq
+```
+
+The wiring below uses the issuer URL as `oidc_issuer_url`, because discovery resolves
+`jwks_uri` itself and so survives a rotation that a hardcoded JWKS URL would not.
+Both shapes were measured on a fresh project pair and both resolve on the create
+response - in tens of milliseconds, to identical key material (same `kid`, same ES256
+key). The choice is which URL you would rather hard-code, not a capability
+difference. This comparison did not touch rotation; what is now settled is that the
+issuer form resolves at all, which is the part the third shape fails at. Rotation's
+own propagation delay is measured separately - see the caution below.
+
+The mechanism underneath is simply that **a Supabase project publishes an asymmetric
+JWKS**:
+
+```bash
+curl -s "https://<hub-ref>.supabase.co/auth/v1/.well-known/jwks.json" | jq
+```
+
+Point every other project at that URL and they will all accept tokens the hub issued.
+That removes the external-IdP dependency from the architecture, at the cost of making
+the hub a hard dependency for every project trusting it.
+
+<Aside type="caution">
+The hub's signing key becomes a fleet-wide concern. Rotating it affects every project
+configured to trust it, and the documented propagation allowance is up to 30 minutes.
+Measured against a live rotation, a trusting project did not accept new-key tokens
+within 20 minutes and kept honoring a revoked key for 15 - see
+[rotating the hub's key](/guides/supabase-tenant-promotion/#rotating-the-hubs-key-is-a-maintenance-window)
+in the promotion guide for the full runbook. If you adopt the hub pattern, treat the
+rotation as a maintenance window rather than a live cutover.
+</Aside>
+
+Use a real external provider instead if you already have one, if you need identity to
+outlive any single Supabase project, or if a fleet-wide rotation blast radius is
+unacceptable. The wiring below is identical either way - only the `jwks_url` changes.
+
+## Part 1: wire the trust
+
+Register the hub as an issuer on the shared project and on every dedicated project:
+
+```bash
+HUB=<hub-ref>
+for REF in <shared-ref> <dedicated-ref>; do
+  curl -s -X POST \
+    -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d "{\"oidc_issuer_url\":\"https://$HUB.supabase.co/auth/v1\"}" \
+    "https://api.supabase.com/v1/projects/$REF/config/auth/third-party-auth" \
+    | jq -c '{id, type, resolved: (.resolved_jwks != null), resolved_at}'
+done
+```
+
+Substitute `{"jwks_url":"https://$HUB.supabase.co/auth/v1/.well-known/jwks.json"}` if
+you prefer to pin the key endpoint; it resolves the same way.
+
+`resolved` must be `true` and `resolved_at` must be populated. If either is null the
+project will reject every token from that issuer, and the failure surfaces as
+`PGRST301 "No suitable key was found to decode the JWT"` at request time rather than
+at configuration time.
+
+List and remove integrations with:
+
+```bash
+curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  "https://api.supabase.com/v1/projects/$REF/config/auth/third-party-auth" \
+  | jq -c '[.[] | {id, oidc_issuer_url, jwks_url, resolved: (.resolved_jwks != null)}]'
+
+curl -s -X DELETE -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  "https://api.supabase.com/v1/projects/$REF/config/auth/third-party-auth/<tpa-id>"
+```
+
+The `DELETE` is the de-provisioning control, and it bites quickly: tokens the
+integration was verifying start failing with `PGRST301` under a second after it is
+removed (measured across three repeats). Neither direction is synchronous with the
+API call - a probe fired immediately after either write still sees the old state - so
+treat both as fast, not instant.
+
+## Part 2: put the tenant id somewhere a tenant cannot change
+
+Create each tenant's user on the hub with `tenant_id` in `app_metadata`. That object
+is writable only through the admin API, so a client cannot alter its own value - a
+tenant cannot promote itself into another tenant's rows by editing a claim.
+
+```bash
+curl -s -X POST "https://$HUB.supabase.co/auth/v1/admin/users" \
+  -H "Authorization: Bearer $HUB_SERVICE_KEY" \
+  -H "apikey: $HUB_SERVICE_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"user@tenant-a.example","password":"...","email_confirm":true,
+       "app_metadata":{"tenant_id":"tenant-a"}}' \
+  | jq -c '{id, email, app_metadata}'
+```
+
+The resulting access token is ES256, carries `role: authenticated`, and holds
+`tenant_id` inside `app_metadata`.
+
+<Aside type="note">
+Do not put `tenant_id` in `user_metadata`. That object IS client-writable, so an RLS
+policy reading it grants every tenant the ability to select its own scope.
+
+Both halves are measured, not inferred. A tenant's own token doing
+`PUT /auth/v1/user` with `{"app_metadata":{"tenant_id":"tenant-b"}}` is refused with
+`403 Updating app_metadata requires admin privileges`. The same token doing
+`{"data":{"tenant_id":"tenant-b"}}` SUCCEEDS - `user_metadata.tenant_id` becomes
+`tenant-b`, the next token carries it, and the read still returns only tenant A's
+rows, because the policy does not look there. Supabase's own docs state only the
+`user_metadata` half.
+</Aside>
+
+<Aside type="caution">
+Signup **silently discards** `app_metadata`. `POST /auth/v1/signup` with
+`app_metadata` in the body returns success and creates a user whose `app_metadata` is
+just `{provider, providers}` - the field is dropped without an error. That closes the
+obvious attack (a self-registered user cannot assign itself a tenant), but it cuts
+both ways: provision tenants through `POST /auth/v1/admin/users` with the secret key,
+because the same silence greets a developer who thinks signup is setting the claim.
+</Aside>
+
+## Part 3: the shared schema
+
+Every tenant-scoped table carries a `tenant_id` and a policy comparing it to the
+claim:
+
+```sql
+create table public.items (
+  id        bigserial primary key,
+  tenant_id text not null,
+  body      text not null
+);
+
+alter table public.items enable row level security;
+
+create policy tenant_isolation on public.items
+  using      (tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id'))
+  with check (tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id'));
+
+grant usage on schema public to authenticated;
+grant select, insert, update, delete on public.items to authenticated;
+grant usage, select on sequence public.items_id_seq to authenticated;
+```
+
+`using` governs reads and `with check` governs writes, but on a `for all` policy the
+two are not independent: Postgres falls back to the `using` expression for new rows
+when `with check` is absent, [as `CREATE POLICY` documents](https://www.postgresql.org/docs/17/sql-createpolicy.html).
+Tested on Postgres 17.10 - with `using`
+alone, an insert tagged for another tenant and an update reassigning an own row both
+failed with `new row violates row-level security policy`. So writing both clauses here
+is explicitness, not a hole being closed. Write them anyway: the moment the read and
+write predicates need to differ, or the policy is split per command, the fallback stops
+applying - and a `for insert` policy cannot use `using` at all, since Postgres rejects
+it with `only WITH CHECK expression allowed for INSERT`.
+
+Index the discriminator on every tenant-scoped table; every query filters on it:
+
+```sql
+create index on public.items (tenant_id);
+```
+
+## Part 4: prove the isolation before you rely on it
+
+Read as tenant A, then as tenant B, against the shared project's Data API:
+
+```bash
+curl -s "https://<shared-ref>.supabase.co/rest/v1/items?select=tenant_id,body&order=id" \
+  -H "apikey: $SHARED_ANON" -H "Authorization: Bearer $TOKEN_A" | jq -c
+# [{"tenant_id":"tenant-a","body":"a-row-1"},{"tenant_id":"tenant-a","body":"a-row-2"}]
+```
+
+Then the attempt that matters - tenant B asking for tenant A's rows by name:
+
+```bash
+curl -s "https://<shared-ref>.supabase.co/rest/v1/items?select=tenant_id,body&tenant_id=eq.tenant-a" \
+  -H "apikey: $SHARED_ANON" -H "Authorization: Bearer $TOKEN_B" | jq -c
+# []
+```
+
+An empty array, not an error. RLS filters rather than refuses, which is what you want
+- there is no oracle telling B that A exists.
+
+## Verification
+
+Run these against a two-tenant fixture before trusting the setup. The negative
+controls matter more than the positive ones - without them, "the token worked" is
+indistinguishable from the API not checking anything.
+
+| Check | How | Expected |
+|---|---|---|
+| JWKS resolved | `GET /v1/projects/{ref}/config/auth/third-party-auth` | `resolved_jwks` non-null, `resolved_at` set |
+| Token accepted | tenant A's token against the shared Data API | rows, not `PGRST301` |
+| Tenant sees only itself | read `items` as A, then as B | each gets only its own rows |
+| **Cross-tenant read denied** | as B, `?tenant_id=eq.tenant-a` | `[]` |
+| **Wrong signature rejected** | a token signed by an untrusted key | `PGRST301` |
+| **Untrusted issuer refused** | the tenant's real token against a project with NO integration configured, before wiring it | `PGRST301` |
+| **Claim not user-writable** | as A, `PUT /auth/v1/user` with `app_metadata.tenant_id = tenant-b` | `403 Updating app_metadata requires admin privileges` |
+| **Signup cannot self-assign** | `POST /auth/v1/signup` with `app_metadata` in the body | user created, `app_metadata` has no `tenant_id`, read returns `[]` |
+| Control: admin CAN move it | `PUT /auth/v1/admin/users/{id}` with the secret key | token carries the new `tenant_id` and the read follows it |
+| Anon is powerless | anon key as bearer | `[]` - grants are `authenticated`-only |
+| Write scope enforced | as B, insert a row with `tenant_id = 'tenant-a'` | rejected by `with check` |
+| **Trust removal takes effect** | `DELETE` the integration, re-read with the same token | `PGRST301` again, within a second |
+
+## Gotchas and lessons learned
+
+- **`custom_jwks` is accepted and never works.** The endpoint takes it, returns 201,
+  and echoes your key material back intact - `kty`, `crv`, `alg`, `use`, `kid`, `x`
+  and `y` all present on a subsequent `GET`. But `resolved_at` stays null and
+  PostgREST never picks the keys up. A valid ES256 token was rejected with `PGRST301`
+  continuously for 7 minutes 32 seconds across 31 polls. Substituting `jwks_url` on the
+  same integration resolved instantly and the equivalent token was accepted on the
+  first request. Re-measured on a fresh project pair: still 201, still null at 92
+  seconds, so this is the shape's behaviour and not one project having a bad day. Use
+  `oidc_issuer_url` or `jwks_url`. The failure mode is bad because everything looks
+  configured.
+- **The `type` field is `custom` whichever shape you sent.** It is not a discriminator.
+  To know how an integration was wired, read `oidc_issuer_url`, `jwks_url` and
+  `custom_jwks` themselves - and check `resolved_at` while you are there, because that
+  is the field that distinguishes a working integration from a decorative one.
+- **Order your portability test so acceptance is attributable.** Probe the target with
+  the tenant's real token BEFORE configuring trust, and require a refusal. An anon-key
+  control does not substitute for this: the anon key is signed by a key the target
+  already trusts, so it is stopped by grants and RLS and says nothing about signature
+  validation. Hold the token constant and vary only the target's configuration.
+- **`PGRST301` means the key, not the claim.** "No suitable key was found to decode
+  the JWT" is a signature-verification failure - unresolved JWKS, wrong `kid`, or a
+  symmetric token. A token that verifies but lacks the right claims fails differently:
+  you get `[]` from RLS, or a permission error from grants. Reading `PGRST301` as an
+  RLS problem sends you to debug policies that are fine.
+- **`tenant_id` belongs in `app_metadata`.** `user_metadata` is client-writable.
+- **`with check` on a `for all` policy is explicitness, not protection.** Omitting it
+  does not open a write hole - Postgres reuses `using` for new rows, verified on 17.10.
+  The claim that a tenant could then write rows it cannot read is wrong, and it was in
+  this guide until it got tested. Write both clauses so the write predicate survives a
+  later narrowing of `using`.
+- **The hub is a dependency you are choosing.** Every project trusting its JWKS
+  depends on it being reachable and on its signing key. That is the price of not
+  running an external IdP.
+- **There is a second scoping dimension if you enable the OAuth server.** Access
+  tokens issued through it carry a `client_id` claim alongside the usual ones, and
+  RLS can read it with `auth.jwt() ->> 'client_id'` to give different permissions to
+  different client applications. Useful when tenants have their own apps rather than
+  just users. Not tested here.
+
+## What this does not settle
+
+Stated plainly, because the architecture is only partly demonstrated.
+
+- **Scale.** Two tenants and three rows. Nothing here supports a claim about
+  contention, per-tenant throughput, or how far one shared instance stretches -
+  and this is a limit of the rig rather than a gap in the schedule. Measuring it
+  needs a properly-sized instance and thousands of tenants; a version of the
+  test small enough to run cheaply would report the hardware, not the
+  architecture.
+- **Noisy neighbours.** The shared tier has no per-tenant resource limit. One tenant
+  can consume the instance's CPU, connections or IO. There is no measurement of how
+  bad that gets.
+- **Per-tenant backup and PITR.** The shared instance has one backup schedule.
+  Restoring one tenant to a point in time means restoring a copy and filtering, which
+  is not the same product as per-project PITR.
+- **The `role` claim specifically.** Only tested with an anon bearer, which fails on
+  grants rather than on the claim. A clean test needs the hub to mint a token with a
+  non-`authenticated` role via a custom access token hook.
+
+## Evidence
+
+| Claim | How it was checked | Result |
+|---|---|---|
+| A project's own JWKS can be trusted by another project | Registered the hub's `/auth/v1/.well-known/jwks.json` as `jwks_url` on a second project | Measured - resolved immediately |
+| A project serves an OIDC discovery document | `GET /auth/v1/.well-known/openid-configuration` on a live project | Measured - 200, full document |
+| `oidc_issuer_url` resolves, like `jwks_url` | Created both shapes side by side on a fresh project pair and polled for resolution | Measured - both resolved on the create response, to identical key material; `oidc_issuer_url` in 59ms and 249ms across two runs |
+| The reported `type` identifies the shape | Compared the `type` field across all three shapes | Measured - `custom` for all three; it does not |
+| An untrusted issuer's token is refused | Same tenant token against the target with no integration configured | Measured - `401 PGRST301` |
+| Deleting the integration stops the token | `DELETE`, then re-read with the same token, polling | Measured - `PGRST301` after 587-654ms across three repeats |
+| Trust changes are synchronous with the API call | Probed immediately after create and after delete | Measured - no; the immediate probe sees the old state both ways. Accept landed in 1038-1169ms |
+| Scale-to-zero on Nano removes the premise for this architecture | Platform documentation; access is granted per account | Documented, not tested |
+| OAuth tokens carry a `client_id` claim usable in RLS | Platform documentation | Documented, not tested |
+| `custom_jwks` never resolves | Created it, polled the Data API with a valid ES256 token | Measured - `PGRST301` for 7m32s over 31 polls; `jwks_url` worked first try |
+| RLS on an external claim isolates tenants | Read `items` as two different tenants | Measured - each saw only its own rows |
+| Cross-tenant read denied | Filtered explicitly for the other tenant's id | Measured - `[]` |
+| A wrong-key token is rejected | Signed with a key the target does not trust | Measured - `PGRST301` |
+| `role` must be `authenticated` | Not isolated - only an anon bearer was tried, which fails on grants | Documented, not tested |
+| Behaviour at scale | Two tenants, three rows | Not tested |
+| Per-tenant isolation, PITR, noisy-neighbour protection on the shared tier | Structural: one instance, row-level separation | Not achievable on this tier by construction |
+
+## Related
+
+- [Consolidating one Supabase project per customer onto a shared project](/guides/supabase-tenant-consolidation/)
+  - the merge that gets you onto this tier when you started with a project per
+  customer. Not the promotion guide's run backwards: two projects provisioned
+  independently collide on addresses, keys and sequences, and one shared address
+  refuses an entire customer.
+- [Consolidating Supabase accounts into one organization](/guides/supabase-org-consolidation/)
+  - if a project per tenant is the right shape after all, this moves them under one
+  organization without a migration.
+- [Promoting a tenant to its own Supabase project](/guides/supabase-tenant-promotion/)
+  - the runbook for moving a tenant off this tier once it converts, including the
+  identity-migration option and the hub key-rotation risk this tier's trust wiring
+  carries.
