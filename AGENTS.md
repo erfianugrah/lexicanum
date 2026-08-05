@@ -130,6 +130,22 @@ Cite the source path when answering from docs.erfi.io in chat, too.
   wit is fine sparingly and in passing ("learned the hard way") - never a bit
   you build up to. When a step has a measured delta, give the delta and the
   command that reproduces it; that IS the persuasion.
+- **One name for one thing.** Do not mix an abbreviation with its expansion in
+  the same doc (config/configuration, database/db, auth/authentication). Pick
+  the form the doc already uses most and hold it; introducing a third form is
+  worse than either. Enforced by the `prose-terms` sensor against
+  `.prose-lint.json`, ratcheted from `.prose-terms-baseline.json` so only NEW
+  rotation fails - docs predating the check are frozen where they stand rather
+  than retro-fixed. Terms of art that only look like synonyms are deliberately
+  absent from that config: `client` is a client library, not a person, and in
+  the tenancy docs a customer has users, so collapsing those would make the
+  prose wrong.
+- **Never delete a measured number to shorten a sentence.** Any figure,
+  backticked identifier or URL in the committed revision must survive the edit.
+  The `prose-facts` sensor diffs them against HEAD. If a number genuinely no
+  longer applies, drop it in its own commit with the reason - not as a side
+  effect of tightening prose. This corpus is worth reading because of its
+  numbers; a sentence that reads better without them is a worse sentence.
 - **Spelling: American -ize** (normalize, organize, optimize). The corpus
   convention; note it diverges from British -ise used in email/reply writing.
 - **Headings: sentence case.** Capitalize only the first word and proper nouns /
