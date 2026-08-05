@@ -268,6 +268,9 @@ const pins: Pin[] = [
       "vanity subdomain",
       // Provisioning: healthy is not writable, measured over five projects.
       "131-159 s",
+      // Why the two directions cannot share a mechanism. Without this the doc
+      // reads as though one of the guides picked the wrong approach.
+      "cannot carry a session",
       // Structure the reference skeleton requires and this doc lacked until it
       // shipped: an up-front summary and a closing decision diagram. TL;DR is a
       // bold label here rather than a heading, matching the exemplar, so the
@@ -295,6 +298,16 @@ const pins: Pin[] = [
       // API tests actually hit, and it made one pattern look like two across the
       // reference and the guides.
       "app_notes",
+      // The first version of "Moving users between projects" claimed both guides
+      // "rest on the same four primitives" and prescribed the admin API over a
+      // SQL copy. Both halves are false: promotion does a SQL copy of
+      // auth.users + identities + sessions + refresh_tokens ON PURPOSE, because
+      // the admin API mints a user but cannot carry the refresh token that user
+      // is holding, and promotion's whole claim is zero re-logins. The error was
+      // in the task spec, so the loop implemented it faithfully and the judge
+      // validated against it - no sensor can catch a wrong specification.
+      "the same four primitives",
+      "Move users through the admin API, not a SQL copy",
     ],
     sections: [
       /^#{2,3} .*(TL;DR|Decision)/m,
