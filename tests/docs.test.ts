@@ -12,7 +12,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
-import { mathRiskLines, smartPunctLines, splitTables } from "./lib/mdx";
+import { markerLines, mathRiskLines, smartPunctLines, splitTables } from "./lib/mdx";
 import { builtPath, CHECK_BUILT, collectDocs } from "./lib/corpus";
 
 const docs = collectDocs();
@@ -20,6 +20,49 @@ const docs = collectDocs();
 test("the corpus is non-empty", () => {
   // Guards against the whole suite passing vacuously because a path changed.
   expect(docs.length).toBeGreaterThan(10);
+});
+
+/**
+ * Docs that predate the phrasing contract, exempted from the marker check.
+ *
+ * AGENTS.md already says the oldest docs predate parts of the style contract
+ * and are not exemplars, so this list is that policy made executable rather
+ * than a new concession. The check applies to everything NOT listed, which
+ * means a new doc is covered by default and this list can only shrink.
+ *
+ * Removing an entry is how a doc is brought into conformance. Almost all of
+ * these are ` -- ` in prose, which SmartyPants renders as an en-dash.
+ */
+const MARKER_GRANDFATHERED = new Set([
+  "guides/k3s-arm64-cluster-ops.mdx",
+  "guides/k3s-monitoring-stack.mdx",
+  "guides/k3s-traefik.mdx",
+  "guides/magic-wan-interop.mdx",
+  "guides/nix-steam-os.mdx",
+  "guides/self-host-matrix.mdx",
+  "guides/vaultwarden-multi-site.mdx",
+  "reference/caching.mdx",
+  "reference/homebrew-fraud-detection.mdx",
+  "reference/media-transformation-architecture.mdx",
+]);
+
+test("no grandfathered marker exemption is stale", () => {
+  // A grandfather list that is never re-checked becomes a list of docs nobody
+  // remembers exempting. Three rationales in the pin file had already gone
+  // stale this way - a doc described as a draft that ships, a cross-link check
+  // described as vacuous that discriminates. If a doc on this list is now
+  // clean, the entry is the defect.
+  const byPath = new Map(docs.map((d) => [d.path, d]));
+  const stale = [...MARKER_GRANDFATHERED].filter((p) => {
+    const doc = byPath.get(p);
+    return doc && markerLines(doc).length === 0;
+  });
+  expect(stale).toEqual([]);
+});
+
+test("every grandfathered path still exists", () => {
+  const paths = new Set(docs.map((d) => d.path));
+  expect([...MARKER_GRANDFATHERED].filter((p) => !paths.has(p))).toEqual([]);
 });
 
 describe.each(docs.map((d) => [d.path, d] as const))("%s", (_path, doc) => {
@@ -36,6 +79,10 @@ describe.each(docs.map((d) => [d.path, d] as const))("%s", (_path, doc) => {
 
   test("no unescaped dollar that could become math", () => {
     expect(mathRiskLines(doc).map((l) => `${l.n}: ${l.raw.trim().slice(0, 70)}`)).toEqual([]);
+  });
+
+  test.skipIf(MARKER_GRANDFATHERED.has(doc.path))("no machine-written phrasing in prose", () => {
+    expect(markerLines(doc).map((h) => `${h.line.n}: ${h.marker.trim()}`)).toEqual([]);
   });
 
   test("every footnote reference has a definition", () => {
