@@ -23,28 +23,27 @@ test("the corpus is non-empty", () => {
 });
 
 /**
- * Docs that predate the phrasing contract, exempted from the marker check.
+ * Docs exempted from the marker check. EMPTY, and that is the goal state - the
+ * whole corpus passes.
  *
- * AGENTS.md already says the oldest docs predate parts of the style contract
- * and are not exemplars, so this list is that policy made executable rather
- * than a new concession. The check applies to everything NOT listed, which
- * means a new doc is covered by default and this list can only shrink.
+ * It was seeded with the ten pre-contract docs that failed, on the assumption
+ * they would be cleared opportunistically. 139 of their 145 findings turned out
+ * to be ` -- ` in prose, which SmartyPants renders as an en-dash, and which a
+ * fence-and-code-span-aware pass fixes without touching a table separator or a
+ * shell flag. The remaining six needed a sentence reworded each. Clearing them
+ * was cheaper than carrying the list.
  *
- * Removing an entry is how a doc is brought into conformance. Almost all of
- * these are ` -- ` in prose, which SmartyPants renders as an en-dash.
+ * The mechanism stays for the next doc that needs it. Add a path, and the two
+ * guards below keep the entry honest: one fails when the doc is clean again,
+ * the other when the path no longer exists.
  */
-const MARKER_GRANDFATHERED = new Set([
-  "guides/k3s-arm64-cluster-ops.mdx",
-  "guides/k3s-monitoring-stack.mdx",
-  "guides/k3s-traefik.mdx",
-  "guides/magic-wan-interop.mdx",
-  "guides/nix-steam-os.mdx",
-  "guides/self-host-matrix.mdx",
-  "guides/vaultwarden-multi-site.mdx",
-  "reference/caching.mdx",
-  "reference/homebrew-fraud-detection.mdx",
-  "reference/media-transformation-architecture.mdx",
-]);
+const MARKER_GRANDFATHERED = new Set<string>([]);
+
+test("the whole corpus is held to the phrasing contract", () => {
+  // The empty exemption set is the assertion. Written explicitly so that
+  // repopulating the list is a visible decision rather than a quiet one.
+  expect([...MARKER_GRANDFATHERED]).toEqual([]);
+});
 
 test("no grandfathered marker exemption is stale", () => {
   // A grandfather list that is never re-checked becomes a list of docs nobody
