@@ -271,7 +271,8 @@ const pins: Pin[] = [
       // Why the two directions cannot share a mechanism. Without this the doc
       // reads as though one of the guides picked the wrong approach.
       "cannot carry a session",
-      // Structure the reference skeleton requires and this doc lacked until it
+      // Structure the reference skeleton requires
+      // (anchor pinned below: both migration guides deep-link to this section) and this doc lacked until it
       // shipped: an up-front summary and a closing decision diagram. TL;DR is a
       // bold label here rather than a heading, matching the exemplar, so the
       // sections regex below cannot see it - pin the literal.
@@ -318,6 +319,9 @@ const pins: Pin[] = [
       // guides competed to be the front door.
       /^## Related/m,
     ],
+    // Both migration guides deep-link here to explain why they use opposite
+    // mechanisms. Renaming the heading silently breaks two inbound anchors.
+    anchors: ["moving-users-between-projects"],
     // linksTo was off here with a note that the old bash matrix grepped built
     // HTML - where Starlight renders the whole sidebar on every page, so every
     // slug matched and the check could never fail. That rationale is stale: this
