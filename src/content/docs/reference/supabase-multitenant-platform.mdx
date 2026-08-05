@@ -1,17 +1,19 @@
 ---
-title: Hand-rolling a multi-tenant Supabase platform (cheaper than one project per tenant)
-description: One Supabase project per end-tenant is a ~$10/mo compute floor for every idle tenant, and a paid plan cannot pause it. The cost model for the alternative - many tenants on one instance isolated by RLS, each promoted to its own project on conversion - with live RLS isolation proofs against a real project, measured provisioning latency, and the isolation guarantees the shared tier cannot offer at all.
+title: "Where should a tenant live: one Supabase project per tenant, or many"
+description: Where an end-tenant should live - its own Supabase project, a shared project with many tenants isolated by row-level security, or Supabase for Platforms' scale-to-zero tier at sufficient scale. The cost of each shape, live RLS isolation proofs against a real project, measured provisioning latency, and the decision tree for picking one - plus where to go to build, consolidate, or promote a tenant.
 author: "Erfi Anugrah"
 ---
 
 If you are building a platform that gives each of your end-users a backend -
-an app builder, a low-code tool, a per-customer workspace - the obvious move is
-"provision one Supabase project per tenant". It is clean, it isolates tenants,
-and the Management API makes it a single call. It also quietly commits you to a
-**linear compute floor**: every tenant is a dedicated Postgres instance you pay
-for whether or not anyone is using it, and on a **paid plan you cannot pause a
-project**. This doc works out what that actually costs, then builds and tests a
-cheaper architecture.
+an app builder, a low-code tool, a per-customer workspace - a tenant has to
+live somewhere: its own Supabase project, a shared project holding many
+tenants, or, at sufficient scale, Supabase for Platforms' managed tier. One
+project per tenant is clean, it isolates tenants, and the Management API makes
+it a single call - but it also quietly commits you to a **linear compute
+floor**: every tenant is a dedicated Postgres instance you pay for whether or
+not anyone is using it, and on a **paid plan you cannot pause a project**.
+This doc works out what each shape costs, tests whether the cheaper one
+actually isolates tenants, and ends with the decision itself.
 
 Everything with a number attached is either from the public
 [Supabase pricing page](https://supabase.com/pricing) or measured live against a
@@ -90,8 +92,8 @@ compute while it sleeps. But it is gated ("Only select customers have access ...
 Submit this form to get access") and applies only to Nano instances; on a normal
 paid org you "cannot launch Nano instances" and Nano "is billed at the same price
 as Micro". It also carries a platform fee that only makes economic sense above a
-certain scale - talk to Supabase for current terms. Below that scale, or without
-access, you are back to hand-rolling. Sources:
+certain scale - talk to Supabase for current terms. Below that scale, or
+without access, the shared tier below is the alternative. Sources:
 [supabase-for-platforms](https://supabase.com/docs/guides/integrations/supabase-for-platforms),
 [compute usage](https://supabase.com/docs/guides/platform/manage-your-usage/compute).
 :::
@@ -177,19 +179,46 @@ the old rows. Storage is a separate pass: objects are not rows, so a per-tenant
 copy has to download and re-upload through the Storage API rather than fall out
 of the same extract.
 
-Three things about that copy are measured rather than assumed. MFA travels: a
+Two things about that copy are measured rather than assumed. MFA travels: a
 TOTP factor enrolled on the shared project arrives at the destination already
 `verified`, and the same secret produces a code that verifies there for an
 [`aal2` session](https://supabase.com/docs/guides/auth/auth-mfa) - without which
 "zero re-logins" would quietly exclude every account that had enrolled one.
 Retiring the source identity is a single `DELETE /auth/v1/admin/users/{id}` and
-it closes both issuing paths at the source
-while the destination carries on; the tenant's ROWS stay behind, so reaping them
-is a separate deliberate step. And do not carry the source's
-`auth.refresh_tokens.id`: it is a bigserial, so a destination that has seen any
-prior auth activity already holds the low ids and the copy dies on
-`refresh_tokens_pkey`. Let the destination assign it - the token string is what
-the client presents.
+it closes both issuing paths at the source while the destination carries on;
+the tenant's ROWS stay behind, so reaping them is a separate deliberate step.
+[Moving users between projects](#moving-users-between-projects) below covers
+the sequence and claim-placement primitives that this copy and the opposite
+direction - consolidation - both depend on.
+
+## Moving users between projects
+
+Promotion moves a tenant out of the shared project; consolidation moves a
+project's users onto it. Both copy `auth.users` rows between two Supabase
+projects, and both rest on the same four primitives.
+
+- **Move users through the admin API, not a SQL copy.**
+  `POST /auth/v1/admin/users` accepts `id` and `password_hash` directly, so
+  the migrated user keeps its uuid and its existing bcrypt password and logs
+  in with it - no reset, no re-registration - and every foreign key already
+  pointing at that uuid still resolves.
+- **Resync the sequence after copying a `bigserial` id.** A copied primary
+  key does not move its sequence with it: the sequence still reports its
+  pre-copy value, so the next `nextval()` collides with an id you just
+  imported. `setval` past the highest migrated id before anyone writes.
+- **Do not copy `auth.refresh_tokens.id` at all.** It is a bigserial, so a
+  destination that has seen any prior auth activity already holds the low
+  ids, and copying the source id collides on `refresh_tokens_pkey`. Let the
+  destination assign it - the token string, not the id, is what the client
+  presents.
+- **`tenant_id` lives in `app_metadata`, never `user_metadata`.**
+  `app_metadata` is writable only through the admin API, which is what stops
+  a tenant editing its own claim - and it is why the migration has to set the
+  claim at creation rather than after.
+
+[Promoting a tenant to its own project](/guides/supabase-tenant-promotion/)
+and [consolidating a project per customer onto a shared
+one](/guides/supabase-tenant-consolidation/) both move users this way.
 
 ## Tested: does shared-instance RLS actually isolate tenants?
 
@@ -204,20 +233,20 @@ One shared table, RLS keyed on the `tenant_id` claim, one policy covering reads
 and writes:
 
 ```sql
-create table app_notes (
+create table items (
   id        bigint generated always as identity primary key,
   tenant_id uuid not null,
   body      text not null
 );
-alter table app_notes enable row level security;
-grant select, insert, update, delete on app_notes to authenticated;
+alter table items enable row level security;
+grant select, insert, update, delete on items to authenticated;
 
 -- tenant_id comes from the verified JWT, never from client input
 create function jwt_tenant() returns uuid language sql stable as $$
   select nullif(auth.jwt() -> 'app_metadata' ->> 'tenant_id','')::uuid
 $$;
 
-create policy tenant_isolation on app_notes
+create policy tenant_isolation on items
   using      (tenant_id = jwt_tenant())   -- reads
   with check (tenant_id = jwt_tenant());  -- writes
 ```
@@ -248,7 +277,7 @@ a transaction per tenant context:
 
 The stronger test: a real project, real users created through GoTrue with
 `tenant_id` in `app_metadata`, real issued JWTs, and requests through the actual
-PostgREST endpoint (`https://<ref>.supabase.co/rest/v1/app_notes`). The token a
+PostgREST endpoint (`https://<ref>.supabase.co/rest/v1/items`). The token a
 user receives carries exactly what the policy reads:
 
 ```json
@@ -263,9 +292,9 @@ Results, with real HTTP status codes returned by the Data API:
 | 1 | User A `POST` a tenant-A note | `201 Created` |
 | 2 | User B `POST` a tenant-B note | `201 Created` |
 | 3 | User A `POST` a row tagged **tenant B** | `403` - `new row violates row-level security policy` |
-| 4 | User A `GET /app_notes` | `200` - only A's row |
-| 5 | User B `GET /app_notes` | `200` - only B's row |
-| 6 | Anon `GET /app_notes` (no user) | `200` - `[]` |
+| 4 | User A `GET /items` | `200` - only A's row |
+| 5 | User B `GET /items` | `200` - only B's row |
+| 6 | Anon `GET /items` (no user) | `200` - `[]` |
 
 Two users, one physical project, complete isolation - enforced by Postgres, not
 by application code. That is the shared tier working through the real stack.
@@ -280,7 +309,7 @@ to reach a seeded tenant-B secret:
 | Attack (as authenticated user A) | Result |
 |---|---|
 | `PUT /auth/v1/user` setting own `app_metadata.tenant_id = B` | ignored; fresh token still shows `app_metadata.tenant_id = A` |
-| `GET /app_notes` with the post-attack token | `200` - `[]`; the seeded tenant-B secret stays invisible |
+| `GET /items` with the post-attack token | `200` - `[]`; the seeded tenant-B secret stays invisible |
 | Public `signup` smuggling `app_metadata.tenant_id = B` | not applied |
 
 This is the difference between safe and broken: had the policy keyed on
@@ -288,33 +317,16 @@ This is the difference between safe and broken: had the policy keyed on
 could assign themselves any `tenant_id`. Keying on `app_metadata`, with the
 control plane as its only writer, is load-bearing - and now tested, not assumed.
 
-### Measured: the cost of the thing we are avoiding
+### The cost of the thing you are avoiding
 
-While I had the live project, I measured the per-tenant-project lifecycle that
-the shared tier lets you skip:
-
-| Operation | Measured | Method |
-|---|---|---|
-| Create project -> `ACTIVE_HEALTHY` | **131-159 s** (n=5, median 131 s) | poll `GET /v1/projects/{ref}` |
-| `ACTIVE_HEALTHY` -> first write actually succeeds | **+1 poll tick** (5 of 5 refused the first `admin/users` write) | poll, then retry the write |
-| Delete project (API call) | ~2 s | `DELETE /v1/projects/{ref}` |
-| Provisioned size on a paid org | `ci_micro`, \$0.01344/hr | billing addons API |
-| Add a tenant to the **shared** tier | 2 API calls, instant, \$0 marginal | create user + insert row |
-
-That is the contrast in one table: a dedicated tenant is a bit over two minutes
-of provisioning and \$10/mo forever; a shared tenant is two instant calls and no
-marginal compute.
-
-The second row is the one that bites a control plane. `ACTIVE_HEALTHY` is not
-readiness, and neither is per-service health - in 4 of 5 runs all three services
-reported healthy on the same poll tick as the project status, so the extra call
-bought no warning. Every one of the five then refused its first
-`POST /auth/v1/admin/users` with `500 unexpected_failure` ("Database error
-checking email") and accepted the next attempt. Five of five is not a race you
-get lucky with: provision-then-immediately-create-a-user must retry, because the
-first attempt currently fails every time. The same first-call failure shows up on
-other GoTrue admin endpoints on a young project, so treat the whole admin surface
-that way rather than special-casing one route.
+A dedicated tenant costs 131-159 s of provisioning and a standing \$10/mo
+compute floor for as long as it exists, whether or not anyone signs in.
+A shared tenant costs two instant API calls - create the user, insert the row -
+and no marginal compute. [The operation-cost
+reference](/reference/supabase-platform-operation-cost/) has the method and
+the full provisioning table this was measured with - create to
+`ACTIVE_HEALTHY`, the first-write retry, and delete - against the same live
+project this section drew from.
 
 ## Cost and feature comparison
 
@@ -365,10 +377,9 @@ earned (and are paying for) those properties.
   keep one project per tenant (or let tenants bring their own via OAuth); at high
   scale, native SfP scale-to-zero is the managed answer - talk to Supabase.
 
-The hand-rolled shared+promote architecture is not "cheaper by cutting corners".
-It is cheaper because it stops paying for isolation that idle free tenants do not
-need, and it is testable end-to-end - which is the part most "just clone SfP"
-plans skip.
+The shared+promote architecture is cheaper because it stops paying for
+isolation that idle free tenants do not need, and Proofs 1-3 above test that
+end-to-end rather than assume it.
 
 ```dot
 digraph {
@@ -396,7 +407,7 @@ digraph {
 
   sfp [label="SfP scale-to-zero\nmanaged, smallest compute tier only\ngated - talk to Supabase"];
   q3 -> sfp [label="yes"];
-  q3 -> shared [label="no - hand-roll it,\nwhich is this doc"];
+  q3 -> shared [label="no - the shared tier\nabove, this doc"];
 }
 ```
 
@@ -463,3 +474,13 @@ MFA, retirement and provisioning results from 2026-08-04 - the last two dates in
 `ap-southeast-1` on Micro compute. The `for all` policy behaviour noted above was
 checked separately on Postgres 17.10. Where a row says documented rather than
 measured, it was read from the platform docs on the date given and not executed._
+
+## Related
+
+| If you are asking | Go to |
+|---|---|
+| Should I share an instance, and what does it save? | This doc - the cost model and the decision above |
+| Build me the shared tier | [Running many tenants on one Supabase project](/guides/supabase-shared-tenancy/) |
+| I already have a project per customer | [Consolidating one Supabase project per customer onto a shared project](/guides/supabase-tenant-consolidation/) |
+| A tenant converted, give it its own project | [Promoting a tenant to its own Supabase project](/guides/supabase-tenant-promotion/) |
+| I just want one bill | [Consolidating Supabase accounts into one organization](/guides/supabase-org-consolidation/) - not a tenancy move: it changes the billing and admin container and leaves the tenant-to-project mapping alone |
