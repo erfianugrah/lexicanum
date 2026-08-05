@@ -82,7 +82,7 @@ describe.each(docs.map((d) => [d.path, d] as const))("%s", (_path, doc) => {
   });
 
   test.skipIf(MARKER_GRANDFATHERED.has(doc.path))("no machine-written phrasing in prose", () => {
-    expect(markerLines(doc).map((h) => `${h.line.n}: ${h.marker.trim()}`)).toEqual([]);
+    expect(markerLines(doc).map((h) => `${h.line.n}: ${h.name}: ${h.marker.trim()}`)).toEqual([]);
   });
 
   test("every footnote reference has a definition", () => {
