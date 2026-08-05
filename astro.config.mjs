@@ -82,6 +82,11 @@ export default defineConfig({
     // links, because that is what almost every caller meant by "the tenancy
     // guide"; callers that meant promotion were repointed individually.
     "/guides/supabase-shared-tenancy-and-promotion": "/guides/supabase-shared-tenancy",
+    // Retitled to the decision it answers, so the slug followed. "multi-tenant"
+    // rather than plain "tenant" is deliberate: the sidebar sorts by filename,
+    // and supabase-tenant-placement would sort after supabase-platform-
+    // operation-cost, putting the cost doc ahead of the decision doc.
+    "/reference/supabase-multitenant-platform": "/reference/supabase-multi-tenant-placement",
   },
   fonts: [
     {

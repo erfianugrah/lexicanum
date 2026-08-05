@@ -174,10 +174,13 @@ rewrite just for style is not required.
 ## Verify before done
 
 Run `bun run build` and confirm:
-- the current page count (39 as of 2026-08-05; 37 docs plus two redirect stubs,
-  for the renamed operation-cost page and the split tenancy guide), exit 0.
-  Treat a DROP as the signal:
-  a doc with `draft: true` does not build, and the count is the cheapest way to notice.
+- exit 0. The page count is no longer a number to keep in your head: `tests/
+  docs.test.ts` asserts built pages minus redirect stubs equals the doc count,
+  so a doc that stops building fails the build instead of quietly shrinking the
+  site. That check exists because this line used to carry the count by hand and
+  had already drifted - it read "37 docs plus two redirect stubs" when the
+  corpus was 36 docs and three stubs, and only summed correctly by accident.
+  A doc with `draft: true` does not build, which is the case this catches.
 - `bun test` is green. ALL doc checks live in `tests/` and run inside `bun run build`,
   so a defect fails the build instead of appearing on the page. There is no verify
   script any more - `scripts/` is gone, and its checks are either here or were found
