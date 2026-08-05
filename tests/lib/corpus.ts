@@ -7,7 +7,7 @@
  * files ask for what they need.
  */
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { parseMdx, type Doc } from "./mdx";
 
 export const ROOT = new URL("../..", import.meta.url).pathname;
@@ -41,6 +41,27 @@ export function collectDocs(): Doc[] {
 }
 
 /** Source text for a slug like "guides/foo", trying .mdx then .md. */
+/**
+ * Every built page, as DIST-relative paths ending in index.html.
+ *
+ * Deliberately a portable fs walk rather than shelling out. The first version
+ * of the caller ran `rg --files dist`, which is fine on the dev box and dies on
+ * the CI runner with `Executable not found in $PATH: "rg"` - ripgrep is not
+ * part of the Actions image. A canary proved that check discriminated, but a
+ * canary runs in the same environment as the check, so it cannot see a
+ * toolchain assumption.
+ *
+ * The site homepage is "index.html" with no directory prefix; collectDocs()
+ * does not return it, so callers comparing against the doc count must exclude
+ * it.
+ */
+export function builtPages(): string[] {
+  if (!existsSync(DIST)) return [];
+  return (readdirSync(DIST, { recursive: true }) as string[])
+    .map(String)
+    .filter((p) => p === "index.html" || p.endsWith(`${sep}index.html`));
+}
+
 export function readSource(slug: string): { path: string; text: string } | undefined {
   for (const ext of [".mdx", ".md"]) {
     const p = join(DOCS, `${slug}${ext}`);
