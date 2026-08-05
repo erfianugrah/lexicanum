@@ -262,11 +262,14 @@ const pins: Pin[] = [
     mustContain: [
       // The gateway was removed from the architecture on 2026-08-04 after the
       // discovery endpoint carried a promotion with nothing in the data path.
-      // These pins are inert while the doc is a draft (the built page does not
-      // exist, so the pin suite skips it) and become live the moment it ships.
+      // (This block once carried a note calling these pins inert because the doc
+      // was a draft. It ships and builds; the note outlived the state it
+      // described. Fourth stale rationale found in this file.)
       "Placement discovery, not a gateway",
       "vanity subdomain",
-      // Provisioning: healthy is not writable, measured over five projects.
+      // Provisioning: healthy is not writable, measured over five projects. The
+      // method table for this now lives in the operation-cost reference; the
+      // figure stays here because the cost comparison is this doc's own argument.
       "131-159 s",
       // Why the two directions cannot share a mechanism. Without this the doc
       // reads as though one of the guides picked the wrong approach.
