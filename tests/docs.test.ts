@@ -164,6 +164,23 @@ describe.skipIf(!CHECK_BUILT)("built output", () => {
     expect(pages.filter((p) => !existsSync(p.html)).map((p) => p.doc.path)).toEqual([]);
   });
 
+  test("every built page is a doc or a declared redirect", () => {
+    // AGENTS.md tracked the page count as a hand-maintained number, and it had
+    // already drifted: "37 docs plus two redirect stubs" was wrong on both terms
+    // and only summed correctly by accident. Derive it instead. A redirect stub
+    // is identifiable by the meta refresh Astro emits for a declared redirect,
+    // so an unexplained page - a stale artifact, or a doc silently dropped - has
+    // nowhere to hide.
+    const built = Bun.spawnSync(["rg", "--files", "dist", "-g", "index.html"])
+      .stdout.toString().trim().split("\n").filter(Boolean);
+    // The site homepage is a built page but not a collection doc, so
+    // collectDocs() does not return it. Excluded by name rather than by
+    // subtracting one, so the assertion still reads as an equality.
+    const contentPages = built.filter((p) => p !== "dist/index.html");
+    const stubs = contentPages.filter((p) => readFileSync(p, "utf8").includes('http-equiv="refresh"'));
+    expect(contentPages.length - stubs.length).toBe(docs.length);
+  });
+
   test("no page leaks an unrendered footnote marker", () => {
     // Scoped to the footnote shape and to text outside code, because "[^" is
     // regex character-class syntax: pages that show a pattern like [^"]* are not
