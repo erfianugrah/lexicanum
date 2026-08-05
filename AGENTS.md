@@ -198,8 +198,18 @@ Run `bun run build` and confirm:
   - `tests/links.test.ts` - external reachability, opt-in via
     `bun run verify:docs:links`. Never gates the build: someone else's 503 is not a
     defect here.
+  - `tests/harness.test.ts` - checks about the checks, and it stops at two: every
+    `verify:*` / `check:*` script is invoked by `build` or by a workflow (a check
+    nobody runs is an intention, and intentions do not fail), and no test spawns a
+    subprocess (the dist walk that shelled out to `rg` worked here and died on the
+    runner). Both classes had already bitten. Do not grow this file into a harness
+    that verifies itself more than the corpus.
   - The parser they share is unit-tested in `tests/lib/mdx.test.ts` against the real
-    defects that produced it - add a case there when you fix a new one.
+    defects that produced it - add a case there when you fix a new one. The phrasing
+    rules are a TABLE there (`LLM_MARKERS`), each row carrying the line it must flag
+    and, where a near-collision exists, the line it must not; the suite iterates the
+    table, so a rule cannot be added without its cases and deleting a rule deletes
+    them rather than leaving a passing test that guards nothing.
 - For a doc you edited with citations: every `[^slug]` resolves (no literal `[^`
   left in the rendered HTML), and the References list item count == distinct slugs.
 - No new KaTeX spans from stray `$` (`grep -c 'class="katex' dist/.../index.html`).

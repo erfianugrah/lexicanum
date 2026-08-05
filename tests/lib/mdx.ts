@@ -269,15 +269,37 @@ export function smartPunctLines(doc: Doc): Line[] {
   return doc.lines.filter((l) => l.kind !== "fence" && SMART_PUNCT.test(l.raw));
 }
 
+/** One phrasing rule, carrying the cases that prove it works. */
+export interface Marker {
+  /** Stable slug, reported on failure and used to key this rule's own tests. */
+  name: string;
+  re: RegExp;
+  /**
+   * A line this rule MUST flag. Required by the type, so a rule cannot be added
+   * without the case that proves it fires.
+   */
+  hit: string;
+  /**
+   * A near-collision that must flag NOTHING. Present where the root word or a
+   * shorter form has legitimate use in this corpus, or where an exemption in
+   * the parser (fence, code span) is what keeps the rule honest.
+   */
+  miss?: string;
+}
+
 /**
  * Phrasings that mark prose as machine-written, plus the house-style bans from
  * AGENTS.md that a regex can enforce.
  *
- * The list is calibrated against this corpus, not copied from a listicle. Each
- * entry was checked for existing legitimate use before being included:
- * "leverage" survives as a noun ("order of leverage against a distant
- * database"), "unlock" is a QMK keymap feature, "elevated" is a privilege level
- * and a fraud score, and "essentially" is not "essential". None are banned.
+ * A table rather than a bare list of regexes, because an absent rule and a rule
+ * that finds nothing emit identical output. The sentence-initial connective
+ * rule was lost once and nothing noticed. Here the rule and its test are the
+ * same object: the suite iterates this table, so deleting a rule deletes its
+ * test instead of silently widening the gate.
+ *
+ * Calibrated against this corpus, not copied from a listicle: every entry was
+ * checked for existing legitimate use first, and the roots that had some are in
+ * REJECTED_MARKERS below rather than here.
  *
  * Matching runs on `proseNoCode`, so fenced code and inline code spans are
  * exempt. That exemption is load-bearing rather than defensive: ` -- ` is
@@ -286,48 +308,96 @@ export function smartPunctLines(doc: Doc): Line[] {
  * `-- writes` as ordinary SQL comments. A fence-blind version of this check
  * flagged both.
  */
-export const LLM_MARKERS: RegExp[] = [
-  /\bdelv\w*/i,
-  /\bseamless(ly)?\b/i,
-  /\bcrucial(ly)?\b/i,
-  /\bessential\b/i,
-  /\bcomprehensive\b/i,
-  /\brobust\b/i,
-  /\bsignificantly\b/i,
-  /\bstreamlin\w*/i,
-  /\bempower\w*/i,
-  /\bcutting-edge\b/i,
-  /\bgame[- ]chang\w*/i,
-  /worth noting/i,
-  /important to note/i,
-  /\b(dive|deep dive) into\b/i,
-  /in today's\b/i,
-  /here's the thing/i,
-  /at the end of the day/i,
-  /when it comes to/i,
-  /testament to/i,
-  /harness the power/i,
-  /navigate the complexities/i,
-  /plays a (key|crucial|vital|central) role/i,
-  // Anchored, because mid-sentence "additionally wants" is ordinary English and
-  // is in the corpus. Only the sentence-initial connective is the tell.
-  /^(Furthermore|Moreover|Additionally)[ ,]/,
+export const LLM_MARKERS: Marker[] = [
+  { name: "delve", re: /\bdelv\w*/i, hit: "we delve into the pooler internals" },
+  { name: "seamless", re: /\bseamless(ly)?\b/i, hit: "the rollout was seamless" },
+  { name: "crucial", re: /\bcrucial(ly)?\b/i, hit: "it is crucial to reboot" },
+  {
+    name: "essential",
+    re: /\bessential\b/i,
+    hit: "an essential prerequisite for the cutover",
+    miss: "PKCE essentially replaces something you know",
+  },
+  { name: "comprehensive", re: /\bcomprehensive\b/i, hit: "a comprehensive overview of the stack" },
+  {
+    name: "robust",
+    re: /\brobust\b/i,
+    hit: "a robust failover path",
+    // The code-span exemption, which is what makes a word ban survivable.
+    miss: "pass `--robust` to the CLI",
+  },
+  {
+    name: "significantly",
+    re: /\bsignificantly\b/i,
+    hit: "throughput improved significantly",
+    // Only the adverb is banned: the adjective carries a number after it.
+    miss: "the difference is significant at 40 ms",
+  },
+  { name: "streamline", re: /\bstreamlin\w*/i, hit: "this streamlines the cutover" },
+  { name: "empower", re: /\bempower\w*/i, hit: "empowering the operator to self-serve" },
+  { name: "cutting-edge", re: /\bcutting-edge\b/i, hit: "a cutting-edge approach to caching" },
+  { name: "game-changer", re: /\bgame[- ]chang\w*/i, hit: "the pooler is a game changer" },
+  { name: "worth-noting", re: /worth noting/i, hit: "it is worth noting that the pooler drops" },
+  { name: "important-to-note", re: /important to note/i, hit: "it is important to note the TTL" },
+  { name: "dive-into", re: /\b(dive|deep dive) into\b/i, hit: "let us dive into the schema" },
+  { name: "in-todays", re: /in today's\b/i, hit: "in today's cloud landscape" },
+  { name: "heres-the-thing", re: /here's the thing/i, hit: "here's the thing about replication" },
+  { name: "end-of-the-day", re: /at the end of the day/i, hit: "at the end of the day it is DNS" },
+  { name: "when-it-comes-to", re: /when it comes to/i, hit: "when it comes to pooling" },
+  { name: "testament-to", re: /testament to/i, hit: "a testament to the design" },
+  { name: "harness-the-power", re: /harness the power/i, hit: "harness the power of RLS" },
+  {
+    name: "navigate-complexities",
+    re: /navigate the complexities/i,
+    hit: "navigate the complexities of tenancy",
+  },
+  {
+    name: "plays-a-role",
+    re: /plays a (key|crucial|vital|central) role/i,
+    hit: "the pooler plays a key role",
+  },
+  {
+    name: "sentence-initial-connective",
+    // Anchored, because mid-sentence "additionally wants" is ordinary English and
+    // is in the corpus. Only the sentence-initial connective is the tell.
+    re: /^(Furthermore|Moreover|Additionally)[ ,]/,
+    hit: "Additionally, the pooler drops.",
+    miss: "the branch additionally wants a direct connection",
+  },
   // AGENTS.md house-style bans: rating your own points, and the SmartyPants
   // en-dash trap.
-  /the big win/i,
-  /the nasty one/i,
-  /the trap that/i,
-  /lock it in/i,
-  / -- /,
+  { name: "the-big-win", re: /the big win/i, hit: "the big win is fewer round trips" },
+  { name: "the-nasty-one", re: /the nasty one/i, hit: "the nasty one is DNS" },
+  { name: "the-trap-that", re: /the trap that/i, hit: "the trap that bites last is MTU" },
+  { name: "lock-it-in", re: /lock it in/i, hit: "lock it in before the cutover" },
+  {
+    name: "double-hyphen",
+    re: / -- /,
+    hit: "a -- b",
+    // The defect that produced the fence-aware parser: the tenancy reference's
+    // RLS policy carries " -- reads" as an ordinary SQL comment.
+    miss: "```sql\nselect 1 -- reads\n```",
+  },
 ];
 
-export function markerLines(doc: Doc): { line: Line; marker: string }[] {
-  const out: { line: Line; marker: string }[] = [];
+/**
+ * Roots considered for the table and rejected, with the corpus usage that
+ * rejected them. Asserted as non-findings so that adding one later fails here
+ * first, next to the reason it was left out.
+ */
+export const REJECTED_MARKERS = [
+  "order of leverage against a distant database",
+  "the unlock combo is a keymap feature",
+  "requires an elevated ephemeral ID score",
+];
+
+export function markerLines(doc: Doc): { line: Line; name: string; marker: string }[] {
+  const out: { line: Line; name: string; marker: string }[] = [];
   for (const l of doc.lines) {
     if (l.kind !== "prose") continue;
-    for (const re of LLM_MARKERS) {
-      const m = re.exec(l.proseNoCode);
-      if (m) out.push({ line: l, marker: m[0] });
+    for (const rule of LLM_MARKERS) {
+      const m = rule.re.exec(l.proseNoCode);
+      if (m) out.push({ line: l, name: rule.name, marker: m[0] });
     }
   }
   return out;
