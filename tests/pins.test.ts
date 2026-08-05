@@ -39,7 +39,8 @@ interface Pin {
 const UPGRADE = "guides/supabase-postgres-major-upgrade-e2e";
 const REGION = "guides/supabase-region-migration-e2e";
 const CONSOLIDATION = "guides/supabase-org-consolidation";
-const TENANCY = "guides/supabase-shared-tenancy-and-promotion";
+const SHARED = "guides/supabase-shared-tenancy";
+const PROMOTION = "guides/supabase-tenant-promotion";
 const MULTITENANT = "reference/supabase-multitenant-platform";
 const TENANT_MERGE = "guides/supabase-tenant-consolidation";
 const PBKDF2 = "guides/pbkdf2-supabase-auth-migration";
@@ -165,16 +166,37 @@ const pins: Pin[] = [
   {
     doc: CONSOLIDATION,
     sections: [/^#{2,3} .*Verification/m, /^#{2,3} .*Gotchas/m],
-    linksTo: [REGION, TENANCY],
+    linksTo: [REGION, SHARED],
   },
+  // The 694-line shared-tenancy-and-promotion guide was two guides: building the
+  // shared tier, and moving one tenant off it. Its pins split by which half's
+  // EXCLUSIVE line range the string came from, checked rather than guessed.
+  // PGRST301 is pinned to both because it occurs in Part 1 (build) and Part 5
+  // (promotion) independently, not only in the sections they shared.
   {
-    doc: TENANCY,
+    doc: SHARED,
     mustContain: [
-      // The shape the API accepts and never honours, and the control that makes
-      // the portability result mean anything. Both were hard-won.
+      // A shape the API accepts and never honours. Belongs with wiring the
+      // trust, which is the only place a reader would try to use it.
       "custom_jwks",
       "PGRST301",
       "app_metadata",
+    ],
+    mustNotContain: [
+      // True when written, measured false since. Inert here but kept as a
+      // regression guard on both halves.
+      "Neither approach was built or tested in this run",
+      "Neither discovery endpoint nor gateway was built",
+    ],
+    sections: [/^#{2,3} .*Verification/m, /^#{2,3} .*Gotchas/m],
+    // The two halves must reach each other. A split guide whose halves do not
+    // cross-link is worse than the single doc was.
+    linksTo: [PROMOTION, TENANT_MERGE],
+  },
+  {
+    doc: PROMOTION,
+    mustContain: [
+      "PGRST301",
       // Measured 2026-08-04. The gateway left the architecture: placement is a
       // runtime lookup and ref-hiding is a project setting. A doc that drifts
       // back to "we would need a proxy" is asserting something disproven.
@@ -189,12 +211,11 @@ const pins: Pin[] = [
       "refresh_token_not_found",
     ],
     mustNotContain: [
-      // Both were true when written and are now measured false.
       "Neither approach was built or tested in this run",
       "Neither discovery endpoint nor gateway was built",
     ],
     sections: [/^#{2,3} .*Verification/m, /^#{2,3} .*Gotchas/m],
-    linksTo: [CONSOLIDATION, REGION],
+    linksTo: [SHARED, REGION],
   },
   {
     doc: TENANT_MERGE,
@@ -212,9 +233,13 @@ const pins: Pin[] = [
       "return=minimal",
     ],
     sections: [/^#{2,3} .*Verification/m, /^#{2,3} .*Gotchas/m],
-    // Not MULTITENANT: that link is real but the doc is still a draft, and a pin
-    // should not encode a state another change is in the middle of.
-    linksTo: [TENANCY, PBKDF2],
+    // This guide used to ask a GUIDE to "argue the case" for shared tenancy,
+    // which is the reference's job - a symptom of the reference having had no
+    // inbound links at all. The lede now routes all three ways: the reference
+    // for the decision, the build guide for the tier this lands on, the
+    // promotion guide for the opposite direction. Pinned so it cannot collapse
+    // back into one link doing three jobs.
+    linksTo: [MULTITENANT, SHARED, PROMOTION, PBKDF2],
   },
   {
     doc: PBKDF2,
