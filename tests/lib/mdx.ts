@@ -309,6 +309,9 @@ export const LLM_MARKERS: RegExp[] = [
   /harness the power/i,
   /navigate the complexities/i,
   /plays a (key|crucial|vital|central) role/i,
+  // Anchored, because mid-sentence "additionally wants" is ordinary English and
+  // is in the corpus. Only the sentence-initial connective is the tell.
+  /^(Furthermore|Moreover|Additionally)[ ,]/,
   // AGENTS.md house-style bans: rating your own points, and the SmartyPants
   // en-dash trap.
   /the big win/i,
