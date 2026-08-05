@@ -276,12 +276,33 @@ const pins: Pin[] = [
       // n=1 at 138 s was superseded by n=5 at 131-159 s, and for a while the
       // evidence table carried both as separate rows.
       "Create -> healthy = 138 s",
+      // The doc framed itself as a reaction to a Supabase product - "hand-rolling
+      // SfP" - which only parses for a reader who already knows the product. SfP
+      // stays as a compared option and a branch of the decision tree; it stops
+      // being the premise.
+      "Hand-rolling",
+      // Both labs that produced the proofs used `items` (41 occurrences in the
+      // erfibase SFP lab, 34 in supabase-lab). `app_notes` appears in neither -
+      // it was invented for the doc, so it misreported the table the live Data
+      // API tests actually hit, and it made one pattern look like two across the
+      // reference and the guides.
+      "app_notes",
     ],
-    sections: [/^#{2,3} .*(TL;DR|Decision)/m, /^#{2,3} .*Verified/m, /^#{2,3} .*design-only/m],
-    // Shipped 2026-08-04. It links to the tenancy guide in two places now, but
-    // linksTo stays off deliberately: the old bash matrix asserted cross-links
-    // by grepping built HTML, where Starlight renders the whole sidebar on
-    // every page, so every slug matched every page. Five cross-link checks could never fail.
+    sections: [
+      /^#{2,3} .*(TL;DR|Decision)/m,
+      /^#{2,3} .*Verified/m,
+      /^#{2,3} .*design-only/m,
+      // This doc is the entry point for the tenancy set and had no Related
+      // section at all, which is why it had zero inbound links while three
+      // guides competed to be the front door.
+      /^## Related/m,
+    ],
+    // linksTo was off here with a note that the old bash matrix grepped built
+    // HTML - where Starlight renders the whole sidebar on every page, so every
+    // slug matched and the check could never fail. That rationale is stale: this
+    // implementation tests the SOURCE text, and it was canaried to confirm it
+    // fails when a link is removed. The hub has to reach every doc it routes to.
+    linksTo: [SHARED, PROMOTION, TENANT_MERGE, CONSOLIDATION, OPCOST],
   },
 ];
 
