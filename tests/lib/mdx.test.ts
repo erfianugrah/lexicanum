@@ -5,7 +5,15 @@
  * a regression is a concrete regression rather than a hypothetical one.
  */
 import { describe, expect, test } from "bun:test";
-import { markerLines, mathRiskLines, parseMdx, smartPunctLines, splitTables } from "./mdx";
+import {
+  LLM_MARKERS,
+  markerLines,
+  mathRiskLines,
+  parseMdx,
+  REJECTED_MARKERS,
+  smartPunctLines,
+  splitTables,
+} from "./mdx";
 
 const fm = (body: string) => `---\ntitle: t\ndescription: d\n---\n\n${body}`;
 
@@ -214,45 +222,35 @@ describe("smart punctuation", () => {
 });
 
 describe("machine-written phrasing", () => {
-  test("a banned word in prose is a finding", () => {
-    expect(markerLines(parseMdx("t.mdx", fm("the rollout was seamless\n")))).toHaveLength(1);
-    expect(markerLines(parseMdx("t.mdx", fm("it is crucial to reboot\n")))).toHaveLength(1);
+  const names = (text: string) => markerLines(parseMdx("t.mdx", fm(`${text}\n`))).map((h) => h.name);
+
+  test("every rule name is unique", () => {
+    // Names key the per-rule cases below and appear in build failures, so a
+    // duplicate would let one rule's case vouch for another's.
+    const seen = LLM_MARKERS.map((r) => r.name);
+    expect(seen.filter((n, i) => seen.indexOf(n) !== i)).toEqual([]);
   });
 
-  // The defect that produced the fence-aware version. AGENTS.md bans " -- " in
-  // prose because SmartyPants renders it as an en-dash, which it does not do
-  // inside a fence. A fence-blind check flagged the tenancy reference's RLS
-  // policy for two ordinary SQL comments.
-  test("a SQL comment inside a fence is not a finding", () => {
-    const doc = parseMdx("t.mdx", fm("```sql\nselect 1 -- reads\n```\n"));
-    expect(markerLines(doc)).toHaveLength(0);
-  });
+  // The table is the test. Each rule carries the line it must flag and, where a
+  // near-collision exists in the corpus, the line it must not - so a rule cannot
+  // be added without a case, and deleting a rule deletes its case rather than
+  // leaving a passing test behind that no longer guards anything.
+  describe.each(LLM_MARKERS.map((r) => [r.name, r] as const))("%s", (name, rule) => {
+    test("fires on its own hit", () => {
+      expect(names(rule.hit)).toContain(name);
+    });
 
-  test("an inline code span is not a finding", () => {
-    expect(markerLines(parseMdx("t.mdx", fm("pass `--robust` to the CLI\n")))).toHaveLength(0);
-  });
-
-  test(" -- in prose is a finding", () => {
-    expect(markerLines(parseMdx("t.mdx", fm("a -- b\n")))).toHaveLength(1);
-  });
-
-  // Calibration cases. Each of these was checked against the corpus and is
-  // legitimate usage, so banning the root word would produce false positives.
-  test("words with legitimate corpus usage are not banned", () => {
-    const ok = [
-      "order of leverage against a distant database",
-      "the unlock combo is a security feature",
-      "requires an elevated ephemeral ID score",
-      "PKCE essentially replaces something you know",
-      "the branch additionally wants a direct connection",
-    ];
-    for (const line of ok) {
-      expect(markerLines(parseMdx("t.mdx", fm(`${line}\n`)))).toHaveLength(0);
+    // Registered only when there is one, so the run does not report two dozen
+    // skips that mean "no near-collision exists" rather than "not checked".
+    if (rule.miss !== undefined) {
+      test("stays quiet on its near-miss", () => {
+        expect(names(rule.miss!)).toEqual([]);
+      });
     }
   });
 
-  test("a sentence-initial connective is a finding", () => {
-    expect(markerLines(parseMdx("t.mdx", fm("Additionally, the pooler drops.\n")))).toHaveLength(1);
+  test("the roots rejected during calibration stay unbanned", () => {
+    for (const line of REJECTED_MARKERS) expect(names(line)).toEqual([]);
   });
 });
 
