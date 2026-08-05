@@ -174,7 +174,8 @@ rewrite just for style is not required.
 ## Verify before done
 
 Run `bun run build` and confirm:
-- the current page count (36 as of 2026-08-04), exit 0. Treat a DROP as the signal:
+- the current page count (37 as of 2026-08-05; 36 docs plus one redirect stub for
+  the renamed operation-cost page), exit 0. Treat a DROP as the signal:
   a doc with `draft: true` does not build, and the count is the cheapest way to notice.
 - `bun test` is green. ALL doc checks live in `tests/` and run inside `bun run build`,
   so a defect fails the build instead of appearing on the page. There is no verify
