@@ -13,7 +13,8 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { markerLines, mathRiskLines, smartPunctLines, splitTables } from "./lib/mdx";
-import { builtPath, CHECK_BUILT, collectDocs } from "./lib/corpus";
+import { join } from "node:path";
+import { builtPages, builtPath, CHECK_BUILT, collectDocs, DIST } from "./lib/corpus";
 
 const docs = collectDocs();
 
@@ -171,13 +172,17 @@ describe.skipIf(!CHECK_BUILT)("built output", () => {
     // is identifiable by the meta refresh Astro emits for a declared redirect,
     // so an unexplained page - a stale artifact, or a doc silently dropped - has
     // nowhere to hide.
-    const built = Bun.spawnSync(["rg", "--files", "dist", "-g", "index.html"])
-      .stdout.toString().trim().split("\n").filter(Boolean);
+    const built = builtPages();
+    // Guards the walk itself: an empty dist would make every filter below
+    // vacuous and the equality would only hold when the corpus is also empty.
+    expect(built.length).toBeGreaterThan(docs.length);
     // The site homepage is a built page but not a collection doc, so
     // collectDocs() does not return it. Excluded by name rather than by
     // subtracting one, so the assertion still reads as an equality.
-    const contentPages = built.filter((p) => p !== "dist/index.html");
-    const stubs = contentPages.filter((p) => readFileSync(p, "utf8").includes('http-equiv="refresh"'));
+    const contentPages = built.filter((p) => p !== "index.html");
+    const stubs = contentPages.filter((p) =>
+      readFileSync(join(DIST, p), "utf8").includes('http-equiv="refresh"'),
+    );
     expect(contentPages.length - stubs.length).toBe(docs.length);
   });
 
