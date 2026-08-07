@@ -1,0 +1,260 @@
+---
+title: "Stripe Sync Engine: schema projection, version drift, and the FDW alternative"
+description: How the one-click Stripe integration copies Stripe into Postgres, why its typed columns can silently go NULL while the data is still there, how the Stripe FDW avoids the same failure, and measured latency between the two paths - plus what an MCP agent sees when it queries the result.
+author: Erfi Anugrah
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Two ways to get Stripe billing data into SQL - copy it into local tables, or query the API through a foreign data wrapper - what each costs, and the version-pinning failure that only one of them has.[^sb-stripe-blog]
+
+All numbers below were measured on a **Supabase preview branch in `ap-southeast-1`**, against a **test-mode Stripe account holding 17 customers, 15 subscriptions (13 active, 2 canceled), 6 products and 6 prices**, on **2026-08-07**. That is one page of Stripe API results, which matters for the latency ratios - see [Reading the numbers](#reading-the-numbers). Claims marked documented-but-not-tested in the [evidence table](#evidence) were read from vendor docs and not reproduced here.
+
+## TL;DR
+
+- The integration projects a Postgres schema from a Stripe OpenAPI spec and records the pin in `stripe._migrations`. On both installs measured, that pin was dated **2020-08-27**, byte-identical, including one installed the same day.
+- Its managed webhook records `api_version = null`, so payloads arrive at whatever version the **Stripe account** currently defaults to. Schema version and data version are independent and nothing reconciles them.
+- When an account's default crosses a field relocation, a typed column stops being populated and the value reappears somewhere the projection has no column for. No error, no log line. `subscriptions.current_period_end` was NULL on 13 of 13 active subscriptions while the value sat in `subscription_items._raw_data`.
+- The Stripe FDW does **not** have this failure, because it pins both a schema and an API version. Forcing it onto a post-relocation version reproduces the failure exactly, which is how the mechanism was confirmed.
+- Local tables answered in **under 1 ms**; the same questions through the FDW took **418 to 1292 ms**. The ratio is a floor, not a ceiling.
+- Nothing is lost either way: the full payload lands in `_raw_data`, so recovery is a query change rather than a support ticket.
+
+## How the integration works
+
+The one-click Stripe Sync Engine installs a `stripe` schema, deploys Edge Functions to receive webhooks, and schedules recurring backfills through Supabase Queues. Each object is stored twice: shredded into typed columns, and whole in a `_raw_data` jsonb column. That redundancy is what makes the drift below both survivable and measurable.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  stripe [label="Stripe API"];
+
+  subgraph cluster_sync {
+    label="Sync Engine (copy)";
+    fn [label="Edge Function\n(webhook + backfill)"];
+    tbl [label="stripe.* tables\ntyped columns + _raw_data"];
+  }
+
+  subgraph cluster_fdw {
+    label="FDW (passthrough)";
+    ft [label="stripe_fdw.*\nforeign tables"];
+  }
+
+  app [label="your SQL\njoins against public.*"];
+
+  stripe -> fn [label="webhook, api_version=null"];
+  fn -> tbl [label="write"];
+  tbl -> app [label="local read"];
+
+  app -> ft [label="query"];
+  ft -> stripe [label="API call per query\npinned api_version"];
+}
+```
+
+The `stripe` schema held **29 base tables** (31 relations including views), of which 24 are Stripe object tables and 5 are the integration's own bookkeeping: `_migrations`, `_sync_runs`, `_sync_obj_runs`, `_managed_webhooks`, `_rate_limits`.
+
+## Which one do I pick
+
+| | Sync Engine | Stripe FDW | Hand-rolled pipeline |
+|---|---|---|---|
+| Read latency (measured, one API page) | under 1 ms | 418 - 1292 ms | depends on your copy |
+| Joins to your own tables | native SQL | works, but every query is an API call | native SQL |
+| Rate limits | handled by the engine | yours to hit | yours to handle |
+| Version pinning | schema pinned, data floating | both pinned together | both yours |
+| Write access | read-only copy | some objects writable[^sb-wrappers-stripe] | yours |
+| Freshness | webhook-driven, near-live | always current | your schedule |
+| Operational cost | one click | one server + foreign tables | ongoing |
+
+Pick the FDW for point lookups where currency matters more than speed - "is this customer subscribed right now" against a filter Stripe can push down. Pick the sync engine for anything that joins, aggregates, or runs more than once. Pick a hand-rolled pipeline when you need transformations neither gives you, and accept that you now own version pinning too.
+
+## The two version axes
+
+The integration maintains two version-dependent things and connects neither to the other.
+
+**The schema** is projected from a Stripe OpenAPI spec. The pin lives in `stripe._migrations`:
+
+```sql
+select name from stripe._migrations where name like 'openapi:%';
+-- openapi:stripe:2020-08-27:9d226db8b2872c23
+```
+
+**The data** arrives through a managed webhook that records no API version, so it follows the Stripe account default:
+
+```sql
+select coalesce(api_version::text, 'null') from stripe._managed_webhooks;
+-- null
+```
+
+Stripe's `2025-03-31.basil` release moved `current_period_start` and `current_period_end` off the Subscription object and onto the Subscription Item.[^stripe-basil] A projection generated from a 2020 spec has a typed `subscriptions.current_period_end` column and no period column on `subscription_items`. Once an account's default version crosses that release, the column can never be filled and the value has nowhere typed to land:
+
+```sql
+select count(*) total,
+       count(current_period_end) typed_populated
+from stripe.subscriptions where status = 'active';
+-- 13 | 0
+
+select count(_raw_data->>'current_period_end')
+from stripe.subscription_items;
+-- 13
+```
+
+The working expression reads through the item:
+
+```sql
+to_timestamp((si._raw_data->>'current_period_end')::bigint)
+```
+
+<Aside type="caution" title="The failure is silent">
+No error, no log line, no advisory. A dashboard query that returned dates one week returns NULL the next, because a background reconcile rewrote rows with a payload shaped differently from the schema waiting for it.
+</Aside>
+
+### Evidence the pin is not just a stale install
+
+Two installs, 18 days apart, recorded the **same pin with the same hash**. The second was created that morning on a fresh branch with no `stripe` schema, and backfilled 13 subscriptions with zero populated. So this is not an install that aged badly.
+
+There was also an accidental control group. Subscriptions in a terminal state are never re-synced, and the two canceled ones still carried non-null values from their original sync while every active row had been overwritten with NULL by a later run. The rows that were rewritten lost the value; the rows that were not, kept it.
+
+## The FDW as a control
+
+The Stripe FDW[^sb-wrappers-stripe] was stood up on the same database, against the same account, on the same day. The prediction was that it would show the same drift, since any schema pinned over a moving API should rot the same way. It does not - and one server option accounts for the entire difference:
+
+| `api_version` on the FDW server | typed column populated | period in payload |
+|---|---|---|
+| `2025-03-31.basil` | 0 / 13 | on the item |
+| unset (the FDW's own default) | 13 / 13 | on the subscription |
+
+Flip it and the column empties; flip it back and it fills. That is one variable, so this claim rests on no inference about sampling or object states.
+
+The corrected diagnosis is narrower and more useful than "pinned schemas go stale":
+
+- The FDW pins **both** sides. It ships a schema and requests a matching API version, so columns and payloads agree by construction. It breaks identically when deliberately pinned forward past a relocation, which is what the table records.
+- The Sync Engine pins the **schema only**, and lets the data version float on the account default.
+
+The failure is not staleness. It is two version knobs that must move together and are not connected to each other. That also names the fix: pin the webhook to the spec the projection came from, or advance the projection, but do not let them drift independently.
+
+## Latency
+
+Same database, same region, same Stripe account, same logical question down both paths. `EXPLAIN ANALYZE` execution time, median of seven, first run discarded because it pays for the TLS handshake to the Stripe API.
+
+| Query | Sync Engine | Stripe FDW | Ratio |
+|---|---|---|---|
+| count active subscriptions | 0.084 ms | 418.019 ms | 4976x |
+| list customers | 0.054 ms | 587.292 ms | 10876x |
+| join billing to application tables | 0.258 ms | 1292.421 ms | 5009x |
+
+Connection setup is identical on both sides and excluded deliberately - it would only add noise to a ratio.
+
+## What an agent sees over MCP
+
+The Supabase MCP server exposes this data to an LLM through `execute_sql`, scoped by URL parameters `project_ref`, `read_only` and `features`.[^sb-mcp] Two findings matter if you are building on that.
+
+**The drift is agent-visible and agent-invisible at the same time.** Asked for renewal dates, an agent reaches for `stripe.subscriptions.current_period_end` - a typed bigint column, exactly what schema inspection recommends - and gets `null` on every row. Verified through a real `tools/call`:
+
+```json
+[{"handle":"...","renews":null},{"handle":"...","renews":null}]
+```
+
+**You cannot leave it a hint.** `list_tables` returns only `{name, rls_enabled, rows}`. No columns, therefore no column comments, so a `comment on column` explaining the trap never reaches the model. An agent only discovers columns by running SQL against `information_schema`, where the comment is not joined in by default.
+
+The tool set at a `features=database,docs` URL is `search_docs`, `list_tables`, `list_extensions`, `list_migrations`, `apply_migration`, `execute_sql`. Note that `apply_migration` is listed even with `read_only=true`; whether it is refused at execution was not tested here.
+
+<Aside type="note" title="Bridging a remote MCP server into a stdio-only client">
+Supabase's MCP server is remote HTTP. A client that only speaks stdio needs a proxy - `mcp-remote` exists for exactly this, handling the OAuth browser flow and caching the token.[^mcp-remote] Configure it as `npx -y mcp-remote <url>` wherever the client expects a command.
+</Aside>
+
+## Exposure and RLS posture
+
+Foreign tables have no RLS at all, so the wrappers documentation is explicit that they belong in a private schema and must not be exposed on the Data API.[^sb-wrappers-overview]
+
+The sync engine's `stripe` schema is safe by default but for a narrower reason than most people assume. Neither `anon` nor `authenticated` has `USAGE` on it and neither holds a single table grant - but **RLS is not enabled on any of the tables**. Protection is schema-level grants plus absence from PostgREST's exposed-schema list. Add `stripe` to the exposed schemas and there is no second line of defence.
+
+## Reading the numbers
+
+**The latency ratio is a floor.** The account measured holds 17 customers - a single Stripe API page. FDW cost is dominated by round trips and grows with pagination; local table cost grows with rows but stays indexed. The measured multiple runs from 4976x to 10876x, and "about a thousand times" is the figure that survives a follow-up question.
+
+**Absolute latency is region-bound.** Both database and FDW client sat in `ap-southeast-1`; the Stripe API call leaves that region. Sub-millisecond local reads generalize; the FDW figures do not, and would shift with the caller's distance from Stripe.
+
+**One field is not the whole story, and this doc does not claim it is.** A sampled diff of typed columns against payload keys suggested roughly 40 columns never populated and 80 returned fields with no column. Those numbers are not published as a finding here, because on 15 subscriptions in one state "absent from every sampled payload" conflates genuine drift with expandable fields that only materialize when requested and with fields that happen to be null. Separating them needs a fixture matrix, which is a different experiment.
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="Does the query join or aggregate?", shape=diamond];
+  q2 [label="Must the answer be\ncurrent to the second?", shape=diamond];
+  q3 [label="Do you need transformations\nneither path gives you?", shape=diamond];
+
+  sync [label="Sync Engine"];
+  fdw  [label="Stripe FDW"];
+  own  [label="Hand-rolled\n(you own version pinning too)"];
+
+  q1 -> sync [label="yes"];
+  q1 -> q2   [label="no"];
+  q2 -> fdw  [label="yes"];
+  q2 -> q3   [label="no"];
+  q3 -> own  [label="yes"];
+  q3 -> sync [label="no"];
+}
+```
+
+Whichever you pick, check the pin against your account's API version before trusting a typed column, and read `_raw_data` when it disagrees.
+
+## Reproducing
+
+```sql
+-- 1. what spec was the schema generated from?
+select name from stripe._migrations where name like 'openapi:%';
+
+-- 2. what version does the data arrive at?
+select coalesce(api_version::text, 'null') from stripe._managed_webhooks;
+
+-- 3. which typed columns can never be filled?
+--    compare declared columns against keys actually present in payloads
+select column_name from information_schema.columns
+ where table_schema = 'stripe' and table_name = 'subscriptions'
+   and column_name not like '\_%'
+except
+select distinct k from stripe.subscriptions, lateral jsonb_object_keys(_raw_data) k;
+```
+
+Query 3 generalizes to any table in the schema and is the cheapest drift check available. Run it after any Stripe API version change.
+
+## Evidence
+
+| Claim | How it was checked |
+|---|---|
+| Schema pin dated 2020-08-27, identical across two installs | `select name from stripe._migrations` on both, 18 days apart. Measured. |
+| Webhook records `api_version = null` | `select api_version from stripe._managed_webhooks`. Measured. |
+| `current_period_end` NULL on 13 of 13 active subscriptions | `count(*)` vs `count(current_period_end)`. Measured. |
+| Value present in `subscription_items._raw_data` | `count(_raw_data->>'current_period_end')` = 13. Measured. |
+| basil moved the field | [Stripe changelog](https://docs.stripe.com/changelog/basil/2025-03-31/deprecate-subscription-current-period-start-and-end). Documented, and consistent with the payload shapes observed. |
+| FDW does not drift; version toggle reproduces the failure | `alter server ... options (add api_version '2025-03-31.basil')`, re-query, revert. Measured, one variable. |
+| Latency figures | `EXPLAIN ANALYZE` execution time, median of 7, warmup discarded. Measured. |
+| `list_tables` returns no columns | Real MCP `tools/call` against the server. Measured. |
+| `apply_migration` listed under `read_only=true` | Present in `tools/list`. Whether it is refused at execution: **not tested**. |
+| `anon` / `authenticated` have no access to `stripe` | `has_schema_privilege` and `information_schema.role_table_grants`. Measured. |
+| ~40 unpopulated columns / ~80 untyped fields | Sampled diff on one account. **Not published as a finding** - see [Reading the numbers](#reading-the-numbers). |
+
+## Gotchas and lessons learned
+
+- **A fresh install does not get a newer projection.** Reinstalling is not a fix for the pin.
+- **Terminal-state rows are never re-synced**, so they preserve whatever the schema-data agreement was on the day they were written. That makes them an accidental control group, and a misleading sample if you only look at them.
+- **`n_live_tup` is an estimate.** A freshly backfilled table can report 0 rows in `pg_stat_user_tables` while `count(*)` returns 13. Do not conclude a sync failed from statistics that autovacuum has not caught up with.
+- **Foreign tables and the sync schema want different names.** The wrappers documentation suggests putting foreign tables in a schema called `stripe`, which collides with the sync engine's own. Use a distinct name if both are installed.
+- **Preview branches pause after inactivity.** If a branch is carrying a long-lived demo or integration, make it persistent.[^sb-branching]
+
+[^sb-stripe-blog]: Supabase, "Sync Stripe data to your Supabase database in one click," Supabase Blog. https://supabase.com/blog/stripe-sync-engine-integration
+[^stripe-basil]: Stripe, "Deprecate subscription current_period_start and current_period_end," Stripe API changelog. https://docs.stripe.com/changelog/basil/2025-03-31/deprecate-subscription-current-period-start-and-end
+[^sb-wrappers-stripe]: Supabase, "Stripe," Supabase Docs - Foreign Data Wrappers. https://supabase.com/docs/guides/database/extensions/wrappers/stripe
+[^sb-wrappers-overview]: Supabase, "Foreign Data Wrappers," Supabase Docs. https://supabase.com/docs/guides/database/extensions/wrappers/overview
+[^sb-mcp]: Supabase, "Supabase MCP Server," Supabase Docs. https://supabase.com/docs/guides/ai-tools/mcp
+[^mcp-remote]: Glen Maddern, "mcp-remote," GitHub. https://github.com/geelen/mcp-remote
+[^sb-branching]: Supabase, "Branching," Supabase Docs. https://supabase.com/docs/guides/deployment/branching
