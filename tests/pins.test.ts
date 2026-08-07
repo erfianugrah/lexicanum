@@ -101,7 +101,7 @@ const pins: Pin[] = [
       // The trap, and the reason the advice inverted. Off-then-on returns a
       // CONSTANT, so any project with extra exposed schemas loses them.
       "rewrites `db_schema` to the constant `public`",
-      "the Dashboard click is the destructive one",
+      "the dashboard click is the destructive one",
       // What a client actually sees once a schema is dropped - greppable by
       // someone debugging it.
       "406 PGRST106",
@@ -131,9 +131,13 @@ const pins: Pin[] = [
       // service network the only options, which is what this sentence said.
       "the options are one endpoint per VPC",
       // Three phrasings of the Data API claim disproved on 2026-08-07. The
-      // last one told readers to prefer the Dashboard click, which is the
-      // destructive path - actively harmful advice, not merely stale.
+      // last one told readers to prefer the dashboard click, which is the
+      // destructive path - actively harmful advice, not merely stale. Both
+      // cases are pinned out: the corpus normalised to lowercase "dashboard"
+      // (171 vs 30 elsewhere) after these were written, so a revert could
+      // reintroduce the claim in either form and one spelling would miss it.
       "remains a Dashboard action",
+      "remains a dashboard action",
       "leave the config alone",
       "it is not equivalent",
     ],
