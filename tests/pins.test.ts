@@ -88,6 +88,12 @@ const pins: Pin[] = [
       // A peered VPC reached the ORIGINAL endpoint given a PHZ association and
       // an SG rule. If this softens back, the doc is wrong again.
       "but it does not need one of its own either",
+      // Confirmed over a transit gateway too, which is the transport that
+      // actually matters - a peering mesh stops being practical past about
+      // three VPCs. Attributed, not assumed: the run checked 0 active
+      // peerings against 2 gateway attachments, because a stale peering
+      // connection would have carried the traffic and made the pass empty.
+      "It generalises to a transit gateway.",
       // The platform refuses to strand clients: an account cannot be removed
       // while any consumer attachment remains. This is why the "what happens
       // to live clients on removal" question has no answer - the state is
