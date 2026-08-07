@@ -45,8 +45,98 @@ const MULTITENANT = "reference/supabase-multi-tenant-placement";
 const TENANT_MERGE = "guides/supabase-tenant-consolidation";
 const PBKDF2 = "guides/pbkdf2-supabase-auth-migration";
 const OPCOST = "reference/supabase-platform-operation-cost";
+const PRIVATELINK = "reference/supabase-aws-privatelink";
+const PRIVATELINK_TOFU = "guides/supabase-aws-privatelink-tofu";
 
 const pins: Pin[] = [
+  // The two PrivateLink docs went unpinned through the corrections that made
+  // them worth reading, and the gap showed: the evidence table said "5
+  // API-triggered restarts" while its own prose described three by psql plus
+  // three through a Lambda. That is the second time this table drifted from the
+  // paragraph above it (RUNLOG run 7 records the first, where a partly-applied
+  // multi-edit left the table quoting a ceiling the prose had already
+  // corrected). Both docs publish numbers that moved repeatedly, so the pins
+  // below are weighted toward the corrections and their caveats rather than
+  // toward structure.
+  {
+    doc: PRIVATELINK,
+    mustContain: [
+      // The ceiling was published wrong three times - 200, then 213, then 287 -
+      // each time because one measurement read as authoritative. All four
+      // samples have to stay on the page: a reader who sees a single number
+      // will size against it, which is the exact mistake this doc made.
+      "174th, 213th, 213th and 287th",
+      "Do not quote a precise ceiling from this.",
+      "Size against the published number",
+      // What actually reproduces. If the integers ever go, this must not.
+      "queue, then refuse",
+      // The page's own confession, and the reason the caveats above are not
+      // hedging. Losing it turns a corrected doc back into a confident one.
+      "wrong three times",
+      // Corrected here: the table said 5, the prose said 3 + 3. The count and
+      // its resolution travel together - a 59s window recorded at a 5s probe
+      // interval, at first success, on one path, is not comparable to a window
+      // measured any other way, and the sibling operation-cost page measures
+      // exactly that differently.
+      "6 API-triggered restarts",
+      "first successful probe",
+      // Create-time-only constraint. Read as "IPv6 unsupported" it costs an
+      // endpoint replacement and a DNS event for every private client.
+      "Build it dualstack from the start",
+      // The finding that makes the association a permanent manual step. If this
+      // softens, the guide's ops-procedure framing stops being justified.
+      "reject personal access tokens (PATs) categorically",
+    ],
+    mustNotContain: [
+      // Shipped, and wrong in the worst way: it agreed with the published
+      // figure, so nothing looked suspicious. Four probes since gave four
+      // different numbers.
+      "at exactly 200",
+      // The drift corrected in this commit. Pinned so a future tightening pass
+      // cannot restore a count that contradicts the paragraph above the table.
+      "5 API-triggered restarts",
+    ],
+    sections: [/^## Reading the numbers$/m, /^## Gotchas$/m, /^## Reproducing$/m],
+    // Both are linked from the guide with a fragment, so renaming either
+    // heading breaks an inbound link silently.
+    anchors: ["what-the-off-switches-do", "gotchas"],
+    linksTo: [PRIVATELINK_TOFU],
+  },
+  {
+    doc: PRIVATELINK_TOFU,
+    mustContain: [
+      // The one-line gap in the official walkthrough. Symptom is a silent drop
+      // on 6543 that reads as a platform fault, and the worst case is an app
+      // falling back to the public pooler unnoticed.
+      "5432 and 6543 inbound",
+      // Not a slow apply - a plan error. Skipping it blocks the build.
+      "two-pass",
+      // A plan file is a zip embedding tfstate, so committing one publishes the
+      // database password and the PAT however well the tfvars are encrypted.
+      "Never commit a plan file.",
+      // The caveat the lab accepts and a customer environment must not.
+      "SSM retains command parameters",
+      // Without contrib the benchmark phases exit 127 and a suite that greps
+      // for numbers records zeros.
+      "postgresql16-contrib",
+      // The same four samples as the reference. The guide is read on its own by
+      // anyone following the build, so the caveat cannot live only next door.
+      "174, 213, 213 and 287",
+      "The pooler queues before it refuses.",
+      // Verbatim AWS error. Reworded it stops being greppable by someone who
+      // just hit it.
+      "Modifying IpAddressType to DUALSTACK is not supported",
+    ],
+    mustNotContain: [
+      // Was true when written, false by the time it was checked: the lists have
+      // 7 entries in common, 3 only in the reference (all HTTP-tier) and 4 only
+      // here (all build mechanics). A cross-reference that overstates what it
+      // points at sends a reader looking for something that is not there.
+      "carries the same list with the measured evidence inline",
+    ],
+    sections: [/^## Verification$/m, /^## Gotchas and lessons learned$/m],
+    linksTo: [PRIVATELINK],
+  },
   {
     doc: OPCOST,
     mustContain: [
