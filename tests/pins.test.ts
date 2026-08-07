@@ -65,7 +65,7 @@ const pins: Pin[] = [
       // each time because one measurement read as authoritative. All four
       // samples have to stay on the page: a reader who sees a single number
       // will size against it, which is the exact mistake this doc made.
-      "174th, 213th, 213th and 287th",
+      "174th, 213th, 213th, 287th and 288th",
       "Do not quote a precise ceiling from this.",
       "Size against the published number",
       // What actually reproduces. If the integers ever go, this must not.
@@ -73,13 +73,26 @@ const pins: Pin[] = [
       // The page's own confession, and the reason the caveats above are not
       // hedging. Losing it turns a corrected doc back into a confident one.
       "wrong three times",
-      // Corrected here: the table said 5, the prose said 3 + 3. The count and
-      // its resolution travel together - a 59s window recorded at a 5s probe
-      // interval, at first success, on one path, is not comparable to a window
-      // measured any other way, and the sibling operation-cost page measures
-      // exactly that differently.
-      "6 API-triggered restarts",
-      "first successful probe",
+      // The 2026-08-07 re-measurement: both private paths sampled at 500ms on
+      // one restart, and they did NOT move together (45s vs 60s, different
+      // failure modes). This replaced a single-path probe whose 49-131s spread
+      // was conflating the two. The methodology has to stay on the page with
+      // the numbers - sustained recovery and a baseline gate are what make
+      // these comparable with the operation-cost page's public-path figures,
+      // and the earlier numbers were not.
+      "direct 5432 down 45s",
+      "the paths do not move together",
+      "recovery counted only once success was sustained",
+      // T24 disproved a claim this doc previously asserted from vendor docs:
+      // that multi-VPC means an endpoint each or a Lattice service network.
+      // A peered VPC reached the ORIGINAL endpoint given a PHZ association and
+      // an SG rule. If this softens back, the doc is wrong again.
+      "but it does not need one of its own either",
+      // The platform refuses to strand clients: an account cannot be removed
+      // while any consumer attachment remains. This is why the "what happens
+      // to live clients on removal" question has no answer - the state is
+      // unreachable. Verbatim so it stays greppable by someone who hit it.
+      "There are still Endpoint Associations attached",
       // Create-time-only constraint. Read as "IPv6 unsupported" it costs an
       // endpoint replacement and a DNS event for every private client.
       "Build it dualstack from the start",
@@ -92,9 +105,15 @@ const pins: Pin[] = [
       // figure, so nothing looked suspicious. Four probes since gave four
       // different numbers.
       "at exactly 200",
-      // The drift corrected in this commit. Pinned so a future tightening pass
-      // cannot restore a count that contradicts the paragraph above the table.
+      // Drift corrected 2026-08-07: the table said 5 restarts, the prose said
+      // 3 + 3. Both are moot now that the per-path measurement replaced them,
+      // but the string stays pinned out so a revert cannot resurrect it.
       "5 API-triggered restarts",
+      // The claim T24 disproved. It was asserted from AWS documentation and
+      // read as authoritative for months. Peering ALONE genuinely does not
+      // carry the endpoint - but that does not make an endpoint-per-VPC or a
+      // service network the only options, which is what this sentence said.
+      "the options are one endpoint per VPC",
     ],
     sections: [/^## Reading the numbers$/m, /^## Gotchas$/m, /^## Reproducing$/m],
     // Both are linked from the guide with a fragment, so renaming either
@@ -121,7 +140,7 @@ const pins: Pin[] = [
       "postgresql16-contrib",
       // The same four samples as the reference. The guide is read on its own by
       // anyone following the build, so the caveat cannot live only next door.
-      "174, 213, 213 and 287",
+      "174, 213, 213, 287 and 288",
       "The pooler queues before it refuses.",
       // Verbatim AWS error. Reworded it stops being greppable by someone who
       // just hit it.
