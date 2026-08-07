@@ -93,6 +93,22 @@ const pins: Pin[] = [
       // to live clients on removal" question has no answer - the state is
       // unreachable. Verbatim so it stays greppable by someone who hit it.
       "There are still Endpoint Associations attached",
+      // 2026-08-07: the Dashboard Data API toggle turned out to BE db_schema,
+      // which killed three claims here at once ("not equivalent", "remains a
+      // Dashboard action", "not expressible in IaC"). Pinned because the
+      // wrong version was load-bearing for the runbook advice.
+      "the same lever",
+      // The trap, and the reason the advice inverted. Off-then-on returns a
+      // CONSTANT, so any project with extra exposed schemas loses them.
+      "rewrites `db_schema` to the constant `public`",
+      "the Dashboard click is the destructive one",
+      // What a client actually sees once a schema is dropped - greppable by
+      // someone debugging it.
+      "406 PGRST106",
+      // eu-central-2 moved from asserted to measured. The control is the whole
+      // value of the claim: same org, same day, section renders elsewhere.
+      "no AWS PrivateLink entry",
+      "Region is the only variable",
       // Create-time-only constraint. Read as "IPv6 unsupported" it costs an
       // endpoint replacement and a DNS event for every private client.
       "Build it dualstack from the start",
@@ -114,6 +130,12 @@ const pins: Pin[] = [
       // carry the endpoint - but that does not make an endpoint-per-VPC or a
       // service network the only options, which is what this sentence said.
       "the options are one endpoint per VPC",
+      // Three phrasings of the Data API claim disproved on 2026-08-07. The
+      // last one told readers to prefer the Dashboard click, which is the
+      // destructive path - actively harmful advice, not merely stale.
+      "remains a Dashboard action",
+      "leave the config alone",
+      "it is not equivalent",
     ],
     sections: [/^## Reading the numbers$/m, /^## Gotchas$/m, /^## Reproducing$/m],
     // Both are linked from the guide with a fragment, so renaming either
