@@ -76,12 +76,47 @@ One row is deliberately "n/a": the public direct endpoint is IPv6-only unless yo
 
 PrivateLink is an **organization-level** configuration: for each project, Supabase creates a VPC Lattice Resource Configuration and shares it to your AWS account(s) via AWS Resource Access Manager (RAM).[^sb-privatelink][^aws-ram] You consume it one of two ways: a VPC endpoint of type **Resource**, or an association to an existing Lattice service network.[^sb-privatelink][^aws-lattice] Both were measured. The service-network path works and connects on 5432 and 6543 like the endpoint does, through a hostname the association hands back in the shape `snra-<id>.rcfg-<id>.<hash>.vpc-lattice-rsc.<region>.on.aws`. That is not the project hostname, and the lab's probe there ran with certificate verification disabled, so the TLS half of this path is untested: the leaf carries a single SAN of `db.<ref>.supabase.co` (measured), so `verify-full` against the Lattice name should fail on hostname mismatch exactly as it does against a raw ENI IP, and the same private-hosted-zone treatment should be needed. That follows from the measured SAN rather than having been probed.
 
-The lifecycle, measured:
+Which produces this lifecycle. Everything to the right of the dashed box is Terraform; the dashed box is the one step that is not:
 
-1. **Add the AWS account in the dashboard** (Settings > Integrations > AWS PrivateLink). Status goes CREATING -> READY in about 2 minutes.
-2. **Accept the RAM share.** The share name is `sspl-<ref>-<random>`; the resource configuration is `<org>-<ref>-rc`.[^sb-privatelink] Acceptance is a hard ordering requirement: `aws ram list-resources` shows nothing while the invitation is PENDING (measured). Any automation must accept first, then look up the Amazon Resource Name (ARN) - a declarative `aws_ram_resource_share_accepter` deadlocks on this.
-3. **Create the endpoint.** Type `Resource`, IPv4, one elastic network interface (ENI) per subnet, security group (SG) allowing **both 5432 and 6543** inbound. The official walkthrough's security-group step only opens 5432 (measured doc gap) - 6543 is the PgBouncer port and half the point.
-4. **DNS is on you.** A Resource-type endpoint does not expose a usable `dns_entry` via the AWS API (measured on provider ~> 6.0)[^tf-aws-vpce]; the reliable handle is the ENI private IPs. Put them in a PHZ A record for `db.<ref>.supabase.co` at a 60-second time to live, TTL (the zone apex cannot be a CNAME record, so the apex carries the IPs directly).
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_human {
+    label="Not automatable"; style="rounded,dashed"; fontsize=12; margin=12;
+    click [label="Dashboard:\nAdd AWS account", style=bold];
+  }
+
+  subgraph cluster_sb {
+    label="Supabase side"; style=rounded; fontsize=12; margin=12;
+    assoc [label="Association\nCREATING -> READY"];
+    rc    [label="Lattice Resource\nConfiguration"];
+  }
+
+  subgraph cluster_you {
+    label="Your AWS account (Terraform from here on)"; style=rounded; fontsize=12; margin=12;
+    ram   [label="RAM invitation\nACCEPT FIRST"];
+    vpce  [label="VPC endpoint\n(type: Resource)"];
+    phz   [label="Route53 PHZ\nA -> ENI IPs"];
+  }
+
+  click -> assoc [label="1. PAT is rejected\non this route"];
+  assoc -> rc    [label="2. creates"];
+  rc -> ram      [label="3. shares via RAM"];
+  ram -> vpce    [label="4. accept, then the\nARN becomes visible"];
+  vpce -> phz    [label="5. ENI IPs into\na PHZ record"];
+}
+```
+
+Four properties of that sequence are worth understanding before building it. For the build itself, follow the [OpenTofu guide](/guides/supabase-aws-privatelink-tofu/), which carries the same ground as ordered steps.
+
+1. **The association is dashboard-only, and takes about 2 minutes.** Settings > Integrations > AWS PrivateLink, CREATING -> READY (measured). There is no API route that accepts a PAT, which is what makes this the one manual step in an otherwise declarative build.
+2. **RAM acceptance gates ARN visibility.** The share name is `sspl-<ref>-<random>`; the resource configuration is `<org>-<ref>-rc`.[^sb-privatelink] This is a hard ordering requirement rather than a convention: `aws ram list-resources` shows nothing while the invitation is PENDING (measured), so automation has to accept first and look up the Amazon Resource Name (ARN) second. A declarative `aws_ram_resource_share_accepter` deadlocks on exactly this.
+3. **The endpoint needs both ports open.** Type `Resource`, IPv4, one elastic network interface (ENI) per subnet, security group (SG) allowing **both 5432 and 6543** inbound. The official walkthrough's security-group step only opens 5432 (measured doc gap) - 6543 is the PgBouncer port and half the point.
+4. **DNS is on you.** A Resource-type endpoint does not expose a usable `dns_entry` via the AWS API (measured on provider ~> 6.0)[^tf-aws-vpce]; the reliable handle is the ENI private IPs. They go in a PHZ A record for `db.<ref>.supabase.co` at a 60-second time to live, TTL (the zone apex cannot be a CNAME record, so the apex carries the IPs directly).
 
 <Aside type="caution" title="The association API rejects personal access tokens">
 The dashboard flow calls undocumented `/platform` routes (`POST /platform/projects/{ref}/privatelink/associations/aws-account`). Measured: those routes reject personal access tokens (PATs) categorically - 401 "JSON Web Token (JWT) could not be decoded", even for an owner-role `sbp_` PAT, on the association POST, the status GET, and entitlements. They want a dashboard session JWT. Net effect for automation: project + settings are fully API-driven, but the association itself is one dashboard click per AWS account; everything downstream (RAM accept, endpoint, DNS) is AWS-side and automatable.
@@ -136,11 +171,7 @@ A stale assumption to unlearn, measured: **prepared statements now work on the t
 
 ## Closing public access
 
-The end state most PrivateLink adopters want is: database reachable **only** through the endpoint. Measured sequence:
-
-1. Apply DB network restrictions narrowed to a single break-glass /32.[^sb-netrestrict]
-2. Public direct (5432) and public Supavisor (6543) both stop connecting - restrictions cover pooled and direct routes.[^sb-netrestrict]
-3. The endpoint path is unaffected - the full connection matrix kept passing with restrictions in force.
+The end state most PrivateLink adopters want is: database reachable **only** through the endpoint. Database network restrictions narrowed to a single break-glass /32 get you there.[^sb-netrestrict] Measured, they stop both public direct (5432) and public Supavisor (6543) - the restriction covers pooled and direct routes alike[^sb-netrestrict] - while leaving the endpoint path untouched, with the full connection matrix still passing in force. The [OpenTofu guide](/guides/supabase-aws-privatelink-tofu/) has the apply and the verification.
 
 That is the full lockout story for database traffic, self-service, no support ticket. The official guide still routes this through "contact support to disable public connectivity";[^sb-privatelink] restrictions achieve the socket-level equivalent today, reversible in one API call. What the support action does beyond socket refusal is untested - if the requirement is public ingress *removed* rather than *refused*, the ticket is still the path.
 
@@ -217,19 +248,32 @@ Two things fall out of that table. The endpoint path costs a fifth of the servic
 
 ## Gotchas
 
+Grouped by when they bite. Each one below was measured, not inferred.
+
+### Standing it up
+
 - **The official walkthrough's SG opens 5432 only.** The endpoint serves 6543 (PgBouncer) too, and SGs drop rather than refuse - so a verbatim walkthrough SG leaves `psql ... :6543` hanging to client timeout while direct 5432 works, an asymmetry that points at Lattice rather than the one-line SG gap. Add TCP 6543 inbound from the same source; the 6543 matrix test only passed after the second rule.[^sb-privatelink]
-- **Association automation stops at the dashboard.** The undocumented `/platform` routes reject PATs with 401 "JWT could not be decoded" - measured on the association POST, the status GET, and entitlements with an owner-role PAT; they want a dashboard session JWT. Write the association runbook as an ops procedure (one click + one RAM share per AWS account); everything downstream (RAM accept, endpoint, DNS) is AWS-side and automatable.
-- **Removing an AWS account is refused while anything is still attached.** The dashboard returns `Cannot remove last AWS PrivateLink Association: There are still Endpoint Associations attached to the Resource Configuration` (measured) until every consumer-side attachment is gone - the VPC endpoint, and any Lattice service-network resource association, both count. So teardown has a mandatory order: destroy the endpoint and any service-network association first, then remove the account. The useful consequence is that the platform will not let you strand live clients by removing an account out from under them. Deleting the whole project bypasses the check entirely, which is why a lab that always tears down by deleting the project never meets it.
-- **The Lattice association resource never converges if you hand it an ARN.** `aws_vpclattice_service_network_resource_association` accepts an ARN for `resource_configuration_identifier` and returns the bare id, so every apply fails with `Provider produced inconsistent result after apply` *and* leaves a replacement association behind - which bills per resource-hour. Measured on AWS provider 6.57.1. Pass the id, not the ARN: `element(split("/", var.resource_configuration_arn), 1)`.
 - **RAM acceptance comes before ARN lookup.** `list-resources` returns empty while the invitation is PENDING (measured), and a declarative `aws_ram_resource_share_accepter` deadlocks: the phase that could apply it needs the ARNs that only acceptance produces. Orchestrate accept-then-lookup (the lab's `make arns`) and gate phase 2 on the produced `arns.tfvars`.
 - **Resource endpoints expose no API-visible DNS name.** Gateway and Interface endpoints hand you `dns_entry`; Resource-type endpoints do not (measured, AWS provider ~> 6.0). Put the ENI IPs in a PHZ apex A record at TTL 60, refreshed by the same apply that manages the endpoint - endpoint replacement is a DNS event.
+- **The Lattice association resource never converges if you hand it an ARN.** `aws_vpclattice_service_network_resource_association` accepts an ARN for `resource_configuration_identifier` and returns the bare id, so every apply fails with `Provider produced inconsistent result after apply` *and* leaves a replacement association behind - which bills per resource-hour. Measured on AWS provider 6.57.1. Pass the id, not the ARN: `element(split("/", var.resource_configuration_arn), 1)`.
+
+### Connecting to it
+
 - **Public direct is IPv6-only without the add-on.** `db.<ref>.supabase.co` publishes only an AAAA (IPv6) record unless you buy IPv4 (~\$4/mo), so an IPv4-only client has no public-direct path while the pooler and Data API still answer - a confusing failure shape.[^sb-ipv4] Supavisor session mode is the free IPv4 answer; under PrivateLink the endpoint already provides in-VPC IPv4 on both ports, so neither matters.
 - **Default `supabase link` goes public.** A plain link stores the shared-pooler connection, so `db push` works right up to the day you close public access and the migration pipeline breaks at deploy time.[^sb-cli] Use `link --skip-pooler` (direct via the PHZ) or `db push --db-url`, and prove it once with restrictions already closed (measured: T08 vs T09/T10).
+- **"Transaction mode breaks prepared statements" is stale.** `PREPARE`/`EXECUTE` succeeded on 6543 (measured), so cargo-culted `prepare: false` costs transaction-mode pooling for no current reason. Re-test against your actual pooler before carrying the workaround forward.
+
+### The HTTP tier
+
 - **PostgREST's root requires service_role.** `/rest/v1/` answers anon keys with 401 "Only the `service_role` API key can be used for this endpoint" (measured on- and off-VPC), which reads as key misconfiguration. Probe a real table with the anon key - and note SQL-created tables get `anon` SELECT via default privileges with no RLS, while dashboard-created tables get RLS enabled.
 - **Disabling the Data API wedges PostgREST rather than removing it, whichever lever you pull.** `db_schema: ""` and the dashboard toggle are the same thing (measured): a steady `503 PGRST002` schema-cache retry loop that also takes `/graphql/v1` down while the root keeps answering 401. Monitoring sees an outage, not a clean 404. Plan the alert copy accordingly.
 - **The dashboard Data API toggle destroys your schema list; the API does not.** Off-then-on rewrites `db_schema` to the constant `public` (measured from `public,graphql_public,pvlab_api`), silently dropping every other exposed schema including `graphql_public`. Clients then get `406 PGRST106 "Invalid schema: ..."`. Use `PATCH /v1/projects/{ref}/postgrest` for this, which round-trips the value you give it, and record the schema list somewhere before anyone clicks that toggle.
 - **`private_only` is enforced at channel join.** The anon WebSocket handshake still completes with it enabled; only the public-channel join is refused (measured, ~9s to effect). The Realtime endpoint stays reachable from the internet, so the exposed surface is unchanged.
-- **"Transaction mode breaks prepared statements" is stale.** `PREPARE`/`EXECUTE` succeeded on 6543 (measured), so cargo-culted `prepare: false` costs transaction-mode pooling for no current reason. Re-test against your actual pooler before carrying the workaround forward.
+
+### Association lifecycle and teardown
+
+- **Association automation stops at the dashboard.** The undocumented `/platform` routes reject PATs with 401 "JWT could not be decoded" - measured on the association POST, the status GET, and entitlements with an owner-role PAT; they want a dashboard session JWT. Write the association runbook as an ops procedure (one click + one RAM share per AWS account); everything downstream (RAM accept, endpoint, DNS) is AWS-side and automatable.
+- **Removing an AWS account is refused while anything is still attached.** The dashboard returns `Cannot remove last AWS PrivateLink Association: There are still Endpoint Associations attached to the Resource Configuration` (measured) until every consumer-side attachment is gone - the VPC endpoint, and any Lattice service-network resource association, both count. So teardown has a mandatory order: destroy the endpoint and any service-network association first, then remove the account. The useful consequence is that the platform will not let you strand live clients by removing an account out from under them. Deleting the whole project bypasses the check entirely, which is why a lab that always tears down by deleting the project never meets it.
 
 ## Decision guide
 
@@ -259,38 +303,77 @@ digraph {
 
 Every measured claim above comes out of a disposable OpenTofu lab (supabase-lab): one directory builds the project, association, RAM accept, endpoint, PHZ, and runner; `make suite` then runs the TLS matrix, connect/pgbench benches, the ceiling probe, and an API-triggered restart measurement over SSM, and renders a single evidence report; `make destroy` tears it all down the same day. The suite is the reproducible form of this doc's numbers - region and tier are variables, so re-running it against your own target shape is a same-afternoon job.
 
+### The network path
+
+Does traffic get there, over what, and with TLS that verifies.
+
 | Claim | Status | How it was checked |
 |---|---|---|
 | 5432 + 6543 through the endpoint, verify-full | tested | psql matrix via PHZ name, hostaddr split, raw-IP negative |
 | Cert = `db.<ref>.supabase.co`, 3-cert chain | tested | `openssl s_client -starttls postgres` on the endpoint |
-| Private pooler ~1.5x public Supavisor throughput | tested, single sample per project | pgbench select-only, 4 clients, 15s. 3810 / 3350 / 2258 tps on one project; 4317 / 3445 on another. Ratios held, absolutes moved |
-| Ceiling: queues before refusing; `max_client_conn` boundary not reproducible (174, 213, 213, 287, 288 across five isolated probes) | tested | pgbench `-j 8`, isolated probe on a quiet system, server error text captured |
-| Restart: direct 5432 down 45s, pooler 6543 down 60s, on the same restart | tested | One API-triggered restart, both private paths sampled independently at 500ms, recovery counted only once sustained, and skipped outright had either path been unhealthy at the first sample. Failure modes differ: `the database system is starting up` on 5432, `timeout expired` on 6543 |
-| Superseded: restart 49-131s (psql), 59-93s (Lambda on 6543) | withdrawn | The six samples were 49s, 72s and 131s by `select 1` at a 2s probe interval, then 93s, 59s and 89s through a Lambda at 5s - a ~3x spread read at the time as run-to-run variance. One path per run, recovery taken at the first successful probe, and no check that the path was working beforehand, so a path already down would have had its outage counted as restart downtime. Not comparable with the per-path row above; retained here so the figures stay visible as withdrawn rather than being silently re-derived |
-| Restrictions lockout, endpoint survives | tested | restrictions -> /32, re-run matrix + public-path negative |
-| `link --skip-pooler` over the endpoint | tested | CLI link + db push via PHZ |
-| Prepared statements OK on transaction mode | tested | `PREPARE`/`EXECUTE` on 6543 |
-| PostgREST root requires service_role | tested | anon vs root path, on- and off-VPC |
-| `/platform` association API rejects PATs | tested | owner-role PAT against POST/GET/entitlements |
-| eu-central-2 excluded from PrivateLink | tested | Project Settings > Integrations on a Team project in eu-central-2 lists GitHub and Vercel only - no AWS PrivateLink entry - in an org where the section renders for an ap-southeast-1 project the same day. Region is the only variable. Shows there is no self-serve path; does not prove the backend would refuse |
 | Resource endpoint exposes no `dns_entry` | tested (AWS provider ~> 6.0) | outputs fallback + console cross-check |
 | Lambda in private subnets -> endpoint, 5432 and 6543 | tested, single sample | VPC-attached Lambda; cold connect 698ms / 218ms (one invocation - cold-start dominated, do not treat as a distribution), prepared statements OK on both |
-| Realtime over the endpoint | not applicable, tested | WebSocket handshake completes from in-VPC against the API hostname (72ms) via NAT; the endpoint does not serve it |
-| Data API disable has no Management API lever | withdrawn | There is no `enabled` field, but that was the wrong field: `db_schema: ""` IS the lever the dashboard toggle uses. Retained so the earlier claim is visible as withdrawn. The 503 PGRST002 behavior it described (120s hold, `/graphql/v1` 503 with it, root still 401, restore 1-2s) still holds |
-| Realtime `private_only` enforced at channel join | tested, three runs | PATCH 204, ~9s to effect; handshake still completes, `phx_join` on a public channel returns `PrivateOnly: This project only allows private channels` |
-| The dashboard Data API toggle's actual off-state | tested | The toggle writes `db_schema: ""` - same lever as the Management API, same observable state (503 PGRST002, root still 401). Confirmed by reading the config back while the toggle was off |
-| The dashboard toggle round-trip is lossy | tested | From `public,graphql_public,pvlab_api`, off-then-on returned `db_schema: "public"` - a constant, not the prior value nor the platform default. Dropped schemas answer `406 PGRST106`. Propagation measured from the click: ~2s to disable, ~8s to enable |
-| Data API off with the private path in use | tested | With `db_schema: ""` wedging PostgREST, a query over the private path succeeded on 5432 and on 6543, and `supabase db push --db-url` still applied migrations over the endpoint. The HTTP tier and the database socket are independent |
-| Read replicas behind PrivateLink | doc-cited, not tested | Replicas have their own database endpoints; PrivateLink for a replica goes through an account rep, not self-serve |
+| Endpoint replacement churns ENI IPs | tested | `-replace` in a two-pass apply: IPs moved `.93/.139` -> `.203/.170`; clients recovered once the same apply refreshed the PHZ record |
+| IPv6: dualstack endpoint | tested | Can be CREATED dualstack in an IPv6-enabled VPC (accepted). CONVERTING an existing IPv4 endpoint is rejected - `ModifyVpcEndpoint` `InvalidParameter`. Build it dualstack from the start |
+
+### Reaching it from elsewhere
+
+One endpoint, several consumers.
+
+| Claim | Status | How it was checked |
+|---|---|---|
 | Reaching the endpoint from a peered VPC | tested, TLS not verified | Lambda in a second, peered VPC connected on 5432 and 6543 through the original endpoint, with routes both ways, a PHZ association for the second VPC, and an SG rule for the peer CIDR. A second endpoint was not needed. The probe disabled certificate verification, so `verify-full` from the peer VPC is untested - same hostname and certificate as the endpoint path, so the gap is small |
 | Reaching the endpoint over Transit Gateway | tested, TLS not verified | Transit gateway with an attachment per VPC and routes both ways, reusing the PHZ association and SG rule; a Lambda in the second VPC connected on 5432 and 6543. Transport was attributed, not assumed: 0 active peering connections against 2 available gateway attachments, checked against AWS directly, so a stale peering path could not have carried it. Certificate verification was disabled on the probe |
 | Reaching the endpoint over Direct Connect | inference only, not lab-testable | Needs a physical cross-connect at a Direct Connect location or a partner-hosted circuit, so it will not be measured on throwaway infrastructure. The peering result should generalise to any routed path, but this row stays an inference by construction rather than by backlog |
 | Service-network consumption path | tested, TLS not verified | Service network + resource association + VPC association; connected on 5432 and 6543 via the `snra-<id>...vpc-lattice-rsc` name, with certificate verification disabled on the probe. Reachability measured, `verify-full` over that name not tested. Costs 5x the endpoint path per resource-hour |
-| Association DELETE (removing an AWS account) | tested | Refused while any consumer attachment remains: `Cannot remove last AWS PrivateLink Association: There are still Endpoint Associations attached to the Resource Configuration`. After destroying the endpoint and the service-network association it succeeded and the RAM share disappeared at once. Client impact at removal was therefore not measurable - the platform does not permit the state where it would occur |
-| Endpoint replacement churns ENI IPs | tested | `-replace` in a two-pass apply: IPs moved `.93/.139` -> `.203/.170`; clients recovered once the same apply refreshed the PHZ record |
+
+### Capacity and failure
+
+What happens under load, and during platform operations.
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| Private pooler ~1.5x public Supavisor throughput | tested, single sample per project | pgbench select-only, 4 clients, 15s. 3810 / 3350 / 2258 tps on one project; 4317 / 3445 on another. Ratios held, absolutes moved |
+| Ceiling: queues before refusing; `max_client_conn` boundary not reproducible (174, 213, 213, 287, 288 across five isolated probes) | tested | pgbench `-j 8`, isolated probe on a quiet system, server error text captured |
+| Restart: direct 5432 down 45s, pooler 6543 down 60s, on the same restart | tested | One API-triggered restart, both private paths sampled independently at 500ms, recovery counted only once sustained, and skipped outright had either path been unhealthy at the first sample. Failure modes differ: `the database system is starting up` on 5432, `timeout expired` on 6543 |
+| Superseded: restart 49-131s (psql), 59-93s (Lambda on 6543) | withdrawn | The six samples were 49s, 72s and 131s by `select 1` at a 2s probe interval, then 93s, 59s and 89s through a Lambda at 5s - a ~3x spread read at the time as run-to-run variance. One path per run, recovery taken at the first successful probe, and no check that the path was working beforehand, so a path already down would have had its outage counted as restart downtime. Not comparable with the per-path row above; retained here so the figures stay visible as withdrawn rather than being silently re-derived |
 | Single availability-zone (AZ) ENI failure behavior | tested | One endpoint ENI address blackholed with a network access control list (NACL) deny: node-postgres 3/3 and psql both still connected via the PHZ name. One address blackholed is not a full AZ outage, and 3/3 does not prove deterministic failover ordering |
 | PgBouncer stability over long idle/bursty periods | out of scope | A known failure shape for serverless workloads needs a multi-day soak, not an afternoon |
-| IPv6: dualstack endpoint | tested | Can be CREATED dualstack in an IPv6-enabled VPC (accepted). CONVERTING an existing IPv4 endpoint is rejected - `ModifyVpcEndpoint` `InvalidParameter`. Build it dualstack from the start |
+
+### Clients and migrations
+
+The tooling that has to keep working once the path is private.
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| `link --skip-pooler` over the endpoint | tested | CLI link + db push via PHZ |
+| Prepared statements OK on transaction mode | tested | `PREPARE`/`EXECUTE` on 6543 |
+| Restrictions lockout, endpoint survives | tested | restrictions -> /32, re-run matrix + public-path negative |
+
+### The HTTP tier
+
+PrivateLink does not cover it; these are the levers that do.
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| PostgREST root requires service_role | tested | anon vs root path, on- and off-VPC |
+| Data API disable has no Management API lever | withdrawn | There is no `enabled` field, but that was the wrong field: `db_schema: ""` IS the lever the dashboard toggle uses. Retained so the earlier claim is visible as withdrawn. The 503 PGRST002 behavior it described (120s hold, `/graphql/v1` 503 with it, root still 401, restore 1-2s) still holds |
+| The dashboard Data API toggle's actual off-state | tested | The toggle writes `db_schema: ""` - same lever as the Management API, same observable state (503 PGRST002, root still 401). Confirmed by reading the config back while the toggle was off |
+| The dashboard toggle round-trip is lossy | tested | From `public,graphql_public,pvlab_api`, off-then-on returned `db_schema: "public"` - a constant, not the prior value nor the platform default. Dropped schemas answer `406 PGRST106`. Propagation measured from the click: ~2s to disable, ~8s to enable |
+| Data API off with the private path in use | tested | With `db_schema: ""` wedging PostgREST, a query over the private path succeeded on 5432 and on 6543, and `supabase db push --db-url` still applied migrations over the endpoint. The HTTP tier and the database socket are independent |
+| Realtime over the endpoint | not applicable, tested | WebSocket handshake completes from in-VPC against the API hostname (72ms) via NAT; the endpoint does not serve it |
+| Realtime `private_only` enforced at channel join | tested, three runs | PATCH 204, ~9s to effect; handshake still completes, `phx_join` on a public channel returns `PrivateOnly: This project only allows private channels` |
+
+### Association lifecycle
+
+The parts that need a human, and the order they have to happen in.
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| `/platform` association API rejects PATs | tested | owner-role PAT against POST/GET/entitlements |
+| Association DELETE (removing an AWS account) | tested | Refused while any consumer attachment remains: `Cannot remove last AWS PrivateLink Association: There are still Endpoint Associations attached to the Resource Configuration`. After destroying the endpoint and the service-network association it succeeded and the RAM share disappeared at once. Client impact at removal was therefore not measurable - the platform does not permit the state where it would occur |
+| eu-central-2 excluded from PrivateLink | tested | Project Settings > Integrations on a Team project in eu-central-2 lists GitHub and Vercel only - no AWS PrivateLink entry - in an org where the section renders for an ap-southeast-1 project the same day. Region is the only variable. Shows there is no self-serve path; does not prove the backend would refuse |
+| Read replicas behind PrivateLink | doc-cited, not tested | Replicas have their own database endpoints; PrivateLink for a replica goes through an account rep, not self-serve |
 
 A caution on the numbers above: most are one sample per project. The ceiling claim in this document was wrong three times (200, then 213, then 287) precisely because a single measurement read as authoritative. Latency and throughput figures moved noticeably between projects even where the qualitative result held, so treat them as orders of magnitude and ratios, not reproducible constants.
 
