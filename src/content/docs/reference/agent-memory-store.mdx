@@ -1,0 +1,283 @@
+---
+title: "A cross-client memory store for coding agents"
+description: One Postgres holding every agent client's session history, with incremental ingest, hybrid full-text and vector retrieval, and the operational lessons from seeding 640k messages
+author: Erfi Anugrah
+---
+
+Every coding agent keeps its own session log in its own format on the machine
+where it ran, prunes it on its own schedule, and searches it with its own
+built-in tool. Three clients on two machines is three histories, three search
+tools, and a retention window that quietly deletes the thing you wanted last
+month. This is the architecture of the store that consolidates them, and what
+seeding 640k messages into it taught.
+
+**Provenance.** Measured 2026-08-09 and 2026-08-10 on a self-hosted deployment:
+Postgres 18 with pgvector, PostgREST, and a CPU embedding worker, all in one
+Compose stack on a 2-core/2GB container allocation, ingesting from one
+workstation. Corpus at time of writing: 642,496 messages across three agent
+clients plus a work-ledger and an agent memory file.
+
+## TL;DR
+
+- Session logs are append-only files, so ingest is a byte-offset or line-count
+  checkpoint per file, not a diff. Re-reading a 30MB log every five minutes to
+  find four new lines is the thing to avoid.
+- One Postgres does both retrieval modes. Full-text search answers "where did I
+  write this exact string", vector search answers "where did I discuss this
+  idea", and they are different questions with different failure modes.
+- Embedding 640k rows on CPU is a throughput problem with one lever that works
+  (parallel workers on disjoint row batches) and one that inverts (more
+  intra-op threads per call).
+- A background worker started from a framework lifecycle hook that the framework
+  silently skipped ran for weeks doing nothing while its health endpoint
+  reported healthy. Heartbeat-or-it-did-not-happen.
+- Expose retrieval as ordinary HTTP. Any client that can make a request can use
+  it - protocol adapters are a thin layer on top, not the architecture.
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_ws {
+    label="workstation";
+    logs [label="session logs\n(jsonl per client)"];
+    ledger [label="work ledger\n(sqlite)"];
+    sync [label="sync CLI\n(timer, every 5 min)"];
+    logs -> sync; ledger -> sync;
+  }
+
+  subgraph cluster_srv {
+    label="server (Compose stack)";
+    pg [label="Postgres 18\n+ pgvector"];
+    rest [label="PostgREST"];
+    emb [label="embedding worker\n+ search API"];
+    rest -> pg; emb -> pg;
+  }
+
+  agents [label="agent clients\n(native tools / MCP)"];
+
+  sync -> rest [label="batched upsert\n(merge-duplicates)"];
+  agents -> rest [label="FTS + table reads"];
+  agents -> emb [label="vector search"];
+}
+```
+
+## What lives in it
+
+| Source | Shape | Checkpoint | Why it is here |
+|---|---|---|---|
+| Agent session logs | jsonl, one line per message, append-only | byte offset | The bulk of the corpus and the only copy past local retention |
+| Prompt history file | jsonl, one line per prompt | line count | A client that logs prompts but not full sessions still has recoverable intent |
+| Account export | zip or json, one array of conversations | one-shot import, idempotent | Web-client history that has no local log at all |
+| Work ledger | sqlite, one row per session summary | max id | The "what did I do on project X" question, already summarized |
+| Agent memories | one json file | whole-file | Small, changes rarely, cheap to re-read |
+
+The unifying key is `session_key = <source>:<host>:<external_id>`, and messages
+are keyed `(session_key, ordinal)` where ordinal is the line index. That choice
+is what makes incremental ingest idempotent: re-reading a file from an earlier
+offset re-derives the same keys, and the upsert merges rather than duplicating.
+
+## Incremental ingest
+
+The ingester is a CLI on a five-minute timer, not a daemon. Per source file it
+stores `(size, mtime, offset, line count)` in an `ingest_state` table, reads
+from the stored offset, and writes back the new one. A file whose size and mtime
+match the checkpoint is skipped without opening it.
+
+Batched writes go through PostgREST with `Prefer: resolution=merge-duplicates`,
+which turns the insert into an upsert on the primary key. Two consequences worth
+knowing before adopting the pattern:
+
+- **Every object in one batch must have the same keys.** PostgREST rejects a
+  heterogeneous batch with `PGRST102 All object keys must match`. A source that
+  only sets optional columns when non-null will produce exactly that batch. Pad
+  the missing keys with null in the client before posting.
+- **Order matters across tables.** Messages carry a foreign key to sessions, so
+  the session rows have to land first. Discovered the way these things are
+  usually discovered: a foreign-key violation on the very first run of a new
+  source.
+
+Because the timer reads the live log file, a session's messages are searchable
+minutes after they are written - closing the client is not what triggers ingest,
+and nothing is lost if the machine is off for a day.
+
+## Two retrieval modes, one database
+
+Full-text search runs in Postgres against a generated `tsvector` column with a
+GIN index, exposed as a function through PostgREST. Vector search runs against
+a pgvector column with an HNSW index.[^pgvector] They answer different questions:
+
+| Mode | Good at | Bad at | Cost |
+|---|---|---|---|
+| Full-text | Exact identifiers, error strings, file paths, flag names | Paraphrase, concepts, "the thing about locking" | Index maintained inline on write |
+| Vector | Concepts, paraphrase, "what was that idea about X" | Exact tokens, rare identifiers, anything the embedding model never saw | Backfill cost + index maintenance per row |
+
+Keep the query syntax honest per mode. Postgres `websearch_to_tsquery` accepts
+quoted phrases, `OR`, and `-negation`, but not the FTS5-style `AND`/`NOT` an
+agent might have learned from a different tool; multi-word queries are joined
+with `OR` before they reach it so a two-word search does not silently require
+both.[^pg-fts]
+
+Vector search needs the query embedded with the same model as the corpus, so it
+belongs behind a small service rather than in each client. That service is also
+where the embedding model lives, which keeps the model out of every consumer.
+
+## Embedding throughput on CPU
+
+Seeding was 640k rows through a 384-dimension CPU model.[^fastembed] The
+measured scaling matrix, one configuration change at a time:
+
+| Configuration | Rows/min |
+|---|---|
+| 2 CPU, 1 worker, batch 8 | 64 |
+| 4 CPU, 1 worker, batch 16 | 128 |
+| 8 CPU, 1 worker, batch 32 | 106 |
+| 8 CPU, 4 workers x batch 8, 2 intra-op threads | 453 |
+| 8 CPU, 6 workers x batch 8, 2 intra-op threads | 589 |
+
+Intra-op thread scaling inverted past four: the 8-CPU single-worker row is
+slower than the 4-CPU one. What scaled was worker threads on **disjoint** row
+batches - each worker claims its own rows with `SELECT ... FOR UPDATE SKIP
+LOCKED`, so six workers never fight over the same batch.[^pg-select] The
+inference runtime releases the interpreter lock during the forward pass, so the
+threads genuinely overlap.
+
+Two things to know before copying the numbers. The rate is content-dependent -
+the same configuration ran at 938 rows/min through a stretch of short tool
+results and 589 through prose - so measure your own corpus rather than
+extrapolating from a row above. And at six workers neither side was saturated
+(the worker container at roughly 3 of 8 cores, Postgres at about 1 of 2), which
+means the ceiling was coordination, not capacity: adding workers past that point
+buys progressively less.
+
+The backfill query itself becomes the bottleneck as the queue drains. `WHERE
+embedding IS NULL ORDER BY ts DESC LIMIT n` has no index that matches it, and
+`pg_stat_statements` put it at a 1.19s mean over 75,199 calls. A partial index -
+`ON messages (ts DESC) WHERE embedding IS NULL` - makes that query proportional
+to what is left rather than to the table, and empties itself when the queue
+does.
+
+## The silent worker
+
+The backfill worker was started from a framework startup hook. When an MCP
+surface was added later, the app set a custom lifespan context - and a custom
+lifespan makes the framework skip the startup hooks entirely. No error, no log
+line, no failed health check: the process was serving search requests while the
+thread that was supposed to be embedding had never been created. It sat at 2.6%
+embedded for weeks.
+
+What found it was `py-spy dump` from a sidecar container sharing the PID
+namespace, which listed two Python threads where there should have been three.
+What prevents the next one is a heartbeat the health endpoint reads:
+
+```python
+WORKER_STATE = {"last_loop": 0.0, "rows_embedded": 0, "errors": 0}
+# ... in the loop: WORKER_STATE["last_loop"] = time.time()
+
+@app.get("/health")
+def health(response: Response):
+    age = time.time() - WORKER_STATE["last_loop"] if WORKER_STATE["last_loop"] else None
+    ok = age is not None and age < 180
+    if not ok:
+        response.status_code = 503
+    return {"ok": ok, "worker": {"last_loop_age_s": age}}
+```
+
+A container healthcheck against that endpoint turns "the worker is wedged" into
+`unhealthy` in `docker ps`, and the same counters go out as Prometheus metrics.
+The rule generalizes past this stack: any background loop inside a serving
+process needs a liveness signal that the serving half exposes, because "the port
+answers" is not evidence that the loop runs.
+
+## Access model
+
+Reads are open on the LAN and tailnet; writes always require a bearer token;
+from outside, both do. That asymmetry is deliberate - the ingester is the only
+writer and it holds the token, while every agent client on the network can
+search without one. It also means the retrieval tools in each client need no
+credential, which removes the whole class of "token in a config file, token in
+a process argv, token in a cache key" problems that a credentialed read path
+would have created. This store had exactly that problem via a protocol shim
+before native tools replaced it.
+
+## Client integration: HTTP first, protocol second
+
+The store speaks plain HTTP, which every client can already do. A protocol
+adapter such as MCP is worth adding for clients that expect it,[^mcp] but it is
+a layer on the same endpoints, not a prerequisite - and it carries real cost:
+process spawn per session, a handshake before the first tool call, and one more
+place for a credential to live.
+
+For a client with a native extension mechanism, wiring the same REST calls
+directly is fewer moving parts and a faster session start. The tool surface is
+small enough to be worth doing twice:
+
+| Tool | Backed by |
+|---|---|
+| Message search | PostgREST function over the FTS index |
+| Semantic search | Embedding service, cosine similarity over HNSW |
+| Ledger search | PostgREST function over summaries |
+| Memory search | PostgREST table filter |
+| Session list | PostgREST table filter, ordered by start time |
+
+## Reading the numbers
+
+The corpus is 642k messages and roughly 2.3GB in the messages table. That is
+small for Postgres and large for a laptop-class container: the interesting
+resource is not disk but the embedding backfill, which is a one-time cost
+proportional to corpus size and a trickle thereafter (a few hundred rows per
+sync). Sizing the compute for the steady state and temporarily scaling it up for
+the initial seed is the right shape - this deployment ran 6 workers on 8 cores
+for the seed and scales back to 1 worker on 2 cores afterwards.
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="More than one agent client\nor machine?", shape=diamond];
+  q2 [label="Do you need history past\nthe client's retention window?", shape=diamond];
+  q3 [label="Is the question ever\n'what did I discuss', not\n'where is this string'?", shape=diamond];
+
+  a1 [label="The client's built-in\nsession search is enough"];
+  a2 [label="Central store, FTS only\n(Postgres + an ingester)"];
+  a3 [label="Add a vector column,\nHNSW index and an\nembedding worker"];
+
+  q1 -> q2 [label="no"];
+  q1 -> q3 [label="yes"];
+  q2 -> a1 [label="no"];
+  q2 -> a2 [label="yes"];
+  q3 -> a2 [label="no"];
+  q3 -> a3 [label="yes"];
+}
+```
+
+## Evidence
+
+| Claim | How it was checked | Status |
+|---|---|---|
+| Embedding throughput matrix | Timed row-count deltas over 90-180s windows per configuration, one change at a time | Measured |
+| Intra-op thread scaling inverts past 4 | 8-CPU single-worker run measured slower than the 4-CPU one (106 vs 128 rows/min) | Measured |
+| Backfill select at 1.19s mean | `pg_stat_statements` after 75,199 calls | Measured |
+| Rate is content-dependent | Same configuration measured at 589 and 938 rows/min in different stretches of the same corpus | Measured |
+| Silent worker, wrong thread count | `py-spy dump` from a sidecar in the same PID namespace showed 2 threads, not 3 | Measured |
+| Heterogeneous batch rejected by PostgREST | `PGRST102` on a live sync until the client padded missing keys | Measured |
+| Partial index fixes the drain-time select | Reasoned from the query plan shape; not built, because the queue drained first | Design only |
+| Vector search quality vs FTS | No side-by-side relevance evaluation was run | Not tested |
+
+## References
+
+[^pgvector]: pgvector contributors, "pgvector," GitHub. https://github.com/pgvector/pgvector
+[^pg-fts]: PostgreSQL, "Controlling text search," PostgreSQL Documentation. https://www.postgresql.org/docs/current/textsearch-controls.html
+[^fastembed]: Qdrant, "FastEmbed," FastEmbed Documentation. https://qdrant.github.io/fastembed/
+[^pg-select]: PostgreSQL, "SELECT," PostgreSQL Documentation. https://www.postgresql.org/docs/current/sql-select.html
+[^mcp]: Model Context Protocol, "Tools," MCP Documentation. https://modelcontextprotocol.io/docs/concepts/tools
