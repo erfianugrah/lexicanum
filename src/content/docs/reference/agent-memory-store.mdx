@@ -38,6 +38,10 @@ clients plus a work-ledger and an agent memory file.
 - A background worker started from a framework lifecycle hook that the framework
   silently skipped ran for weeks doing nothing while its health endpoint
   reported healthy. Heartbeat-or-it-did-not-happen.
+- The same worker later held one uncommitted transaction open across its idle
+  sleeps, which blocked every DDL statement and then every query behind it. A
+  loop that touches a database has to commit on the path where it finds nothing
+  to do.
 - Expose retrieval as ordinary HTTP. Any client that can make a request can use
   it - protocol adapters are a thin layer on top, not the architecture.
 
@@ -219,9 +223,14 @@ traded for the 43%. Three things to know before copying it:
 - A parallel index build asks for dynamic shared memory - 265 MB here - and
   Docker gives a container 64 MB of `/dev/shm` by default. It fails with `could
   not resize shared memory segment ... No space left on device`, which reads like
-  a full disk and is not one. Either raise `shm_size` or build serially with
-  `max_parallel_maintenance_workers = 0` (9m29s for 644k rows, spilling past a
-  256 MB `maintenance_work_mem` after 180,983 tuples).
+  a full disk and is not one. Building serially with
+  `max_parallel_maintenance_workers = 0` works around it (9m29s for 644k rows,
+  spilling past a 256 MB `maintenance_work_mem` after 180,983 tuples); raising
+  `shm_size` to 1 GB fixed it properly and the same build then took 5m35s with two
+  workers. Note `shm_size` is a ceiling rather than a reservation, and the pages
+  used are charged to the container's memory limit: writing 300 MB into
+  `/dev/shm` moved this container from 86 MiB to 402.6 MiB, and back to 100 MiB
+  when the file was deleted.
 - A freshly built index is cold, and cold is seconds: the first `limit=50` search
   after the swap took 5.37s before settling to 0.047-0.18s. The warm numbers in
   this doc are not a claim about the first query after a deploy.
@@ -292,6 +301,45 @@ A container healthcheck against that endpoint turns "the worker is wedged" into
 The rule generalizes past this stack: any background loop inside a serving
 process needs a liveness signal that the serving half exposes, because "the port
 answers" is not evidence that the loop runs.
+
+### The loop that held a lock forever
+
+The same worker had a second defect, and it took the database down rather than
+quietly doing nothing. Each pass claimed a batch per table with `SELECT ... FOR
+UPDATE SKIP LOCKED`, which opens a transaction and takes a row-share lock on the
+table. The early-exit path for "nothing to embed" returned without committing:
+
+```python
+rows = cur.fetchall()
+if not rows:
+    conn.commit()   # <- this line. without it the transaction, and its
+    continue        #    table lock, stay open across every idle sleep
+```
+
+While the backfill queue had work this was invisible, because the write path
+committed every pass. Once the queue drained - the steady state a backfill is
+trying to reach - the worker held that lock indefinitely. The next `ALTER TABLE`
+queued behind it, and a queued `ACCESS EXCLUSIVE` request blocks every later
+query on the table, so a routine deploy took the whole database out. Diagnosis is
+one query:
+
+```sql
+SELECT pid, state, now() - xact_start AS xact_age,
+       pg_blocking_pids(pid), wait_event
+  FROM pg_stat_activity WHERE datname = current_database();
+```
+
+which showed a 22-minute `idle in transaction` connection, the DDL waiting 21
+minutes on it, and twenty-odd ordinary queries stacked behind the DDL.
+
+Two settings look like they should prevent this.
+`idle_in_transaction_session_timeout` was set to five minutes throughout and
+never fired, because it measures continuous idle time since the last state
+change while the worker returns to active every sleep interval - the transaction
+is long, the idle spells are not.
+`transaction_timeout` would catch it and is the wrong instrument at server
+scope: `pg_dump` holds a long transaction by design, so the nightly backup
+becomes the casualty. Fix the loop, not the server.
 
 ## Access model
 
@@ -380,7 +428,10 @@ digraph {
 | Half-precision index is 597 MB against 1,043 MB | Built both, compared `pg_relation_size`; database went 4,415 MB -> 3,946 MB after dropping the full-precision one | Measured |
 | Recall 183/200 full, 185/200 half | 20 query vectors pinned by primary key, top-10 diffed against exact search (`enable_indexscan = off`) | Measured |
 | Earlier "identical to exact" recall claim | Withdrawn - the query vector was drawn with `OFFSET` and no `ORDER BY`, so each run sampled a different row | Corrected |
-| Parallel index build fails on 64 MB `/dev/shm` | Reproduced on the live build; succeeded serially with `max_parallel_maintenance_workers = 0` | Measured |
+| Parallel index build fails on 64 MB `/dev/shm` | Reproduced on the live build; succeeded serially with `max_parallel_maintenance_workers = 0`, then in parallel at 5m35s after raising `shm_size` to 1 GB | Measured |
+| `/dev/shm` pages count against the container memory limit | Wrote 300 MB into `/dev/shm` and watched the container go from 86 MiB to 402.6 MiB, then back to 100 MiB on delete | Measured |
+| Uncommitted worker transaction blocks all DDL | `pg_blocking_pids` traced a stalled `REINDEX` to a 22-minute `idle in transaction` connection with 20+ queries queued behind it; after committing on the empty path the worker's connections idle with no open transaction | Measured |
+| `idle_in_transaction_session_timeout` does not catch it | Setting was 5 min for the whole 22-minute transaction; it measures continuous idle, not transaction age | Measured |
 | Vector search quality vs FTS | No side-by-side relevance evaluation was run | Not tested |
 
 [^pgrst-upsert]: PostgREST, "Tables and Views," PostgREST Documentation. https://docs.postgrest.org/en/latest/references/api/tables_views.html
