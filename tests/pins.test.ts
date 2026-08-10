@@ -47,6 +47,9 @@ const PBKDF2 = "guides/pbkdf2-supabase-auth-migration";
 const OPCOST = "reference/supabase-platform-operation-cost";
 const PRIVATELINK = "reference/supabase-aws-privatelink";
 const PRIVATELINK_TOFU = "guides/supabase-aws-privatelink-tofu";
+const MONTOPO = "reference/self-hosted-monitoring-topology";
+const MONGUIDE = "guides/monitor-compose-postgres-prometheus";
+const MEMSTORE = "reference/agent-memory-store";
 
 const pins: Pin[] = [
   // The two PrivateLink docs went unpinned through the corrections that made
@@ -490,6 +493,75 @@ const pins: Pin[] = [
       "sparse mode is not the answer",
     ],
     sections: [/^#{2,3} .*Verification$/m, /^## Gotchas and lessons learned$/m],
+  },
+  // 2026-08-10 monitoring + memory-store trio. These publish numbers that were
+  // measured once, on one rig, during the deploy that produced them: the
+  // throughput matrix in particular is the whole reason the memory-store page
+  // is worth reading, and its inversion row (8 CPU slower than 4) is the part
+  // a later editor would most plausibly "clean up" as a typo.
+  {
+    doc: MONTOPO,
+    mustContain: [
+      // The failure that motivated host mode. If this softens to "may not
+      // work", the page stops being actionable.
+      "policy-drop host",
+      "answers on its bridge IP and nowhere else",
+      // The measured series count is the proof the nft rule works end to end.
+      "717",
+      // The lock incident: an idempotent-looking DDL is not lock-free, and the
+      // queue-blocking half is the part people do not know.
+      "ACCESS EXCLUSIVE",
+      "all new queries queued behind it",
+      // The interval floor exists because panels went blank, not on taste.
+      "holds one sample",
+    ],
+    mustNotContain: [
+      // The k3s guide covers the orchestrated case; this page must keep
+      // saying which case it is rather than claiming generality.
+      "works the same on Kubernetes",
+    ],
+    sections: [/^## Evidence$/m, /^## Decision guide$/m, /^## Topology$/m],
+    anchors: ["evidence", "decision-guide"],
+  },
+  {
+    doc: MONGUIDE,
+    mustContain: [
+      // A guide that drops its verification step is a blog post.
+      "docker exec prometheus wget",
+      // The two floors, and why.
+      "15s",
+      "30s",
+      // The single-source-address rule IS the access model here.
+      "ip saddr 10.0.71.59",
+    ],
+    sections: [/^## Verification$/m, /^## Gotchas and lessons learned$/m, /^## File reference$/m],
+    linksTo: ["reference/self-hosted-monitoring-topology"],
+  },
+  {
+    doc: MEMSTORE,
+    mustContain: [
+      // The inversion. Losing this row turns the matrix into "more cores is
+      // faster", which is the opposite of what was measured.
+      "8 CPU, 1 worker, batch 32 | 106",
+      "inverted past four",
+      // What actually scaled, and the mechanism that makes it safe.
+      "FOR UPDATE SKIP",
+      // The caveat that keeps a reader from sizing against one number.
+      "content-dependent",
+      "measure your own corpus",
+      // The silent-worker incident and its one-line prevention.
+      "never been created",
+      "heartbeat",
+      // Ingest correctness details that cost a live failure each.
+      "PGRST102",
+      "session rows have to land first",
+    ],
+    mustNotContain: [
+      // The store holds session history, not a claim about model quality.
+      "improves model accuracy",
+    ],
+    sections: [/^## Evidence$/m, /^## Topology$/m, /^## Reading the numbers$/m],
+    anchors: ["evidence", "embedding-throughput-on-cpu"],
   },
 ];
 
