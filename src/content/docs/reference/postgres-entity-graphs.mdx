@@ -1,0 +1,399 @@
+---
+title: "Entity graphs on managed Postgres"
+description: Answering who-is-connected-to-whom without a graph database - the extension inventory, recursive CTE against pgrouting with measured latencies, the two name collisions that derail the discussion, why Apache AGE and SQL/PGQ are not the answer today, measured PDF extraction ceilings across two runtimes, and how to size a document corpus you have not extracted yet
+author: Erfi Anugrah
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+A working example is live at [pggraph.erfi.dev](https://pggraph.erfi.dev): seven
+public-domain US federal documents turned into 1521 entities, 10016 mentions and
+14233 edges, with traversal, shortest path, connected components and byte-exact
+provenance. No graph database anywhere in it.
+
+Everything below was measured on a throwaway project in `ap-southeast-1`:
+**Postgres 17.6**, **medium** compute (2 vCPU / 4 GB), 2026-08-10. Query
+latencies are `EXPLAIN ANALYZE`'s own `Execution Time` with the cold first run
+discarded, so they are database work rather than round trip. Read the compute as
+a floor - a real deployment provisions more. Claims that are documented rather
+than measured are marked in [Evidence](#evidence).
+
+**TL;DR:**
+
+- **No property-graph store.** Apache AGE is absent from the 78 available
+  extensions, and there is no Cypher.[^sb-extensions] Say so plainly.
+- **`pgrouting` 3.4.1 is available** and is not geospatial-only: 209 `pgr_*`
+  functions, including Dijkstra, breadth- and depth-first search, k-shortest
+  paths, connected components, articulation points, bridges and transitive
+  closure, over ordinary relational edge tables.[^pgr-manual]
+- **Recursive CTE traversal mostly settles the question.** Depth-3 neighbourhood
+  over 100000 entities / 400000 edges runs in about a fifth of a millisecond with
+  two indexes present, against roughly 167.59 milliseconds without them, on a 602
+  millisecond index build.[^pg-cte]
+- **Two name collisions derail this discussion.** `pg_graphql` is a GraphQL API
+  over tables.[^sb-graphql] `ltree` models single-parent hierarchies, and an
+  entity graph is not a tree.[^pg-ltree]
+- **SQL/PGQ is committed for PG19 and does not change the engine** - it is
+  rewritten to a standard relational query in the rewriter.[^pgq-commit]
+- **Extraction belongs outside the database**, and which runtime you pick moves
+  the ceiling by 5.6x.
+- **Do not size a corpus from its PDF bytes.** The extracted-text ratio measured
+  0.048 to 1.0885 across seven documents.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  src [label="Source documents", shape=box, style=rounded];
+
+  subgraph cluster_out {
+    label="Outside the database"; style=rounded; fontsize=12; margin=12;
+    parse [label="Parse / OCR"];
+    ner   [label="Entity + relation\nextraction"];
+    res   [label="Entity resolution"];
+  }
+
+  subgraph cluster_pg {
+    label="Postgres"; style=rounded; fontsize=12; margin=12;
+    docs  [label="documents\ntext + provenance"];
+    ents  [label="entities"];
+    edges [label="edges\nid, source, target, cost"];
+    cte   [label="recursive CTE\nneighbourhood"];
+    pgr   [label="pgrouting\npaths, components,\nbridges"];
+    trgm  [label="pg_trgm +\nfuzzystrmatch"];
+  }
+
+  api [label="PostgREST", shape=box, style=rounded];
+  ui  [label="Static UI\non Workers", shape=box, style=rounded];
+
+  src -> parse -> ner -> res;
+  res -> ents; res -> edges; parse -> docs;
+  ents -> cte; edges -> cte;
+  ents -> pgr; edges -> pgr;
+  ents -> trgm [label="resolution"];
+  cte -> api; pgr -> api; docs -> api;
+  api -> ui;
+}
+```
+
+The three stages on the left are yours. That split is not a limitation of
+Postgres so much as how document-to-graph pipelines are built generally: the
+graph store is the last and most swappable stage, and the hard parts are
+extraction, entity resolution and provenance.
+
+---
+
+## Which traversal option
+
+<Aside type="tip" title="Pick by question, not by preference">
+The recursive CTE and pgrouting answer different questions. Comparing their
+latencies head to head is a category error.
+</Aside>
+
+| Question | Use | Measured |
+|---|---|---|
+| Who is within N hops | Recursive CTE, indexes on both edge columns | 0.22 ms at depth 3 |
+| What connects these two, how strongly | `pgr_dijkstra`, `cost` as inverse evidence weight | 1092.61 ms over 400000 edges |
+| Does the data cluster | `pgr_connectedComponents` | 1098.11 ms |
+| What is structurally critical | `pgr_articulationPoints`, `pgr_bridges` | 9883.44 ms, 254 bridges |
+| Which things are named similarly | `pg_trgm` + `fuzzystrmatch` | index-backed |
+| Which things mean something similar | `pgvector` | see [Agent memory store](/reference/agent-memory-store/) |
+
+The CTE expands a bounded neighbourhood; `pgr_dijkstra` computes a global
+shortest path across the whole edge set.
+
+### The edge-table contract
+
+`pgr_*` functions require an inner query exposing columns named exactly `id`,
+`source`, `target` and `cost`, optionally `reverse_cost`. The first three are
+typed `ANY-INTEGER` and the costs `ANY-NUMERICAL`.[^pgr-dijkstra] Two
+consequences:
+
+- A `uuid` primary key cannot be handed to `pgr_*`. Carry a surrogate integer
+  key on entities if you want the algorithms.
+- Naming your columns `source_id` and `target_id`, the natural relational
+  choice, forces an aliasing subquery at every call site.
+
+Setting `cost` to the inverse of an evidence weight makes the cheapest path the
+most strongly evidenced one rather than the shortest hop count.
+
+---
+
+## What the extension catalogue holds
+
+78 extensions available. Read the graph answer as two facts, because either
+alone misleads:
+
+| Capability | Status |
+|---|---|
+| Property-graph store: node/edge storage plus a traversal language | **None available.** No `age`, `agensgraph`, `apache_age`, `sqlg` |
+| Graph-algorithm library: algorithms over relational edge tables | **`pgrouting` 3.4.1**, requiring `postgis` |
+
+"No graph database" overstates the gap. "There is a graph extension" overstates
+the capability. Both sentences are needed.
+
+Also present: `vector` 0.8.2, `pg_trgm` 1.6, `fuzzystrmatch` 1.2, `unaccent`
+1.1, `ltree` 1.3, `rum` 1.3, `pgroonga` 3.2.5, `pgmq` 1.5.1, `pg_cron` 1.6.4,
+`pg_net` 0.20.4, `http` 1.6, `pg_partman` 5.3.1, `hypopg` 1.4.1.
+
+### The two name collisions
+
+- **`pg_graphql`** exposes a GraphQL API over relational tables.[^sb-graphql] It
+  shares nothing with a graph database but the word. Anyone grepping an
+  extension list for `graph` finds it and reports the question closed.
+- **`ltree`** models labelled paths through single-parent
+  hierarchies.[^pg-ltree] A tree is not a graph; it fails on the first node with
+  two parents.
+
+<Aside type="caution" title="A one-letter false negative">
+A hand-written probe used `name ~* 'age|graph|route'`, found nothing, and nearly
+produced the write-up "no graph capability available". `pgrouting` contains
+`routi`, not `route`. Match extension names exactly - a substring search for
+`age` also collects `pageinspect` and `storage`, so the regex is wrong in both
+directions.
+</Aside>
+
+---
+
+## Apache AGE and SQL/PGQ
+
+Both get offered as the answer. Neither is, today.
+
+**Apache AGE is not installable on managed Postgres here.** It is absent from
+the 78 available extensions, so `CREATE EXTENSION age` cannot succeed. Upstream
+is active - releases exist for PG17 and PG18, and a PG19 branch exists - but
+those are release candidates, and availability is decided by whether the
+provider packages it.[^age] That makes it a packaging request, not a design
+option.
+
+**SQL/PGQ is real, committed, and syntax rather than an engine.** It was
+committed on 2026-03-16 into the PG19 cycle, implementing the SQL:2023 standard's
+`GRAPH_TABLE` pattern matching plus `CREATE PROPERTY GRAPH` DDL.[^pgq-commit]
+[^pgq-cf] Three things follow:
+
+1. PG19 is unreleased. The newest supported major series is PG18,[^pg-versions]
+   and the platform measured here runs 17.6 - so the wait is PG19 general
+   availability and then provider adoption.
+2. The commit notes the security-definer variant is not implemented.
+3. A property graph is a new relkind that, in the commit's own words, "acts like
+   a view in many ways" and "is rewritten to a standard relational query in the
+   rewriter."
+
+That third point decides it. PGQ replaces hand-rolled recursive CTEs with
+declarative graph patterns, which is a real improvement in how queries are
+written. The plan underneath is the relational plan measured above. Waiting buys
+ergonomics; the capability is already here.
+
+---
+
+## Extraction, and where it can run
+
+PDF-to-text and OCR extensions exist. `pgpdf` adds a `pdf` type castable from
+`bytea`, parsing via poppler.[^pgpdf] `pg_ocr` runs an ONNX pipeline
+in-database.[^pg-ocr] Neither is reachable on managed Postgres: neither is in the
+catalogue, and `pg_ocr` needs `plpython3u` while the only procedural languages
+available are `plpgsql` and `plpgsql_check`. Untrusted PL is arbitrary code
+execution as the database user, so its absence is a deliberate provider position.
+
+It would not pay off anyway. Extracting all seven documents with `pdftotext`
+took about eleven seconds, a few percent of the pipeline, and `pgpdf` uses
+poppler too - so the best case is the same work on the database's CPU instead of
+a stateless worker's. Parsing is also the stage that most wants to scale
+horizontally, and the database is the component that cannot.
+
+### The runtime ceiling moves by 5.6x
+
+Same task, same fixtures, same `unpdf`/pdf.js build, both V8 isolates - so this
+measures the runtime envelope, not the parser.
+
+| Fixture bytes | Supabase Edge Function | Cloudflare Worker |
+|---|---|---|
+| 191290 | ok | ok - 40 pages |
+| 2504695 | **ok, its ceiling** | ok - 188 pages |
+| 3595043 | HTTP 546 | **ok - 894 pages** |
+| 6073678 | HTTP 546 | **ok - 492 pages** |
+| 14034445 | HTTP 546 | **ok - 2780 pages** |
+| 14930674 | HTTP 546 | 1102 / HTTP 503 |
+
+Cloudflare's failure was disambiguated rather than left as "resource limit":
+error 1102 covers CPU or memory indistinguishably from the HTTP response, and
+the analytics API reported `exceededMemory`. So it is the **128 MB per-isolate**
+limit, not CPU - the CPU ceiling was raised to the documented paid-plan
+maximum.[^cf-limits]
+
+<Aside type="caution" title="You cannot time CPU inside a Worker">
+Extraction time measured as **0 ms for every fixture**. In Workers, `Date.now()`
+returns the time of the last I/O and does not advance during code execution, a
+deliberate Spectre mitigation.[^cf-timers] Pure-CPU work measures as zero by
+construction. Bracket with an I/O, or use an external clock.
+</Aside>
+
+### Hosting the read UI
+
+A static read UI can live anywhere, since every data call goes browser to
+PostgREST with an anon key. Supabase Storage is not one of those places: it
+**records** `index.html` as `text/html` and **serves** it as `text/plain` with
+`x-content-type-options: nosniff`, so a browser renders the source as text. JS
+and CSS serve with correct types, so the downgrade is HTML-specific and
+deliberate - a public bucket takes arbitrary uploads, and serving HTML as HTML
+would make it a stored-XSS surface on the project's own origin.
+
+The live demo is therefore a Cloudflare Workers static-assets deployment, which
+serves `text/html` correctly.
+
+---
+
+## Driving ingestion: a queue in the database, workers outside it
+
+Once extraction lives outside the database, something has to hand work to it and
+collect the results. `pgmq` is available on the platform, alongside `pg_cron`,
+`pg_net` and `http`,[^pgmq][^pg-cron] and the pattern of queue-in-Postgres plus
+an external consumer is already documented for embedding
+generation.[^sb-queues][^sb-autoembed]
+
+What makes it a good fit here:
+
+- **The queue and the data are one database**, so a consumer can delete the
+  message and insert the extracted rows in a single transaction. A separate
+  broker reintroduces the dual-write problem and needs idempotency keys to cover
+  it.
+- **Consumers are stateless**, which is what parsing wants: it is the stage that
+  parallelises, and the database is the component that cannot be scaled out by
+  adding replicas.
+- **Scale-to-zero consumers** make a backfill cost nothing between runs.[^fly-autostop]
+- Region matters: put consumers in the region hosting the database, not wherever
+  is convenient.[^fly-regions]
+
+The documented version of this pattern uses serverless functions as the
+consumer. For PDF work that substitution is wrong on the measurements above -
+the platform's own function runtime stopped at 2504695 bytes. A long-running
+machine has neither that ceiling nor the 128 MB isolate limit.
+
+<Aside type="caution" title="The queue lives inside the resource you are protecting">
+Every polling consumer is a connection and a query against the same instance
+serving your traversals. This is the same argument that rules out parsing PDFs
+in-database: do not spend database CPU on queue mechanics. Bound the consumer
+count explicitly rather than letting autoscaling decide, use long-poll intervals
+rather than tight loops, and remember that a fixed `max_connections` meets an
+autoscaling worker pool badly.
+</Aside>
+
+Three more things to set deliberately:
+
+- **Bulk writes should not go through the transaction pooler.** It silently
+  drops connection-time options, and large TOASTed writes are not what it is
+  for. Use the direct connection for ingestion and keep the pooler for the read
+  API.
+- **Visibility timeout must exceed the real p99 job duration.** Measure first.
+  Too low duplicates work; too high means a crashed consumer holds its message
+  that long.
+- **A queue can be over-engineering.** For a one-time historical backfill with a
+  light ongoing tail, a bounded parallel runner is enough - fetching 40 MB across
+  seven documents took about a minute at seven-way concurrency. Reach for the
+  queue when arrival is continuous and unpredictable, or when per-document retry
+  and audit are requirements.
+
+---
+
+## Sizing a corpus you have not extracted yet
+
+The shortcut is to assume extracted text is a small fraction of the PDF and
+multiply. Measured across seven public-domain federal documents:
+
+| Genre | extracted / source | TOAST / logical |
+|---|---|---|
+| Positioned form | **0.048** | 0.4765 |
+| Standard, control catalogue | 0.2573 | 0.3744 |
+| Budget narrative | 0.2775 | 0.4132 |
+| Legislation | 0.5799 | 0.3464 |
+| Annotated constitution | 0.8490 | 0.4668 |
+| Budget appendix | 0.9049 | 0.3387 |
+| Dense regulation | **1.0885** | 0.3896 |
+| **Aggregate** | **0.7633** | **0.3965** |
+
+- **Extracted text can exceed its own PDF.** Dense regulation came out above
+  1.0, because PDF already compresses its content streams.
+- **Genre does not predict the ratio.** The two regulation documents landed at
+  0.8490 and 1.0885; the two budget documents at 0.2775 and 0.9049. Text density
+  and prior compression predict it.
+- **TOAST roughly halves the stored size** again, so logical bytes and database
+  footprint are also different numbers.
+
+A projection built on 5% is wrong by roughly 6x at the aggregate and by more than
+20x on the least favourable document. Extract a genre-spanning sample and
+measure.
+
+<Aside type="caution" title="Source size is not database size">
+Corpus size in PDF bytes and Postgres footprint differ by a factor that varies
+22x by document. Quoting a terabyte of source PDFs as a database size is the
+most common error in reading this kind of requirement.
+</Aside>
+
+---
+
+## Reading the numbers
+
+- **The index ratio generalises.** Two indexes turning a 167.59 ms depth-3
+  traversal into 0.22 ms is a statement about access paths. Absolute values
+  scale with graph size and compute.
+- **The traversal latencies are a floor.** Taken on 2 vCPU / 4 GB.
+- **The expansion ratios are corpus-specific; the SPREAD is the point.** Do not
+  reuse 0.7633. Reuse the finding that one ratio is not safe.
+- **The pgrouting timings are single-query and uncontended.** They say nothing
+  about behaviour under concurrency.
+
+---
+
+## Evidence
+
+| Claim | How it was checked |
+|---|---|
+| 78 available extensions; no `age`, `agensgraph`, `apache_age`, `sqlg` | Measured - `pg_available_extensions`, exact-name match |
+| `pgrouting` 3.4.1 available, requires `postgis`; 209 `pgr_*` functions | Measured - catalogue query, then `CREATE EXTENSION ... CASCADE` and a `pg_proc` count |
+| pgrouting algorithms run on a non-geospatial graph with integer ids | Measured - Dijkstra, components and bridges over a generated 100000/400000 graph, no geometry column |
+| Depth-3 CTE 0.22 ms indexed against 167.59 ms unindexed, 602 ms build | Measured - `EXPLAIN ANALYZE` median, cold run discarded, both index states |
+| `pgr_dijkstra` column contract and `ANY-INTEGER` typing | Documented - pgRouting manual[^pgr-dijkstra] |
+| Extracted/source 0.048 to 1.0885, aggregate 0.7633, TOAST 0.3965 | Measured - seven documents extracted and loaded, byte counts from relation size |
+| Edge Function ceiling 2504695 B; Worker ceiling 14034445 B | Measured - same fixtures and parser on both runtimes |
+| The Worker failure is memory, not CPU | Measured - GraphQL analytics reported `exceededMemory`; the 128 MB isolate limit is documented[^cf-limits] |
+| `Date.now()` does not advance during Worker CPU execution | Documented[^cf-timers] and observed as 0 ms extract time |
+| Storage serves HTML as `text/plain` with `nosniff` | Measured - response headers plus a screenshot of raw source rendering |
+| SQL/PGQ committed 2026-03-16, rewritten in the rewriter | Documented - commit message and commitfest entry[^pgq-commit][^pgq-cf] |
+| PG18 is the newest supported major series | Documented[^pg-versions] |
+| Apache AGE has PG17/PG18 release candidates and a PG19 branch | Documented - upstream tags and branches[^age] |
+| `pgpdf` parses via poppler; `pg_ocr` needs `plpython3u` | Documented[^pgpdf][^pg-ocr] |
+| Only `plpgsql` and `plpgsql_check` procedural languages available | Measured - catalogue query for `^pl` |
+| Maximum disk size for a single project | **Not established.** Five candidate endpoints probed; only a billing addons path returned disk fields, describing throughput rather than a size ceiling |
+| Recall or quality of any vector index | **Not measured.** Synthetic vectors cannot support a recall claim |
+
+---
+
+## Sources
+
+[^sb-extensions]: Supabase, database extensions. https://supabase.com/docs/guides/database/extensions
+[^sb-graphql]: Supabase, GraphQL via `pg_graphql`. https://supabase.com/docs/guides/graphql
+[^pgr-manual]: pgRouting manual. https://docs.pgrouting.org/latest/en/index.html
+[^pgr-dijkstra]: pgRouting, `pgr_dijkstra`, including the Edges SQL inner-query contract. https://docs.pgrouting.org/latest/en/pgr_dijkstra.html
+[^pg-cte]: PostgreSQL, recursive queries with `WITH`. https://www.postgresql.org/docs/current/queries-with.html
+[^pg-ltree]: PostgreSQL, `ltree`. https://www.postgresql.org/docs/current/ltree.html
+[^pgq-commit]: PostgreSQL commit, SQL Property Graph Queries (SQL/PGQ), 2026-03-16. https://www.postgresql.org/message-id/E1w247I-0000Tk-2Y%40gemulon.postgresql.org
+[^pgq-cf]: PostgreSQL commitfest entry 4904, closed Committed in PG19-Final. https://commitfest.postgresql.org/patch/4904/
+[^pg-versions]: PostgreSQL, supported version list. https://www.postgresql.org/versions.json
+[^age]: Apache AGE. https://age.apache.org/
+[^pgpdf]: pgpdf, a PDF type for Postgres, parsing via poppler. https://pgxn.org/dist/pgpdf/
+[^pg-ocr]: pg_ocr, OCR in Postgres via PL/Python3U and ONNX Runtime. https://github.com/Z-Xiao-M/pg_ocr
+[^cf-limits]: Cloudflare Workers, platform limits. https://developers.cloudflare.com/workers/platform/limits/
+[^cf-timers]: Cloudflare Workers, security model - timers only advance after I/O. https://developers.cloudflare.com/workers/reference/security-model/
+[^pgmq]: pgmq, a Postgres message queue. https://github.com/pgmq/pgmq
+[^pg-cron]: pg_cron, a job scheduler for Postgres. https://github.com/citusdata/pg_cron
+[^sb-queues]: Supabase Queues. https://supabase.com/docs/guides/queues
+[^sb-autoembed]: Supabase, automatic embeddings - the documented queue-plus-consumer architecture. https://supabase.com/docs/guides/ai/automatic-embeddings
+[^fly-autostop]: Fly.io, autostop and autostart machines. https://fly.io/docs/launch/autostop-autostart/
+[^fly-regions]: Fly.io regions. https://fly.io/docs/reference/regions/
