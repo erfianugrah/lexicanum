@@ -1,0 +1,294 @@
+---
+title: "Monitoring a self-hosted stack behind a policy-drop edge"
+description: Where to put exporters, how a scrape reaches them when the host firewall defaults to drop, and why the box being watched should keep its own short-retention copy
+author: Erfi Anugrah
+---
+
+Adding Prometheus to a Docker Compose stack is a five-line change until the host
+running it is also the network edge. Then the interesting part is not the
+exporter, it is the three ways a scrape can fail to arrive. This is the topology
+that resulted, and the decisions behind it.
+
+**Provenance.** Measured 2026-08-10 on a two-host homelab: a NixOS edge router
+(Intel i9-13900H, nftables `input` and `forward` both `policy drop`) hosting a
+Compose stack with Postgres 18 plus a Python worker, and a separate box running
+the central Prometheus and Grafana. Numbers below are from that rig unless the
+row says otherwise.
+
+## TL;DR
+
+- A published container port (`ports: ["9187:9187"]`) does not survive a
+  policy-drop host. Docker's NAT rules land the packet in the `forward` chain,
+  which drops it. The container answers on its bridge IP and nowhere else.
+- `network_mode: host` with the exporter bound to one interface address is the
+  fix that keeps the blast radius small: the listener never appears on the WAN
+  interface, and a single nftables rule admits exactly one source address.
+- An application that already sits behind a reverse proxy does not need a new
+  exposure at all. Add `/metrics` to the app and scrape the route the proxy
+  already publishes.
+- Store edge metrics twice: a short-retention TSDB on the box being watched, and
+  the long-retention archive elsewhere. The archive is across the link that the
+  metrics exist to diagnose.
+- Scrape interval is not a taste setting. At 60s, Grafana's
+  `\$__rate_interval` resolves to a window that holds one sample and every
+  `rate()` panel renders "No data".
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_mon {
+    label="monitoring host";
+    prom [label="Prometheus\n30d archive"];
+    graf [label="Grafana"];
+    prom -> graf [dir=back];
+  }
+
+  subgraph cluster_edge {
+    label="edge router (nftables policy drop)";
+    localprom [label="Prometheus\n3d safety net"];
+    proxy [label="reverse proxy\n(host mode)"];
+    exporter [label="postgres_exporter\nhost mode, VLAN addr:9187"];
+    subgraph cluster_stack {
+      label="Compose stack (bridge)";
+      pg [label="Postgres"];
+      app [label="worker + API\n/metrics"];
+    }
+    exporter -> pg [label="bridge IP"];
+    proxy -> app [label="path route"];
+    localprom -> exporter;
+    localprom -> app [label="bridge IP"];
+  }
+
+  prom -> exporter [label="nft: one source addr"];
+  prom -> proxy [label="https /metrics"];
+}
+```
+
+## Which scrape path to use
+
+| Target | Path | Why |
+|---|---|---|
+| Database or host exporter | host mode, bound to one interface address, nftables rule for the scraper's source address | The exporter is infrastructure, not part of the app's request flow. Binding one address keeps it off the WAN interface. |
+| Application already behind the proxy | add `/metrics` to the app, scrape the existing public route | No new listener, no new firewall rule, and the route inherits whatever access policy the proxy already enforces. |
+| Anything only the local Prometheus reads | container bridge IP, no publish | The host can route to its own bridges. Nothing else can. |
+| Container on a macvlan | its own LAN address | A macvlan interface is not reachable from its own host; scrape it from another box. |
+
+## Platform note: this is the un-orchestrated case
+
+On Kubernetes the same decisions are made for you by an operator: the
+ServiceMonitor CR is the scrape config, the CNI is the reachability answer, and
+RBAC is the access model. This page is about the case where none of that exists
+- a Compose stack on a host you also firewall by hand - and the parts that carry
+across either way are the last two sections: the interval floors, and keeping a
+copy of the metrics inside the failure domain they describe.
+
+## The published-port trap
+
+`ports:` asks Docker to DNAT a host port to the container. On a host whose
+`filter forward` chain defaults to drop, the translated packet is then evaluated
+by that chain and discarded unless a rule admits it.[^docker-fw] The failure is
+quiet in the worst way: `docker ps` shows the container healthy, the exporter
+logs `Listening on [::]:9187`, and `curl` from the host itself returns nothing.
+
+```
+# from the router host, exporter published as 9187:9187
+$ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9187/metrics
+000
+$ docker port stack-postgres-exporter      # no mapping listed
+$ curl -s -o /dev/null -w '%{http_code}' http://172.20.3.3:9187/metrics
+200
+```
+
+The bridge IP answers, so the exporter is fine and the packet path is not. Two
+ways out: whitelist the bridge in the forward chain (which is what a stack's
+inter-container traffic needs anyway), or take the container out of the bridge
+namespace entirely with `network_mode: host` and bind it to one address:
+
+```yaml
+postgres-exporter:
+  image: quay.io/prometheuscommunity/postgres-exporter:v0.20.1
+  network_mode: host
+  environment:
+    DATA_SOURCE_NAME: postgresql://app:${PW}@172.20.3.10:5432/app?sslmode=disable
+    PG_EXPORTER_WEB_LISTEN_ADDRESS: 10.0.71.1:9187
+```
+
+Host mode inverts the reachability problem in a useful way. The exporter can
+reach the stack's bridge addresses (the host routes to its own bridges, which is
+how it talks to Postgres above), and the only inbound exposure is one address on
+one interface, gated by one rule:
+
+```nix
+iifname "servers" ip saddr 10.0.71.59 tcp dport { 9100, 9187, 9598 } accept
+```
+
+That is the whole authorization model: the scraper's address on the scraper's
+VLAN. `postgres_exporter` has no authentication of its own, and metrics from a
+database exporter are a reasonable inventory of your schema and workload, so the
+firewall is the access control.[^pgexp]
+
+## Application metrics ride the route that already exists
+
+The worker in this stack is already proxied - the reverse proxy strips a path
+prefix and forwards to the container. Adding a `/metrics` handler to the
+application makes it scrapable on the route the proxy already serves, with no
+new port, no new rule, and the proxy's existing access policy (reads open on the
+LAN, bearer required from the internet) applied unchanged:
+
+```yaml
+- job_name: app-embedder
+  scrape_interval: 30s
+  scheme: https
+  metrics_path: /semantic/metrics
+  static_configs:
+    - targets: ['app.example.com']
+```
+
+What belongs in that endpoint is the state the process knows and the database
+does not: how long since the background worker completed a pass, how many rows
+it has processed since start, how many exceptions it has caught.[^prom-instr]
+Exporting a worker heartbeat as a gauge is what turns "the container is healthy"
+into "the container is doing its job" - the distinction that a silent worker
+teaches you eventually.
+
+```
+app_worker_last_loop_age_seconds 0.2
+app_worker_rows_embedded_total 123
+app_worker_errors_total 0
+app_rows_total{table="messages"} 642496
+app_rows_embedded{table="messages"} 640985
+```
+
+## Exporter credentials
+
+`postgres_exporter`'s default collectors read the statistics views, which a
+plain application role sees only partially. `pg_monitor` is the predefined role
+that grants exactly that visibility - it is the union of `pg_read_all_settings`,
+`pg_read_all_stats` and `pg_stat_scan_tables`.[^pg-roles]
+
+```sql
+GRANT pg_monitor TO app_role;
+```
+
+Granting it to the existing application role is one line in a migration and adds
+no credential to manage. A separate `exporter` role is the textbook answer and
+the right one when the exporter runs somewhere the application password should
+not be; for a sidecar in the same Compose project, reading the same secret the
+application already reads, the separate role is ceremony. Either way the grant
+belongs in a migration, not in a shell history.
+
+## Two stores, because the archive is across the link
+
+The metrics that diagnose a flapping link should not be stored only on the far
+side of it. This stack keeps a 3-day Prometheus on the router itself, scraping
+the same targets, alongside the 30-day archive on the monitoring host. During a
+link event the local copy keeps recording; afterwards the archive holds the
+history that the 3-day window has already dropped.
+
+| Store | Retention | Scrapes | Role |
+|---|---|---|---|
+| Router-local | 3d | Its own exporters, over loopback and bridge addresses | Survives the failure it is watching |
+| Central | 30d | Both hosts' exporters, plus the app route | Trend history, dashboards, alerting |
+
+The duplication is cheap - the same series twice, at single-digit MB/day for
+this target set - and it is only worth it for targets that live inside the
+failure domain. Metrics about the monitoring host itself do not need a copy on
+the monitoring host.
+
+## Scrape interval and rate windows
+
+Grafana resolves `\$__rate_interval` from the panel's interval and the data
+source's scrape interval; a `rate()` over a window that contains fewer than two
+samples is undefined and the panel renders empty.[^grafana-query][^prom-rate] At
+a 60s scrape interval, common dashboard zooms produce exactly that. The fix is
+to scrape faster than the shortest window you intend to graph:
+
+| Job class | Interval | Reason |
+|---|---|---|
+| LAN exporters | 15s | Four samples in a 1m window |
+| Proxied app endpoints | 30s | Two samples in a 1m window; the endpoint costs a query per scrape |
+| Upstream APIs that refresh slowly | 30s | Faster than the window, slower than the upstream's own refresh |
+
+Set the global to something conservative and override per job, rather than
+raising the global and paying for it on every target.
+
+## A lock-queue failure that monitoring caused
+
+Deploying the exporter re-ran the stack's migration one-shot, which re-applies
+every migration file on every up. One of them contains `ALTER TABLE ... ADD
+COLUMN IF NOT EXISTS`, which takes `ACCESS EXCLUSIVE` even when the column
+already exists and the statement is a no-op. Six worker transactions were
+holding `ACCESS SHARE` on that table in a continuous cycle, so the `ALTER`
+never acquired - and because a waiting lock request blocks every later
+request for that relation, all new queries queued behind it.[^pg-locks] The
+database went from healthy to fully stalled without a single error:
+
+```
+ pid   | state  | wait_event | waiting  | query
+ 46162 | active | relation   | 00:08:55 | ALTER TABLE messages ADD COLUMN IF NOT EXISTS embedding
+ 46216 | active | relation   | 00:07:41 | SELECT count(*), count(embedding) FROM messages
+ 46300 | active | relation   | 00:05:58 | INSERT INTO "public"."messages" ...
+```
+
+`docker stop` on the worker cleared it in under ten seconds. The generalizable
+part: an idempotent-looking DDL statement is not a lock-free statement, and a
+migration runner that re-applies applied versions turns every deploy into a
+lock-acquisition race against your own workload. Two independent fixes - skip
+versions already recorded, and set `lock_timeout` inside each migration so a
+contended one fails fast and retries on the next deploy - and the second is the
+one that keeps a partial outage from becoming a total one.
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="Is the target an application\nalready behind a proxy?", shape=diamond];
+  q2 [label="Does anything outside\nthe host scrape it?", shape=diamond];
+  q3 [label="Is the host firewall\npolicy drop?", shape=diamond];
+
+  a1 [label="Add /metrics to the app,\nscrape the existing route"];
+  a2 [label="Bridge IP, no publish"];
+  a3 [label="Host mode + bind one address\n+ one nft rule per source"];
+  a4 [label="Published port is fine"];
+
+  q1 -> a1 [label="yes"];
+  q1 -> q2 [label="no"];
+  q2 -> a2 [label="no"];
+  q2 -> q3 [label="yes"];
+  q3 -> a3 [label="yes"];
+  q3 -> a4 [label="no"];
+}
+```
+
+## Evidence
+
+| Claim | How it was checked | Status |
+|---|---|---|
+| Published port unreachable on a policy-drop host | `curl 127.0.0.1:9187` returned 000 while the container's bridge IP returned 200, `docker port` listed no mapping | Measured |
+| Host mode + single nft rule works | `wget` from the monitoring container returned 717 `pg_`-prefixed series | Measured |
+| App metrics via the existing proxy route | A `curl` of the proxied metrics path returned the exposition format with no config change to the proxy | Measured |
+| Waiting `ACCESS EXCLUSIVE` blocks later readers | `pg_stat_activity` showed the `ALTER` waiting 8m55s with 20+ queries queued behind it; stopping the worker cleared it | Measured |
+| 60s scrape leaves `rate()` undefined at 1m windows | Panels rendered "No data" until the LAN jobs moved to 15s | Measured |
+| `pg_monitor` is sufficient for the default collectors | Exporter served its full series set after the grant; not differentially tested against a bare role | Partly measured |
+| Dual-store survives a link event | Design reasoning; no link failure has been ridden out since the second store was added | Design only |
+
+## References
+
+[^docker-fw]: Docker, "Packet filtering and firewalls," Docker Docs. https://docs.docker.com/engine/network/packet-filtering-firewalls/
+[^pgexp]: Prometheus Community, "postgres_exporter," GitHub. https://github.com/prometheus-community/postgres_exporter
+[^prom-instr]: Prometheus, "Instrumentation," Prometheus Docs. https://prometheus.io/docs/practices/instrumentation/
+[^pg-roles]: PostgreSQL, "Predefined roles," PostgreSQL Documentation. https://www.postgresql.org/docs/current/predefined-roles.html
+[^grafana-query]: Grafana, "Prometheus query editor," Grafana Documentation. https://grafana.com/docs/grafana/latest/datasources/prometheus/query-editor/
+[^prom-rate]: Prometheus, "Query functions," Prometheus Docs. https://prometheus.io/docs/prometheus/latest/querying/functions/
+[^pg-locks]: PostgreSQL, "Explicit locking," PostgreSQL Documentation. https://www.postgresql.org/docs/current/explicit-locking.html

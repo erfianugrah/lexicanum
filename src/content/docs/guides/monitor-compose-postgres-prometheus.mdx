@@ -1,0 +1,231 @@
+---
+title: "Add Prometheus monitoring to a Compose Postgres stack"
+description: Exporter sidecar, application metrics through an existing reverse-proxy route, one firewall rule, and the scrape config - on a host whose firewall defaults to drop
+author: Erfi Anugrah
+---
+
+You have a Docker Compose stack with Postgres and an application, running on a
+host you also use as a router, and a Prometheus somewhere else on the LAN. This
+gets both under monitoring without publishing a single new port to the internet.
+The architecture reasoning behind the choices is in
+[Monitoring a self-hosted stack behind a policy-drop edge](/reference/self-hosted-monitoring-topology/).
+
+**Prerequisites**: a Compose stack you can edit and redeploy, a Prometheus you
+control, shell on both hosts, and a firewall you administer declaratively
+(nftables here; the same rule applies wherever your allow-list lives).
+
+## Constants
+
+The fixed facts every later step depends on. Substitute your own.
+
+| Thing | Value here | Where it comes from |
+|---|---|---|
+| Stack host address on the scrape VLAN | `10.0.71.1` | The router's address on the VLAN the monitoring host sits on |
+| Monitoring host source address | `10.0.71.59` | The Prometheus container's own LAN address (macvlan) |
+| Exporter port | `9187` | postgres_exporter default |
+| Postgres address inside the stack | `172.20.3.10` | The stack's backend bridge, static IP |
+| Application metrics route | `/semantic/metrics` | Existing proxy path prefix + the new endpoint |
+
+## Component versions
+
+| Component | Version |
+|---|---|
+| postgres_exporter | `v0.20.1` |
+| Postgres | 18 (pgvector image) |
+| Prometheus | `v3.13.2` |
+| Grafana | `13.1.3` |
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.6;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  prom [label="Prometheus\n10.0.71.59"];
+  exporter [label="postgres_exporter\nhost mode\n10.0.71.1:9187"];
+  proxy [label="reverse proxy\n(host mode)"];
+  app [label="application\n/metrics"];
+  pg [label="Postgres\n172.20.3.10"];
+
+  prom -> exporter [label="nft allow"];
+  prom -> proxy [label="https"];
+  proxy -> app;
+  exporter -> pg;
+}
+```
+
+## Part 1: grant the exporter its statistics access
+
+`postgres_exporter`'s default collectors read statistics views that a plain
+application role sees only partially. Add a migration rather than running this
+by hand, so a rebuilt database still has it:
+
+```sql
+-- migrations/005_monitoring.sql
+GRANT pg_monitor TO app_role;
+```
+
+Apply it the way your stack applies migrations. Verify:
+
+```bash
+psql "$DSN" -c "SELECT pg_has_role('app_role','pg_monitor','member')"
+```
+
+## Part 2: add the exporter as a host-mode sidecar
+
+```yaml
+  postgres-exporter:
+    container_name: stack-postgres-exporter
+    restart: unless-stopped
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.20.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    network_mode: host
+    environment:
+      DATA_SOURCE_NAME: postgresql://app_role:${POSTGRES_PASSWORD:?required}@172.20.3.10:5432/app?sslmode=disable
+      PG_EXPORTER_WEB_LISTEN_ADDRESS: 10.0.71.1:9187
+```
+
+Two deliberate choices. `network_mode: host` instead of `ports:` because a
+published port is DNAT'd into the `forward` chain, which a policy-drop host
+discards - the container ends up reachable only on its bridge IP. And
+`PG_EXPORTER_WEB_LISTEN_ADDRESS` binds one interface address, so the exporter
+never appears on the WAN interface at all.
+
+Redeploy, then confirm the exporter answers locally:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://10.0.71.1:9187/metrics    # 200
+curl -s http://10.0.71.1:9187/metrics | grep -c '^pg_'                    # 717 here
+```
+
+## Part 3: expose application metrics on the route you already have
+
+If the application is already proxied, it needs no new exposure - only an
+endpoint. Emit the state the database cannot report: worker liveness, work done,
+errors seen.
+
+```python
+@app.get("/metrics")
+def metrics():
+    lines = []
+    with psycopg.connect(DSN) as conn, conn.cursor() as cur:
+        for table in TABLES:
+            cur.execute(f"SELECT count(*), count(embedding) FROM {table}")
+            total, embedded = cur.fetchone()
+            lines.append(f'app_rows_total{{table="{table}"}} {total}')
+            lines.append(f'app_rows_embedded{{table="{table}"}} {embedded}')
+    age = time.time() - WORKER_STATE["last_loop"] if WORKER_STATE["last_loop"] else -1
+    lines += [
+        f"app_worker_last_loop_age_seconds {age:.1f}",
+        f'app_worker_rows_embedded_total {WORKER_STATE["rows_embedded"]}',
+        f'app_worker_errors_total {WORKER_STATE["errors"]}',
+    ]
+    return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+```
+
+Include the `# HELP` and `# TYPE` lines per metric in the real thing. If the
+proxy strips a path prefix (`handle_path /semantic*` in Caddy), the endpoint
+lands at that prefix plus `/metrics` from outside.
+
+## Part 4: open exactly one path through the firewall
+
+The exporter has no authentication of its own, so the firewall is the access
+control. Allow the scraper's source address, on the scraper's interface, to the
+exporter port - nothing wider:
+
+```nix
+# nftables input chain, alongside the other exporter ports
+iifname "servers" ip saddr 10.0.71.59 tcp dport { 9100, 9187, 9598 } accept
+```
+
+Apply it, then prove it from the monitoring host - not from the stack host,
+which would pass regardless:
+
+```bash
+docker exec prometheus wget -qO- --timeout=8 http://10.0.71.1:9187/metrics | grep -c '^pg_'
+```
+
+## Part 5: add the scrape jobs
+
+Two jobs, two different intervals. Keep this file in git; a scrape config that
+lives only in a bind mount is a config you will not be able to diff after an
+incident.
+
+```yaml
+  - job_name: stack-postgres
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['10.0.71.1:9187']
+
+  - job_name: stack-app
+    scrape_interval: 30s
+    scheme: https
+    metrics_path: /semantic/metrics
+    static_configs:
+      - targets: ['app.example.com']
+```
+
+15s for the LAN exporter and 30s for the proxied endpoint are floors, not
+preferences: Grafana's `\$__rate_interval` resolves to 1m at common zooms, and a
+1m window over 60s scrapes holds one sample, so `rate()` renders "No data".
+
+Reload Prometheus (`docker compose up -d prometheus`, or `SIGHUP` if you run it
+with `--web.enable-lifecycle`).
+
+## Verification
+
+```bash
+# both targets healthy, from the Prometheus API
+docker exec prometheus wget -qO- 'http://localhost:9090/api/v1/targets?state=active' \
+  | python3 -c "import json,sys; [print(t['labels']['job'], t['health']) \
+      for t in json.load(sys.stdin)['data']['activeTargets']]"
+```
+
+Expect `up` for both. Then confirm each side returns real series:
+
+| Check | Command | Expect |
+|---|---|---|
+| Exporter series | `curl -s http://10.0.71.1:9187/metrics \| grep -c '^pg_'` | Hundreds |
+| Database up | `pg_up` in the Prometheus expression browser | `1` |
+| Worker liveness | `app_worker_last_loop_age_seconds` | Below your healthcheck threshold |
+| Rate windows resolve | Any `rate()` panel at a 1h zoom | Data, not "No data" |
+
+## Gotchas and lessons learned
+
+**A published port fails silently on a policy-drop host.** `docker ps` shows
+healthy, the exporter logs `Listening on [::]:9187`, `docker port` lists no
+mapping, and `curl` to `127.0.0.1:9187` returns nothing while the bridge IP
+returns 200. Check the bridge IP before you debug the exporter.
+
+**A migration one-shot that re-applies every file can stall the database.**
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` still requests `ACCESS EXCLUSIVE`
+when the column exists. If hot workers hold `ACCESS SHARE` in a continuous
+cycle, the `ALTER` never acquires - and every query that arrives after it queues
+behind it. Symptom: everything stops, no errors anywhere. `docker stop` the
+worker and it clears in seconds. Fix it properly with `SET lock_timeout` in each
+migration so a contended one fails fast, and by skipping versions already
+recorded.
+
+**A macvlan container is unreachable from its own host.** Test the scrape from
+the monitoring container, not from an SSH session on the box that runs it.
+
+**Sidecar credentials are worth a thought, not a ceremony.** A dedicated
+`exporter` role is right when the exporter runs where the application password
+should not be. For a sidecar in the same project reading the same secret, the
+`pg_monitor` grant on the existing role is one line and one fewer credential to
+rotate.
+
+## File reference
+
+| File | Change |
+|---|---|
+| `compose.yml` | `postgres-exporter` service, host mode, bound to one address |
+| `migrations/005_monitoring.sql` | `GRANT pg_monitor` |
+| Application source | `/metrics` endpoint plus the worker counters it reads |
+| Router config | one nftables rule adding the exporter port for the scraper's address |
+| `prometheus.base.yml` | the two scrape jobs |
