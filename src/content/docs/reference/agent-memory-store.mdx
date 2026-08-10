@@ -25,6 +25,10 @@ clients plus a work-ledger and an agent memory file.
 - One Postgres does both retrieval modes. Full-text search answers "where did I
   write this exact string", vector search answers "where did I discuss this
   idea", and they are different questions with different failure modes.
+- Filtering a vector search needs its own design. The index applies the filter
+  after it collects candidates, so a selective filter returns short, and the
+  workaround for that scans the table when the filter is broad: 9,625 ms
+  against 18 ms for the index path on the same query.
 - Embedding 640k rows on CPU is a throughput problem with one lever that works
   (parallel workers on disjoint row batches) and one that inverts (more
   intra-op threads per call).
@@ -127,6 +131,62 @@ Vector search needs the query embedded with the same model as the corpus, so it
 belongs behind a small service rather than in each client. That service is also
 where the embedding model lives, which keeps the model out of every consumer.
 
+## Filtering a vector search
+
+A `WHERE` clause and a vector index do not compose the way a `WHERE` clause and
+a B-tree do. HNSW collects `ef_search` candidates from the whole index first and
+the filter runs against those candidates, so a filter selective enough to reject
+most of them returns short: restricted to the smallest source in this corpus
+(3,703 of 644,030 rows), a `LIMIT 10` search returned 2 rows.[^pgvector]
+
+Materializing the filtered subset and scanning it exactly fixes that, and was
+the only path here for a day. It also takes the index away from a broad filter,
+where the subset is most of the table:
+
+| Filtered search, LIMIT 10 | Latency | Rows |
+|---|---|---|
+| Broad filter (593k of 644k rows), materialized subset | 9,625 ms | 10 |
+| Broad filter, plain index scan | 18 ms | 10 |
+| Selective filter (3,703 rows), materialized subset | 21 ms | 10 |
+| Selective filter, plain index scan | 74 ms | 2 |
+| Selective filter, index scan with iterative scan enabled | 1,618 ms | 10 |
+
+The resolution probes the index and falls back to the exact subset only when the
+probe returns fewer rows than were asked for, which is the signature of the
+post-filter discard. The index path costs no recall where it is taken: under the
+broad filter its top-10 was identical to the exact top-10 at `ef_search` 40 and
+100, and diffing the search endpoint's output from before and after the change
+reported no difference. End to end that endpoint went from 8.4s to 0.21s.
+
+Two adjacent behaviours, a day between them:
+
+- A similarity threshold belongs after the query rather than in the `WHERE`
+  clause. With the threshold in SQL, a query that legitimately has few results
+  above it looks the same as a recall failure, so every such query takes the
+  slow fallback.
+- HNSW returns at most `ef_search` rows whatever the `LIMIT` says. At the
+  default 40, a `LIMIT 50` came back with 40 rows, tripped the fallback, and
+  measured 13.8s; deriving `ef_search` from the requested row count returned it
+  to 0.19s.
+
+### What the index costs
+
+| Component of the messages table | Size |
+|---|---|
+| Table including TOAST | 2,814 MB |
+| HNSW index | 1,041 MB |
+| Vector column | 945 MB |
+| Full-text GIN index | 387 MB |
+| Stored message content | 1,133 MB |
+
+Vectors dominate: the column and its index together are 1,986 MB against
+1,133 MB of message content. The index earns that. A top-10 search takes 2.8 ms
+warm and 26 ms cold, and with index scans disabled the same query took
+2,535 ms - then 3,005 ms on a second run, because table plus TOAST is 2,814 MB
+against a 2GB container allocation, so the exact scan re-reads roughly 1.6GB
+from disk every time and never warms. Storing the vectors as `halfvec` halves
+both figures, and cache residency rather than disk is the reason to weigh it.
+
 ## Embedding throughput on CPU
 
 Seeding was 640k rows through a 384-dimension CPU model.[^fastembed] The
@@ -228,7 +288,10 @@ small enough to be worth doing twice:
 ## Reading the numbers
 
 The corpus is 642k messages and roughly 2.3GB in the messages table. That is
-small for Postgres and large for a laptop-class container. The constraining
+small for Postgres and large for a laptop-class container. Once the embeddings
+landed the same table measured 4,395 MB of a 4,412 MB database, and 1,986 MB of
+that is the vector column plus its index - a vector store's footprint tracks its
+index and dimensionality, not the text it was derived from. The constraining
 cost is the embedding backfill: one pass proportional to corpus size, then a
 trickle of a few hundred rows per sync. Sizing the compute for the steady state and temporarily scaling it up for
 the initial seed is the right shape - this deployment ran 6 workers on 8 cores
@@ -270,7 +333,12 @@ digraph {
 | Rate is content-dependent | Same configuration measured at 589 and 938 rows/min in different stretches of the same corpus | Measured |
 | Silent worker, wrong thread count | `py-spy dump` from a sidecar in the same PID namespace showed 2 threads, not 3 | Measured |
 | Heterogeneous batch rejected by PostgREST | `PGRST102` on a live sync until the client padded missing keys | Measured |
+| Filtered-search latency table | `EXPLAIN (ANALYZE, BUFFERS)` per variant against the live table, one query vector, top-10 | Measured |
+| Index path loses no recall under a broad filter | Its top-10 diffed against the exact top-10 at `ef_search` 40 and 100; search endpoint output diffed before and after the change | Measured |
+| HNSW index earns its 1,041 MB | Top-10 timed with the index and with index scans disabled, cold and warm | Measured |
+| `ef_search` caps rows below `LIMIT` | `LIMIT 50` returned 40 rows at `ef_search` 40 and 50 rows at 100 | Measured |
 | Partial index fixes the drain-time select | Reasoned from the query plan shape; not built, because the queue drained first | Design only |
+| `halfvec` halves vector storage | Arithmetic from the 384-dimension column and index sizes; not migrated, and no recall re-test was run | Design only |
 | Vector search quality vs FTS | No side-by-side relevance evaluation was run | Not tested |
 
 [^pgrst-upsert]: PostgREST, "Tables and Views," PostgREST Documentation. https://docs.postgrest.org/en/latest/references/api/tables_views.html
