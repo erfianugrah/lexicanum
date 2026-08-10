@@ -1,0 +1,432 @@
+---
+title: Reclaiming disk space from WSL2 and Docker Desktop
+description: WSL2 distros and Docker Desktop store everything in dynamic VHDX files that grow on write and never shrink on their own. Reclaim the space safely - clean inside the guest, trim the filesystem, compact the VHDX from an elevated PowerShell - plus the measured failure modes of sparse mode, bare-mounted data disks, and distro relocation, from a real 860 GB to 150 GB reclaim.
+author: "Erfi Anugrah"
+---
+
+A WSL2 distro is a single `ext4.vhdx` on the Windows host, and Docker Desktop keeps another one (`docker_data.vhdx`) of its own. Both are dynamic virtual disks: they grow when the guest writes and never give space back, because deleting a file inside the guest only updates guest metadata - the host file keeps every block it ever allocated. This guide is the reclaim procedure, in the order that works: clean the guest, trim so the freed blocks are visible to the host, shut everything down, compact. It ends with the structural fixes (relocate the distro, move the Docker disk) for when reclaim is a recurring chore, and the two inverse operations (grow the disk, repair a read-only one) for when the problem is something else.
+
+Prerequisites: an elevated PowerShell, and enough free space somewhere to hold a `wsl --export` tarball if you want a backup first. Everything here was run on the rig in the constants table in May 2026; the failure modes quoted in Gotchas are from that session, not from the manual.
+
+## Constants (read this first)
+
+Everything that follows is a consequence of these fixed facts.
+
+### Why the space is stuck
+
+| Fact | Consequence |
+|---|---|
+| The VHDX is dynamic | Grows on guest writes, never shrinks on guest deletes. The guest sees a default maximum of 1 TB (512 GB before WSL 0.58.0, 256 GB before that) regardless of physical disk size.[^ms-wsl-disk] |
+| ext4 delete only updates guest metadata | The host cannot tell a deleted block from a live one until the guest issues a discard. |
+| `fstrim` issues that discard | After trim, the host-side compaction tools can see which blocks are reclaimable. Trim before compact is non-negotiable; without it, compaction "succeeds" and the file size does not change. |
+| `Optimize-VHD` and `compact vdisk` refuse compressed, encrypted, or NTFS-sparse files | Check with `compact /q` and `fsutil sparse queryflag` before blaming the tool. The compression flag is sticky even at a 1.0:1 ratio. The exact error text is in Microsoft's own troubleshooting page.[^ms-wsl-troubleshoot] |
+| WSL sparse mode (`sparseVhd=true` / `--set-sparse true`) auto-shrinks on shutdown | Unreliable in practice, with corruption reports - Part 6. Manual compaction is the dependable path. |
+
+### The rig (measured example)
+
+| Piece | Detail |
+|---|---|
+| OS drive | C: (NVMe), chronically full |
+| Data drive | D: |
+| WSL version | 2.6.3.0 (`wsl --version`) |
+| Distro | `archlinux`, single user, UID 1000 |
+| Starting state | C: distro vhdx 860 GB holding ~148 GB of files; Docker Desktop disk 166 GB on C:; a bare-mounted `D:\WSL\data.vhdx` at 372 GB |
+| End state | one 491 GB distro vhdx on D: (~480 GB of data), Docker disk compacted, ~700 GB freed on C: |
+
+### Where VHDX files live
+
+| Source | Path pattern |
+|---|---|
+| `wsl --install -d <distro>` | `%LOCALAPPDATA%\wsl\{guid}\ext4.vhdx` |
+| Old Microsoft Store install | `%LOCALAPPDATA%\Packages\<vendor>\LocalState\ext4.vhdx` |
+| `wsl --import` to a custom location | wherever you specified |
+| Docker Desktop data (modern) | `%LOCALAPPDATA%\Docker\wsl\disk\docker_data.vhdx` |
+| Docker Desktop data (older) | `%LOCALAPPDATA%\Docker\wsl\data\ext4.vhdx` |
+| Docker Desktop, relocated via GUI | wherever **Settings -> Resources -> Advanced -> Disk image location** points |
+| Bare-mounted user vhdx | wherever you put it |
+
+The authoritative per-distro lookup is the WSL registry key; Part 4 has the command.[^ms-wsl-disk]
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  ntfs [label="Windows host NTFS\nC: and D:"];
+  dvhdx [label="ext4.vhdx\n(dynamic, grows-only)"];
+  dext4 [label="guest ext4\n(your distro)"];
+  ddvhdx [label="docker_data.vhdx\n(dynamic, grows-only)"];
+  ddext4 [label="docker-desktop VM\nimages/volumes"];
+  ntfs -> dvhdx [dir=none];
+  ntfs -> ddvhdx [dir=none];
+  dvhdx -> dext4 [dir=none];
+  ddvhdx -> ddext4 [dir=none];
+}
+```
+
+Reclaim always crosses the same boundary twice: free the space on the right side (guest filesystem), then make it visible and reclaimable on the left side (host file). Skipping the right side is why most "I compacted and nothing happened" reports exist.
+
+## Which part do I need
+
+| Symptom | Part |
+|---|---|
+| Distro vhdx much larger than its contents | 1, 3, 5 (clean, trim, compact) |
+| Docker disk huge after pulls/builds | `docker system prune -a --volumes`, then 3, 5 on `docker_data.vhdx` |
+| C: chronically full, another drive has room | 7 (relocate the distro - do it once, stop playing the game) |
+| Want automatic shrink going forward | 6 first (read why the honest answer is "don't") |
+| Want a separate "archive" disk inside WSL | 8, with its brittleness warnings |
+| Docker disk should live on another drive | 9 (GUI-managed, low risk) |
+| Distro reports out of space but the host has room | 10 (grow the vhdx maximum) |
+| Distro boots read-only after a power event | 11 (e2fsck repair) |
+
+## Part 1: clean inside the distro
+
+Start the distro and delete from within. This is what makes Part 5 able to reclaim anything.
+
+Arch:
+
+```bash
+sudo pacman -Scc --noconfirm
+pacman -Qdtq | sudo pacman -Rns - 2>/dev/null || echo "no orphans"
+yay -Scc --noconfirm 2>/dev/null; paru -Scc --noconfirm 2>/dev/null   # AUR helper caches
+rm -rf ~/.cache/*
+du -h -d 1 ~/ 2>/dev/null | sort -rh | head -20   # find the real hogs
+```
+
+Ubuntu/Debian:
+
+```bash
+sudo apt clean
+sudo apt autoremove --purge -y
+rm -rf ~/.cache/*
+journalctl --vacuum-size=100M
+```
+
+Docker (from any integrated distro; frees the Docker Desktop disk, not the distro disk):
+
+```bash
+docker system prune -a --volumes
+docker buildx prune -a -f    # separate cache, often the bigger one
+```
+
+:::caution
+`--volumes` removes every unused volume. Drop the flag if you have anonymous volumes worth keeping. The build cache is safe to nuke.
+:::
+
+Then the step everything else depends on - mark the freed blocks as discarded:
+
+```bash
+sudo fstrim -av
+```
+
+## Part 2: clean the Windows host
+
+Independent of WSL, but usually the same "C: is full" session. Elevated PowerShell throughout.
+
+| Target | Command / location | Reclaims | Care |
+|---|---|---|---|
+| Hibernation file | `powercfg /hibernate off` | 40-75% of RAM as `hiberfil.sys` | Also kills Fast Startup. On NVMe the boot difference is negligible, and Fast Startup causes WSL clock skew and dual-boot oddities. Reverse with `powercfg /hibernate on`. |
+| Crash dump | delete `C:\Windows\MEMORY.DMP`; Startup and Recovery -> "Write debugging information" -> None | RAM-sized | Only safe if you are not debugging a BSOD. |
+| Shadow copies | `vssadmin delete shadows /all` (or Disk Cleanup -> "Clean up system files") | varies | Removes all restore points. |
+| Installer cache | `C:\Windows\Installer` via [PatchCleaner](https://www.homedev.com.au/free/patchcleaner) only | varies | Blind deletion breaks repair/uninstall of installed programs. |
+| Driver extraction caches | `C:\AMD`, `C:\NVIDIA`, `%LOCALAPPDATA%\NVIDIA\GLCache` | GBs | Recreated on next driver update / shader compile. |
+| Chrome on-device model | `%LOCALAPPDATA%\Google\Chrome\User Data\OptGuideOnDeviceModel`, then `chrome://flags/#optimization-guide-on-device-model` -> Disabled | ~4 GB | Re-downloads unless the flag is disabled. |
+| Package caches | `%LOCALAPPDATA%\npm-cache`, `%LOCALAPPDATA%\pnpm\store`, `%LOCALAPPDATA%\Yarn\Cache`, `%LOCALAPPDATA%\pip\Cache` | varies | Regenerated on demand. |
+
+## Part 3: shut everything down
+
+Compaction needs exclusive access to the vhdx files.
+
+1. Quit Docker Desktop from the system tray (**Quit Docker Desktop**, not close-the-window). It manages two WSL distros of its own; quitting the GUI stops them cleanly. Verify with `Get-Process *docker*` - empty means actually gone.
+2. `wsl --shutdown`
+3. Verify: `wsl -l -v` shows every distro Stopped.
+
+:::note
+`wsl --shutdown` also detaches any bare-mounted vhdx (Part 8). It has to be re-attached from PowerShell after WSL restarts.
+:::
+
+## Part 4: find every VHDX
+
+```powershell
+Get-ChildItem -Path "$env:LOCALAPPDATA" -Recurse -Filter "*.vhdx" -ErrorAction SilentlyContinue |
+    Select-Object FullName, @{N='SizeGB';E={[math]::Round($_.Length/1GB,2)}}, LastWriteTime |
+    Sort-Object SizeGB -Descending
+```
+
+The authoritative per-distro path (covers installs outside `%LOCALAPPDATA%`):[^ms-wsl-disk]
+
+```powershell
+Get-ChildItem HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss\ |
+    ForEach-Object { Get-ItemProperty $_.PSPath } |
+    Select-Object DistributionName, BasePath
+```
+
+`BasePath` is the folder containing each distro's `ext4.vhdx`.
+
+## Part 5: trim and compact
+
+The core loop. Per vhdx, in order:
+
+1. Guest side already done: files deleted (Part 1), `sudo fstrim -av` run, WSL shut down (Part 3).
+2. Check the blocking flags:
+
+```powershell
+compact /q "D:\WSL\archlinux\ext4.vhdx"          # compression
+fsutil sparse queryflag "D:\WSL\archlinux\ext4.vhdx"
+```
+
+3. Clear them if set:
+
+```powershell
+compact /u "D:\WSL\archlinux\ext4.vhdx"          # fast when ratio was 1.0:1 - flag removal only
+wsl --manage archlinux --set-sparse false        # sparse: disable in WSL, then wsl --shutdown
+```
+
+4. Compact - option A, `Optimize-VHD` (Hyper-V PowerShell module; Pro/Enterprise/Education, or enable "Hyper-V Module for Windows PowerShell" in Optional Features):
+
+```powershell
+Optimize-VHD -Path "D:\WSL\archlinux\ext4.vhdx" -Mode Full
+```
+
+| Mode | Behaviour |
+|---|---|
+| `Full` | Scans for zero blocks and reclaims. The default you want. |
+| `Quick` | Reclaims unused blocks without the zero scan. Faster, reclaims less. |
+| `Retrim` | Re-issues trim only. Rarely useful standalone. |
+| `Pretrimmed` / `Prezeroed` | For non-NTFS guests or externally zeroed disks. |
+
+Option B, `diskpart` (works on Home edition). The disk must be attached read-only first or `compact vdisk` fails:
+
+```
+select vdisk file="D:\WSL\archlinux\ext4.vhdx"
+attach vdisk readonly
+compact vdisk
+detach vdisk
+exit
+```
+
+Each compaction takes 5-15 minutes depending on size. Repeat for every vhdx from Part 4, including `docker_data.vhdx` (Docker Desktop fully quit) and any bare-mounted data vhdx (`wsl --unmount \\?\D:\WSL\data.vhdx` first; `ERROR_FILE_NOT_FOUND` from that command just means already detached).
+
+5. Verify with the Part 4 size listing. Expect 50-80% reduction on a freshly cleaned, trimmed disk. The rig's distro vhdx went 860 GB to 150 GB holding ~148 GB of files.
+
+## Part 6: sparse mode is not the answer
+
+WSL can mark vhdx files sparse so they shrink automatically: `sparseVhd=true` in `.wslconfig` makes newly created disks sparse,[^ms-wsl-config] and `wsl --manage <distro> --set-sparse true` converts an existing one. In practice the feature has been unreliable since release: reclamation that works one shutdown and not the next, and filesystem corruption reports on both the host NTFS and the guest ext4 side.[^wsl-sparse-broken][^wsl-sparse-alpine] Once sparse is on, `Optimize-VHD` refuses the file until you turn it back off.
+
+The dependable auto-reclaim pattern is the manual one from Part 5 run quarterly. If you want deletes to propagate promptly between compactions, mount the guest ext4 with `discard` so a delete issues a TRIM immediately, and still run `sudo fstrim -av` before a scheduled compact.
+
+If you still want to try sparse, do it on a distro you can lose:
+
+```powershell
+wsl --manage archlinux --get-sparse
+wsl --manage archlinux --set-sparse true
+fsutil sparse queryflag "D:\WSL\archlinux\ext4.vhdx"   # confirm the NTFS flag followed
+```
+
+## Part 7: relocate the distro to another drive
+
+The structural fix when C: is chronically full. `wsl --manage --move` is atomic, updates the registry, and preserves `/etc/wsl.conf`, the default user, and Docker Desktop integration (which may still need a toggle - Gotchas). It was added in WSL 2.3.11;[^wsl-2311] check with `wsl --version`.
+
+Pre-flight:
+
+```powershell
+# 1. Back up first - a tarball is the only rollback if anything below surprises you
+wsl --export archlinux "D:\WSL\archlinux-backup-$(Get-Date -Format 'yyyyMMdd').tar"
+
+# 2. Compact (Part 5) so you are not moving bloat, then stop everything
+wsl --shutdown
+
+# 3. Destination needs room for the current vhdx size
+Get-PSDrive D
+```
+
+```powershell
+wsl --manage archlinux --move "D:\WSL\archlinux"
+wsl -l -v          # new path registered
+wsl
+whoami           # your user, not root
+```
+
+Fallbacks for older WSL or special cases:
+
+| Option | When | Catch |
+|---|---|---|
+| `--export` + `--unregister` + `--import` | WSL older than 2.3.11, or you want a rename | `--unregister` deletes the source vhdx - verify the tarball first. `--import` resets the default user to root; fix with a `[user]` / `default=<name>` block in `/etc/wsl.conf`, then `wsl --terminate`. |
+| `--import-in-place <name> <path\to\ext4.vhdx>` | You already moved the vhdx file by hand | Same default-user reset as `--import`. |
+
+Post-move cleanup: the old `%LOCALAPPDATA%\wsl\{guid}\ext4.vhdx` should be deleted by `--move`. If the Part 4 listing still shows it and the distro provably runs from the new path, delete it manually.
+
+The rig's relocation also absorbed a 372 GB bare-mounted data disk: the data was `rsync`ed into the distro's own filesystem first, the data vhdx detached and deleted, and the single distro vhdx then moved to D:. One disk, no mount machinery - which is why Part 8 is marked last resort.
+
+## Part 8: bare-mounting a second VHDX (last resort)
+
+`wsl --mount --vhd <path> --bare` attaches an extra vhdx as a whole disk device. It works, and it is brittle in four independent ways:
+
+1. **No automount.** There is no supported `.wslconfig` option to attach a vhdx at boot;[^wsl-automount] the workaround is a Task Scheduler entry at logon (script below).
+2. **`wsl --shutdown` detaches it**, so every reboot and every manual shutdown needs a re-attach.
+3. **Device letters shift** across attach cycles. Reference the disk by filesystem UUID in fstab (`defaults,nofail,x-systemd.device-timeout=5s`), never by `/dev/sdX`, and re-read the UUID with `sudo blkid` after any host-side resize or compact - some operations regenerate it.
+4. **Docker bind-mount sources behind symlinks break.** Docker Desktop's WSL proxy resolves symlinked source paths at container-restore time and can fail when the target lives on the second disk. Use absolute real paths in compose files.
+
+Setup, if you accept all four:
+
+```powershell
+New-VHD -Path "D:\WSL\extra.vhdx" -SizeBytes 500GB -Dynamic
+wsl --mount --vhd "D:\WSL\extra.vhdx" --bare
+```
+
+```bash
+lsblk                                              # find the new device
+sudo mkfs.ext4 -L wsl-extra /dev/sdX               # first time only
+sudo mkdir -p /mnt/extra && sudo mount /dev/sdX /mnt/extra
+UUID=$(sudo blkid -s UUID -o value /dev/sdX)
+echo "UUID=$UUID /mnt/extra ext4 defaults,nofail,x-systemd.device-timeout=5s 0 2" | sudo tee -a /etc/fstab
+sudo chown -R $(id -u):$(id -g) /mnt/extra
+```
+
+Logon auto-attach (run once, elevated):
+
+```powershell
+$action = New-ScheduledTaskAction `
+    -Execute "C:\Windows\System32\wsl.exe" `
+    -Argument "--mount --vhd D:\WSL\extra.vhdx --bare"
+$trigger = New-ScheduledTaskTrigger -AtLogon -User "$env:USERDOMAIN\$env:USERNAME"
+$principal = New-ScheduledTaskPrincipal `
+    -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -RestartCount 2 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName "WSL Mount Extra VHD" `
+    -Action $action -Trigger $trigger -Principal $principal -Settings $settings
+```
+
+Test without rebooting: `Start-ScheduledTask -TaskName "WSL Mount Extra VHD"`. One race to know about: Docker Desktop also starts at logon, and if it wins, the distro boots without `/mnt/extra` and bind mounts into it fail silently under `nofail`. Disable Docker Desktop's "Start Docker Desktop when you sign in" to make the order deterministic.
+
+:::note
+`wsl --mount` has no `-d` flag and no `--help`. `--vhd <path> --bare` attaches to all distros; that is the whole interface.
+:::
+
+## Part 9: relocate the Docker Desktop disk
+
+`docker_data.vhdx` grows independently of any distro and often dwarfs them - a 50 GB distro next to 200 GB of Docker data is normal. Moving it is GUI-managed and safe:
+
+1. **Settings -> Resources -> Advanced -> Disk image location** -> pick a folder on the target drive.
+2. **Apply & Restart**. Docker Desktop copies the image itself.
+3. Confirm the file exists at the new path and is gone from the old, then compact it there (Part 5, after a full quit).
+
+## Part 10: grow the disk instead
+
+The inverse problem: the distro reports no space left while the host drive has plenty. The vhdx has a fixed maximum - 1 TB by default since WSL 0.58.0 - and hitting it needs an explicit expansion, not a compact.[^ms-wsl-disk]
+
+Check first (from PowerShell):
+
+```powershell
+wsl.exe --system -d archlinux df -h /mnt/wslg/distro
+```
+
+With WSL 2.5+, one command resizes the vhdx and the filesystem inside it:[^ms-wsl-disk]
+
+```powershell
+wsl --shutdown
+wsl --manage archlinux --resize 2TB
+```
+
+Size strings are integer-only (`B/M/MB/G/GB/T/TB`; `2.5TB` is rejected). On older WSL, the manual path is `diskpart` -> `select vdisk` -> `expand vdisk maximum=<sizeInMegaBytes>`, then inside the distro `sudo resize2fs /dev/sdX <size>M` against the device `mount | grep ext4` reports.[^ms-wsl-disk] Growing is the safe direction; shrinking a vhdx maximum is the complicated one, so overshoot deliberately.
+
+## Part 11: repair a read-only distro disk
+
+A sudden shutdown or power loss can flip the distro disk read-only (`An error occurred mounting the distribution disk, it was mounted read-only as a fallback`). The repair is an offline `e2fsck` against the bare-attached disk:[^ms-wsl-disk]
+
+```powershell
+wsl.exe --shutdown
+wsl.exe --mount <path-to-ext4.vhdx> --vhd --bare
+wsl.exe lsblk                          # identify the distro device, e.g. sdc
+wsl.exe sudo e2fsck -f /dev/sdc
+wsl.exe --unmount
+```
+
+Two footnotes from Microsoft's own doc:[^ms-wsl-disk] with a single distro installed you may hit "ext file in use" and need a second throwaway distro just to run `lsblk`; and Docker Desktop holding its disks causes `Wsl/Service/CreateInstance/MountVhd/HCS/ERROR_SHARING_VIOLATION` - quit it first. A `sudo mount -o remount,rw /` looks like a fix but the recovered writes are in-memory only and evaporate on restart; do the e2fsck.
+
+## Playbook: the one-pass migration
+
+The full chronic-C:-pressure run, in order, as executed on the rig:
+
+1. In WSL: clean caches (Part 1) and `sudo fstrim -av`.
+2. In WSL: `docker compose down` for every stack.
+3. In Windows: quit Docker Desktop fully (tray).
+4. PowerShell admin: `wsl --shutdown`; verify all distros Stopped.
+5. PowerShell admin: `compact /q`, then `compact /u` on any flagged vhdx.
+6. PowerShell admin: `Optimize-VHD -Mode Full` on each vhdx (distro + `docker_data.vhdx`).
+7. PowerShell admin: `wsl --manage <distro> --move "D:\WSL\<distro>"`.
+8. PowerShell admin: verify with `wsl -l -v`; the Part 4 listing of `%LOCALAPPDATA%\wsl` should show no orphan vhdx.
+9. In WSL: `whoami` returns your user, `df -h /` reflects the move.
+10. Update compose files: any path that referenced a separate data vhdx now points into the distro filesystem - absolute paths, not `~`.
+11. Restart Docker Desktop; toggle WSL integration off/on if the daemon is unreachable.
+12. Bring the stacks back up and check their health endpoints.
+
+## Verification
+
+The end state, all reproduced on the rig:
+
+| Check | How | Expected |
+|---|---|---|
+| Guest lean | `df -h /` in the distro | usage matches actual data |
+| Trimmed | `sudo fstrim -av` second run | trims near-zero bytes |
+| Host reclaimed | Part 4 size listing | 50-80% smaller per compacted vhdx; rig: 860 GB -> 150 GB |
+| Relocated | `wsl -l -v`, `whoami`, `df -h /` | new path, non-root user, data intact |
+| Old disk gone | Part 4 listing of `%LOCALAPPDATA%\wsl` | no orphan `{guid}\ext4.vhdx` |
+| Docker healthy | `docker ps`, stack health endpoints | daemon reachable from the distro, stacks up |
+| C: free | `Get-PSDrive C` | rig: ~700 GB freed across the whole session |
+
+## Gotchas and lessons learned
+
+- **`compact` succeeded but the file is the same size** means the guest never issued discards. Boot, `sudo fstrim -av`, shut down, compact again. This is the number-one false failure.
+- **`Optimize-VHD: ... virtual disk system limitation ... must be uncompressed and unencrypted and must not be sparse`** is the NTFS compression flag almost every time.[^ms-wsl-troubleshoot] `compact /q` to confirm, `compact /u` to clear. A 1.0:1 ratio still blocks - the flag is sticky independent of actual compression.
+- **`Optimize-VHD: Failed to attach the virtual disk`** means something holds it open. `wsl --shutdown`; for the Docker disk, quit Docker Desktop and check `Get-Process *docker*`.
+- **Default user becomes root** after `--import` / `--import-in-place` (and occasionally after `--move`). Fix in `/etc/wsl.conf` with a `[user]` block, `wsl --terminate <distro>`, relaunch.
+- **A sudo password that "stops working" after `--move`** is a session sync quirk, not a forgotten password. Reset from PowerShell: `wsl -d archlinux -u root passwd <user>`.
+- **fstab mounts that silently vanish after reboot** are one of three things: the bare-mounted disk was never re-attached, the UUID changed after a resize/compact, or the fstab entry names a `/dev/sdX` that shifted. UUID-based fstab entries with `nofail` plus a post-resize `sudo blkid` check cover all three.
+- **`Cannot connect to the Docker daemon` after a relocation**: toggle the distro off and on under Settings -> Resources -> WSL Integration. If `/var/run/docker.sock` is a stale root-owned regular file instead of a symlink, delete it and toggle again. Use the `default` context, not `desktop-linux`, from inside WSL.
+- **Bloat travels with `--move`.** A vhdx that was never trimmed keeps its air on the new drive. On the rig, moving 480 GB of data into the distro before the `--move` happened to leave the moved vhdx lean (491 GB); that was a lucky side effect of the rsync, and `fstrim` + `Optimize-VHD` on the source is the deterministic version of the same outcome.
+- **`-d` is not a valid `wsl --mount` flag** (`Invalid command line argument`). Attach goes to all distros; verify with `lsblk`.
+- **`wsl --unmount \\?\D:\WSL\data.vhdx` returning `ERROR_FILE_NOT_FOUND`** means already detached (a prior `wsl --shutdown` did it). Proceed to delete the file.
+
+## Command reference
+
+| Command | Purpose |
+|---|---|
+| `docker system prune -a --volumes` | Reclaim Docker images/cache/volumes |
+| `sudo fstrim -av` | Issue discards for freed guest blocks |
+| `wsl --shutdown` | Stop all distros (also detaches bare mounts) |
+| `compact /q` / `compact /u <file>` | Check / clear NTFS compression flag |
+| `fsutil sparse queryflag <file>` | Check NTFS sparse flag |
+| `Optimize-VHD -Path <file> -Mode Full` | Compact (Hyper-V module) |
+| `diskpart` -> `attach vdisk readonly` -> `compact vdisk` | Compact without Hyper-V |
+| `wsl --manage <distro> --resize <size>` | Grow the vhdx maximum (WSL 2.5+)[^ms-wsl-disk] |
+| `wsl --manage <distro> --move <dest>` | Relocate the distro (WSL 2.3.11+)[^wsl-2311] |
+| `wsl --manage <distro> --set-sparse true` | Auto-shrink (Part 6 caveats) |
+| `wsl --export` / `wsl --import` / `wsl --import-in-place` | Backup / restore / register-in-place |
+| `wsl --unregister <distro>` | Destructive - deletes the vhdx |
+| `wsl --mount --vhd <path> --bare` / `wsl --unmount \\?\<path>` | Attach / detach an extra vhdx |
+
+| Operation | Risk |
+|---|---|
+| Guest cleanup (Part 1) | Low |
+| Host cleanup (Part 2) | Low per item; read the Care column |
+| Compact (Part 5) | None - read-only against the guest |
+| Sparse mode (Part 6) | Medium-high - corruption reports |
+| `--move` (Part 7) | Low - atomic |
+| `--export` / `--import` (Part 7) | Medium - the `--unregister` step deletes the source |
+| Bare mount (Part 8) | Medium - four independent brittleness modes |
+| Docker GUI relocation (Part 9) | Low |
+| Grow (Part 10) | Low - the safe direction |
+| e2fsck repair (Part 11) | Medium - offline filesystem check, take the Part 7 backup first |
+
+[^ms-wsl-disk]: Microsoft, "How to manage WSL disk space," Microsoft Learn. https://learn.microsoft.com/en-us/windows/wsl/disk-space
+[^ms-wsl-config]: Microsoft, "Advanced settings configuration in WSL," Microsoft Learn. https://learn.microsoft.com/en-us/windows/wsl/wsl-config
+[^ms-wsl-troubleshoot]: Microsoft, "Troubleshooting Windows Subsystem for Linux," Microsoft Learn. https://learn.microsoft.com/en-us/windows/wsl/troubleshooting
+[^wsl-2311]: microsoft/WSL, release 2.3.11 ("Implement wsl --manage --move"). https://github.com/microsoft/WSL/releases/tag/2.3.11
+[^wsl-sparse-broken]: microsoft/WSL, issue #12103, "WSL Sparse does not work at all." https://github.com/microsoft/WSL/issues/12103
+[^wsl-sparse-alpine]: microsoft/WSL, issue #10703, sparse vhdx reclamation failure on Alpine. https://github.com/microsoft/WSL/issues/10703
+[^wsl-automount]: microsoft/WSL, issue #11187, automount of vhdx at boot not supported. https://github.com/microsoft/WSL/issues/11187
