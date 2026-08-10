@@ -473,6 +473,24 @@ const pins: Pin[] = [
     // fails when a link is removed. The hub has to reach every doc it routes to.
     linksTo: [SHARED, PROMOTION, TENANT_MERGE, CONSOLIDATION, OPCOST],
   },
+  {
+    doc: "guides/wsl2-disk-reclaim",
+    mustContain: [
+      // The one-step-precondition the whole guide hangs on. An edit that
+      // drops the trim-first rule turns the compact part into a no-op.
+      "Trim before compact is non-negotiable",
+      // The measured anchors. The guide is worth keeping because these are
+      // real; without them it is a retelling of the Microsoft page.
+      "860 GB to 150 GB",
+      "~700 GB freed on C:",
+      // The version gates a reader will size their attempt against.
+      "WSL 2.3.11",
+      // The honest verdict on sparse mode; rewording it into a
+      // recommendation reverses the guide's advice.
+      "sparse mode is not the answer",
+    ],
+    sections: [/^#{2,3} .*Verification$/m, /^## Gotchas and lessons learned$/m],
+  },
 ];
 
 describe.each(pins.map((p) => [p.doc, p] as const))("%s", (_name, pin) => {
