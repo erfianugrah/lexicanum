@@ -29,6 +29,9 @@ clients plus a work-ledger and an agent memory file.
   after it collects candidates, so a selective filter returns short, and the
   workaround for that scans the table when the filter is broad: 9,625 ms
   against 18 ms for the index path on the same query.
+- Measure recall against exact search before trusting an approximate index, and
+  pin the query vectors when you do. An unpinned `OFFSET` sample here reported
+  100% recall for something that measures around 92%.
 - Embedding 640k rows on CPU is a throughput problem with one lever that works
   (parallel workers on disjoint row batches) and one that inverts (more
   intra-op threads per call).
@@ -153,10 +156,25 @@ where the subset is most of the table:
 
 The resolution probes the index and falls back to the exact subset only when the
 probe returns fewer rows than were asked for, which is the signature of the
-post-filter discard. The index path costs no recall where it is taken: under the
-broad filter its top-10 was identical to the exact top-10 at `ef_search` 40 and
-100, and diffing the search endpoint's output from before and after the change
-reported no difference. End to end that endpoint went from 8.4s to 0.21s.
+post-filter discard. End to end that endpoint went from 8.4s to 0.21s.
+
+Measuring the recall this costs needs care, and the first attempt here got it
+wrong in a way worth copying the fix for. Drawing a query vector with `OFFSET n
+LIMIT 1` and no `ORDER BY` returns a different row per run, so two runs of the
+same "offset 5000" probe disagreed - 10 of 10 against exact one time, 6 of 10 the
+next - and a single such draw had already been written up as "identical to exact".
+Pinning the sample by primary key and widening it to 20 vectors gives a figure
+that holds still, top-10 against exact search:
+
+| Index | Recall | Worst single vector |
+|---|---|---|
+| Full precision | 183/200 (91.5%) | 0/10 |
+| Half precision | 185/200 (92.5%) | 0/10 |
+
+Approximate means approximate: the index was never returning exact results, and
+the honest number for both is around 92%, not 100%. Both share the same worst
+vector, consistent with duplicate embeddings and tied distances rather than a
+graph failure.
 
 Two adjacent behaviours, a day between them:
 
@@ -184,8 +202,29 @@ Vectors dominate: the column and its index together are 1,986 MB against
 warm and 26 ms cold, and with index scans disabled the same query took
 2,535 ms - then 3,005 ms on a second run, because table plus TOAST is 2,814 MB
 against a 2GB container allocation, so the exact scan re-reads roughly 1.6GB
-from disk every time and never warms. Storing the vectors as `halfvec` halves
-both figures, and cache residency rather than disk is the reason to weigh it.
+from disk every time and never warms.
+
+The index is also the half of that pair worth shrinking, because it is what gets
+traversed on every search. pgvector can index the cast rather than the column -
+`hnsw ((embedding::halfvec(384)) halfvec_cosine_ops)` - which leaves the stored
+vectors at full precision and the write path untouched. Here that took the
+messages index from 1,043 MB to 597 MB and the database from 4,415 MB to
+3,946 MB, at the recall shown above: 185/200 against 183/200, so no quality was
+traded for the 43%. Three things to know before copying it:
+
+- An expression index is only used when the query repeats the cast verbatim.
+  `embedding <=> $1::vector` against a `halfvec` index silently becomes a
+  sequential scan, which is the 2,535 ms path. Create the new index and drop the
+  old one in separate steps with the application deploy in between.
+- A parallel index build asks for dynamic shared memory - 265 MB here - and
+  Docker gives a container 64 MB of `/dev/shm` by default. It fails with `could
+  not resize shared memory segment ... No space left on device`, which reads like
+  a full disk and is not one. Either raise `shm_size` or build serially with
+  `max_parallel_maintenance_workers = 0` (9m29s for 644k rows, spilling past a
+  256 MB `maintenance_work_mem` after 180,983 tuples).
+- A freshly built index is cold, and cold is seconds: the first `limit=50` search
+  after the swap took 5.37s before settling to 0.047-0.18s. The warm numbers in
+  this doc are not a claim about the first query after a deploy.
 
 ## Embedding throughput on CPU
 
@@ -338,7 +377,10 @@ digraph {
 | HNSW index earns its 1,041 MB | Top-10 timed with the index and with index scans disabled, cold and warm | Measured |
 | `ef_search` caps rows below `LIMIT` | `LIMIT 50` returned 40 rows at `ef_search` 40 and 50 rows at 100 | Measured |
 | Partial index fixes the drain-time select | Reasoned from the query plan shape; not built, because the queue drained first | Design only |
-| `halfvec` halves vector storage | Arithmetic from the 384-dimension column and index sizes; not migrated, and no recall re-test was run | Design only |
+| Half-precision index is 597 MB against 1,043 MB | Built both, compared `pg_relation_size`; database went 4,415 MB -> 3,946 MB after dropping the full-precision one | Measured |
+| Recall 183/200 full, 185/200 half | 20 query vectors pinned by primary key, top-10 diffed against exact search (`enable_indexscan = off`) | Measured |
+| Earlier "identical to exact" recall claim | Withdrawn - the query vector was drawn with `OFFSET` and no `ORDER BY`, so each run sampled a different row | Corrected |
+| Parallel index build fails on 64 MB `/dev/shm` | Reproduced on the live build; succeeded serially with `max_parallel_maintenance_workers = 0` | Measured |
 | Vector search quality vs FTS | No side-by-side relevance evaluation was run | Not tested |
 
 [^pgrst-upsert]: PostgREST, "Tables and Views," PostgREST Documentation. https://docs.postgrest.org/en/latest/references/api/tables_views.html
