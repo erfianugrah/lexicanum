@@ -50,6 +50,7 @@ const PRIVATELINK_TOFU = "guides/supabase-aws-privatelink-tofu";
 const MONTOPO = "reference/self-hosted-monitoring-topology";
 const MONGUIDE = "guides/monitor-compose-postgres-prometheus";
 const MEMSTORE = "reference/agent-memory-store";
+const SBRESIDENCY = "reference/supabase-data-residency";
 
 const pins: Pin[] = [
   // The two PrivateLink docs went unpinned through the corrections that made
@@ -562,6 +563,44 @@ const pins: Pin[] = [
     ],
     sections: [/^## Evidence$/m, /^## Topology$/m, /^## Reading the numbers$/m],
     anchors: ["evidence", "embedding-throughput-on-cpu"],
+  },
+  {
+    doc: SBRESIDENCY,
+    mustContain: [
+      // The four measured claims. Each is re-runnable against the live
+      // platform by .pi/sensors/residency-live.sh, and each was wrong or
+      // absent in an earlier draft.
+      "17 specific regions and 3 smart groups",
+      "Need to use one of available regions",
+      "x-sb-edge-region",
+      "server: cloudflare",
+      // Legal wording that three verification passes had to correct. The
+      // carve-out is the difference between what the DPA promises and what
+      // an earlier draft claimed it promised.
+      "as necessary to provide Services requested by Customer",
+      "projects that contain Customer's data",
+      "possession, custody, or control",
+      "Supabase Pte. Ltd",
+      // The region pin's actual scope, and the surfaces outside it.
+      "Postgres database, the Auth service, and Storage objects",
+      // Pasal 20(2) reads and/or, and the committee sits in 20(4).
+      "manage, process and/or store",
+    ],
+    mustNotContain: [
+      // Quotation marks around words the security page does not contain.
+      "at the CDN level via Cloudflare",
+      // Legal conclusions this doc deliberately does not draw. If one comes
+      // back, it needs a source that adjudicates it.
+      "cannot answer a strict foreign-jurisdiction-exclusion",
+      "Self-hosting is the only full answer",
+      // The claim the Supabase for Platforms page contradicts.
+      "Smart groups are not accepted by the public project-creation API",
+    ],
+    sections: [
+      /^## The per-surface map$/m,
+      /^## What the docs do not answer$/m,
+      /^## Reading the numbers$/m,
+    ],
   },
 ];
 
