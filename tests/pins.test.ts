@@ -602,6 +602,33 @@ const pins: Pin[] = [
       /^## Reading the numbers$/m,
     ],
   },
+  {
+    doc: "reference/postgres-entity-graphs",
+    mustContain: [
+      "The [working example](https://pggraph.erfi.dev)",
+      "561 persons and 2284 organizations",
+      "candidate-generation example",
+      "not a production named-entity recognizer",
+      "Not discoverable via the Management API.",
+    ],
+    mustNotContain: [
+      "~/work/supabase-lab",
+      "make up rebuilds",
+      "the project bills",
+      "Resumed 2026-08-11",
+      "Cloudflare-side state",
+    ],
+    sections: [
+      /^## Topology$/m,
+      /^## Which traversal option$/m,
+      /^## What the extension catalogue holds$/m,
+      /^## Apache AGE and SQL\/PGQ$/m,
+      /^## Extraction, and where it can run$/m,
+      /^## Reading the numbers$/m,
+      /^## Evidence$/m,
+      /^## Sources$/m,
+    ],
+  },
 ];
 
 describe.each(pins.map((p) => [p.doc, p] as const))("%s", (_name, pin) => {
