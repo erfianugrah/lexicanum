@@ -629,6 +629,28 @@ const pins: Pin[] = [
       /^## Sources$/m,
     ],
   },
+  {
+    // Public-reference anonymization: the generic names are the pinned state.
+    // The original home identifiers (SSIDs, MACs, subnets, hostnames) live in
+    // ~/.config/lexicanum/banned-identifiers, NOT here - this file is public.
+    doc: "reference/home-iot-network",
+    mustContain: [
+      "SSID `home-iot`",
+      "`pi-iot`",
+      "pi-hub",
+      "10.40.0.0/24",
+      "cc:8d:a2:00:00:01",
+      "cc:8d:a2:00:00:04",
+      "PVID 40",
+    ],
+    sections: [
+      /^## Topology$/m,
+      /^## The segment design$/m,
+      /^## The adoption path that works$/m,
+      /^## Reading the numbers$/m,
+      /^## What generalizes$/m,
+    ],
+  },
 ];
 
 describe.each(pins.map((p) => [p.doc, p] as const))("%s", (_name, pin) => {
