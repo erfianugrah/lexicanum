@@ -1,0 +1,423 @@
+---
+title: "Monitor Supabase with Grafana: dashboards and alerting"
+description: One-click Grafana Cloud integration, manual Cloud and self-hosted scrape setups, which of the 200+ dashboard panels answer which question, and a full alert rule set with thresholds - from the Metrics API to a page
+author: Erfi Anugrah
+---
+
+You have a Supabase project and want production-grade observability: a
+dashboard that answers "what is on fire" and alerts that fire before the
+answer matters. Since July 2026 there is a one-click Grafana Cloud
+integration in the Supabase Dashboard that provisions everything -
+authentication, metric scraping, and a pre-built dashboard over 200+ metrics -
+on every plan including free.[^sb-launch] This covers that path, the manual
+equivalents, how to read the dashboard, and the alert rules worth running.
+
+**Prerequisites**: a Supabase project, and for the manual paths a Secret API
+key (`sb_secret_...` from Project Settings > API Keys). No credit card on
+either side for the free tiers.
+
+## Constants
+
+| Thing | Value | Where it comes from |
+|---|---|---|
+| Metrics endpoint | `https://<project-ref>.supabase.co/customer/v1/privileged/metrics` | The Supabase Metrics API, one endpoint per project |
+| Auth | HTTP basic, username `service_role`, password `sb_secret_...` | Secret API key, Project Settings > API Keys |
+| Recommended scrape interval | 1 minute | Upstream refreshes about every 60s, so faster scrapes mostly re-read the same values[^sb-docs-gc] |
+| Metric volume | ~200 families, with per-CPU and per-device label fan-out | The full list is in the repo's `docs/metrics.md`[^sb-metrics-list] |
+| Grafana Cloud free tier | 10k active series/mo, 14-day retention, 3 users | Enough for several projects' worth of this endpoint[^g-free] |
+| Grafana Cloud Pro | from \$19/mo, 13-month metrics retention | When 14 days of trend stops being enough[^g-pricing] |
+| Free-tier alert rules | 500 rules, 1000 alert instances per rule | Grafana-managed alert limit, Free Forever plan[^g-gma] |
+
+## Which path
+
+| Path | Setup effort | Retention | Pick when |
+|---|---|---|---|
+| One-click Grafana Cloud | One button in the Supabase Dashboard | 14d free / 13mo paid | Default. Nothing to operate, dashboards pre-installed |
+| Manual Grafana Cloud | Scrape job + dashboard import | Same | Custom scrape topology, existing stack, non-standard auth |
+| Self-hosted Prometheus + Grafana | You run both | Yours to set | You already operate monitoring infra, want long retention or local alert routing |
+
+All three read the same Metrics API and can load the same dashboard - the
+definitions in the `supabase/supabase-grafana` repo power the one-click
+integration, the Grafana Cloud connection, and self-hosted imports
+alike.[^sb-launch] One caution about that repo: it bills itself as an example,
+not a production deployment.[^sb-repo] Treat its compose file as a reference,
+not a stack to run as-is.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  api [label="Supabase Metrics API\n<ref>.supabase.co\n/customer/v1/privileged/metrics"];
+  oneclick [label="one-click integration\n(provisioned scrape)"];
+  agent [label="Grafana Cloud\nmanaged agent"];
+  prom [label="self-hosted\nPrometheus"];
+  gc [label="Grafana Cloud\nPrometheus + dashboards + alerting"];
+  self [label="self-hosted Grafana\n+ alerting"];
+
+  api -> oneclick;
+  api -> agent [label="manual scrape job"];
+  api -> prom [label="scrape_config"];
+  oneclick -> gc;
+  agent -> gc;
+  prom -> self;
+}
+```
+
+## Part 1: one-click Grafana Cloud
+
+1. Open the project in the Supabase Dashboard, go to **Integrations**, select
+   **Grafana Cloud Observability Platform**, click **Install**.
+2. Choose an existing Grafana Cloud workspace or create one - new accounts
+   land on the free tier by default.
+3. Authorize the connection. Credentials are exchanged between Supabase and
+   Grafana Cloud directly; no keys to copy.
+4. Metrics start flowing immediately, and the **Supabase Project** dashboard
+   is pre-installed when you arrive in Grafana. A short tutorial points at the
+   key panels, inviting teammates, and configuring alerts.[^gc-launch]
+
+Done. Skip to [reading the dashboard](#part-4-reading-the-dashboard).
+
+## Part 2: manual Grafana Cloud
+
+For an existing stack, a scrape topology the one-click path does not offer, or
+credential handling you want to control.[^sb-docs-gc]
+
+1. Sign in to [Grafana Cloud](https://grafana.com/auth/sign-in), create or
+   select a stack with Prometheus metrics enabled.
+2. **Connections > Add new connection > Supabase**. Provide the project ref,
+   the Metrics API endpoint, and the Secret API key as the basic-auth
+   password. Name the scrape job after the environment
+   (`production-ap-southeast-1`), not the project - the name is what alert
+   labels carry.
+3. Set the scrape interval to 1 minute, test the connection, save. Grafana
+   Cloud deploys a managed agent that scrapes the endpoint and forwards to
+   your hosted Prometheus. One scrape job per project - basic auth is
+   per-scrape-config, so projects with different secrets cannot share a job.
+4. Import the dashboard: **Dashboards > New > Import**, paste the raw
+   [`dashboard.json`](https://raw.githubusercontent.com/supabase/supabase-grafana/refs/heads/main/grafana/dashboard.json),
+   and select the Prometheus datasource that receives the metrics. The
+   Grafana Cloud **Connections** tile can also install it for you, along with
+   a scrape-health overview dashboard.[^g-integration]
+
+## Part 3: self-hosted Prometheus
+
+The scrape config is short; the operational details around it (retention,
+firewall path, rule files) are the same as any exporter, and
+[Add Prometheus monitoring to a Compose Postgres stack](/guides/monitor-compose-postgres-prometheus/)
+walks them for a compose host.
+
+```yaml
+scrape_configs:
+  - job_name: supabase-production
+    metrics_path: /customer/v1/privileged/metrics
+    scheme: https
+    scrape_interval: 30s        # see the rate-interval gotcha below
+    basic_auth:
+      username: service_role
+      password_file: /run/secrets/sb_metrics_key   # or password: sb_secret_...
+    static_configs:
+      - targets: ['<project-ref>.supabase.co:443']
+```
+
+30s rather than the documented 1m, deliberately: Grafana's
+`$__rate_interval` resolves to 1m at common zooms, and a 1m left-open rate
+window over 60s scrapes holds at most one sample, so `rate()` is undefined and
+panels render "No data". 30s guarantees at least two samples per window. This
+costs nothing - the upstream values still only refresh about once a minute -
+and it is the difference between dashboards that render and dashboards that
+do not.
+
+If you run more than a couple of projects, generate the jobs rather than
+hand-editing: one job per project, each with its own 0600 credential file, so
+no secret sits in `prometheus.yml`.
+
+## Part 4: reading the dashboard
+
+The integration installs two dashboards.[^g-integration] **Metrics endpoint
+scrape overview** is scrape health - up/down, duration, samples. Open it when
+data looks stale, not before. **Supabase Project** is the operational one: a
+row of headline stats, then collapsible rows of panels. The 200+ number counts
+every panel; the ones that answer production questions are a small subset.
+
+Headline stats across the top: CPU Busy, Sys Load (5m/15m), RAM Used, Root FS
+Used, SWAP Total, Data Disk Total, Uptime. Then:
+
+| Question | Panels (row) |
+|---|---|
+| Is the database up? | Postgres status, DB Mode, In Recovery (Postgres) |
+| CPU or memory pressure? | CPU Basic, Memory Basic (Basic CPU / Mem / Net / Disk); System Load (System Misc); major faults, swap, OOM Killer (Memory Vmstat) |
+| Disk filling or slow? | Disk Space Used, EBS IO Balance (Basic row); Disk Average Wait Time, Average Queue Size (Storage Disk); Filesystem space available (Storage Filesystem) |
+| Connection pressure? | Client connections, pgbouncer status (Postgres) |
+| Replication falling behind? | Realtime replication status / lag (Postgres: realtime) |
+| Checkpoint churn? | bgwriter stats: checkpoints - the requested-vs-timed mix (Postgres: bgwriter) |
+| Growth and query shape? | Database size, Query stats, pg stats, Conflicts (Postgres) |
+
+The remaining rows - Memory Meminfo, System Timesync, System Processes,
+Systemd, Network Sockstat/Netstat, Node Exporter - are node-exporter deep
+cuts. Leave them collapsed until a headline panel points at one.
+
+Two habits make the dashboard pay off:
+
+- **Read rates over windows, not point values.** A MemAvailable snapshot can
+  look healthy while the working set pages in from disk all hour - the signal
+  is the `node_vmstat_pgmajfault` / `node_vmstat_pswpin` rate over a window,
+  not the gauge.
+- **The requested/timed checkpoint mix is the write-pressure tell.** Timed
+  checkpoints are the healthy interval-driven case; a rising requested share
+  means WAL fills before `checkpoint_timeout` and each checkpoint is a burst
+  of full-page writes.
+
+## Part 5: alerting
+
+Supabase serves the metrics but has no in-product alert notification path -
+alerting is on the Grafana/Prometheus side. Two rule sources, then how to wire
+them in Grafana Cloud.
+
+### The rule set
+
+Sixteen rules in two groups: eleven run on the Metrics API alone, five
+need a scrape source you add yourself. Thresholds are starting values tuned
+for tier-scaled managed Postgres, not universal constants. Three of the
+eleven originate in the repo's `docs/example-alerts.md`[^sb-example-alerts];
+the rest come from pg-analyser's threshold catalogue.
+
+**The core eleven - the endpoint alone covers these.** Straight from the
+metric families the Metrics API serves:
+
+| Alert | Condition | Severity |
+|---|---|---|
+| `PostgresDatabaseDown` | `pg_up == 0` for 5m | critical |
+| `SupabaseOomKill` | any `node_vmstat_oom_kill` rate over 1h | high |
+| `SupabaseCpuSaturated` | >= 50% of 1h window at/above 80% CPU | high |
+| `SupabaseWalArchivalBacklog` | pending WAL archival >= 1, mean over 1h | high |
+| `SupabaseMemorySaturated` | >= 30% of 1h window at/above 85% memory | medium |
+| `SupabaseDiskFull` | data disk >= 80% used, held 10m | medium |
+| `SupabaseMajorPageFaults` | major faults >= 20/s, mean over 1h | medium |
+| `SupabaseSwapIn` | swap-in >= 2 pages/s, mean over 1h | medium |
+| `SupabaseCheckpointPressure` | requested / (requested + timed) checkpoints >= 0.3 | medium |
+| `PostgresReplicationLagHigh` | lag > 600s and still rising over 10m | warning |
+| `PostgresDatabaseSizeGrowth` | size up > 20% over 12h | warning |
+
+**The optional five - each needs an extra scrape source.** PSI stall rules
+need a node_exporter with the pressure-stall collector; the EBS burst-balance
+rules need a CloudWatch exporter. On the Supabase endpoint alone they stay silent,
+so only run them with the source they name - an inert rule reads as coverage
+it is not.
+
+| Alert | Condition | Needs |
+|---|---|---|
+| `SupabasePsiCpuStall` / `SupabasePsiMemoryStall` / `SupabasePsiIoStall` | PSI stall >= 20% over 1h | node_exporter pressure collector |
+| `SupabaseEbsIopsBalanceLow` / `SupabaseEbsThroughputBalanceLow` | EBS burst balance `<= 20%`, held 10m | cloudwatch_exporter |
+
+The EBS pair maps to the Supabase **Disk IO Budget**: Nano through Medium run
+on the gp3 baseline (3,000 IOPS / 125 MB/s) plus burst credits and cannot
+provision extra IOPS - a depleting balance is the early warning before
+throttling clamps throughput to baseline.
+
+### The rules as YAML
+
+Prometheus rule-file form, genericized (no project ref pinned - scope by
+`job` or `supabase_project_ref` in multi-project setups). The sustained-fraction
+rules count the share of window samples past the line rather than requiring an
+unbroken run, which is what "sustained" means on a spiky metric; `for:` would
+answer a different question.
+
+```yaml
+groups:
+  - name: supabase-core
+    rules:
+      - alert: PostgresDatabaseDown
+        expr: pg_up == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: PostgreSQL database is down
+
+      - alert: SupabaseCpuSaturated
+        expr: >-
+          (count_over_time((clamp_min(100 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100, 0) >= 80)[1h:5m])
+          / count_over_time(clamp_min(100 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100, 0)[1h:5m])) >= 0.5
+        labels: {severity: high}
+        annotations:
+          summary: CPU sustained high - queries are queueing for cores
+
+      - alert: SupabaseMemorySaturated
+        expr: >-
+          (count_over_time(((1 - avg(node_memory_MemAvailable_bytes) / avg(node_memory_MemTotal_bytes)) * 100 >= 85)[1h:5m])
+          / count_over_time(((1 - avg(node_memory_MemAvailable_bytes) / avg(node_memory_MemTotal_bytes)) * 100)[1h:5m])) >= 0.3
+        labels: {severity: medium}
+        annotations:
+          summary: Memory sustained near the ceiling
+
+      - alert: SupabaseDiskFull
+        expr: >-
+          100 - (avg(node_filesystem_avail_bytes{mountpoint="/data"}) * 100
+          / avg(node_filesystem_size_bytes{mountpoint="/data"})) >= 80
+        for: 10m
+        labels: {severity: medium}
+        annotations:
+          summary: Data disk past the fill threshold - a full disk forces Postgres read-only
+
+      - alert: SupabaseOomKill
+        expr: avg_over_time(sum(rate(node_vmstat_oom_kill[5m]))[1h:5m]) > 0
+        labels: {severity: high}
+        annotations:
+          summary: Kernel OOM killer fired - even one event means requests were killed
+
+      - alert: SupabaseMajorPageFaults
+        expr: avg_over_time(sum(rate(node_vmstat_pgmajfault[5m]))[1h:5m]) >= 20
+        labels: {severity: medium}
+        annotations:
+          summary: Working set paging in from disk (major faults)
+
+      - alert: SupabaseSwapIn
+        expr: avg_over_time(sum(rate(node_vmstat_pswpin[5m]))[1h:5m]) >= 2
+        labels: {severity: medium}
+        annotations:
+          summary: Working set paging in from swap
+
+      - alert: SupabaseCheckpointPressure
+        expr: >-
+          sum(rate(pg_stat_bgwriter_checkpoints_req_total[5m]))
+          / (sum(rate(pg_stat_bgwriter_checkpoints_req_total[5m]))
+          + sum(rate(pg_stat_bgwriter_checkpoints_timed_total[5m]))) >= 0.3
+        labels: {severity: medium}
+        annotations:
+          summary: Most checkpoints forced by WAL filling - raise max_wal_size
+
+      - alert: SupabaseWalArchivalBacklog
+        expr: avg_over_time(max(pg_ls_archive_statusdir_wal_pending_count)[1h:5m]) >= 1
+        labels: {severity: high}
+        annotations:
+          summary: WAL archival falling behind - PITR and disk headroom at risk
+
+      - alert: PostgresReplicationLagHigh
+        expr: >-
+          (physical_replication_lag_physical_replication_lag_seconds > 600)
+          and (rate(physical_replication_lag_physical_replication_lag_seconds[10m]) > 0)
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Replication lag over 10m and growing
+
+      - alert: PostgresDatabaseSizeGrowth
+        expr: >-
+          (pg_database_size_mb - pg_database_size_mb offset 12h)
+          / pg_database_size_mb offset 12h * 100 > 20
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Database grew more than 20% in 12h
+```
+
+Every rule here pairs with a remediation: size up the compute tier, raise
+`max_wal_size`, cut backend count through the pooler, add indexes to shrink
+the hot set. The pg-analyser project generates this same pack with full
+remediation and runbook annotations from its threshold catalogue
+(`alerts-init`), which is how the YAML above stays in sync with a monitoring
+report instead of drifting from it.
+
+### What not to alert on
+
+Some obvious candidates are traps:
+
+- **Cache hit ratio** - a rate-window rule pages on idle projects; the ratio
+  only means anything above a block-volume floor that a range window cannot
+  express.
+- **Disk fill projection** - `predict_linear` extrapolates an auto-expansion
+  as a cliff; the series has to be segmented on resize events first, which
+  PromQL cannot do.
+- **Connection ceiling %** - the denominator (`max_connections` from
+  `pg_settings`) is not on the scrape, so the ratio needs a baked-in literal
+  per project.
+- **Deadlocks** - the counter is cumulative since stats reset; a threshold on
+  it fires forever after the first event.
+
+A pack that alerts on what Prometheus cannot see is worse than no pack.
+
+### Wiring alerts in Grafana Cloud
+
+New Grafana Cloud stacks default to **Grafana-managed alerting**;
+data source-managed rules are deprecated there.[^g-gma] That means you create
+rules in the UI (or via the provisioning API / Terraform), not by mounting a
+rule file:
+
+1. **Alerting > Alert rules > New alert rule**. Pick the Prometheus
+   datasource, paste the query in **Code** mode, set the threshold condition,
+   and **Preview** - the preview evaluates the expression against real data,
+   so a typo'd metric name shows up as empty before the rule ever ships.
+2. Set the evaluation group interval (1m matches the scrape cadence) and a
+   pending period. For the sustained-fraction rules the window is already in
+   the expression; a short pending period (or none) is right. For gauge
+   rules like disk fill, hold 10m so one bad scrape cannot page.
+3. Set **no data** handling explicitly: `pg_up == 0` already covers the
+   database being down, but if the scrape itself dies, every rule goes
+   no-data at once. Alerting on scrape absence (the scrape-overview
+   dashboard's up metric, or no-data = alerting on one dedicated rule) is
+   what catches a rotated key or an expired token.
+4. Add annotations a responder can act on: what the signal means, the fix,
+   and a runbook link. A page that says "CPU high" and nothing else costs the
+   responder the minutes the annotation would have saved.
+5. **Contact points** (Alerting > Contact points) carry the notification:
+   email, Slack, PagerDuty, webhook. **Notification policies** route by label -
+   the `severity` labels above are the routing key, so `critical` can page
+   while `warning` lands in a channel.
+
+## Verification
+
+| Check | Where | Expect |
+|---|---|---|
+| Scrape healthy | Metrics endpoint scrape overview dashboard, or `up` in the expression browser | `1`, scrape duration well under the interval |
+| Panels render at any zoom | Supabase Project dashboard at 1h and 24h ranges | Data in `rate()` panels, not "No data" |
+| Alert expressions valid | Rule editor **Preview** per rule | Series return, threshold line visible |
+| Notifications deliver | Contact points > **Test** | Message lands in the channel |
+| Rules loaded (self-hosted) | `curl -s localhost:9090/api/v1/rules \| jq '.data.groups[] \| {name, rules: (.rules\|length)}'` | Every group and rule listed |
+| Rule YAML valid (self-hosted) | `promtool check rules alerts.yml` (ships in the `prom/prometheus` image) | `SUCCESS` |
+
+## Gotchas and lessons learned
+
+**60s scrapes silently break `rate()` panels.** Covered in Part 3 - the
+single most common "the dashboard is empty" cause on self-hosted setups. Scrape
+at 30s and move on.
+
+**The Metrics API is point-in-time; there is no history before you start
+scraping.** Trends exist only from the moment a scraper runs, and on the free
+tier they age out after 14 days. If you need month-scale trends for capacity
+calls, that decides Pro vs self-hosted for you.
+
+**A 401 is a key problem, not a network problem.** Rotate or create a Secret
+API key in Project Settings > API Keys and update the scrape credentials; the
+managed agent and manual jobs fail identically here.
+
+**The one-click path hides the scrape entirely.** Convenient until you need to
+change the interval or relabel - then you are in the manual path anyway, and
+the manual scrape config above is the whole thing.
+
+**Alert on the scrape, not just the database.** Every rule in the set goes
+quiet simultaneously when the scrape breaks. One rule on scrape presence (or
+no-data handling set to alerting) turns "monitoring silently dead" into a
+page.
+
+## File reference
+
+| File | Where | What |
+|---|---|---|
+| `grafana/dashboard.json` | `supabase/supabase-grafana` repo | the 200+ panel dashboard, imported everywhere |
+| `docs/example-alerts.md` | same | the three upstream starter rules |
+| `docs/metrics.md` | same | the full exported metric list |
+| `prometheus.yml` scrape config | yours | Part 3, one job per project |
+| `alerts.yml` | yours | the rule set above, mounted as a `rule_files:` entry |
+
+[^sb-launch]: Supabase, "Observability for every Supabase project with Grafana Cloud," Supabase Blog. https://supabase.com/blog/observability-for-every-supabase-project-with-grafana-cloud
+[^gc-launch]: Grafana Labs, "How to monitor your Supabase projects: connect Grafana Cloud in one click," Grafana Blog. https://grafana.com/blog/grafana-cloud-supabase-one-click-integration/
+[^sb-docs-gc]: Supabase, "Metrics API with Grafana Cloud," Supabase Docs. https://supabase.com/docs/guides/monitoring-and-debugging/metrics/grafana-cloud
+[^sb-metrics-list]: Supabase, "Exported metrics," supabase-grafana repo. https://github.com/supabase/supabase-grafana/blob/main/docs/metrics.md
+[^g-free]: Grafana Labs, "What's Included in Grafana Cloud Free." https://grafana.com/products/cloud/free-tier/
+[^g-pricing]: Grafana Labs, "Grafana Pricing." https://grafana.com/pricing/
+[^g-gma]: Grafana Labs, "Configure Grafana-managed alert rules," Grafana Docs. https://grafana.com/docs/grafana/latest/alerting/alerting-rules/create-grafana-managed-rule/
+[^g-integration]: Grafana Labs, "Supabase integration for Grafana Cloud," Grafana Cloud Docs. https://grafana.com/docs/grafana-cloud/observe-and-act/monitor-infrastructure/integrations/integration-reference/integration-supabase/
+[^sb-repo]: Supabase, "supabase-grafana README," GitHub. https://github.com/supabase/supabase-grafana
+[^sb-example-alerts]: Supabase, "Example Alerts," supabase-grafana repo. https://github.com/supabase/supabase-grafana/blob/main/docs/example-alerts.md
