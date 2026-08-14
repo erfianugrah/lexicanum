@@ -1,0 +1,236 @@
+---
+title: "Tailscale homelab reference: overlay as second path and management plane"
+description: Reference for running Tailscale alongside IPsec/GRE in a multi-site homelab - declarative NixOS authkey provisioning, Unraid Tailscale SSH, multi-path SSH aliases, access-control idioms, and the failure modes that actually happened
+author: Erfi Anugrah
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+How Tailscale runs in this homelab: not as a replacement for the site-to-site IPsec/GRE tunnels (covered in [Magic WAN interop](/guides/magic-wan-interop/)), but as a parallel overlay with its own job - out-of-band management, a third path when LAN and tunnel routes are both unavailable, and an identity layer for SSH. Covers the NixOS authkey pattern, the Unraid plugin, the multi-path SSH alias scheme, and every failure mode observed in production. Hostnames, addresses, and paths are anonymized; the patterns are exactly as built.
+
+**TL;DR:** Tailscale earns its place for OOB access and per-device identity, not for bulk site-to-site traffic (IPsec/GRE wins there). The two configurations to copy are the NixOS `authKeyFile` pattern (a rebuilt node rejoins unattended) and SSH Host pattern lists (one identity block, three addresses). The failures to avoid: placeholder authkeys, stale tailnet entries in a WSL-generated `/etc/hosts`, and an overlay node that was never authenticated in the first place.
+
+<Aside type="note" title="Provenance">
+  Every failure mode in this document was observed on the live tailnet and is labeled with its evidence (repo comment, README, or session). External behavioral claims (flag persistence, key expiry, check mode) are cited to the Tailscale documentation, and the nixpkgs module behavior was checked against the module source. Live state quoted below was re-verified against the running nodes on 2026-08-15.
+</Aside>
+
+---
+
+## What the tailnet is for
+
+Three jobs, in order of how much they matter day to day:
+
+1. **Out-of-band management.** When the edge router, the IPsec/GRE tunnel, or local DNS is broken, the tailnet is the path that still works - it shares no fate with any of them. PiKVMs and the second-site Pi stay reachable even when the primary network does not.
+2. **A third path for SSH.** Every host alias carries a `10.0.x` address (LAN or site-to-site), a `10.68.x` address (cross-tunnel), and the MagicDNS name. The tailnet path works from arbitrary networks - a hotel line, a phone hotspot - where neither RFC1918 path exists.
+3. **Identity for SSH.** Tailscale SSH on the Unraid box replaces `authorized_keys` distribution with tailnet policy, and check mode adds browser re-authentication for high-risk connections.[^ts-ssh]
+
+What it is not for: bulk traffic between sites. The IPsec/GRE tunnels move more data at lower latency because they are routed, not relayed, and do not depend on DERP fallback when NAT traversal fails.
+
+| Decision | Payoff | Cost |
+|---|---|---|
+| Tailscale alongside IPsec/GRE, not instead of | Independent failure domain for OOB | Two overlays to reason about |
+| Box-level tailscale on the router (subnet routing deferred) | Management plane without touching production routing | Devices without tailscaled stay unreachable from the tailnet for now |
+| Tailscale SSH on Unraid only | Kills key-distribution toil where it hurt most | Check-mode re-auth URLs interrupt automation |
+| Authkey file on the NixOS appliance | Rebuilt node rejoins unattended | Key material on disk; 90-day max key lifetime[^ts-authkeys] |
+
+---
+
+## Topology
+
+```dot
+digraph tailnet {
+  bgcolor="transparent";
+  rankdir=LR;
+  node [shape=box, style=rounded];
+  ts [label="tailnet\n100.64.0.0/10", shape=cloud];
+
+  subgraph cluster_site1 {
+    label="Site 1";
+    router [label="NixOS edge router\n(box-level; subnet routing planned)"];
+    unraid [label="Unraid server\nTailscale SSH"];
+    pikvm [label="PiKVMs (OOB)"];
+  }
+
+  subgraph cluster_site2 {
+    label="Site 2";
+    iotpi [label="IoT Pi (RPi 4B, NixOS)\nauthkey-provisioned"];
+  }
+
+  devbox [label="dev box\nWindows + WSL2", shape=ellipse];
+
+  router -> ts;
+  unraid -> ts;
+  pikvm -> ts;
+  iotpi -> ts;
+  devbox -> ts;
+  router -> iotpi [label="IPsec/GRE site-to-site", style=dashed, constraint=false];
+}
+```
+
+Every node is box-level today: tailnet devices reach tailnet devices, nothing more. Subnet-router advertising from the router (the site VLAN ranges) is a planned cutover step, deliberately not enabled - the router's Tailscale role is management plane, not production routing. Its firewall treats `tailscale0` as a management interface: SSH, the management UI port, and ping, nothing else.
+
+---
+
+## Node classes
+
+| Class | Examples | How it joins | Verified state |
+|---|---|---|---|
+| NixOS router | edge router | Interactive `tailscale up` once; node key persists under `/var/lib/tailscale` | `BackendState: Running`, home DERP relay #3 |
+| NixOS appliance | IoT Pi | `authKeyFile` + `tailscaled-autoconnect` unit | `Running`; autoconnect unit inert after registration |
+| Unraid | media/automation server | Plugin manager, interactive login once | `Running`, Tailscale 1.102.2 |
+| Windows + WSL2 | dev box | Windows GUI client; WSL2 has no tailscaled | - |
+| OOB | PiKVMs | Stock tailscaled on the PiKVM OS | - |
+
+Two consequences of the split. First, the authkey-joined node can rebuild and rejoin without a browser; the interactively-joined nodes cannot, but their node keys survive reboots under `/var/lib/tailscale`. Second, anything on the Windows box resolves MagicDNS through the Windows client - WSL2 inherits that DNS but runs no daemon of its own, which produces two of the failure modes below.
+
+---
+
+## Declarative tailscaled on NixOS
+
+### The two variants
+
+The router gets the minimal form - enable the service, open the management ports on `tailscale0`, authenticate interactively once:
+
+```nix
+# router: box-level management plane. First auth is interactive:
+# `sudo tailscale up` + browser URL (one-time; node key persists
+# under /var/lib/tailscale).
+services.tailscale.enable = true;
+
+# nftables: management plane from the tailnet
+# iifname "tailscale0" tcp dport { 22, <mgmt-ui-port> } accept
+# iifname "tailscale0" icmp type echo-request accept
+```
+
+The IoT Pi gets the unattended form. The nixpkgs `services.tailscale` module generates a `tailscaled-autoconnect` systemd unit when `authKeyFile` is set; the unit polls `tailscale status --json` and, on `NeedsLogin`, runs `tailscale up --auth-key "$(cat <keyfile>)"` plus any `extraUpFlags`, then exits once the state reaches `Running`:[^nixos-module]
+
+```nix
+# IoT Pi: Tailscale is the second way in when the LAN path breaks.
+# The auth key is placed by hand, out-of-repo like the other secrets;
+# tailscaled consumes it on first start and ignores it once the node
+# is registered:
+#   printf %s '<key from the admin console>' > /etc/tailscale-authkey
+#   chmod 600 /etc/tailscale-authkey
+services.tailscale = {
+  enable = true;
+  authKeyFile = "/etc/tailscale-authkey";
+};
+```
+
+Verified live after provisioning: `BackendState: Running`, and `tailscaled-autoconnect` is `inactive` - the unit is a one-shot that did its job on first boot and now sits inert. The key file on disk is ignored from then on; the node's identity lives in `/var/lib/tailscale`.
+
+### Gotchas, all observed
+
+<Aside type="caution" title="The placeholder key trap">
+  The install README has a `printf %s '<tailscale auth key>' | sudo tee ...` line, and copy-pasting it verbatim wrote the literal placeholder text into two of the three secret files on the first attempt. A missing or bogus key fails `tailscaled-autoconnect` and makes the whole `nixos-rebuild switch` report failure - and `tailscale status` just shows `NeedsLogin` with no hint that the key file is the problem. Verify the byte count after writing, before rebuilding.
+</Aside>
+
+<Aside type="caution" title="printf %s, not echo">
+  A trailing newline in the key file is passed straight to `tailscale up` and rejected. `printf %s`, never `echo`.
+</Aside>
+
+<Aside type="caution" title="An un-authenticated overlay is not a second path">
+  The reason the Pi has an authkey at all: during an earlier LAN incident (an interface-naming trap on the NIC), the tailnet on that box had never been authenticated - so when the LAN path broke, there was no remote path left at all. Tailscale you have not logged into is not redundancy. The authkey pattern exists so a rebuild can never leave the node in that state.
+</Aside>
+
+<Aside type="tip" title="tailscale up flags are not sticky the way you think">
+  `tailscale up` flags are not persisted between runs - you must specify all flags each time, and since v1.8 the CLI warns and prints a copyable command if you drop a flag you set before.[^ts-up] The NixOS module sidesteps this by always passing the full flag set to the autoconnect unit.
+</Aside>
+
+Authkeys expire after 1-90 days (90 default), so the key on disk is a consumable: if the node ever needs to re-register after the key lapses, generate a new one and drop it in place. An already-registered node stays authorized until its node key expires.[^ts-authkeys] Note that re-registration also means a **new tailnet IP** - when the Pi was re-registered, its old `100.x` address was gone and anything pinned to it (including a stale `/etc/hosts` entry, below) dialed a dead node.
+
+---
+
+## Tailscale SSH on Unraid
+
+Unraid gets Tailscale from the plugin manager (the `tailscale` plugin plus `unraid-tailscale-utils`), not from a container. Enabling Tailscale SSH is one command on the host:
+
+```bash
+tailscale set --ssh
+```
+
+That claims port 22 on the tailnet IP only - the Unraid SSH daemon, `sshd_config`, and `authorized_keys` are untouched, and SSH over the LAN IP keeps working exactly as before.[^ts-ssh]
+
+The default tailnet policy puts SSH to your own devices in **check mode**: the first connection of the day returns a `login.tailscale.com/a/...` URL and waits for browser re-authentication, then stays authorized for the 12-hour check period.[^ts-ssh] Two operational notes:
+
+- Deploy scripts that SSH to the box (mine takes the tailscale IP as an argument) fail on the first run of the day until someone opens the re-auth URL. Run one manual `ssh` first, then let automation ride the 12-hour window.
+- Check rules win over accept rules when both match, so adding a permissive `accept` rule does not bypass check mode - you must scope the `accept` rule more precisely than the `check` rule.[^ts-ssh]
+
+---
+
+## Multi-path SSH aliases
+
+The SSH config gives each host **one block, many addresses**. The `Host` line is a pattern list covering every way the host is addressed; the block below it carries the user and identity file. You pick the path by what you type:
+
+```sshconfig
+Host unraid 10.0.x.2 10.68.x.2 unraid.<tailnet>.ts.net
+  User root
+  IdentityFile ~/.ssh/id_unraid
+  IdentitiesOnly yes
+```
+
+`ssh unraid` resolves through local DNS (LAN) or MagicDNS; `ssh 10.0.x.2` forces the primary path; `ssh 10.68.x.2` forces the cross-tunnel backup. Same identity either way, no duplicate blocks to drift.
+
+The hard rules that keep this survivable:
+
+- **`IdentitiesOnly yes` on every block.** Without it, ssh-agent offers every key in turn and locks accounts (Unraid `root` after a handful of offers) before the right key is tried.
+- **MagicDNS names are patterns, never `HostName`.** Pin `HostName` to the LAN address. The tailnet name stays an alias you can type, not a resolution the config depends on.
+- **Tailnet names do not override local DNS.** The router's own zones win for short names; the tailnet name is always the FQDN form.
+
+<Aside type="caution" title="Stale tailnet entries in a WSL-generated /etc/hosts">
+  Observed: the bare `iot-pi` alias had no `HostName`, so it resolved through whatever `/etc/hosts` said - and that file is WSL-generated, carrying a stale tailnet block pointing at the node from the *previous* OS install on that Pi, deleted days earlier. ssh dialed a dead address while the LAN path worked fine. The fix is the `HostName` pin above; the comment in the config says why, so the next cleanup does not remove it.
+</Aside>
+
+---
+
+## Access control notes
+
+The idioms that ended up mattering, all from the policy-file syntax reference:[^ts-policy]
+
+- **`autogroup:internet` as a `dst`** is what permits exit-node use. A device with no grant to `autogroup:internet` cannot use any exit node, and ACLs cannot restrict *which* exit node - that needs grants with `via`.
+- **`autoApprovers.routes`** will matter at the subnet-router cutover: it lets advertised subnets skip the admin-console approval click. Auto-approval only applies when the route is first advertised - editing the policy file does not retroactively approve a pending route; remove and re-advertise it.
+- **Tags beat users for servers.** A tagged node authenticates with an authkey, gets key expiry disabled by default,[^ts-authkeys] and its access is governed by the tag rather than by whoever happened to log it in.
+- **`tests` are free insurance.** A `deny` test on a sensitive subnet fails the policy-file save if a future edit accidentally opens it.
+
+<Aside type="caution" title="Subnet routes do not fail over across prefix lengths">
+  Docs-verified, relevant to the planned cutover: with overlapping advertisements (`10.0.0.0/16` from router A, `10.0.0.0/24` from router B), Tailscale picks the longest prefix and does **not** fall back to the less-specific route when B goes offline - traffic to `10.0.0.1` is dropped. The workaround is to have every router advertise both prefixes.[^ts-subnets]
+</Aside>
+
+---
+
+## Failure modes observed
+
+| Failure | Observation | Root cause | Fix | Evidence |
+|---|---|---|---|---|
+| Placeholder authkey | `nixos-rebuild switch` fails; `NeedsLogin` | Verbatim paste of the README line wrote literal placeholder text into two of three secret files | `printf %s` the real key; verify byte count | install README |
+| Newline in key file | `tailscale up` rejects the key | `echo` appends `\n` | `printf %s` | install README |
+| No second path during LAN incident | NIC naming trap broke LAN; tailnet unreachable too | Tailscale on the box had never been authenticated | authkey provisioning so a rebuild can never leave it un-authenticated | config comment |
+| Alias dialed a dead node | `ssh iot-pi` hung while the LAN IP worked | WSL-generated `/etc/hosts` held a stale tailnet entry for the previous OS install | Pin `HostName` to the LAN address | ssh config comment |
+| Dead tailnet IP after re-registration | Old `100.x` address gone | Re-registering a node allocates a new tailnet IP | Never pin configs to tailnet IPs; use MagicDNS names | ssh config comment |
+| `ping` shows `tx 1404 rx 0` to dev box | Tailnet healthy, all other peers fine | Windows-side Tailscale broken, not the tailnet | Check `tailscale status --json` `BackendState`, not just ping | session, 2026-07 |
+| WSL2: ping fails, SSH works | `ping <alias>` no replies, `ssh <alias>` fine | Windows does not answer tailnet ICMP on the dev box | Test with the protocol you actually use | session, 2026-07 |
+| Monitoring pipeline died mid-run | Postgres at `100.x:5433` unreachable; 8300-row run lost | tailscaled restarted on the DB host; the tailnet had silently become a production dependency | Treat tailnet IPs in connection strings as dependencies to monitor, not conveniences | session, 2026-08 |
+
+---
+
+## Verification checklist
+
+After touching anything Tailscale-related on a node:
+
+| Check | Command | Expected |
+|---|---|---|
+| Daemon state | `tailscale status --json \| jq -r .BackendState` | `Running` |
+| Authkey file is real | `wc -c /etc/tailscale-authkey` | Key length, no trailing newline; not 15-ish placeholder bytes |
+| Autoconnect consumed | `systemctl is-active tailscaled-autoconnect` | `inactive` after first registration (one-shot, done) |
+| Router management plane | `ssh router` from a tailnet device | Connects over the tailnet IP |
+| Tailscale SSH | `ssh unraid` from a tailnet device | Connects, or returns a check-mode URL (re-auth, then retry) |
+| Path selection | `ssh 10.0.x.2` vs `ssh 10.68.x.2` | Same identity, both land on the same host |
+| MagicDNS | `getent hosts <host>.<tailnet>.ts.net` | Current `100.x` address (compare against the admin console after any re-registration) |
+| DERP vs direct | `tailscale netcheck`; `tailscale ping <peer>` | Nearest relay region; `direct` after a few tries |
+
+[^ts-subnets]: Tailscale, "Subnet routers." https://tailscale.com/kb/1019/subnets
+[^ts-ssh]: Tailscale, "Tailscale SSH." https://tailscale.com/kb/1193/tailscale-ssh
+[^ts-policy]: Tailscale, "Syntax reference for the tailnet policy file." https://tailscale.com/docs/reference/syntax/policy-file
+[^ts-up]: Tailscale, "tailscale up command." https://tailscale.com/docs/reference/tailscale-cli/up
+[^ts-authkeys]: Tailscale, "Auth keys." https://tailscale.com/kb/1085/auth-keys
+[^nixos-module]: nixpkgs, "services.tailscale module (tailscaled-autoconnect)." https://github.com/NixOS/nixpkgs/blob/nixos-unstable/nixos/modules/services/networking/tailscale.nix
