@@ -195,7 +195,11 @@ describe.skipIf(!CHECK_BUILT)("built output", () => {
       if (!existsSync(p.html)) continue;
       const prose = readFileSync(p.html, "utf8")
         .replace(/<pre[\s\S]*?<\/pre>/g, "")
-        .replace(/<code[\s\S]*?<\/code>/g, "");
+        .replace(/<code[\s\S]*?<\/code>/g, "")
+        // expressive-code embeds the full source in the copy button's
+        // data-code attribute; a regex class like [^0-9] there is not a
+        // leaked footnote marker - it is never rendered as text.
+        .replace(/data-code="[^"]*"/g, "");
       const found = prose.match(/\[\^[A-Za-z0-9-]+\]/g);
       if (found) leaks.push(`${p.doc.path}: ${found.slice(0, 3).join(" ")}`);
     }
