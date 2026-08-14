@@ -1,0 +1,358 @@
+---
+title: Build a public-record entity graph on managed Postgres
+description: Take a corpus of public PDFs - council minutes, committee papers, registers, filings - and build a queryable entity graph with people, organisations, checksum-validated registry identifiers, dated edges and as-at queries, served through PostgREST behind an edge-cached worker. Deterministic extraction where the source is regular, every number verified against the bytes.
+author: "Erfi Anugrah"
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+This builds the thing [the reference doc](/reference/postgres-entity-graphs)
+argues for: a corpus of public PDFs turned into an entity graph - people,
+organisations, checksum-validated ABNs, dated co-occurrence edges - queryable
+through a handful of read-only RPCs, with a static UI cached at the edge. The
+reference doc explains *why* and carries the measured latencies; this guide is
+the *how*, in order, with a verification step per part.
+
+The full working tree for everything below is the `pdf-corpus-graph`
+experiment in [supabase-lab](https://github.com/erfianugrah/supabase-lab)
+(`experiments/pdf-corpus-graph/`). Fragments here are load-bearing excerpts;
+clone that for the complete files.
+
+**Prerequisites:** a Supabase Personal Access Token, OpenTofu, `psql`, bun,
+`poppler-utils` (`pdftotext`, `pdfinfo`, `pdftoppm`), `tesseract`, and a
+Cloudflare account for the serving worker. No ML models, no graph database,
+no message broker.
+
+## Constants (read this first)
+
+Everything that follows is a consequence of these measured facts. If your
+build contradicts them, something is wrong - they are the drift detectors.
+
+| Fact | Value | Where it came from |
+|---|---|---|
+| Extension catalogue (PG 17.6, both ap-southeast regions probed) | `pgrouting` 3.4.1, `pg_trgm` 1.6, `fuzzystrmatch` 1.2, `unaccent` 1.1, `vector` 0.8.2, `pgmq` 1.5.1 present; `age`/`apache_age`/`sqlg` absent | catalogue queries 2026-08-10 and 2026-08-14 |
+| Extraction ratio (extracted text / source bytes) | 0.0256 aggregate (AU council minutes) to 0.7633 aggregate (US federal) - genre swings it ~30x | measured on both corpora |
+| TOAST compression on the extracted text column | 0.4893 (AU) / 0.3965 (US) of logical bytes | `pg_column_size` on loaded rows |
+| Scanned-document detection threshold | ~270 chars/page: born-digital references run 2710-3242, an image-only scan 0.5 | G09 probe |
+| Recursive-CTE traversal, real 28778-edge hub graph, depth 3 | 154.924 ms warm - and 65721.220 ms if the walk enumerates paths instead of level sets | 2026-08-14, medium compute |
+| Full corpus rebuild from nothing | ~446 s provision + schema + seed + deploy | `make up` |
+| End-to-end extraction over 111 documents | 31.6 s wall clock | the re-extract run |
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  corpus [label="Public PDFs\n(council minutes, registers,\ntender notices, filings)", shape=box, style=rounded];
+  loader [label="loader\nfetch + pdftotext / OCR\n+ manifest dates", shape=box, style=rounded];
+
+  subgraph cluster_pg {
+    label="Supabase Postgres"; style=rounded; fontsize=12; margin=12;
+    docs [label="corpus.documents\ntext + doc_date"];
+    ents [label="demo.entities"];
+    ment [label="demo.mentions\nchar_offset + snippet"];
+    edg  [label="demo.edges\nco-proximity 400 chars"];
+    rpc  [label="read RPCs\nsecurity definer"];
+  }
+
+  pgr [label="PostgREST\n(demo schema, anon key)", shape=box, style=rounded];
+
+  subgraph cluster_cf {
+    label="Cloudflare Worker"; style=rounded; fontsize=12; margin=12;
+    cache [label="Cache API\n/rest/* proxy"];
+    assets [label="static UI\n(Astro + React)"];
+  }
+
+  corpus -> loader -> docs;
+  docs -> ment [label="pattern extraction\n+ checksum gate"];
+  ment -> ents; ment -> edg;
+  ents -> rpc; ment -> rpc; edg -> rpc;
+  rpc -> pgr -> cache;
+  assets -> cache [label="browser calls\nsame-origin", style=dashed];
+}
+```
+
+The database never parses a PDF. The loader does that on boring local compute
+(the Edge Function ceiling is 2504695 bytes and real documents blow through
+it - see the reference doc), writes rows, and SQL does everything else.
+
+## Part 1 - Provision the project
+
+One `supabase_project` resource via the Supabase OpenTofu provider: `medium`
+compute, the region your readers are in (extension catalogues are per-region
+per-platform-version until probed - this guide's numbers are verified for
+`ap-southeast-1` and `ap-southeast-2`). Put the org id in a gitignored,
+SOPS-encrypted tfvars; never the committed one.
+
+After apply, wait for `ACTIVE_HEALTHY` on the Management API health endpoint,
+then enable the extensions:
+
+```sql
+create extension if not exists pgrouting cascade;  -- pulls postgis
+create extension if not exists pg_trgm;
+create extension if not exists fuzzystrmatch;
+create extension if not exists unaccent;
+create extension if not exists vector;
+```
+
+**Verify:** `select name, default_version from pg_available_extensions where
+name in ('pgrouting','pg_trgm','vector')` shows the catalogue versions, and
+`select count(*) from pg_proc where proname like 'pgr\_%'` returns 209.
+
+## Part 2 - Acquire a corpus engineered for overlap
+
+The corpus is chosen, not found. The property you want is *recurrence*: one
+issuing body's documents across consecutive years, so the same people and
+organisations appear in dozens of them. Council minutes plus committee
+minutes plus the same council's contracts registers and tender notices is the
+shape that works (the reference build's US federal corpus, seven unrelated
+documents, produced 1.3% bridging - arithmetic, not a flaw).
+
+Two acquisition tricks that matter:
+
+- **Find the enumerable archive.** Councils on WordPress expose
+  `/wp-json/wp/v2/media?search=minutes&per_page=100` - a paginated, filterable
+  JSON listing of every PDF. Enumerate the listing; never guess URLs.
+- **Fetch with a browser UA.** Council sites 403 non-browser agents.
+
+Write a manifest (`slug, genre, doc_date, source_url, source_bytes` per
+document), parse the meeting date out of the filename, dedupe by content
+hash, and commit it - the manifest is the corpus definition. The loader then
+fetches (or cache-hits), extracts text, and routes:
+
+```ts
+const pages = Number(pdfinfo.match(/^Pages:\s+(\d+)/m)?.[1] ?? "0");
+const text = await $`pdftotext ${pdf} -`.text();
+if (pages > 0 && text.length / pages < 270) {
+  // image-only scan: pdftoppm -r 200 -gray, then tesseract per page
+}
+```
+
+Bulk-load with one staged `\copy` (CSV handles embedded newlines; per-row
+inserts are quoting roulette at tens of MB).
+
+<Aside type="caution" title="The transaction pooler hands back dirty backends">
+A temp table created on a pooled backend can outlive your client session - a
+second run then dies on `relation "st_au" already exists`. `drop table if
+exists pg_temp.<name>` before every `create temporary table` in loader SQL.
+</Aside>
+
+**Verify:** `select genre, count(*), min(doc_date), max(doc_date) from
+corpus.documents group by 1` shows your corpus, and every row has
+`extracted_text` non-null. The 103-document reference corpus measured
+44317522 source bytes producing 1134495 extracted bytes.
+
+## Part 3 - The schema
+
+Four tables: `corpus.documents` (the text + provenance + `doc_date`), and
+`demo.entities` / `demo.mentions` / `demo.edges`. The edge table's columns
+are named exactly `id`, `source`, `target`, `cost` because that is the
+`pgr_*` inner-query contract (`ANY-INTEGER` for the first three) - a `uuid`
+key cannot be handed to the algorithms at all, so entities carry a surrogate
+`bigint generated always as identity`.
+
+```sql
+create table demo.edges (
+  source bigint not null references demo.entities(id),
+  target bigint not null references demo.entities(id),
+  doc_slug text not null references corpus.documents(slug),
+  weight int not null default 1,
+  doc_date date,                      -- the time axis, filled by trigger
+  cost double precision generated always as (1.0 / weight) stored,
+  id bigint generated always as identity unique,
+  primary key (source, target, doc_slug)
+);
+create index edges_source_idx on demo.edges(source);
+create index edges_target_idx on demo.edges(target);
+```
+
+`cost = 1/weight` makes the cheapest Dijkstra path the *most strongly
+evidenced* one, which is the question a reader actually asks. Both edge
+columns are indexed: that pair of indexes is the difference between a
+167.59 ms and a 0.22 ms depth-3 traversal.
+
+`doc_date` is nullable and the US fixtures stay null on purpose: as-at
+queries exclude undated edges, which is the honest reading of "as at" - only
+what was known by then.
+
+RLS goes ON for every table with ZERO policies (deny by default) and no table
+grants to `anon`/`authenticated`. The entire read surface is functions.
+
+## Part 4 - Extraction, with a checksum gate
+
+The extractor shape that survives contact with real corpora is set-based SQL:
+`regexp_matches` with `WITH ORDINALITY` for the matches,
+`regexp_split_to_table` with ordinality for the parts, window sums to
+reconstruct character offsets. Two traps are encoded in the reference
+implementation's comments: Postgres's word boundary is `\y` (`\b` is
+backspace and silently matches nothing), and every regex group must be
+non-capturing because the machinery reads `(t.m)[1]`.
+
+Persons and organisations are honorific/suffix patterns - `Cr X`,
+`Councillor X`, `Mayor X`, `... Pty Ltd` with the suffix case-flexible
+(council resolutions are set in ALL CAPS; the first pass missed 3 of 103
+documents). Precision is candidate-grade and that is stated wherever the
+numbers are quoted.
+
+Registry identifiers are where this stops being fuzzy. An ABN is eleven
+digits with a published check:
+
+```sql
+create or replace function demo.valid_abn(d text)
+returns boolean language sql immutable as $$
+  with digits as (select regexp_replace(d, '[^0-9]', '', 'g') as v),
+  w as (select array[10,1,3,5,7,9,11,13,15,17,19] as weights)
+  select case when length(v) = 11 then
+           ( (substring(v from 1 for 1)::int - 1) * weights[1]
+           + (select sum(substring(v from i + 1 for 1)::int * weights[i + 1])
+                from generate_series(1, 10) as i) ) % 89 = 0
+         else false end
+    from digits, w
+$$;
+```
+
+Candidates are filtered through it BEFORE insert: shape proposes, arithmetic
+disposes. On the real corpus that was 148 digit-group candidates, 14 valid
+mentions, 134 rejected, zero false positives. The `case when length(v) = 11`
+guard is load-bearing - without it, shorter strings cast empty substrings to
+int and the function errors at runtime.
+
+Test the gate with known vectors before trusting any extraction:
+
+```sql
+select demo.valid_abn('45 153 592 173'),  -- t (a real corpus ABN)
+       demo.valid_abn('45 153 592 174'),  -- f (one digit flipped)
+       demo.valid_abn('89 001 288 400');  -- t
+```
+
+And one trigger carries the time axis through every insert path, so no
+extractor or edge builder needs to know about dates:
+
+```sql
+create or replace function demo.fill_doc_date() returns trigger language plpgsql as $$
+begin
+  if NEW.doc_date is null then
+    select doc_date into NEW.doc_date from corpus.documents where slug = NEW.doc_slug;
+  end if;
+  return NEW;
+end $$;
+```
+
+## Part 5 - Edges
+
+An edge is co-presence within 400 characters of extracted text, rebuilt in
+one statement from the mentions' window sums, `on conflict` adding weights.
+At this corpus scale the rebuild takes about a second. Then
+`refresh_counters()` denormalises per-entity mention/document counts for the
+read RPCs.
+
+## Part 6 - The read surface, and the hub trap
+
+Every read is a `stable, security definer` function with
+`set search_path = demo, corpus, public, extensions`, granted to
+`anon, authenticated`; tables stay ungrantable. The set: `stats`,
+`documents`, `search_entities` (tiered exact -> punctuation-insensitive ->
+prefix -> trigram), `search_documents`, `provenance` (byte-exact offsets),
+`neighbourhood`, `shortest_path`, `components`, `subgraph`,
+`cross_document_entities`, plus the editorial five: `entity_timeline`,
+`bridges_as_at`, `neighbourhood_as_at`, `entity_registry_ids`, and an
+`entity_get` lookup for deep links.
+
+<Aside type="danger" title="Write the walk as a level set, not a path set">
+A `union all` recursive walk enumerates every *path* to every node. On a
+synthetic benchmark (average degree 8) that is invisible; on a real
+co-occurrence graph an attendance list cliques the whole chamber, a
+degree-917 hub appears, and depth 3 means 65 seconds. The fix is `union`
+(level-set semantics): each `(id, depth)` enters the frontier once and the
+work is bounded by nodes, not paths. Same rows out - 154.924 ms instead of
+65721.220 ms on the same data. This is the single most important line of SQL
+in the build.
+</Aside>
+
+The as-at variants are the same walk with `and g.doc_date <= p_as_of` in the
+edge predicate. `entity_registry_ids` is not a new graph at all - it reads
+the existing co-proximity edges filtered to `kind='abn'`, so "this
+organisation printed this ABN in this document" falls out of machinery
+already built.
+
+## Part 7 - PostgREST exposure
+
+Widen `db-schema` in project config to `public, demo`, send
+`Content-Profile: demo` on every request, and `select pg_notify('pgrst',
+'reload schema')` after any DDL that adds or changes functions - a stale
+schema cache reads as `PGRST202` "no matches found" on functions that
+obviously exist.
+
+**Verify the security posture as queries, not vibes:**
+
+```sql
+-- zero tables without RLS
+select count(*) from pg_tables where schemaname in ('demo','corpus') and not rowsecurity;  -- 0
+-- anon reading a table directly: 42501
+curl -s https://$REF.supabase.co/rest/v1/entities?limit=1 -H "apikey: $ANON" -H 'Accept-Profile: demo'
+```
+
+## Part 8 - Serving, with an edge cache
+
+A static UI can live anywhere except Supabase Storage (it serves HTML as
+`text/plain` with `nosniff` - a deliberate anti-stored-XSS posture, no flag
+to change it). The build uses a Workers static-assets deploy with a small
+script that owns `/rest/*` only: POST bodies hashed into synthetic GET cache
+keys, freshness tracked with `x-cached-at` against a six-hour TTL, and
+serve-stale regardless of age when the origin errors - the demo keeps
+answering while the disposable project is down.
+
+```ts
+const key = new Request(`https://pggraph.cache/${CACHE_VERSION}${url.pathname}?h=${hash}`);
+const cached = await caches.default.match(key);
+if (cached && Date.now() - Number(cached.headers.get("x-cached-at")) < CACHE_TTL_MS)
+  return withMark(cached, "HIT");
+// ... origin fetch; on !ok or throw: if (cached) return withMark(cached, "STALE");
+const store = new Response(origin.clone().body, origin);
+store.headers.delete("set-cookie");   // Cache API rejects put() with Set-Cookie
+store.headers.set("x-cached-at", String(Date.now()));
+ctx.waitUntil(caches.default.put(key, store));
+```
+
+The `set-cookie` strip is not decorative: Cloudflare's edge adds `__cf_bm` to
+every response, the put throws inside `waitUntil`, and the symptom is a
+permanent MISS with no error anywhere. Also note `cf-cache-status: DYNAMIC`
+on responses is the *zone* edge cache saying nothing - it is a different
+system from the Cache API and never applies to POST RPCs; trust only your own
+`x-pggraph-cache` header.
+
+## Part 9 - Verify with a browser
+
+The demo's e2e suite is five Playwright specs against the deployed site:
+landing stats, the as-at filter emptying and restoring the bridging table
+(await the RPC response before asserting, or the test proves nothing), the
+registry pin showing `45 153 592 173` for the organisation that printed it,
+selection surviving a reload via the `?entity=` deep link, and the
+origin-down state showing the diagnostic panel. Serial, read-only, ~7
+seconds.
+
+## Lifecycle
+
+Everything above lives in committed files and one `make up` reproduces it
+(~446 s). Two lessons are encoded in the runbook because they cost real
+incidents: never create a function by hand in the live database (a hand-made
+`demo.documents()` survived nowhere and a fresh rebuild shipped a UI whose
+corpus table 404'd), and never run a destructive seed path against a
+populated project - the rebuild path is destroy-and-recreate, and the data
+manifest plus loader is the idempotent layer.
+
+## Verification checklist
+
+- [ ] Catalogue probe returns the expected extension versions for YOUR region
+- [ ] Corpus rows all carry extracted text; scanned docs routed to OCR
+- [ ] `valid_abn` passes the known-vector trio
+- [ ] Every mention and edge on dated documents has `doc_date`
+- [ ] An as-at query at a pre-corpus date returns zero rows
+- [ ] RLS: zero unprotected tables; direct table read returns 42501
+- [ ] A hub entity's depth-3 neighbourhood answers in hundreds of ms, not a minute
+- [ ] `x-pggraph-cache` flips MISS -> HIT on a repeated RPC
+- [ ] The Playwright suite passes against the deployment
