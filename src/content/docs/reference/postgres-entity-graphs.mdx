@@ -6,12 +6,17 @@ author: Erfi Anugrah
 
 import { Aside } from "@astrojs/starlight/components";
 
-The [working example](https://pggraph.erfi.dev) may be offline because it runs
-on disposable infrastructure. The measurements below remain the reference for
-the design: seven public-domain US federal documents turned into 1521 citation
-entities, 10016 mentions and 14233 edges, with traversal, shortest path,
-connected components and byte-exact provenance. No graph database anywhere in
-it.
+The [working example](https://pggraph.erfi.dev) serves its read surface through
+an edge cache, so it keeps answering from stale responses even while the
+disposable database behind it is destroyed - `x-pggraph-cache` on every
+response says which. The measurements below remain the reference for the
+design, and two corpora now sit under them: seven public-domain US federal
+documents (1521 citation entities, 10016 mentions, 14233 edges) and 103
+Australian local-government public documents - one council's minutes,
+committee papers, contracts registers and tender notices across 2015-2026 -
+which added the people, organisations and registry identifiers the editorial
+questions actually ask about (4787 entities, 28778 edges total). No graph
+database anywhere in it.
 
 That line is a claim about capability, not category, and it deserves the
 boundary stated. The requirement this answers is a set of graph *questions* -
@@ -26,9 +31,10 @@ eventually becomes one of those, the relational work below is not wasted - the
 extraction, resolution and provenance layers are the parts every pipeline
 keeps regardless of which store sits at the end.
 
-Everything below was measured on a disposable project in `ap-southeast-1`:
-**Postgres 17.6**, **medium** compute (2 vCPU / 4 GB), between 2026-08-10 and
-2026-08-11. Query
+Everything below was measured on disposable projects: **Postgres 17.6**,
+**medium** compute (2 vCPU / 4 GB), in `ap-southeast-1` between 2026-08-10 and
+2026-08-11, and in `ap-southeast-2` on 2026-08-14 for the editorial corpus
+run. Query
 latencies are `EXPLAIN ANALYZE`'s own `Execution Time` with the cold first run
 discarded, so they are database work rather than round trip. Read the compute as
 a floor - a real deployment provisions more. Claims that are documented rather
@@ -62,10 +68,18 @@ than measured are marked in [Evidence](#evidence).
   24-row review of 561 persons and 2284 organizations found truncated
   names, labels split at line breaks and occasional sentence-level
   over-captures.
-- **Cross-document bridging is the payoff, and this corpus barely exercises
-  it.** 20 of the 1521 citation entities appear in more than one document.
-  Choose a demo corpus for overlap, and put dates on edges - the interesting
-  questions are temporal.
+- **Cross-document bridging is the payoff, and the corpus has to be built for
+  it.** 20 of the 1521 US citation entities span documents; the council corpus
+  engineered for overlap puts sitting councillors in 86-93 of its 103
+documents.
+- **Registry identifiers make resolution arithmetic, not similarity.** Every
+  ABN candidate shape in the corpus (148 of them) was checked against the
+  mod-89 checksum at extraction: 14 valid mentions, 134 rejected, zero false
+  positives surviving.
+- **Real co-occurrence graphs have hubs, and hubs break naive walks.** A
+  path-set recursive walk (UNION ALL) took 65721.220 ms at depth 3 on the
+  28778-edge real graph; level-set semantics (UNION) answers the same query in
+  154.924 ms. The synthetic benchmark never showed it: its average degree is 8.
 
 ---
 
@@ -281,7 +295,50 @@ deliberate - a public bucket takes arbitrary uploads, and serving HTML as HTML
 would make it a stored-XSS surface on the project's own origin.
 
 The live demo is therefore a Cloudflare Workers static-assets deployment, which
-serves `text/html` correctly.
+serves `text/html` correctly. The same worker also proxies the read RPCs through
+the documented Cache-API pattern for POSTs - body hashed into a synthetic GET
+cache key - which buys two properties the demo's disposable database needs.
+Repeated reads (`stats`, the document inventory, the bridging list) answer at
+the edge in single-digit milliseconds rather than round-tripping to the project
+region. And when the project is destroyed between engagements, the demo keeps
+answering from stale cache entries instead of 502ing: freshness is tracked with
+an `x-cached-at` stamp against a six-hour TTL, and any origin failure falls back
+to whatever is stored, marked `x-pggraph-cache: STALE`. Two implementation notes
+cost real time to learn: the Cache API rejects `put()` of any response carrying
+`Set-Cookie` (Cloudflare's own edge adds `__cf_bm`, so strip it on the stored
+copy or every request is a silent permanent MISS), and the store is
+per-colocation with an asynchronous write, so two back-to-back probes can both
+MISS without anything being broken.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  browser [label="browser", shape=box, style=rounded];
+
+  subgraph cluster_worker {
+    label="Cloudflare Worker (pggraph)"; style=rounded; fontsize=12; margin=12;
+    assets [label="static assets binding\n(page, JS, CSS)"];
+    script [label="worker script\n/rest/* only"];
+    cache  [label="Cache API\nper-colo store"];
+  }
+
+  pgr  [label="PostgREST", shape=box, style=rounded];
+  db   [label="Postgres\n(disposable demo project)", shape=box, style=rounded];
+
+  browser -> assets [label="GET page"];
+  browser -> script [label="POST /rest/v1/rpc/*"];
+  script -> cache [label="synthetic GET key\n(path + body hash + version)"];
+  cache -> script [label="HIT in TTL"];
+  cache -> script [label="STALE when origin down"];
+  script -> pgr [label="MISS"];
+  pgr -> db;
+  script -> cache [label="store (Set-Cookie stripped)", style=dashed];
+}
+```
 
 ---
 
@@ -381,36 +438,65 @@ The citation layer proves the machinery; the editorial question is about people
 and organizations. Four properties of the loaded corpus matter more than its
 size.
 
-**Cross-document bridging is the payoff, and this corpus barely exercises it.**
-20 of the 1521 citation entities appear in more than one document - 18 in two,
-2 in three: 1.3%. That is arithmetic rather than a flaw, because seven
-documents across five genres share almost no citation surface. A corpus chosen
-to demonstrate bridging looks different: one issuing body's minutes across
-consecutive years, plus a filing from an organization those minutes name. Then
-the bridging count is the headline instead of a footnote. The query side
-already exists - the demo exposes it as `cross_document_entities()`, returning
-every entity that spans two or more documents with the document slugs attached.
+**Cross-document bridging is the payoff, and the corpus has to be engineered
+for it.** 20 of the 1521 citation entities appear in more than one document -
+1.3%, which is arithmetic rather than a flaw: seven documents across five
+genres share almost no citation surface. The council corpus applies the fix:
+one issuing body's ordinary minutes, committee minutes, contracts registers
+and tender notices across consecutive years, where the same councillors and
+contractors recur by construction. Measured on the loaded graph: the top
+bridging entities are the sitting councillors at 86-93 of 103 documents each,
+and the quiet payoff is that no single document is about them. The query side
+is `cross_document_entities()`, every entity spanning two or more documents
+with the slugs attached.
 
-**Person and organization extraction is the noisy stage.** The deterministic
-honorific and suffix patterns produce candidates, and the 24-row review graded
-them honestly. A production pipeline puts a model pass and a review step here;
-the demo's job is to show the machinery handles entity kinds beyond citations,
-with the precision labelled rather than tuned toward plausible.
+**Person and organization extraction is the noisy stage, and the corpus tells
+you exactly where.** Over the AU documents the patterns found 292 distinct
+persons and 123 organisations. A graded sample (12 + 12 rows) shows the same
+four classes as the US review - over-captured leading words, line-break
+splits, honorific-only rows, job-titles-as-people ("Director Corporate" spans
+92 documents and is not a person) - plus two organic lessons the synthetic
+planning did not predict: council resolutions are set in ALL CAPS, so the
+first `Pty Ltd` suffix pattern missed 3 of 103 documents until the suffix was
+made case-flexible, and a source-document typo ("Cr Jo Willians") survives as
+its own entity, which is the fuzzy-resolution case arriving on its own. A
+production pipeline puts a model pass and a review step here; the demo's job
+is to show the machinery handles entity kinds beyond citations, with the
+precision labelled rather than tuned toward plausible.
 
-**Edges need a time axis.** The editorial question is temporal: dealt with,
-five years ago, and also in twenty other places. Minutes and filings are dated,
-so validity metadata is free at ingestion. Carry the document date onto the
-mention and the edge, and an "as at" query becomes a date filter over the same
-tables rather than a new structure.
+**Edges carry a time axis.** The editorial question is temporal: dealt with,
+five years ago, and also in twenty other places. Minutes and filings are
+dated, so the metadata is free at ingestion: `doc_date` sits on every mention
+and edge (a BEFORE INSERT trigger fills it from the document, so no extractor
+needs to know), an entity's history is `entity_timeline()` in document-date
+order, and every read has an as-at form - `bridges_as_at()` and
+`neighbourhood_as_at()` traverse only edges whose documents existed by the
+date. Measured discrimination on the recurring local builder: 0 neighbours
+as at 2020-01-01 against 171 as at 2026-12-31. The US federal documents carry
+no dates and are simply absent from as-at answers, which is the honest reading
+of "as at": only what was known by then.
 
-**Registry identifiers make resolution exact.** `pg_trgm` and `fuzzystrmatch`
-are the fallback, not the primary mechanism. Jurisdictions whose corporate
-documents carry a registry identifier - an ACN or ABN in Australian filings, a
-company number in UK ones - provide a deterministic join key, and resolving on
-a key is exact where trigram similarity is a judgment call. Extract the
-identifier as its own entity kind and match on it first. This is the citation
-extractor's own trick applied to entities: where the source carries a
-structured identifier, use it.
+**Registry identifiers make resolution arithmetic.** `pg_trgm` and
+`fuzzystrmatch` stay as the fallback. Australian documents print ABNs, an ABN
+carries a checksum (subtract 1 from the first digit, weight by
+10,1,3,5,7,9,11,13,15,17,19, sum must divide by 89), and a checksum turns
+extraction into proof: 148 eleven-digit candidate shapes across the corpus,
+14 valid mentions, 3 distinct entities, 134 rejected by arithmetic, zero false
+positives surviving. The join is exact where a key exists: the organisation
+WHITE ROCK WIND FARM PTY LTD co-occurs in a 2015 committee paper with its
+printed ABN, so a co-proximity edge pins the identity
+(`entity_registry_ids()` surfaces it) while the 2022 minutes name the same
+venture's community fund through a councillor appointment - no fuzzy match
+involved in the pin, the trigram only has to link the name variants.
+(Zero ACN tokens were found in this corpus, so no `acn` kind was built.)
+
+**The visual is a renderer, not a build.** The traversal, bridging and cluster
+queries existed; the demo now draws the read as a radial node-link graph over
+`subgraph()` output - concentric rings by CTE depth, no force layout, no
+dependency. Two discipline notes from doing it: hub nodes make full edge sets
+unreadable (the graph draws the top 24 nodes by weight, top 3 edges per node,
+and says so), and the answer to "is the graph real" is the table beside
+the picture, not the picture.
 
 ---
 
@@ -463,7 +549,11 @@ structured identifier, use it.
 | Maximum disk size for a single project | **Not discoverable via the Management API.** Billing/addons surfaces probed again 2026-08-11 (3 endpoints; only throughput fields exist). The ceiling question stays open - the experiment project itself measured 88% disk full at the 2026-08-11 audit |
 | Person/organisation extraction quality | Measured - 561 persons + 2284 orgs extracted live 2026-08-11; a 24-row sample showed name truncation, newline-split labels and sentence over-capture. NOISY, recorded as a finding rather than tuned toward plausible |
 | 20 of 1521 citation entities span 2+ documents (18 in two, 2 in three) | Measured - `cross_document_entities()` over the loaded corpus, 2026-08-11 |
-| Dates on edges, registry-identifier resolution, the ~100-document real-pipeline run | **Not measured.** Design guidance; the loaded corpus exercises none of them |
+| Dates on edges, registry-identifier resolution, the 111-document real-pipeline run | Measured, 2026-08-14 - `doc_date` on mentions and edges via a BEFORE INSERT trigger, a hub entity resolving to 0 neighbours as at 2020-01-01 and 171 as at 2026-12-31; 148 ABN-shaped candidates gated by the mod-89 checksum to 14 valid mentions and 3 entities; 103 AU council documents loaded and extracted (292 persons / 123 organisations, 31.6 s wall clock for re-extract plus edge build, per-genre ratios 0.0011-0.0362, TOAST 0.4893) |
+| Hub traversal semantics on a real co-occurrence graph | Measured - a degree-917 hub turned the path-set (UNION ALL) depth-3 walk into 65721.220 ms server-side; the level-set (UNION) walk answers the same query in 154.924 ms warm, same project, 2026-08-14 |
+| Edge-cached read surface | Measured - the worker caches POST bodies under synthetic GET cache keys, 6 h freshness via `x-cached-at`, serve-stale on origin failure; `x-pggraph-cache` HIT/MISS/STALE verified on the deployed domain, 2026-08-14 |
+| Functions created by hand in a live database do not survive a rebuild | Measured - `demo.documents()` existed in no committed file, only in an older live project, and a fresh rebuild shipped a UI whose corpus table 404'd (PGRST202). It is defined in `demo/db/04-api.sql` now |
+| Browser-level end-to-end proof of the deployed demo | Measured - Playwright suite (`demo/e2e/`) over the live domain: landing, as-at bridging, entity graph + timeline + deep-link persistence, the registry-pin search flow, and the origin-down diagnostic state |
 | Recall or quality of any vector index | **Not measured.** Synthetic vectors cannot support a recall claim |
 | Scanned / image-only PDFs | Detection measured - an image-only NARA scan extracted 0.5 chars/page against 2710-3242 for born-digital references, so ~270 chars/page routes a document to OCR. OCR itself remains unavailable in-database: `plpython3u` absent from `pg_available_extensions`, verified by query 2026-08-11 |
 | Behaviour under concurrent traversal | Measured - depth-3 CTE at concurrency 1/4/16/64 on the 100000/400000 graph: p50 0.29 ms aggregate, p95 ~3 ms, 0 errors in 85 queries, same 2-vCPU medium, 2026-08-11. pgrouting algorithms remain single-query |
