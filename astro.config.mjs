@@ -1,5 +1,9 @@
 // @ts-check
 import { defineConfig, fontProviders } from "astro/config";
+import { createHash } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { unified } from "@astrojs/markdown-remark";
 import starlight from "@astrojs/starlight";
 import sitemap from "@astrojs/sitemap";
@@ -11,6 +15,52 @@ import { getCache } from "@beoe/cache";
 // Build-cache for rendered diagrams so unchanged dot blocks are not re-rendered
 // through the wasm Graphviz engine on every build.
 const beoeCache = await getCache();
+
+// Sidebar and redirects are derived from doc frontmatter at config-load, and
+// the dev server evaluates the config once - so taxonomy edits were invisible
+// until a manual restart. Restarting on every .mdx save would kill hot reload
+// for prose, so this watches the docs tree and restarts only when a doc's
+// FRONTMATTER BLOCK changes (or a doc appears/disappears). Prose-only edits
+// keep normal hot reload.
+const DOCS_ROOT = fileURLToPath(new URL("./src/content/docs", import.meta.url));
+const isDoc = (/** @type {string} */ f) =>
+  /[\\/](guides|reference)[\\/][^\\/]+\.mdx?$/.test(f) && f.startsWith(DOCS_ROOT);
+const fmHash = (/** @type {string} */ f) => {
+  try {
+    const m = readFileSync(f, "utf8").match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    return m ? createHash("sha1").update(m[1]).digest("hex") : null;
+  } catch {
+    return null;
+  }
+};
+const taxonomyWatcher = {
+  name: "taxonomy-frontmatter-restart",
+  hooks: {
+    "astro:server:setup": (/** @type {{ server: import("vite").ViteDevServer }} */ { server }) => {
+      const hashes = new Map();
+      for (const dir of ["guides", "reference"]) {
+        for (const f of readdirSync(join(DOCS_ROOT, dir))) {
+          const p = join(DOCS_ROOT, dir, f);
+          if (isDoc(p)) hashes.set(p, fmHash(p));
+        }
+      }
+      server.watcher.on("add", (/** @type {string} */ f) => {
+        if (isDoc(f)) server.restart();
+      });
+      server.watcher.on("unlink", (/** @type {string} */ f) => {
+        if (isDoc(f)) server.restart();
+      });
+      server.watcher.on("change", (/** @type {string} */ f) => {
+        if (!isDoc(f)) return;
+        const h = fmHash(f);
+        if (hashes.get(f) !== h) {
+          hashes.set(f, h);
+          server.restart();
+        }
+      });
+    },
+  },
+};
 
 // @beoe/rehype-graphviz emits SVGs with only a viewBox (no width/height), so
 // each stretches to 100% of the column - wide diagrams squeeze their text, tall
@@ -110,7 +160,7 @@ export default defineConfig({
       ],
     },
   ],
-  integrations: [sitemap(), starlight({
+  integrations: [sitemap(), taxonomyWatcher, starlight({
     title: "Erfi's Lexicanum",
     favicon: "/ea_favicon.png",
     customCss: ["./src/styles/custom.css"],
