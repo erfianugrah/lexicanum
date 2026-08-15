@@ -23,17 +23,23 @@ and every edit. Build with `bun run build`; dev with `bun dev` (localhost:4321).
   "Footnotes" heading to a visible **References** section. Do not rename it back.
 - `src/styles/custom.css` styles `.footnotes` dense (small type, tight leading).
 - Navigation is frontmatter-driven. Each doc declares `category:` (required;
-  one of the providers in `TAXONOMY` in `src/lib/taxonomy.mjs`), optional
-  `group:` (subcategory), and optional `featured: true` + `blurb:` (homepage
-  card). The sidebar is generated from that at config-load, the homepage card
-  grids via `src/components/TopicCards.astro`, and both are validated at build
-  time (`docsSchema` extend in `src/content.config.ts` fails on unknown
-  values; the generator fails on a missing category). Adding a doc = write
-  the doc, set frontmatter, done. Sidebar order within a group is guides
-  first, then optional `sidebar.order`, then title. Dev caveat: the sidebar
-  is computed once at server start - restart `bun dev` after changing
-  taxonomy frontmatter. Adding a CATEGORY is a deliberate edit to `TAXONOMY`
-  and the schema enum, not something a doc can invent.
+  one of the providers in `TAXONOMY` in `src/lib/taxonomy.mjs`), `group:`
+  (required when the category has subcategories), and optional
+  `featured: true` + `blurb:` (homepage card) and `aliases:` (old published
+  URLs, emitted as redirects - renaming or moving a doc means renaming the
+  file and adding its old URL here). The sidebar, redirects, and homepage
+  card grids are generated from frontmatter at config-load
+  (`src/lib/taxonomy.mjs`, `src/components/TopicCards.astro`) and validated
+  at build time (the `docsSchema` enums derive from `TAXONOMY`, so a category
+  edit is `TAXONOMY`-only; the generator fails on a missing category or a
+  colliding alias). Adding a doc = `bun run new` (prompts, scaffolds
+  frontmatter + skeleton) or write the doc and set frontmatter by hand.
+  Sidebar entries carry a Guide/Reference badge stamped from the folder.
+  Order within a group is guides first, then optional `sidebar.order`, then
+  title. Dev caveat: the sidebar and redirects are computed once at server
+  start - restart `bun dev` after changing taxonomy or alias frontmatter.
+  Adding a CATEGORY is a deliberate edit to `TAXONOMY`, not something a doc
+  can invent.
 
 ## Two traps in this repo
 
@@ -73,7 +79,8 @@ also" list.
 Reference:
 ```
 frontmatter (title sentence-case, rich description, author, category, group if
-  the category has groups, featured+blurb if it belongs on the homepage)
+  the category has groups, featured+blurb if it belongs on the homepage,
+  aliases on rename)
 Lede (1-2 sentences: what this is, who it's for)
 Provenance note - if it has measurements (rig / region / date; measured vs asserted)
 TL;DR bullets
@@ -88,7 +95,9 @@ References  (auto-rendered from footnotes; see Citations)
 
 Guide:
 ```
-frontmatter
+frontmatter (same fields as reference: title, description, author, category,
+  group if the category has groups, featured+blurb if homepage-worthy,
+  aliases on rename)
 Lede (what you'll build + prerequisites)
 Constants preamble - if measurement-heavy: the fixed facts every later claim
   depends on (hardware/IDs, physics, event IDs, GUIDs, expected numbers),
