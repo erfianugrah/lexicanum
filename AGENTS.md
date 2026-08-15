@@ -140,7 +140,7 @@ claim, and a References list renders at the bottom. Mechanism:
 - Links in an evidence / "How it was checked" table stay INLINE, even in a reference
   doc. There the link IS the evidence rather than prose-flow attribution, and
   footnoting it puts the proof one hop away from the claim it supports.
-  `reference/supabase-multitenant-platform` is the case that established this.
+  `reference/supabase-multi-tenant-placement` is the case that established this.
 
 **Guides**: keep links inline in the step where they're used (flow beats
 attribution in a how-to). Add a References footnote list only if the guide is
@@ -226,12 +226,13 @@ Run `bun run build` and confirm:
   corpus was 36 docs and three stubs, and only summed correctly by accident.
   A doc with `draft: true` does not build, which is the case this catches.
 - `bun test` is green. ALL doc checks live in `tests/` and run inside `bun run build`,
-  so a defect fails the build instead of appearing on the page. There is no verify
-  script any more - `scripts/` is gone, and its checks are either here or were found
-  to be vacuous.
+  so a defect fails the build instead of appearing on the page. `scripts/` holds
+  tooling only (`new-doc.ts`, the scaffolder) - checks live here in `tests/`,
+  after the old verify scripts were either absorbed or found to be vacuous.
   - `tests/docs.test.ts` - corpus-wide structure: split tables, footnote balance,
     smart punctuation, math-risk dollars, internal links, draft links, dot-fence
-    style, built-page assertions.
+    style, built-page assertions, and the taxonomy checks (every doc in the
+    generated sidebar, every alias emitting a redirect stub, no dead blurb).
   - `tests/pins.test.ts` - per-doc pins: corrections that must not regress, claims
     that must not creep back, required sections, and the anchors other docs link to.
     Adding a pin is a row in the table.
