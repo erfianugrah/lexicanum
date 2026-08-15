@@ -36,8 +36,9 @@ and every edit. Build with `bun run build`; dev with `bun dev` (localhost:4321).
   frontmatter + skeleton) or write the doc and set frontmatter by hand.
   Sidebar entries carry a Guide/Reference badge stamped from the folder.
   Order within a group is guides first, then optional `sidebar.order`, then
-  title. Dev caveat: the sidebar and redirects are computed once at server
-  start - restart `bun dev` after changing taxonomy or alias frontmatter.
+  title. Dev note: the sidebar and redirects are computed at server start,
+  and a watcher in `astro.config.mjs` restarts the dev server automatically
+  when a doc's frontmatter block changes (prose edits keep hot reload).
   Adding a CATEGORY is a deliberate edit to `TAXONOMY`, not something a doc
   can invent.
 

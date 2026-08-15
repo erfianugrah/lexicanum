@@ -59,8 +59,9 @@ aliases:                  # optional: old published URLs, emitted as redirects
   A colliding alias fails the build.
 - Adding a *category* is a deliberate edit to `TAXONOMY` in
   `src/lib/taxonomy.mjs`; the schema enums derive from it.
-- Dev caveat: sidebar/redirects are computed once at server start - restart
-  `bun dev` after changing taxonomy frontmatter.
+- Dev note: sidebar/redirects are computed at server start; a watcher
+  restarts the dev server automatically when a doc's frontmatter changes
+  (prose edits keep hot reload).
 
 ## Commands
 
