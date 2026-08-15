@@ -1,17 +1,20 @@
 /**
- * Frontmatter-driven sidebar generator.
+ * Frontmatter-driven navigation: taxonomy, sidebar, and redirects.
  *
  * The taxonomy (which categories exist, their order, their subgroups) lives
- * here in ONE ordered table. Doc membership lives in each doc's frontmatter
+ * here in ONE ordered table; the content-collection schema enums derive from
+ * it in src/content.config.ts. Doc membership lives in each doc's frontmatter
  * (`category`, optional `group`, optional `sidebar.order`, optional
- * `aliases`). No framework supports
- * page-declared group membership natively - Starlight frontmatter only orders
- * within directory-derived groups - so this module scans the docs directories
- * at config-load time and builds the sidebar array itself (the pattern
- * documented in https://github.com/stalwartlabs/website/blob/main/astro.config.mjs).
+ * `aliases`). No framework supports page-declared group membership natively -
+ * Starlight frontmatter only orders within directory-derived groups - so this
+ * module scans the docs directories at config-load time and builds the
+ * sidebar array itself (the pattern documented in
+ * https://github.com/stalwartlabs/website/blob/main/astro.config.mjs).
  *
  * Sort within a group: guides before reference docs, then optional numeric
- * `order`, then title. The taxonomy order is the sidebar order.
+ * `order`, then title. Every entry also carries a Guide/Reference badge
+ * stamped from its folder - doc type is invisible in the sidebar otherwise.
+ * The taxonomy order is the sidebar order.
  *
  * Failure handling: a doc missing `category`, carrying an unknown
  * category/group, or missing `group` in a category that has groups throws at
@@ -69,8 +72,14 @@ export const TAXONOMY = [
 const DOCS_ROOT = fileURLToPath(new URL("../content/docs/", import.meta.url));
 const DIRS = ["guides", "reference"];
 
-/** Read every doc's id, title, and taxonomy frontmatter. */
+let cache = null;
+
+/** Read every doc's id, title, and taxonomy frontmatter (memoized). */
 export function collectDocMeta() {
+  // Config load calls this via buildSidebar AND buildRedirects; the memo
+  // makes both come from one scan, so sidebar and redirects can never
+  // disagree about what exists.
+  if (cache) return cache;
   const docs = [];
   for (const dir of DIRS) {
     for (const file of readdirSync(join(DOCS_ROOT, dir))) {
@@ -111,6 +120,7 @@ export function collectDocMeta() {
       });
     }
   }
+  cache = docs;
   return docs;
 }
 
@@ -119,6 +129,18 @@ function byTypeThenOrder(a, b) {
   if (a.type !== b.type) return a.type === "guides" ? -1 : 1;
   if ((a.order ?? 0) !== (b.order ?? 0)) return (a.order ?? 0) - (b.order ?? 0);
   return String(a.title).localeCompare(String(b.title));
+}
+
+// Doc type is otherwise invisible in the sidebar: two same-topic docs, one
+// task and one concept, look identical. The folder already knows the type, so
+// stamp it. Guide = tip (green), Reference = note (blue).
+const BADGE = {
+  guides: { text: "Guide", variant: "tip" },
+  reference: { text: "Reference", variant: "note" },
+};
+
+function entry(d) {
+  return { slug: d.id, badge: BADGE[d.type] };
 }
 
 /**
@@ -148,22 +170,20 @@ export function buildSidebar() {
   return TAXONOMY.map((category) => {
     const inCategory = docs.filter((d) => d.category === category.id);
     if (category.groups) {
-      return {
-        label: category.label,
-        items: category.groups
-          .map((group) => ({
-            label: group.label,
-            items: inCategory
-              .filter((d) => d.group === group.id)
-              .sort(byTypeThenOrder)
-              .map((d) => d.id),
-          }))
-          .filter((group) => group.items.length > 0),
-      };
+      const items = category.groups
+        .map((group) => ({
+          label: group.label,
+          items: inCategory
+            .filter((d) => d.group === group.id)
+            .sort(byTypeThenOrder)
+            .map(entry),
+        }))
+        .filter((group) => group.items.length > 0);
+      // A category whose groups all filtered out would render as a bare
+      // label with nothing under it; drop it entirely instead.
+      return items.length > 0 ? { label: category.label, items } : null;
     }
-    return {
-      label: category.label,
-      items: inCategory.sort(byTypeThenOrder).map((d) => d.id),
-    };
-  });
+    const items = inCategory.sort(byTypeThenOrder).map(entry);
+    return items.length > 0 ? { label: category.label, items } : null;
+  }).filter((c) => c !== null);
 }

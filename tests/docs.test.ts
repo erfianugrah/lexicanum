@@ -106,6 +106,13 @@ describe.each(docs.map((d) => [d.path, d] as const))("%s", (_path, doc) => {
     expect(doc.frontmatter.description ?? "").not.toBe("");
   });
 
+  test("blurb is only set on featured docs", () => {
+    // blurb only does anything on the homepage card grid, which renders
+    // featured docs. A blurb without `featured: true` is dead frontmatter -
+    // the author meant one of the two.
+    expect(doc.frontmatter.blurb && !doc.frontmatter.featured ? ["blurb without featured"] : []).toEqual([]);
+  });
+
   test("every dot fence is transparent and uncoloured", () => {
     // House style: graphviz diagrams inherit the page theme instead of carrying
     // their own palette, which is what makes them legible in both colour modes.
@@ -157,9 +164,13 @@ describe("cross-document", () => {
     // and fails this import - which is the same failure the build would hit.
     // What remains to assert is coverage: every non-draft doc lands in the
     // output exactly once.
-    type Entry = string | { items?: Entry[] };
+    type Entry = string | { slug?: string; items?: Entry[] };
     const flatten = (items: Entry[]): string[] =>
-      items.flatMap((i) => (typeof i === "string" ? [i] : flatten(i.items ?? [])));
+      items.flatMap((i) => {
+        if (typeof i === "string") return [i];
+        if (i.slug) return [i.slug];
+        return flatten(i.items ?? []);
+      });
     const listed = flatten(buildSidebar());
     expect(listed.length).toBeGreaterThan(10);
     const expected = docs
