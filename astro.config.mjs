@@ -67,27 +67,15 @@ function rehypeFootnoteLabelToReferences() {
 }
 
 import react from "@astrojs/react";
+import { buildRedirects, buildSidebar } from "./src/lib/taxonomy.mjs";
 
 // https://astro.build/config
 export default defineConfig({
   site: "https://erfi.dev",
-  // PBKDF2 migration doc was reclassified reference -> guide (it is a
-  // task-sequenced how-to, not setup-independent architecture). Keep the old
-  // published URL alive.
-  redirects: {
-    "/reference/pbkdf2-supabase-auth-migration": "/guides/pbkdf2-supabase-auth-migration",
-    "/reference/supabase-platform-operation-downtime":
-      "/reference/supabase-platform-operation-cost",
-    // Split into one guide per transition. The build half keeps the inbound
-    // links, because that is what almost every caller meant by "the tenancy
-    // guide"; callers that meant promotion were repointed individually.
-    "/guides/supabase-shared-tenancy-and-promotion": "/guides/supabase-shared-tenancy",
-    // Retitled to the decision it answers, so the slug followed. "multi-tenant"
-    // rather than plain "tenant" is deliberate: the sidebar sorts by filename,
-    // and supabase-tenant-placement would sort after supabase-platform-
-    // operation-cost, putting the cost doc ahead of the decision doc.
-    "/reference/supabase-multitenant-platform": "/reference/supabase-multi-tenant-placement",
-  },
+  // Derived from `aliases:` frontmatter on the docs (src/lib/taxonomy.mjs) -
+  // renaming or moving a doc is a frontmatter change on the doc itself. An
+  // alias colliding with a live doc or another alias fails the build.
+  redirects: buildRedirects(),
   fonts: [
     {
       name: "IBM Plex Sans",
@@ -201,16 +189,14 @@ export default defineConfig({
       label: "GitHub",
       href: "https://github.com/erfianugrah",
     }],
-    sidebar: [
-      {
-        label: "Guides",
-        items: [{ autogenerate: { directory: "guides" } }],
-      },
-      {
-        label: "Reference",
-        items: [{ autogenerate: { directory: "reference" } }],
-      },
-    ],
+    // Provider-grouped sidebar, derived from doc frontmatter at config-load
+    // (category/group per doc; taxonomy and generator in src/lib/taxonomy.mjs).
+    // A flat alphabetical autogenerate is sequential access: it only helps a
+    // reader who already knows the doc's title. A doc missing a valid
+    // category fails the build in the generator, so no doc falls out of the
+    // nav silently. Dev caveat: this array is computed once at server start -
+    // restart `bun dev` after changing taxonomy frontmatter.
+    sidebar: buildSidebar(),
     expressiveCode: {
       shiki: {
         // These fence tags aren't in Shiki's bundled grammar set; alias them to

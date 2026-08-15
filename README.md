@@ -1,60 +1,74 @@
-# Technical Documentation Portal
+# Erfi's Lexicanum
 
 [![Built with Starlight](https://astro.badg.es/v2/built-with-starlight/tiny.svg)](https://starlight.astro.build)
 
-This repository contains technical documentation and guides for various technologies and services. It is built using [Astro](https://astro.build) with the [Starlight](https://starlight.astro.build) documentation theme.
+Notes, guides, and architecture references on the stuff I actually run - Supabase,
+Cloudflare, k3s, home networking, self-hosting. Published at https://erfi.dev.
+Built with [Astro](https://astro.build) + [Starlight](https://starlight.astro.build).
 
-## Features
+**AGENTS.md is the authoring contract** (doc types, skeletons, citation
+convention, house style). Read it before adding or editing docs.
 
-- Responsive design optimized for both desktop and mobile viewing
-- Dark/light mode support
-- Mermaid diagram integration for clear visualizations
-- Syntax highlighting for code blocks
-- Organized structure with guides and reference materials
-
-## 📁 Project Structure
-
-The documentation site is organized as follows:
+## Project structure
 
 ```
 .
-├── public/              # Static assets (favicons, etc.)
 ├── src/
-│   ├── assets/          # Images and other assets
 │   ├── content/
-│   │   ├── docs/        # Documentation content
-│   │   │   ├── guides/  # Step-by-step guides
-│   │   │   └── reference/ # Reference materials
-│   └── styles/          # Custom CSS for styling
-├── astro.config.mjs     # Astro configuration
+│   │   └── docs/
+│   │       ├── guides/      # Task-sequenced how-tos (Diataxis how-to)
+│   │       └── reference/   # Explanation-led architecture docs
+│   ├── components/          # TopicCards.astro (homepage card grids), etc.
+│   ├── lib/
+│   │   └── taxonomy.mjs     # TAXONOMY table + sidebar/redirect generators
+│   ├── content.config.ts    # docs collection + taxonomy frontmatter schema
+│   └── styles/custom.css
+├── tests/                   # All doc checks; run inside `bun run build`
+├── astro.config.mjs
 └── package.json
 ```
 
-Documentation content is written in `.md` or `.mdx` files in the `src/content/docs/` directory. Each file is exposed as a route based on its file name.
+## Navigation is frontmatter-driven
 
-## 🔧 Development
+Adding a doc means writing the doc and setting its frontmatter - the sidebar,
+redirects, and homepage cards are all derived:
 
-All commands are run from the root of the project:
+```yaml
+---
+title: ...
+description: ...
+author: Erfi Anugrah
+category: supabase        # required; one of TAXONOMY in src/lib/taxonomy.mjs
+group: tenancy            # required when the category has groups
+featured: true            # optional: show on the homepage card grid
+blurb: "..."              # optional: card text (defaults to description)
+aliases:                  # optional: old published URLs, emitted as redirects
+  - "/reference/old-slug"
+---
+```
 
-| Command           | Action                                           |
-| :---------------- | :----------------------------------------------- |
-| `bun install`     | Installs dependencies                            |
-| `bun dev`         | Starts local dev server at `localhost:4321`      |
-| `bun build`       | Build your production site to `./dist/`          |
-| `bun preview`     | Preview your build locally, before deploying     |
+- A missing or unknown `category`/`group` fails the build (schema enum +
+  generator), so no doc falls out of the nav silently.
+- Renaming or moving a doc = rename the file + add its old URL to `aliases`.
+  A colliding alias fails the build.
+- Adding a *category* is a deliberate edit to `TAXONOMY` in
+  `src/lib/taxonomy.mjs`; the schema enums derive from it.
+- Dev caveat: sidebar/redirects are computed once at server start - restart
+  `bun dev` after changing taxonomy frontmatter.
 
-## 📝 Content Guidelines
+## Commands
 
-When adding new documentation:
+| Command                  | Action                                          |
+| :----------------------- | :---------------------------------------------- |
+| `bun install`            | Install dependencies                            |
+| `bun dev`                | Dev server at `localhost:4321`                  |
+| `bun run build`          | Run all doc tests, then build to `./dist/`      |
+| `bun test`               | Run the doc checks without building             |
+| `bun run verify:docs:links` | Opt-in external-link reachability check      |
+| `bun run deploy`         | Deploy via Wrangler                             |
 
-1. Choose the appropriate section (guides or reference)
-2. Use descriptive filenames and titles
-3. Include diagrams for complex architectures using Mermaid
-4. Provide both CLI and Infrastructure-as-Code examples when applicable
-5. Include adequate comments in code samples
+## Resources
 
-## 🔗 Resources
-
-- [Starlight Documentation](https://starlight.astro.build/)
-- [Astro Documentation](https://docs.astro.build)
-- [Mermaid Diagram Syntax](https://mermaid.js.org/)
+- [Starlight documentation](https://starlight.astro.build/)
+- [Astro documentation](https://docs.astro.build)
+- [Diataxis](https://diataxis.fr/) - the guide/reference doc-type split
