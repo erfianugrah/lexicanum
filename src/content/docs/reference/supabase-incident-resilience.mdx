@@ -1,0 +1,252 @@
+---
+title: "Supabase incidents: what a client can actually do - a resilience reference"
+description: Every recurring Supabase incident class - JWT claim rejection, lifecycle downtime, pooler failures, capacity events, schema-cache wedges, storage billing shocks - with the client-visible signature, the workaround that exists, and which claims are lab-validated with numbers versus doc-claimed. Includes the measured warm-standby cutover path.
+author: Erfi Anugrah
+category: supabase
+group: operations
+featured: true
+blurb: "Incident classes, client-side workarounds, and the measured numbers behind each - including a warm standby with portable sessions."
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+The platform fails in a small number of recurring ways. Each class below has
+a mechanism, a client-visible signature, and a workaround tier - and each
+claim is marked as measured in the lab (with the number) or documented-only.
+The implementation of every workaround here is the companion guide,
+[the resilience runbook](/guides/supabase-resilience-runbook/).
+
+**TL;DR** - Reads are cheap to protect (edge cache, measured: byte-identical
+through a forced origin outage). Writes and auth need a warm standby, which
+works managed-to-managed with logical replication and sessions that survive
+cutover via third-party-auth registration (measured: 34ms-1s replication
+lag, TPA resolution ~60-122ms). The JWT clock-skew incident class has no
+runtime workaround - only exposure reduction (a token TTL lever that takes
+effect in ~6.5s) and detection (the PGRST code, not the HTTP status).
+
+## Which do I pick
+
+| You need to survive... | Tier | Cost | Evidence |
+| --- | --- | --- | --- |
+| Origin 5xx on read paths | Edge cache (cache-first Worker) | One Worker, no infra change | Measured, W04 |
+| JWT claim rejections (PGRST303) | TTL raise + code-aware alerting | Config change | Measured, W01/W03 |
+| Auth outage with active sessions | Longer TTL (sessions keep validating) | Config change | Measured, W03 |
+| Full regional/project loss | Warm standby + cutover | Second project + rehearsal | Measured, W05 |
+| Anything else | Cold DR (pg_dump) | Cron + object storage | Measured, W06 |
+| Fleet-wide incident | Contract (SLA) | Enterprise plan | Documented |
+
+## Class 1: JWT claim rejection (PGRST303)
+
+**Mechanism.** PostgREST validates `iat`/`exp` on every request with a
+30-second clock-skew tolerance.[^pgrst-auth] If the issuer's clock runs
+ahead of the validator's, freshly minted tokens carry a future `iat` and
+are rejected - while tokens minted before the skew began keep working. Auth
+(`/auth/v1/user`) can return 200 while the Data API rejects the same token;
+the two validate on different hosts.[^gh-48123]
+
+**Client sees.** `401 {"code":"PGRST303","message":"JWT issued at future"}`.
+The failure wave is every active session as its access token expires and
+refreshes - the default 1-hour TTL washes the whole user base through the
+broken path within one TTL.
+
+**Measured (edge-resilience W01, 2026-08-15).** The documented tolerance is
+exact: +30s accepted, +31s rejected (401 PGRST303). Expired tokens reject
+with the same code; an unknown signing key rejects PGRST301.
+
+**Public incidents.** 2026-08-14 "401 errors due to JWT rejections" on the
+Supabase status page ("newly refreshed JWTs being rejected by the API"),
+with an earlier "elevated JWT authorization errors" incident the same week
+and a matching community report three weeks prior.[^sb-status][^gh-48123]
+Recurring, not a one-off.
+
+**Workarounds.**
+
+- **Reduce exposure**: raise `jwt_exp` via the Management API. Readback is
+  immediate; the issuer honors it ~6.5s later (measured, W03). A 12h TTL
+  means a 20-minute skew window touches a small fraction of sessions
+  instead of all of them.
+- **Detect by code**: alert on the PGRST303 rate. The HTTP status (401) is
+  ambiguous; the code is not.
+- **Do not retry mid-skew**: every refreshed token is equally future-iat.
+  The default client already does the right thing - exactly 1 attempt on a
+  claim rejection (measured, W02, supabase-js 2.112.3).
+- **No runtime fix exists.** The repair is platform-side (PostgREST update
+  plus NTP hardening).
+
+## Class 2: Compute lifecycle downtime
+
+**Measured (platform-downtime, 2026-08-06..08).** On restart: REST gap ~10s,
+Storage ~26s, Auth ~75s (N=3, p50). A resize costs about twice a restart.
+REST and Realtime did not fail at all under four operations at 500ms
+sampling - the paths do not move together.
+
+Two probe-design lessons generalize: anonymous network probes see nothing
+(network accept is not readiness), and the Auth probe must be the signUp
+REST surface - RLS blocks the password grant on a fresh project, so a
+password-grant sensor reports an outage that is really its own permission
+model.
+
+## Class 3: Pooler failure modes
+
+**Measured (pooler-semantics, http-tier-lockdown).** Session mode: startup
+auth failure is a clean 58P01 at connect. Transaction mode: connect
+succeeds, the first statement fails 08P01/0A000, and prepared statements
+are unsupported. The same HTTP 400 can be a bad request or a capacity
+ceiling - read the SQLSTATE. Non-pooler 5432 can accept and then silently
+blackhole; always set connect and statement timeouts.
+
+## Class 4: Capacity and control-plane events
+
+**Documented (public status history, 2026).** Recurring multi-region
+project creation/resize/restart failures: April APAC (~1.3h), April
+us-east (~2h), June multi-region ("existing projects are not affected
+unless restarted or resized"), August us-east-2 project access.[^sb-status]
+Existing projects usually keep serving.
+
+**Workaround.** Pre-provision a project pool if your product provisions
+per-tenant, and never couple app availability to control-plane
+availability. There is no runtime fallback.
+
+## Class 5: Schema-cache wedge
+
+**Measured (http-tier-lockdown).** A PostgREST schema-cache wedge returns
+503 PGRST002 "schema cache load"; the fix is
+`pg_notify('pgrst', 'reload schema')`. PGRST001 on an empty exposed schema
+is not a wedge. ACTIVE_HEALTHY means the HTTP tier is up, not that
+PostgREST can reach Postgres - probe a real table, never the status field.
+
+## Class 6: Storage image-transform billing
+
+**Documented.** Transformations bill per distinct origin image per billing
+cycle - \$5 per 1,000, 100 included on Pro and Team, count resets each
+cycle.[^sb-transform-billing] A library that grows 30x in a month re-bills
+the whole live library every month it is viewed. It is not per-request, and
+CDN cache hits do not reduce the count.
+
+**Workarounds.** Pre-generate renditions at upload (the docs-recommended
+architecture; the billing fix doubles as a resilience fix against the
+render path). The per-project transformations toggle is a hard stop with a
+caveat: cached transformed images may still bill after disabling, so do
+not promise a clean zero. Spend cap is Pro-only; Team and above have no
+ceiling and no per-line alerting - the org usage page and Upcoming Invoice
+show spend mid-cycle, so a weekly check is the monitoring story.
+
+## Class 7: Edge caching as an outage absorber
+
+**Measured (edge-resilience W04, 2026-08-15).** A cache-first Cloudflare
+Worker served warm URLs 200 with byte-identical bodies while the origin
+was hard-down. Cold URLs failed - only warm reads survive.
+
+<Aside type="caution" title="The gotcha that makes naive caches silently useless">
+The Supabase gateway's Cloudflare front sets `Set-Cookie: __cf_bm` on every
+response. The Cache API refuses to store responses with Set-Cookie, and a
+rejection inside `waitUntil` is swallowed - a cache proxy that does not
+strip the header never caches and never tells you. Delete `set-cookie`
+before `cache.put`.
+</Aside>
+
+A second platform behavior matters for failure simulation: Cloudflare
+Workers wraps TCP failures to unroutable addresses as a 403 response, not
+a JS exception - catch-based stale fallback never fires for that failure
+mode. Handle it in the status branch.
+
+## Class 8: Client retry behavior
+
+**Measured (edge-resilience W02, supabase-js 2.112.3).** 401 PGRST303 ->
+exactly 1 attempt (no retry amplification). 503 x3 then 200 -> 4 attempts,
+success in ~7.0s. Connection refused -> surfaced in ~7.0s. The built-in
+retries cover 408/409/503/504 and network failures, on by default since
+v2.102.0; custom policies go through `fetch-retry`.[^sb-retries]
+
+## Class 9: Warm standby and cutover (the HA tier)
+
+**Measured (edge-resilience W05, 2026-08-15, cross-region
+ap-southeast-2 -> ap-southeast-1).** The full HA path works on managed
+projects:
+
+- **Logical replication, managed to managed**: a subscription on the
+  standby against the primary's direct host (`db.<ref>.supabase.co`)
+  works. Initial sync ~3.1-6.5s on a small table; replication lag
+  34ms-1057ms across regions. The pooler cannot be the source - it fails
+  at the tenant-identifier layer (`ENOIDENTIFIER`).
+- **Sessions survive cutover without copying secrets**: register the
+  primary's OIDC issuer as a third-party-auth integration on the standby
+  (resolves in ~60-122ms) and primary-issued tokens read the standby's
+  API. Copying the JWT secret is not an option anyway - the config API
+  accepts the write and changes nothing (measured 2026-08-14).
+- **The cold path is real**: a first-time issuer's key costs ~30s of
+  PGRST301 before PostgREST trusts it; a previously-seen JWKS warms in
+  ~300ms. Rehearse the cutover before you need it.
+
+Cutover hygiene, all measured or directly observed: sequences do not
+replicate (resync at cutover), DDL does not replicate (apply to both
+sides), and dropping a subscription leaves its replication slot on the old
+primary pinning WAL.
+
+**Cold DR floor (W06).** pg_dump 12.4s, restore 6.4s for 10k rows through
+the pooler session host.
+
+**Break-glass (W07).** `GET /v1/projects/{ref}/postgrest` returns the
+project's `jwt_secret`, and a locally minted token authenticates against
+the live API with zero Auth involvement. During an Auth outage that is an
+escape hatch; it is also the crown jewels. Prefer TPA portability.
+
+## Class 10: What you cannot work around
+
+Fleet-wide platform incidents have no client-side answer - the remedy is
+contractual (SLA, degradation prioritization), not engineering. Read
+replicas are GET-only, never promoted, and Auth always goes to the
+Primary, so they absorb read load, not outages.[^sb-read-replicas]
+Multi-region active-active writes remain split-brain territory: fail over,
+never dual-write.
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  start [label="What is failing?"];
+  reads [label="Reads 5xx / origin down"];
+  jwt [label="401 PGRST303 wave"];
+  auth [label="Logins / refresh dead"];
+  region [label="Project or region lost"];
+  cache [label="Cache-first Worker (W04)"];
+  ttl [label="Raise jwt_exp (W03)\n+ alert on code"];
+  sess [label="Longer TTL:\nexisting tokens still validate"];
+  standby [label="Warm standby + TPA cutover (W05)\nrehearsed"];
+  start -> reads; start -> jwt; start -> auth; start -> region;
+  reads -> cache; jwt -> ttl; auth -> sess; region -> standby;
+}
+```
+
+## Evidence table
+
+| Claim | Value | How it was checked |
+| --- | --- | --- |
+| Skew tolerance boundary | +30s pass, +31s PGRST303 | Measured (W01, two runs) |
+| jwt_exp acceptance-to-effect | ~6.5s | Measured (W03) |
+| supabase-js on PGRST303 | 1 attempt | Measured (W02, mock) |
+| Edge cache under origin outage | 200, byte-identical | Measured (W04, forced outage) |
+| Standby replication lag | 34ms-1057ms | Measured (W05, three runs) |
+| TPA resolution on standby | ~60-122ms | Measured (W05) |
+| Cold kid trust on cutover | ~30s PGRST301 | Measured (W05 full suite) |
+| Cold DR, 10k rows | dump 12.4s, restore 6.4s | Measured (W06) |
+| Break-glass minting works | 200 real / 401 wrong secret | Measured (W07) |
+| Concurrent refresh race | both 200 | Measured (W08) |
+| Restart gaps REST/Storage/Auth | ~10s / ~26s / ~75s | Measured (platform-downtime) |
+| 30s documented tolerance | documented | PostgREST v11 docs[^pgrst-auth] |
+| Transform billing model | \$5/1000 distinct origins/cycle | Supabase docs[^sb-transform-billing] |
+
+All measured rows come from the supabase-lab pvlab harness
+(experiments/edge-resilience), 2026-08-15, and are reproducible from the
+experiment's Makefile.
+
+[^pgrst-auth]: PostgREST, "API Configuration and Custom Claims," PostgREST Docs v11. https://docs.postgrest.org/en/v11/references/auth.html
+[^gh-48123]: Supabase GitHub Discussion #48123, "Fresh Supabase Auth JWT rejected by PostgREST: PGRST303 'JWT issued at future'," 2026-07-21. https://github.com/orgs/supabase/discussions/48123
+[^sb-status]: Supabase, "Status - Incident History," status.supabase.com. https://status.supabase.com/
+[^sb-retries]: Supabase, "Automatic retries in supabase-js," Supabase Docs. https://supabase.com/docs/guides/api/automatic-retries-in-supabase-js
+[^sb-transform-billing]: Supabase, "Manage Storage Image Transformations usage," Supabase Docs. https://supabase.com/docs/guides/platform/manage-your-usage/storage-image-transformations
+[^sb-read-replicas]: Supabase, "Read Replicas," Supabase Docs. https://supabase.com/docs/guides/platform/read-replicas

@@ -22,17 +22,28 @@ and every edit. Build with `bun run build`; dev with `bun dev` (localhost:4321).
 - A custom rehype pass (`rehypeFootnoteLabelToReferences`) renames the GFM
   "Footnotes" heading to a visible **References** section. Do not rename it back.
 - `src/styles/custom.css` styles `.footnotes` dense (small type, tight leading).
-- Sidebar auto-generates from directory: `guides/` and `reference/`. No manual
-  sidebar entries.
+- Navigation is frontmatter-driven. Each doc declares `category:` (required;
+  one of the providers in `TAXONOMY` in `src/lib/taxonomy.mjs`), optional
+  `group:` (subcategory), and optional `featured: true` + `blurb:` (homepage
+  card). The sidebar is generated from that at config-load, the homepage card
+  grids via `src/components/TopicCards.astro`, and both are validated at build
+  time (`docsSchema` extend in `src/content.config.ts` fails on unknown
+  values; the generator fails on a missing category). Adding a doc = write
+  the doc, set frontmatter, done. Sidebar order within a group is guides
+  first, then optional `sidebar.order`, then title. Dev caveat: the sidebar
+  is computed once at server start - restart `bun dev` after changing
+  taxonomy frontmatter. Adding a CATEGORY is a deliberate edit to `TAXONOMY`
+  and the schema enum, not something a doc can invent.
 
 ## Two traps in this repo
 
 - **Do not assert "zero KaTeX spans" site-wide.** `guides/magic-wan-interop` renders
   MTU/MSS arithmetic as real LaTeX on purpose. Math checks are per-doc, and a doc that
   means it opts out with `{/* prose-dollar: math-intentional */}`.
-- **A `dist/` path can exist with no source file.** `astro.config.mjs` declares
-  redirects, and Astro emits a stub page at the old URL. Do not infer that a doc
-  exists from a built directory, and do not treat an unmatched one as a stale artifact.
+- **A `dist/` path can exist with no source file.** Docs declare `aliases:`
+  frontmatter for their old URLs, and Astro emits a redirect stub page at each.
+  Do not infer that a doc exists from a built directory, and do not treat an
+  unmatched one as a stale artifact.
 
 ## Doc taxonomy
 
@@ -51,11 +62,18 @@ for concepts rather than explaining them inline.
 Test: "how does X work / which do I pick?" -> reference. "how do I do X, step by
 step?" -> guide.
 
+Pair across types. Task and concept are intertwingled for the reader even
+though the folders split them: a guide that rests on a reference doc links it
+from the lede, and the reference doc links back. Name the relationship
+("covered in X", "the implementation of this decision") - never a bare "see
+also" list.
+
 ## Skeletons
 
 Reference:
 ```
-frontmatter (title sentence-case, rich description, author)
+frontmatter (title sentence-case, rich description, author, category, group if
+  the category has groups, featured+blurb if it belongs on the homepage)
 Lede (1-2 sentences: what this is, who it's for)
 Provenance note - if it has measurements (rig / region / date; measured vs asserted)
 TL;DR bullets

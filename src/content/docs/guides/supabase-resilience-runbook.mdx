@@ -1,0 +1,302 @@
+---
+title: "Supabase resilience runbook: probes, TTL levers, edge cache, warm standby"
+description: Step-by-step implementation of the incident-class workarounds - authenticated per-service probes with PGRST-code alerting, the jwt_exp exposure lever, a cache-first edge Worker that serves reads through an origin outage, and a managed-to-managed warm standby with session-portable cutover, all with measured expectations.
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Build the four layers of client-side resilience against Supabase platform
+incidents: detection (probes that see real outages), exposure reduction
+(token TTL), read survival (edge cache), and full HA (warm standby with
+cutover). The concepts and the evidence for every number are in the
+companion reference, [Supabase incidents: what a client can actually
+do](/reference/supabase-incident-resilience/).
+
+**Prerequisites.** A Supabase Management API personal access token, a
+project on any paid plan (spend cap behavior differs on Pro), `bun` or
+Node, `wrangler` for the edge layer, `pg_dump`/`psql` for cold DR. The
+standby layer needs a second project (any region) - everything else uses
+the one you have.
+
+## Constants preamble
+
+Measured facts every later step depends on (supabase-lab, 2026-08-15):
+
+| Fact | Value |
+| --- | --- |
+| PostgREST iat/exp skew tolerance | ~30s (+30s passes, +31s rejects PGRST303) |
+| jwt_exp config acceptance to issuer effect | ~6.5s |
+| TPA resolution time | ~60-122ms |
+| JWKS trust lag after TPA registration | ~30s cold, ~300ms warm |
+| Standby initial sync (small table) | ~3.1-6.5s |
+| Standby replication lag (cross-region) | 34ms-1057ms |
+| Cold DR floor (10k rows via pooler) | dump 12.4s, restore 6.4s |
+| Gateway behavior on every response | sets `Set-Cookie: __cf_bm` |
+
+## Architecture overview
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  client [label="Client"];
+  worker [label="Edge Worker\ncache-first + failover"];
+  primary [label="Primary project"];
+  standby [label="Standby project\n(logical replication)"];
+  probes [label="Synthetic probes\n(per-service, authed)"];
+  client -> worker;
+  worker -> primary [label="normal"];
+  worker -> standby [label="cutover", style=dashed];
+  primary -> standby [label="WAL (direct host)"];
+  probes -> primary;
+}
+```
+
+## Part 1: Detection - probes that see real outages
+
+Anonymous network probes see nothing: `ACTIVE_HEALTHY` means the HTTP tier
+is up, not that PostgREST can reach Postgres, and TCP accept is not
+readiness. Every probe is authenticated and hits a real table.
+
+1. Create a canary table on each project you monitor:
+
+```bash
+curl -s -X POST \
+  -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://api.supabase.com/v1/projects/$REF/database/query" \
+  -d '{"query":"create table if not exists public.probe_canary(id int primary key); insert into public.probe_canary values (1) on conflict do nothing;"}'
+```
+
+2. Probe per service, and record the PGRST code, not just the status:
+
+```bash
+# Data API - 200 with rows = healthy; capture body code on failure
+curl -s -w '\n%{http_code}' \
+  -H "apikey: $PUBLISHABLE_KEY" -H "Authorization: Bearer $PUBLISHABLE_KEY" \
+  "https://$REF.supabase.co/rest/v1/probe_canary?select=id"
+```
+
+3. Alert on the code classes, which separate incident types cleanly:
+
+| Signal | Meaning | Action |
+| --- | --- | --- |
+| PGRST303 rate | JWT claim rejection (skew incident) | TTL lever (Part 2), wait for platform fix |
+| PGRST301 | unknown signing key | key rotation/TPA config, not an outage |
+| PGRST002 | schema-cache wedge | `select pg_notify('pgrst','reload schema')` |
+| PGRST000 / 5xx on a real table | DB or tier failure | incident response |
+| 520/521/522 from CF front | gateway path | retry with backoff; cache serves reads |
+
+## Part 2: Exposure reduction - the jwt_exp lever
+
+A JWT-skew incident only rejects tokens minted during the skew window.
+Tokens minted before it keep working, so a longer access-token TTL shrinks
+the cohort washed through refresh during the window.
+
+```bash
+# Read current value (default 3600)
+curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  "https://api.supabase.com/v1/projects/$REF/config/auth" | jq '.jwt_exp'
+
+# Raise to 12h (issuer-effective in ~6.5s, not instantly)
+curl -s -X PATCH -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://api.supabase.com/v1/projects/$REF/config/auth" \
+  -d '{"jwt_exp": 43200}'
+```
+
+Verify the EFFECT, not the status code - issue a token and decode
+`exp - iat`. Use the admin path, because hosted `/auth/v1/signup` hits
+email rate limits under scripted load:
+
+```bash
+curl -s -X POST -H "apikey: $SECRET_KEY" -H "Authorization: Bearer $SECRET_KEY" \
+  -H "Content-Type: application/json" \
+  "https://$REF.supabase.co/auth/v1/admin/users" \
+  -d '{"email":"probe@example.com","password":"probe-pass-1","email_confirm":true}'
+curl -s -X POST -H "apikey: $PUBLISHABLE_KEY" -H "Content-Type: application/json" \
+  "https://$REF.supabase.co/auth/v1/token?grant_type=password" \
+  -d '{"email":"probe@example.com","password":"probe-pass-1"}' | jq -r .access_token
+```
+
+Trade-off: longer-lived tokens are longer-lived if leaked. 12h is a
+reasonable incident posture for apps whose enterprise clients already hold
+day-long sessions.
+
+## Part 3: Read survival - the cache-first edge Worker
+
+A cache-first Worker makes an origin outage invisible for warm reads.
+Measured: 200 with a byte-identical body while the origin was hard-down.
+
+```ts
+export default {
+  async fetch(req: Request, env: { UPSTREAM: string }, ctx: ExecutionContext) {
+    const url = new URL(req.url);
+    if (req.method !== "GET") return fetch(new Request(env.UPSTREAM + url.pathname + url.search, req));
+
+    const cache = caches.default;
+    const key = new Request(url.toString(), { headers: req.headers });
+    const hit = await cache.match(key);
+    if (hit) return hit;
+
+    let origin: Response;
+    try {
+      origin = await fetch(new Request(env.UPSTREAM + url.pathname + url.search, req));
+    } catch {
+      const stale = await cache.match(key);
+      return stale ?? new Response('{"error":"origin unreachable"}', { status: 503 });
+    }
+    if (origin.status >= 500) {
+      const stale = await cache.match(key);
+      if (stale) return stale;
+      return origin;
+    }
+    if (origin.ok) {
+      const toCache = origin.clone();
+      // The gateway sets Set-Cookie (__cf_bm) on EVERY response and the
+      // Cache API refuses Set-Cookie responses - strip or nothing caches.
+      toCache.headers.delete("set-cookie");
+      toCache.headers.set("cache-control", "public, max-age=86400");
+      ctx.waitUntil(cache.put(key, toCache));
+    }
+    return origin;
+  },
+};
+```
+
+Deploy with wrangler (`wrangler deploy`); set `UPSTREAM` to
+`https://<ref>.supabase.co`. Scope the cache to read-only paths you mean to
+cache - do not cache auth or per-user responses without varying on the
+Authorization header (this example keys on the full request including
+headers, which handles that).
+
+## Part 4: Full HA - warm standby with session-portable cutover
+
+Measured end to end: replication lag 34ms-1057ms cross-region, sessions
+portable via third-party-auth, cutover rehearsable.
+
+### 4.1 Replicate
+
+On the primary (single statements - see gotchas):
+
+```sql
+create publication ha_pub for table public.<your_tables>;
+```
+
+On the standby, same table DDL first (DDL does not replicate), then the
+subscription against the primary's DIRECT host - never the pooler:
+
+```sql
+create subscription ha_sub connection
+  'host=db.<PRIMARY_REF>.supabase.co port=5432 dbname=postgres
+   user=postgres password=<DB_PASSWORD> sslmode=require connect_timeout=15'
+  publication ha_pub;
+```
+
+Verify: seed rows appear on the standby (initial sync ~3.1-6.5s on a small
+table), then insert a canary and time its appearance (34ms-1057ms
+cross-region).
+
+### 4.2 Make sessions portable
+
+Register the primary's issuer on the standby once, at setup time (not at
+incident time):
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://api.supabase.com/v1/projects/$STANDBY_REF/config/auth/third-party-auth" \
+  -d "{\"oidc_issuer_url\": \"https://$PRIMARY_REF.supabase.co/auth/v1\"}"
+```
+
+Primary-issued tokens then validate against the standby's API (measured
+200). Note the cold path: the first time the standby's PostgREST sees the
+issuer's key it answers PGRST301 for ~30s. Rehearse before you need it.
+
+### 4.3 Cutover procedure
+
+1. Confirm replication lag is near zero (canary insert appears < 2s).
+2. Freeze writes on the primary (fail closed, not open - never dual-write).
+3. Resync sequences on the standby (sequences do not replicate):
+
+```sql
+select setval(pg_get_serial_sequence('public.<t>','id'),
+              coalesce((select max(id) from public.<t>), 1));
+```
+
+4. Flip routing (DNS, or your edge Worker's routing table) to the standby.
+5. After stabilization, drop the old subscription and the orphaned
+   replication slot on the old primary:
+
+```sql
+-- standby
+drop subscription if exists ha_sub;
+-- old primary
+select pg_drop_replication_slot('ha_sub');
+```
+
+6. Reverse the replication direction to fail back.
+
+### 4.4 Rehearse
+
+Run the cutover monthly against a canary workspace. The measured numbers
+say the mechanics cost seconds; the cold-path and forgotten-step costs are
+what rehearsals find.
+
+## Part 5: Cold DR floor
+
+For data too big to replicate or too cold to matter hourly:
+
+```bash
+PGPASSWORD=$DB_PASSWORD pg_dump -h aws-0-<region>.pooler.supabase.com -p 5432 \
+  -U postgres.$REF -d postgres -Fc -f backup-$(date +%F).dump
+```
+
+Measured floor: 12.4s dump / 6.4s restore for 10k rows. Schedule it; ship
+the file to object storage outside the incident blast radius.
+
+## Verification
+
+- Probes: kill nothing, but confirm each probe reports the right code when
+  you hand it a bad token (PGRST301) and a future-iat token (PGRST303,
+  mintable with the lab harness).
+- TTL lever: issue a token after the PATCH, decode `exp - iat` = new value.
+- Edge cache: prime a URL, block the origin (point `UPSTREAM` at a dead
+  host), confirm 200 from cache for the warm URL and failure for a cold
+  one.
+- Standby: run 4.3 end-to-end on a canary workspace and time it.
+
+## Gotchas and lessons learned
+
+- **`CREATE SUBSCRIPTION` must be a single-statement query.** The
+  Management query endpoint wraps multi-statement strings in one
+  transaction, and Postgres rejects `CREATE SUBSCRIPTION` inside one. This
+  presented as an unexplained SQL 400 until the verbatim body was read.
+- **Config APIs are not request-path truth.** TPA shows `resolved` while
+  PostgREST still rejects the key (~30s cold); `jwt_exp` reads back before
+  the issuer honors it (~6.5s); a `jwt_secret` PATCH returns 200 and
+  changes nothing. Verify at the request path, always.
+- **The gateway sets `Set-Cookie` on everything.** Strip it before
+  `cache.put` or the Cache API refuses silently.
+- **Cloudflare Workers wraps TCP failures to unroutable IPs as a 403
+  response**, not a JS exception - stale-fallback `catch` blocks never see
+  it. Branch on status too.
+- **Standby REST reads need the standby's own publishable key**, not the
+  primary's. They look interchangeable and are not.
+- **Hosted signup is not a scriptable probe surface** - the default email
+  sender rate limits (`over_email_send_rate_limit`). Admin-create plus
+  password grant is the probe-safe path.
+
+## File reference
+
+| File | Role |
+| --- | --- |
+| `experiments/edge-resilience/worker/worker.ts` | Reference Worker (cache + outage drill) |
+| `experiments/edge-resilience/tests/w05-standby-replication.ts` | The standby drill, runnable |
+| `experiments/edge-resilience/FAILURE-MATRIX.md` | The full failure-point inventory |
+| `RELIABILITY.md` (repo root) | The incident-class reference this guide implements |
