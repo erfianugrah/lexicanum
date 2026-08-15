@@ -1,10 +1,15 @@
-# D2 Diagram Fullscreen Component
-
-Interactive fullscreen modal functionality for D2 diagrams in Starlight documentation.
-
-## Component
+# Components
 
 - **D2Fullscreen.astro** - Handles D2 diagrams (`img[src*="/d2/"]`)
+- **TopicCards.astro** - Homepage discovery hub. Renders one section per
+  taxonomy category (`TAXONOMY` in `src/lib/taxonomy.mjs`): a CardGrid of
+  `featured: true` docs, then a collapsed full listing of every doc in the
+  category. Driven entirely by frontmatter.
+- **Head.astro** - Starlight head override; loads the D2 fullscreen script.
+
+## D2 diagram fullscreen
+
+Interactive fullscreen modal functionality for D2 diagrams in Starlight documentation.
 
 Loaded via `Head.astro` and automatically enhances all D2 diagrams on every page.
 
