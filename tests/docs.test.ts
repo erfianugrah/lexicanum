@@ -15,6 +15,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { markerLines, mathRiskLines, smartPunctLines, splitTables } from "./lib/mdx";
 import { join } from "node:path";
 import { builtPages, builtPath, CHECK_BUILT, collectDocs, DIST } from "./lib/corpus";
+import { buildRedirects, buildSidebar } from "../src/lib/taxonomy.mjs";
 
 const docs = collectDocs();
 
@@ -149,6 +150,24 @@ describe("cross-document", () => {
     }
     expect(bad).toEqual([]);
   });
+
+  test("every non-draft doc appears in the generated sidebar", () => {
+    // The sidebar is derived from frontmatter (src/lib/taxonomy.mjs): a doc
+    // missing a category, or carrying an unknown one, throws in the generator
+    // and fails this import - which is the same failure the build would hit.
+    // What remains to assert is coverage: every non-draft doc lands in the
+    // output exactly once.
+    type Entry = string | { items?: Entry[] };
+    const flatten = (items: Entry[]): string[] =>
+      items.flatMap((i) => (typeof i === "string" ? [i] : flatten(i.items ?? [])));
+    const listed = flatten(buildSidebar());
+    expect(listed.length).toBeGreaterThan(10);
+    const expected = docs
+      .filter((d) => !d.isDraft)
+      .map((d) => d.path.replace(/\.(mdx|md)$/, ""));
+    expect(expected.filter((slug) => !listed.includes(slug))).toEqual([]);
+    expect(listed.length).toBe(expected.length);
+  });
 });
 
 // Dist-dependent assertions. See CHECK_BUILT in lib/corpus.ts for why they are
@@ -184,6 +203,16 @@ describe.skipIf(!CHECK_BUILT)("built output", () => {
       readFileSync(join(DIST, p), "utf8").includes('http-equiv="refresh"'),
     );
     expect(contentPages.length - stubs.length).toBe(docs.length);
+  });
+
+  test("every declared alias produced a redirect stub", () => {
+    // The page-count check balances if a stub vanishes (one fewer page, one
+    // fewer stub), so a dropped redirect would pass silently and 404 the old
+    // URL. Assert each alias exists in dist directly.
+    const missing = Object.keys(buildRedirects()).filter(
+      (alias) => !existsSync(join(DIST, alias.slice(1), "index.html")),
+    );
+    expect(missing).toEqual([]);
   });
 
   test("no page leaks an unrendered footnote marker", () => {
