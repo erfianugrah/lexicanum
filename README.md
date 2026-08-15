@@ -13,6 +13,8 @@ convention, house style). Read it before adding or editing docs.
 
 ```
 .
+├── scripts/
+│   │   └── new-doc.ts       # `bun run new` doc scaffolder
 ├── src/
 │   ├── content/
 │   │   └── docs/
@@ -30,8 +32,10 @@ convention, house style). Read it before adding or editing docs.
 
 ## Navigation is frontmatter-driven
 
-Adding a doc means writing the doc and setting its frontmatter - the sidebar,
-redirects, and homepage cards are all derived:
+Adding a doc means running `bun run new` (prompts for type/category/title and
+scaffolds the file with correct frontmatter and the section skeleton) or
+writing the doc by hand - the sidebar, redirects, and homepage cards are all
+derived from frontmatter:
 
 ```yaml
 ---
@@ -49,6 +53,8 @@ aliases:                  # optional: old published URLs, emitted as redirects
 
 - A missing or unknown `category`/`group` fails the build (schema enum +
   generator), so no doc falls out of the nav silently.
+- Sidebar entries carry a Guide/Reference badge stamped from the folder, so
+  doc type is visible in the nav.
 - Renaming or moving a doc = rename the file + add its old URL to `aliases`.
   A colliding alias fails the build.
 - Adding a *category* is a deliberate edit to `TAXONOMY` in
@@ -61,6 +67,7 @@ aliases:                  # optional: old published URLs, emitted as redirects
 | Command                  | Action                                          |
 | :----------------------- | :---------------------------------------------- |
 | `bun install`            | Install dependencies                            |
+| `bun run new`            | Scaffold a new doc (frontmatter + skeleton)     |
 | `bun dev`                | Dev server at `localhost:4321`                  |
 | `bun run build`          | Run all doc tests, then build to `./dist/`      |
 | `bun test`               | Run the doc checks without building             |
