@@ -88,8 +88,9 @@ Two probe-design lessons generalize: anonymous network probes see nothing
 REST surface - RLS blocks the password grant on a fresh project, so a
 password-grant sensor reports an outage that is really its own permission
 model. One more measured note for runbooks: pg_cron jobs resume across a
-project restart and keep firing on schedule, with no catch-up doubling
-(measured, edge-resilience W23, 2026-08-16).
+project restart and keep firing on schedule - a 1/min heartbeat job had 2
+rows before the restart and 5 after (3 new rows across the window), with
+no catch-up doubling (measured, edge-resilience W23, 2026-08-16).
 
 ## Class 3: Pooler failure modes
 
@@ -128,13 +129,18 @@ cycle.[^sb-transform-billing] A library that grows 30x in a month re-bills
 the whole live library every month it is viewed. It is not per-request, and
 CDN cache hits do not reduce the count.
 
-**Measured render-path behavior (edge-resilience W19, 2026-08-16).** An
-invalid source (text bytes under a `.png` name) returns 400
-`InvalidRequest` on the render URL while the plain public URL still
-serves the original bytes; an SVG passes through the render path
-unchanged (no rasterization); the render path never produced a 5xx. The
-original always serves - which is exactly the degradation posture the
-billing workaround below relies on.
+**Measured render-path behavior (edge-resilience W19, 2026-08-16).** All
+six outcomes, verbatim:
+
+| Source object | Render URL (`?width=32`) | Plain public URL |
+| --- | --- | --- |
+| Valid PNG | 200, resized | 200 |
+| `corrupt.png` (text bytes) | 400 `InvalidRequest` - "The source image is invalid or unsupported for rendering" | 200, original bytes |
+| SVG | 200, source SVG unchanged (no rasterization) | 200 |
+
+The render path never produced a 5xx, and the original always serves -
+which is exactly the degradation posture the billing workaround below
+relies on.
 
 **Workarounds.** Pre-generate renditions at upload (the docs-recommended
 architecture; the billing fix doubles as a resilience fix against the
@@ -167,14 +173,36 @@ primary, because the failure arrives as a 403 response (measured,
 edge-resilience W24, 2026-08-16 - the shipped worker fails over on 5xx,
 403, or any non-ok in outage mode).
 
-Two more measured traps for edge proxies in front of PostgREST (W24):
-cache-first serving and failover logic do not compose - a cache HIT
-carries no origin information, so a failover mode behind a cache-first
-read is masked by warm entries (skip the cache when failing over, tag
-every response with its origin), and PostgREST treats unknown query
-parameters as column filters and answers 400, so a `?_bust=`
-cache-buster forwarded to the origin 400s every probe - strip probe-only
-params from the origin URL, keep them only in the cache key.
+**The failover proxy, measured end to end (edge-resilience W24,
+2026-08-16).** The full sequence ran clean, every step HTTP 200:
+prime the probe URL (origin: primary) -> redeploy with the primary
+pointed at an unroutable address (origin: standby) -> restore the
+primary and probe immediately (origin: still standby - the HOLD_MS
+flap-damping window, persisted in the Cache API so it survives the
+redeploy) -> probe after the window (origin: primary). Getting that
+sequence to run green surfaced three traps, each measured as a bug
+before it became a rule:
+
+1. **Cache-first masks failover.** The first iteration measured origin
+   "none" on the prime and outage probes: the cache-first read ran
+   before the failover logic, and HIT responses carry no origin
+   information. A failover mode behind a cache-first read is masked by
+   warm entries - skip the cache when failing over, and tag every
+   response with the origin that served it.
+2. **The 403 wrap defeats `>=500` failover conditions** (the wrap
+   described above). The shipped worker fails over on 5xx, 403, or any
+   non-ok in outage mode.
+3. **PostgREST 400s on unknown query params** (treated as column
+   filters). The drill's `?_w24=` cache-buster, forwarded to the
+   origin, 400'd every probe - and a 400 is not a failover condition,
+   so the outage phase served 400s tagged primary. Strip probe-only
+   params from the origin URL; keep them only in the cache key.
+
+Sizing note from the same drill: the hold window must exceed the
+redeploy-plus-settle path between the last outage probe (which
+refreshes the failure timestamp) and the holdover probe - ~11s
+observed, so HOLD_MS=15000 measured an expired window and 60000 is
+what the drill ships.
 
 ## Class 8: Client retry behavior
 
@@ -206,28 +234,44 @@ projects:
 
 Cutover hygiene, all measured (2026-08-16 unless noted): sequences do
 not replicate - the first post-cutover insert fails with a verbatim
-duplicate-key error, and `setval` resync restores inserts (W16). DDL
-does not replicate, and primary-side DDL stalls ALL table replication -
-even rows not using the new column - until the same DDL lands on the
-standby, which resumes replication in ~6.1s with backfill and no
-subscription recreation; apply standby DDL first (W15). Per-project
-auth config (SMTP, `SITE_URL`, redirect URLs, rate limits, `jwt_exp`)
-does not follow a cutover - re-apply it via the Management API (W17).
-Realtime has a matching trap from the earlier round: dropping and
-recreating a table under an active subscription kills events for that
-table NAME (new OID, stale channel metadata) - stable canary tables
-only (W12). And dropping a subscription leaves its replication slot on
-the old primary pinning WAL.
+duplicate-key error (`duplicate key value violates unique constraint
+"w16_t_pkey"`), and `setval` resync restores inserts (W16). DDL does
+not replicate, and primary-side DDL stalls ALL table replication -
+even rows not using the new column, because the apply worker holds
+streaming changes for any table not yet in `r` state - until the same
+DDL lands on the standby, which resumes replication in ~6.1s with
+backfill and no subscription recreation; apply standby DDL first
+(W15). Per-project auth config (SMTP, `SITE_URL`, redirect URLs, rate
+limits, `jwt_exp`) does not follow a cutover - re-apply it via the
+Management API; the diff is readable verbatim from
+`GET /v1/projects/{ref}/config/auth` on both projects (W17). Realtime
+has a matching trap from the earlier round: dropping and recreating a
+table under an active subscription kills events for that table NAME
+(new OID, stale channel metadata) - stable canary tables only (W12).
+And the wedged-subscription recovery is ordered: `disable` ->
+`set (slot_name = none)` -> `drop subscription` ->
+`pg_drop_replication_slot` on the publisher - dropping without the
+slot detach leaves the publisher slot pinning WAL.
 
-**The replication boundary (W09/W14, measured 2026-08-15/16).** Public
-and custom schemas replicate fine managed-to-managed (a custom schema
-syncs in ~4s), but `auth.*` and `storage.*` stream zero changes at any
-tested size - micro or small, with or without `copy_data` (the WAL
-sender connects, `received_lsn` stays NULL). `max_worker_processes` is
-6 on both sizes; the wall is platform-managed schemas, not workers or
-size. The standby auth posture is therefore: TPA token portability for
-existing sessions, SQL-level user backfill or forced re-login for fresh
-logins.
+**The replication boundary (W09/W14, measured 2026-08-15/16).** The
+early hypothesis was worker exhaustion on micro; sizing the standby up
+disproved it. pg_settings DO scale with size (max_connections 60 -> 90,
+shared_buffers 256MB -> 512MB) but `max_worker_processes` is 6 on both
+micro and small - platform-fixed. The failure mechanics differ by
+mode: with `copy_data=true` the initial sync stalls in
+pg_subscription_rel state `d` forever, the sync worker hung at
+IPC/BgworkerStartup with its publisher sync slot inactive; with
+`copy_data=false` the WAL sender connects but `received_lsn` stays
+NULL - zero changes stream either way, at any size. The discriminator:
+a custom non-public schema (`lab_schema.t`) replicates in ~4s on the
+same instances, while `storage.buckets` does not - and inserts via the
+postgres role change nothing, so the writer role is not the filter.
+The wall is specific to platform-managed schemas (`auth.*`,
+`storage.*`), not size, not workers, not schema privacy. The standby
+auth posture is therefore: TPA token portability for existing sessions,
+SQL-level user backfill or forced re-login for fresh logins
+(`password_hash` is not portable via the admin API - a backfill copies
+hashes via direct SQL).
 
 **Sync at scale (W22).** A 1,000,000-row initial sync completed in
 22.7s (12.5s on a later battery run), with streaming lag ~245-276ms
@@ -242,7 +286,33 @@ project's `jwt_secret`, and a locally minted token authenticates against
 the live API with zero Auth involvement. During an Auth outage that is an
 escape hatch; it is also the crown jewels. Prefer TPA portability.
 
-## Class 10: What you cannot work around
+## Class 10: Edge function limits
+
+**Measured (edge-resilience W13/W18, 2026-08-15/16).** The wall clock is
+a 150s idle timeout - a sleeper function holding the connection past it
+dies with 504 `IDLE_TIMEOUT` (W13). Cold start is smaller than folklore:
+only the first invoke after deploy plus idle carries the real cost
+(~1.4s); subsequent idle-cold invokes land at 121-302ms. Over 5 cold
+invokes at 60s gaps: p50 284ms, p99 1433ms; warm p50 over 20 invokes is
+98ms (W18). Keep-warm pings buy the difference between 98ms and ~300ms,
+not the 1.4s - and long jobs belong on a queue plus cron, not in a
+request path.
+
+## Class 11: Statement and lock timeout signatures
+
+**Measured (edge-resilience W20, 2026-08-16).** Both surfaces return
+HTTP 400 - the SQLSTATE in the body is the signal, not the status:
+
+- `statement_timeout` (2s setting against `pg_sleep(5)`): verbatim
+  `ERROR 57014: canceling statement due to statement timeout`, 3467ms
+  wall.
+- `lock_timeout` (3s setting on an advisory-lock contender, two
+  sessions): verbatim `ERROR 55P03: canceling statement due to lock
+  timeout`, 4533ms wall.
+
+Alert on the codes; a 400 alone is ambiguous with ordinary bad queries.
+
+## Class 12: What you cannot work around
 
 Fleet-wide platform incidents have no client-side answer - the remedy is
 contractual (SLA, degradation prioritization), not engineering. Read
@@ -287,8 +357,11 @@ digraph {
 | DDL on primary stalls all table replication | resume ~6.1s after standby DDL | Measured (W15) |
 | Post-cutover insert without resync | duplicate key; setval fixes | Measured (W16) |
 | Edge function cold start | ~1.4s first-after-idle only; p50 284ms cold vs 98ms warm | Measured (W18) |
+| Edge function wall clock | 150s idle -> 504 IDLE_TIMEOUT | Measured (W13) |
 | Render path on invalid source | 400 InvalidRequest; original still serves | Measured (W19) |
-| pg_cron across restart | resumes on schedule, no doubling | Measured (W23) |
+| statement_timeout signature | 57014 verbatim, 3467ms wall | Measured (W20) |
+| lock_timeout signature | 55P03 verbatim, 4533ms wall | Measured (W20) |
+| pg_cron across restart | resumes on schedule (2 -> 5 rows), no doubling | Measured (W23) |
 | Edge failover sequence | primary -> standby -> holdover -> primary, all 200 | Measured (W24) |
 | TPA resolution on standby | ~60-122ms | Measured (W05) |
 | Cold kid trust on cutover | ~30s PGRST301 | Measured (W05 full suite) |
