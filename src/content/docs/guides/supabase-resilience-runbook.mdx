@@ -38,6 +38,11 @@ Measured facts every later step depends on
 | auth.*/storage.* replication | zero changes at any tested size - do not plan on it |
 | DDL on the primary while subscribed | stalls ALL table replication; standby-side DDL resumes in ~6.1s |
 | Edge failover trip condition | 5xx, or the CF-wrapped 403 of an unroutable origin - never `>=500` alone |
+| Edge function wall clock | 150s idle -> 504 IDLE_TIMEOUT |
+| Edge function cold start | ~1.4s first-after-idle only; then 121-302ms vs 98ms warm |
+| statement_timeout signature | verbatim 57014, ~3.5s wall (2s setting vs 5s sleep) |
+| lock_timeout signature | verbatim 55P03, ~4.5s wall (3s setting) |
+| pg_cron across a restart | resumes on schedule (2 -> 5 heartbeat rows), no doubling |
 | Cold DR floor (10k rows via pooler) | dump 12.4s, restore 6.4s |
 | Gateway behavior on every response | sets `Set-Cookie: __cf_bm` |
 
@@ -188,6 +193,22 @@ cache - do not cache auth or per-user responses without varying on the
 Authorization header (this example keys on the full request including
 headers, which handles that).
 
+**Failover variant.** The lab worker extends this into an active-passive
+failover proxy: env vars `FAILOVER_PRIMARY` / `FAILOVER_STANDBY` /
+`HOLD_MS`; on a primary failure (5xx, the CF-wrapped 403, or any non-ok
+in outage mode) it re-fetches from the standby and tags the response
+`x-drill-origin: standby`; after a failure it holds on standby for
+`HOLD_MS` even if the primary recovers (flap damping), with the
+last-failure timestamp persisted in the Cache API so the window survives
+redeploys. Two rules from the measured drill: failover mode SKIPS the
+cache-first read (a HIT carries no origin information and would mask the
+failover), and the hold window must exceed your redeploy-plus-settle
+path (~11s observed; the drill ships 60000 after 15000 measured an
+expired window). Full code:
+[worker.ts](https://github.com/erfianugrah/supabase-lab/blob/main/experiments/edge-resilience/worker/worker.ts);
+the drill that drives it end to end:
+[w24-edge-failover-proxy.ts](https://github.com/erfianugrah/supabase-lab/blob/main/experiments/edge-resilience/tests/w24-edge-failover-proxy.ts).
+
 ## Part 4: Full HA - warm standby with session-portable cutover
 
 Measured end to end: replication lag 34ms-1057ms cross-region, sessions
@@ -212,8 +233,14 @@ create subscription ha_sub connection
 ```
 
 Verify: seed rows appear on the standby (initial sync ~3.1-6.5s on a small
-table), then insert a canary and time its appearance (34ms-1057ms
-cross-region).
+table; 22.7s/12.5s measured for 1M rows), then insert a canary and time
+its appearance (34ms-1057ms cross-region; ~245-276ms right after a
+large initial sync). Public and custom schemas replicate; `auth.*` and
+`storage.*` never do - with `copy_data=true` the initial sync hangs in
+pg_subscription_rel state `d` (sync worker stuck at IPC/BgworkerStartup),
+with `copy_data=false` the WAL sender connects but `received_lsn` stays
+NULL, and instance size is not the variable (`max_worker_processes` is 6
+on both micro and small).
 
 <Aside type="caution" title="Replication carries table data only - and not every table">
 RLS policies, grants, functions, triggers and views are schema - they do
@@ -250,11 +277,13 @@ hit the standby's own auth store, and auth.* replication between managed
 projects is a measured dead end (zero changes stream at any tested size,
 micro or small, with or without copy_data), so the posture is: reads and
 existing sessions survive; new logins need a SQL-level user backfill or a
-forced re-login after cutover. Per-project auth config (SMTP, `SITE_URL`,
-redirect URLs, rate limits, `jwt_exp`) does not follow a cutover either -
-re-apply it to the standby via the Management API as part of the
-procedure below (measured: the diff is readable verbatim from
-`GET /v1/projects/{ref}/config/auth`).
+forced re-login after cutover. The backfill caveat, measured:
+`password_hash` is not portable via the admin API - copy hashes via
+direct SQL into `auth.users`, or accept the re-login. Per-project auth
+config (SMTP, `SITE_URL`, redirect URLs, rate limits, `jwt_exp`) does
+not follow a cutover either - re-apply it to the standby via the
+Management API as part of the procedure below (measured: the diff is
+readable verbatim from `GET /v1/projects/{ref}/config/auth`).
 
 ### 4.3 Cutover procedure
 
@@ -262,8 +291,8 @@ procedure below (measured: the diff is readable verbatim from
    measured ~245-276ms immediately after a 1M-row initial sync).
 2. Freeze writes on the primary (fail closed, not open - never dual-write).
 3. Resync sequences on the standby (sequences do not replicate - the
-   first insert without this step fails with a verbatim duplicate-key
-   error, measured):
+   first insert without this step fails verbatim: `duplicate key value
+   violates unique constraint "<table>_pkey"`, measured):
 
 ```sql
 select setval(pg_get_serial_sequence('public.<t>','id'),
@@ -281,7 +310,10 @@ drop subscription if exists ha_sub;
 select pg_drop_replication_slot('ha_sub');
 ```
 
-6. Reverse the replication direction to fail back.
+6. Re-apply per-project auth config on the standby: GET
+   `/v1/projects/{ref}/config/auth` on both projects, diff, PATCH the
+   standby (SMTP, `SITE_URL`, redirect URLs, rate limits, `jwt_exp`).
+7. Reverse the replication direction to fail back.
 
 ### 4.4 Rehearse
 
@@ -311,6 +343,10 @@ the file to object storage outside the incident blast radius.
   host), confirm 200 from cache for the warm URL and failure for a cold
   one.
 - Standby: run 4.3 end-to-end on a canary workspace and time it.
+- Failover: point the Worker's primary at an unroutable address, confirm
+  the response flips to the standby origin tag, restore, and confirm the
+  holdover window keeps serving standby until it expires (the lab's W24
+  drill automates exactly this, four redeploys included).
 
 ## Gotchas and lessons learned
 
@@ -342,6 +378,12 @@ the file to object storage outside the incident blast radius.
   cache key (measured 2026-08-16; the Part 3 example does this).
 - **Standby REST reads need the standby's own publishable key**, not the
   primary's. They look interchangeable and are not.
+- **Wedged-subscription recovery is ordered**: `alter subscription <s>
+  disable` -> `alter subscription <s> set (slot_name = none)` -> `drop
+  subscription <s>` -> `pg_drop_replication_slot('<s>')` on the
+  publisher. Dropping without the slot detach leaves the publisher slot
+  pinning WAL; subscriptions can also vanish and reappear under platform
+  management (measured during the W09/W14 drills).
 - **Hosted signup is not a scriptable probe surface** - the default email
   sender rate limits (`over_email_send_rate_limit`). Admin-create plus
   password grant is the probe-safe path.
