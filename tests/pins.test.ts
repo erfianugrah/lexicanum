@@ -670,6 +670,15 @@ const pins: Pin[] = [
       // The post-cutover defaults: sequences and auth config do not follow.
       "duplicate-key error",
       "does not follow a cutover",
+      // W14 mechanics: the size-up disproof and the two failure modes.
+      "max_worker_processes` is 6 on both",
+      "IPC/BgworkerStartup",
+      // W20: the verbatim signatures with wall times.
+      "57014",
+      "55P03",
+      "4533ms",
+      // W13: the wall clock number.
+      "IDLE_TIMEOUT",
       // Public links, not machine-relative paths (this is a public site).
       "github.com/erfianugrah/supabase-lab",
     ],
@@ -680,8 +689,12 @@ const pins: Pin[] = [
     mustContain: [
       // 4.2: the measured negative replaces the old "untested" hedge.
       "zero changes stream at any tested size",
+      // 4.2: the backfill caveat - admin API cannot carry password_hash.
+      "password_hash` is not portable via the admin API",
       // 4.1 Aside: standby-first DDL ordering with the resume number.
       "migrate the standby first",
+      // Gotchas: the ordered wedged-subscription recovery.
+      "slot_name = none",
       // Part 3: the param-strip is IN the code example, not only the gotchas.
       "PostgREST treats unknown query params as column filters",
       // Gotchas: the failover trip condition includes 403 (line-wrapped in
