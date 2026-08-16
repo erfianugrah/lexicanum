@@ -1,0 +1,161 @@
+---
+title: "AirGradient ONE on ESPHome, fully local"
+description: Adopt an AirGradient ONE (I-9PSL kit) into Home Assistant via ESPHome with no cloud dependency - the upstream ESPHome repo is frozen at a 2024 commit and breaks on ESPHome 2026.x in four places, so this pins the packages, vendors the broken ones, applies the PM batch correction locally, and re-points the LED bar at something that changes.
+author: Erfi Anugrah
+category: homelab
+---
+
+A guide to running an AirGradient ONE (kit version, PCB v9) on ESPHome and Home Assistant with zero cloud dependency: no AirGradient account, no data leaving the LAN, PM batch correction applied on-device. Written against ESPHome 2026.5.1 and the airgradienthq/esphome repo pinned at `709ceeab` (2024-01-24, the repo's last commit).[^ag-esphome]
+
+The network design this lands on - IoT SSID bridged into a router-owned VLAN with per-MAC kea pins and a deny-by-default forward policy - is covered in [Home IoT: an ESPHome fleet on a Flint-bridged VLAN](/reference/home-iot-network/), which this guide links instead of repeating.
+
+## Constants
+
+The fixed facts every later step depends on:
+
+| Fact | Value |
+|---|---|
+| MCU | ESP32-C3 (native USB-serial-JTAG, shows as `/dev/ttyACM*`) |
+| Sensors | PMS5003 (PM), SenseAir S8 (CO2), SHT40 (temp/RH), SGP41 (VOC/NOx index) |
+| Display | SH1106 128x64 OLED on I2C `0x3C` |
+| LED bar | 11 x WS2812 on GPIO10 |
+| External hardware watchdog | kicked on GPIO2 every few minutes or it hard-resets the ESP |
+| Upstream config | `airgradient-one.yaml`, packages pinned `@709ceeab19e9e4d7a31bac00b366ac183d88f44d` |
+| Kit firmware state | ships with AirGradient's stock Arduino firmware pre-installed - works out of the box, but has no ESPHome OTA endpoint, so the first ESPHome flash is serial-only[^ag-assembly] |
+
+## Step 1: Start from upstream, pin it, drop the cloud
+
+The upstream `airgradient-one.yaml` is a `packages:` list plus substitutions. Three changes before anything else:
+
+1. **Pin every package ref to the commit SHA**, not a branch. The repo has no tags and is unmaintained; a branch ref silently changes what you build.
+2. **Drop the `airgradient_api` package.** It POSTs sensor data to `hw.airgradient.com` every 2.5 minutes. That is the entire cloud path; removing the package removes it. (Upstream ships it with a switch defaulting to off, but an isolated VLAN has no route out anyway - the point is not carrying the code.)
+3. **Set `api.reboot_timeout: 0s`.** The ESPHome default reboots the device 15 minutes after the API client disappears; on a fleet that reboots relays and sensors for no reason.
+
+## Step 2: Fix the four ESPHome 2026.x breaks
+
+The pinned packages were written against early-2024 ESPHome. On 2026.5.1, `esphome config` fails or misbehaves in four places. Each fix is a local override; nothing upstream is edited.
+
+| Break | Error / symptom | Fix |
+|---|---|---|
+| `watchdog.yaml` names its GPIO output `id: watchdog` | `ID 'watchdog' conflicts with the name of an esphome integration` | Vendor the package (20 lines) with the id renamed, e.g. `ext_watchdog` |
+| `led.yaml` sets `rmt_channel: 0` | `This feature is not available for the ESP32-C3` | `!extend led_strip` with `rmt_channel: !remove` |
+| AQI template: `skip_initial: 10` at `update_interval: 5min` | First AQI value ~50 minutes after every boot; looks broken, is not | `!extend pm_2_5_aqi` with `update_interval: 60s` (first value ~10 min; keep the skip - without it the first tick reads a NaN and upstream's else-branch publishes a bogus 500) |
+| `led_strip` has `restore_mode: RESTORE_DEFAULT_OFF` | LED bar dark after every OTA/reboot | Same `!extend`: `restore_mode: RESTORE_DEFAULT_ON` |
+
+`!extend` reaches into package-defined entities. One placement rule bit during this work: the extension must sit under the matching top-level key - a `sensor` id extended inside the `light:` block fails with `Source for extension of ID 'pm_2_5_aqi' was not found`, because the resolver looks for a light by that id.
+
+## Step 3: First flash over serial
+
+Stock firmware has no ESPHome OTA endpoint, so the first image goes over USB:
+
+1. USB-C data cable from the monitor to the ESPHome host.
+2. Enter flash mode: press and hold the BOOT button - pin hole on the back of the enclosure, paperclip job, the button is on the mainboard, not the config button - plug in USB while holding, release after. Correct entry looks like a dead device: no screen, no LEDs.[^ag-assembly]
+3. `esphome run --device /dev/ttyACM0 airgradient-one-1.yaml`. This is also the real compile check - `esphome config` validates schema only, and lambdas are not compile-checked until here.
+4. On success the device boots, joins the configured SSID, and DHCPs. Every flash after this one is OTA.
+
+## Step 4: Pin the lease
+
+The device arrives on a dynamic pool address with hostname `esp32c3-<mac-suffix>` under stock firmware, or the configured `name:` under ESPHome. Read the MAC from the lease table, add a server-side reservation, done. Reservations over `manual_ip`, for the reasons in the reference doc: the pin lives in git, survives reflashes and factory resets, and makes `use_address` stable across segments where mDNS cannot be relied on.
+
+The pre-allocated-stub workflow validated here: the reservation existed as a commented stub before the hardware arrived, the first stock-firmware lease supplied the MAC, and after the ESPHome flash the device re-DHCP'd straight onto its pin.
+
+## Step 5: Adopt in Home Assistant
+
+Settings -> Devices & Services. mDNS does not cross the VLAN boundary, so if discovery does not fire, add the ESPHome integration manually by the pinned IP. Then:
+
+- **Flip "SenseAir S8 Automatic Background Calibration" OFF.** ABC re-baselines the sensor on a 7-day cycle assuming the lowest reading it saw was fresh outdoor air (~400 ppm).[^ag-assembly] In a sealed air-conditioned flat that never happens, so ABC would re-baseline a real 600 ppm floor as "400" and under-report from then on, compounding weekly. Calibrate manually instead: device outdoors or in verified fresh air for 5+ minutes, then the "SenseAir S8 Calibration" button.
+- First-boot norms from the assembly doc's troubleshooting table, so they are not mistaken for defects: TVOC reads 0 for the first 1-2 minutes (warm-up), NOx sits at 0-1 almost always (it only moves at very high concentrations).[^ag-assembly]
+
+## Step 6: Apply the PM batch correction locally
+
+AirGradient discovered that some PMS5003 production batches systematically misread PM2.5; they measure each batch against reference instruments and publish a per-batch linear correction.[^ag-batch] The correction is a formula on the raw 0.3um particle count, applied server-side for cloud users - so a local-only device needs it in firmware.[^ag-calib] As a template sensor:
+
+```yaml
+substitutions:
+  pm_corr_factor: "0.004341"   # your batch's row from the live table
+  pm_corr_offset: "0"
+
+sensor:
+  - platform: template
+    name: "PM 2.5 Calibrated"
+    id: pm_2_5_calibrated
+    unit_of_measurement: "µg/m³"
+    device_class: pm25
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      if (${pm_corr_factor} == 0.0) {
+        return id(pm_2_5).state;      // factor unknown: pass raw through
+      }
+      float count = id(pm_0_3um).state;
+      if (count < 100.0) {
+        return 0.0f;
+      }
+      return count * ${pm_corr_factor} + ${pm_corr_offset};
+```
+
+The batch comes from the sticker on the blue Plantower module: `PMS5003-YYYYMMDDxxxxx`, first 8 digits. The formula semantics (count < 100 -> 0, else count x factor + offset) are from AirGradient's calibration-algorithms doc, cross-checked against the firmware's own `slrCorrectionBy003Count` in airgradienthq/arduino.[^ag-calib]
+
+Two lessons, both learned on the day:
+
+- **Fetch the table live at application time.** A cached copy of the batch page fetched hours earlier showed a factor 7x larger than the revised live table for the same batch. Applied blindly, that would have turned a real ~30 ug/m3 into a displayed ~220. Sanity-check the output against the raw reading and outdoor conditions before trusting it.
+- **Verify the substitution landed.** `esphome config` does not evaluate lambdas. The check that caught a missing factor here was post-OTA: calibrated equal to raw when it should have been count x factor. Read the generated `main.cpp` (`.esphome/build/<name>/src/main.cpp`) or compare live values.
+
+Batch correction is meant for DIY kits precisely because they skip factory calibration; do not stack it with AirGradient's per-unit factory calibration.[^ag-batch]
+
+## Step 7: Make the LED bar carry information
+
+Upstream drives the 11-LED bar from CO2: green below 800 ppm. In a ventilated flat CO2 sits at 450-500, so the bar is green forever - zero information. The `led_co2` package is a 1-minute interval with colored bands; vendor it and re-point at the calibrated PM2.5, with bands that match local standards (here: WHO 24h 15 / Singapore SS 554 indoor 37.5 / NEA 1-hr Normal ceiling 55 / NEA Elevated 150):
+
+```yaml
+interval:
+  - interval: 1min
+    then:
+      - if:
+          condition:
+            light.is_on: led_strip
+          then:
+            - if:
+                condition:
+                  lambda: 'return !isnan(id(pm_2_5_calibrated).state) && id(pm_2_5_calibrated).state < 15;'
+                then:
+                  - light.turn_on:
+                      id: led_strip
+                      brightness: !lambda 'return id(led_brightness).state / 100.0;'
+                      red: 0%
+                      green: 100%
+                      blue: 0%
+            # ... yellow 15-37.5, orange 37.5-55, red 55-150, purple >=150
+```
+
+Keep the `light.is_on` guard and the NaN guard on the first band: with no guard, a NaN state falls through every comparison and the bar holds its last color, which is fine, but an unguarded first band would paint green on boot before the sensors warm up.
+
+## Step 8: One number everywhere
+
+After step 6 the device has two PM2.5 values - raw and calibrated - and every surface picks one. Default split: OLED display shows raw, LED and dashboard show calibrated. Two numbers on one box. Fix by vendoring the display package (one-line change: `id(pm_2_5).state` -> `id(pm_2_5_calibrated).state` in the page lambda) and overriding the AQI template's lambda to read the calibrated value. Display, LED bar, dashboard, and AQI then agree.
+
+## Verification
+
+| Check | Expected | How |
+|---|---|---|
+| Config | `Configuration is valid!` | `esphome config airgradient-one-1.yaml` |
+| Lease | Device hostname = yaml `name:`, address = the pin | router lease table |
+| API | ESPHome API reachable on :6053 from the HA host | `nc -z <pin> 6053` |
+| Correction | `pm_2_5_calibrated` = `pm_0_3` x factor (within one 30s tick) | HA states, compare against raw |
+| AQI | matches the calibrated value's EPA band, not the raw one | HA states, ~10 min after boot |
+| LED bar | color = calibrated value's band, on after every reboot | eyeball |
+
+## Gotchas and lessons learned
+
+- **`esphome config` is not a compile.** Schema and id references validate; lambda C++ does not. The first `esphome run` is the real check.
+- **The AQI "delay" is a filter, not a fault.** `skip_initial: 10` times the update interval is the warm-up; know the product of the two before concluding a sensor is dead.
+- **OTA wipes the LED strip state** unless `restore_mode` says otherwise - a dark bar after every update reads as a dead device.
+- **ABC is wrong for sealed spaces.** Any room that never sees outdoor air should run manual CO2 calibration on a schedule, not automatic baseline.
+- **Batch tables change.** The correction factor is a living document; re-fetch, and sanity-check the corrected output against raw and outdoors before trusting it.
+- **NOx at 0-1 is normal.** So is TVOC = 0 for two minutes after boot. The assembly doc's troubleshooting table is the reference for which zeros are faults.[^ag-assembly]
+
+[^ag-esphome]: AirGradient, "AirGradient ESPHome," GitHub. https://github.com/airgradienthq/esphome
+[^ag-assembly]: AirGradient, "AirGradient ONE Assembly Instructions," AirGradient Documentation. https://www.airgradient.com/documentation/one-v9/
+[^ag-batch]: AirGradient, "PM Sensor Batch Correction Factors," AirGradient Knowledge Base. https://www.airgradient.com/documentation/kb/pm-batch-correction-factors
+[^ag-calib]: AirGradient, "Calibration Algorithms," AirGradient Knowledge Base. https://www.airgradient.com/documentation/kb/kb-diy-calibration-algorithms/
