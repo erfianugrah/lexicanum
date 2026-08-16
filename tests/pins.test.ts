@@ -651,6 +651,47 @@ const pins: Pin[] = [
       /^## What generalizes$/m,
     ],
   },
+  {
+    // Pinned 2026-08-16 after the W09-W24 measured round landed: these are
+    // the claims most likely to rot back into the pre-measurement versions
+    // (auth replication "untested", failover on 5xx-only, cache-buster
+    // forwarded to the origin).
+    doc: "reference/supabase-incident-resilience",
+    mustContain: [
+      // The W14 boundary - the single most-cited correction of the round.
+      "do not replicate at any tested size",
+      // W15: DDL stall is table-wide; the resume number is the operationalizer.
+      "stalls ALL table replication",
+      "~6.1s",
+      // W22: sync at scale extrapolates; losing this reopens the stall story.
+      "22.7s",
+      // W24: the 403 wrap as a failover trip condition, not just a W04 note.
+      "failover condition",
+      // The post-cutover defaults: sequences and auth config do not follow.
+      "duplicate-key error",
+      "does not follow a cutover",
+      // Public links, not machine-relative paths (this is a public site).
+      "github.com/erfianugrah/supabase-lab",
+    ],
+    linksTo: ["guides/supabase-resilience-runbook"],
+  },
+  {
+    doc: "guides/supabase-resilience-runbook",
+    mustContain: [
+      // 4.2: the measured negative replaces the old "untested" hedge.
+      "zero changes stream at any tested size",
+      // 4.1 Aside: standby-first DDL ordering with the resume number.
+      "migrate the standby first",
+      // Part 3: the param-strip is IN the code example, not only the gotchas.
+      "PostgREST treats unknown query params as column filters",
+      // Gotchas: the failover trip condition includes 403 (line-wrapped in
+      // prose, so pin the constants-table phrasing instead).
+      "never `>=500` alone",
+      // File reference links out to the public repo.
+      "github.com/erfianugrah/supabase-lab/blob/main/experiments/edge-resilience/worker/worker.ts",
+    ],
+    linksTo: ["reference/supabase-incident-resilience"],
+  },
 ];
 
 describe.each(pins.map((p) => [p.doc, p] as const))("%s", (_name, pin) => {
