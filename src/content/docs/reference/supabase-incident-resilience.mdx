@@ -20,9 +20,12 @@ The implementation of every workaround here is the companion guide,
 through a forced origin outage). Writes and auth need a warm standby, which
 works managed-to-managed with logical replication and sessions that survive
 cutover via third-party-auth registration (measured: 34ms-1s replication
-lag, TPA resolution ~60-122ms). The JWT clock-skew incident class has no
-runtime workaround - only exposure reduction (a token TTL lever that takes
-effect in ~6.5s) and detection (the PGRST code, not the HTTP status).
+lag, TPA resolution ~60-122ms) - with one hard boundary: platform-managed
+schemas (`auth.*`, `storage.*`) do not replicate at any tested size, so
+standby auth posture is token portability plus forced re-login, not user
+replication. The JWT clock-skew incident class has no runtime workaround -
+only exposure reduction (a token TTL lever that takes effect in ~6.5s) and
+detection (the PGRST code, not the HTTP status).
 
 ## Which do I pick
 
@@ -84,7 +87,9 @@ Two probe-design lessons generalize: anonymous network probes see nothing
 (network accept is not readiness), and the Auth probe must be the signUp
 REST surface - RLS blocks the password grant on a fresh project, so a
 password-grant sensor reports an outage that is really its own permission
-model.
+model. One more measured note for runbooks: pg_cron jobs resume across a
+project restart and keep firing on schedule, with no catch-up doubling
+(measured, edge-resilience W23, 2026-08-16).
 
 ## Class 3: Pooler failure modes
 
@@ -123,6 +128,14 @@ cycle.[^sb-transform-billing] A library that grows 30x in a month re-bills
 the whole live library every month it is viewed. It is not per-request, and
 CDN cache hits do not reduce the count.
 
+**Measured render-path behavior (edge-resilience W19, 2026-08-16).** An
+invalid source (text bytes under a `.png` name) returns 400
+`InvalidRequest` on the render URL while the plain public URL still
+serves the original bytes; an SVG passes through the render path
+unchanged (no rasterization); the render path never produced a 5xx. The
+original always serves - which is exactly the degradation posture the
+billing workaround below relies on.
+
 **Workarounds.** Pre-generate renditions at upload (the docs-recommended
 architecture; the billing fix doubles as a resilience fix against the
 render path). The per-project transformations toggle is a hard stop with a
@@ -148,7 +161,20 @@ before `cache.put`.
 A second platform behavior matters for failure simulation: Cloudflare
 Workers wraps TCP failures to unroutable addresses as a 403 response, not
 a JS exception - catch-based stale fallback never fires for that failure
-mode. Handle it in the status branch.
+mode. Handle it in the status branch. The same wrap bites failover
+logic: a `>=500`-only failover condition never trips on an unroutable
+primary, because the failure arrives as a 403 response (measured,
+edge-resilience W24, 2026-08-16 - the shipped worker fails over on 5xx,
+403, or any non-ok in outage mode).
+
+Two more measured traps for edge proxies in front of PostgREST (W24):
+cache-first serving and failover logic do not compose - a cache HIT
+carries no origin information, so a failover mode behind a cache-first
+read is masked by warm entries (skip the cache when failing over, tag
+every response with its origin), and PostgREST treats unknown query
+parameters as column filters and answers 400, so a `?_bust=`
+cache-buster forwarded to the origin 400s every probe - strip probe-only
+params from the origin URL, keep them only in the cache key.
 
 ## Class 8: Client retry behavior
 
@@ -178,10 +204,35 @@ projects:
   PGRST301 before PostgREST trusts it; a previously-seen JWKS warms in
   ~300ms. Rehearse the cutover before you need it.
 
-Cutover hygiene, all measured or directly observed: sequences do not
-replicate (resync at cutover), DDL does not replicate (apply to both
-sides), and dropping a subscription leaves its replication slot on the old
-primary pinning WAL.
+Cutover hygiene, all measured (2026-08-16 unless noted): sequences do
+not replicate - the first post-cutover insert fails with a verbatim
+duplicate-key error, and `setval` resync restores inserts (W16). DDL
+does not replicate, and primary-side DDL stalls ALL table replication -
+even rows not using the new column - until the same DDL lands on the
+standby, which resumes replication in ~6.1s with backfill and no
+subscription recreation; apply standby DDL first (W15). Per-project
+auth config (SMTP, `SITE_URL`, redirect URLs, rate limits, `jwt_exp`)
+does not follow a cutover - re-apply it via the Management API (W17).
+Realtime has a matching trap from the earlier round: dropping and
+recreating a table under an active subscription kills events for that
+table NAME (new OID, stale channel metadata) - stable canary tables
+only (W12). And dropping a subscription leaves its replication slot on
+the old primary pinning WAL.
+
+**The replication boundary (W09/W14, measured 2026-08-15/16).** Public
+and custom schemas replicate fine managed-to-managed (a custom schema
+syncs in ~4s), but `auth.*` and `storage.*` stream zero changes at any
+tested size - micro or small, with or without `copy_data` (the WAL
+sender connects, `received_lsn` stays NULL). `max_worker_processes` is
+6 on both sizes; the wall is platform-managed schemas, not workers or
+size. The standby auth posture is therefore: TPA token portability for
+existing sessions, SQL-level user backfill or forced re-login for fresh
+logins.
+
+**Sync at scale (W22).** A 1,000,000-row initial sync completed in
+22.7s (12.5s on a later battery run), with streaming lag ~245-276ms
+immediately after - the small-table numbers above extrapolate better
+than the stall stories suggested.
 
 **Cold DR floor (W06).** pg_dump 12.4s, restore 6.4s for 10k rows through
 the pooler session host.
@@ -231,6 +282,14 @@ digraph {
 | supabase-js on PGRST303 | 1 attempt | Measured (W02, mock) |
 | Edge cache under origin outage | 200, byte-identical | Measured (W04, forced outage) |
 | Standby replication lag | 34ms-1057ms | Measured (W05, three runs) |
+| Standby initial sync, 1M rows | 22.7s / 12.5s; lag after ~245-276ms | Measured (W22, two runs) |
+| auth.*/storage.* replication | zero changes at any tested size | Measured (W09/W14) |
+| DDL on primary stalls all table replication | resume ~6.1s after standby DDL | Measured (W15) |
+| Post-cutover insert without resync | duplicate key; setval fixes | Measured (W16) |
+| Edge function cold start | ~1.4s first-after-idle only; p50 284ms cold vs 98ms warm | Measured (W18) |
+| Render path on invalid source | 400 InvalidRequest; original still serves | Measured (W19) |
+| pg_cron across restart | resumes on schedule, no doubling | Measured (W23) |
+| Edge failover sequence | primary -> standby -> holdover -> primary, all 200 | Measured (W24) |
 | TPA resolution on standby | ~60-122ms | Measured (W05) |
 | Cold kid trust on cutover | ~30s PGRST301 | Measured (W05 full suite) |
 | Cold DR, 10k rows | dump 12.4s, restore 6.4s | Measured (W06) |
@@ -240,9 +299,13 @@ digraph {
 | 30s documented tolerance | documented | PostgREST v11 docs[^pgrst-auth] |
 | Transform billing model | \$5/1000 distinct origins/cycle | Supabase docs[^sb-transform-billing] |
 
-All measured rows come from the supabase-lab pvlab harness
-(experiments/edge-resilience), 2026-08-15, and are reproducible from the
-experiment's Makefile.
+All measured rows come from the
+[supabase-lab](https://github.com/erfianugrah/supabase-lab) pvlab harness
+([experiments/edge-resilience](https://github.com/erfianugrah/supabase-lab/tree/main/experiments/edge-resilience)),
+2026-08-15/16, and are reproducible from the experiment's Makefile -
+the full run log with every number is
+[RUNLOG.md](https://github.com/erfianugrah/supabase-lab/blob/main/experiments/edge-resilience/RUNLOG.md)
+(22 modules, 22/22 in the unattended battery).
 
 [^pgrst-auth]: PostgREST, "API Configuration and Custom Claims," PostgREST Docs v11. https://docs.postgrest.org/en/v11/references/auth.html
 [^gh-48123]: Supabase GitHub Discussion #48123, "Fresh Supabase Auth JWT rejected by PostgREST: PGRST303 'JWT issued at future'," 2026-07-21. https://github.com/orgs/supabase/discussions/48123

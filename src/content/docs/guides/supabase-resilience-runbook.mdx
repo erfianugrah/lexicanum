@@ -23,7 +23,8 @@ the one you have.
 
 ## Constants preamble
 
-Measured facts every later step depends on (supabase-lab, 2026-08-15):
+Measured facts every later step depends on
+([supabase-lab](https://github.com/erfianugrah/supabase-lab), 2026-08-15/16):
 
 | Fact | Value |
 | --- | --- |
@@ -32,7 +33,11 @@ Measured facts every later step depends on (supabase-lab, 2026-08-15):
 | TPA resolution time | ~60-122ms |
 | JWKS trust lag after TPA registration | ~30s cold, ~300ms warm |
 | Standby initial sync (small table) | ~3.1-6.5s |
+| Standby initial sync (1M rows) | 22.7s / 12.5s (two runs); lag ~245-276ms after |
 | Standby replication lag (cross-region) | 34ms-1057ms |
+| auth.*/storage.* replication | zero changes at any tested size - do not plan on it |
+| DDL on the primary while subscribed | stalls ALL table replication; standby-side DDL resumes in ~6.1s |
+| Edge failover trip condition | 5xx, or the CF-wrapped 403 of an unroutable origin - never `>=500` alone |
 | Cold DR floor (10k rows via pooler) | dump 12.4s, restore 6.4s |
 | Gateway behavior on every response | sets `Set-Cookie: __cf_bm` |
 
@@ -144,9 +149,17 @@ export default {
     const hit = await cache.match(key);
     if (hit) return hit;
 
+    // PostgREST treats unknown query params as column filters and 400s.
+    // Strip probe-only params (this example: anything starting with "_")
+    // from the origin URL; keep the full URL only in the cache key above.
+    const originUrl = new URL(url);
+    for (const k of [...originUrl.searchParams.keys()]) {
+      if (k.startsWith("_")) originUrl.searchParams.delete(k);
+    }
+
     let origin: Response;
     try {
-      origin = await fetch(new Request(env.UPSTREAM + url.pathname + url.search, req));
+      origin = await fetch(new Request(env.UPSTREAM + originUrl.pathname + originUrl.search, req));
     } catch {
       const stale = await cache.match(key);
       return stale ?? new Response('{"error":"origin unreachable"}', { status: 503 });
@@ -202,14 +215,19 @@ Verify: seed rows appear on the standby (initial sync ~3.1-6.5s on a small
 table), then insert a canary and time its appearance (34ms-1057ms
 cross-region).
 
-<Aside type="caution" title="Replication carries table data only">
+<Aside type="caution" title="Replication carries table data only - and not every table">
 RLS policies, grants, functions, triggers and views are schema - they do
 not replicate. Apply `pg_dump --schema-only` to the standby before the
 subscription, and re-apply on every schema change. Storage objects do not
 follow their metadata (sync objects separately or dual-write), vault
 secrets replicate as useless ciphertext, and pg_cron / function secrets /
-Realtime state do not move. Fresh logins on the standby are a separate
-question from token portability - see gotchas.
+Realtime state do not move (pg_cron at least resumes on its own after a
+restart - measured). Two boundaries are absolute, measured 2026-08-15/16:
+`auth.*` and `storage.*` stream zero changes at any tested size, so user
+replication is not a path at all; and DDL applied on the primary only
+stalls ALL table replication until the same DDL lands on the standby
+(resume measured at ~6.1s) - migrate the standby first. Fresh logins on
+the standby are a separate question from token portability - see gotchas.
 </Aside>
 
 ### 4.2 Make sessions portable
@@ -228,15 +246,24 @@ Primary-issued tokens then validate against the standby's API (measured
 200). Note the cold path: the first time the standby's PostgREST sees the
 issuer's key it answers PGRST301 for ~30s. Rehearse before you need it.
 This keeps EXISTING sessions alive on reads. Fresh logins on the standby
-hit the standby's own auth store - auth.* replication between managed
-projects is untested, so the honest interim posture is: reads and existing
-sessions survive, users may need to log in again until that drill lands.
+hit the standby's own auth store, and auth.* replication between managed
+projects is a measured dead end (zero changes stream at any tested size,
+micro or small, with or without copy_data), so the posture is: reads and
+existing sessions survive; new logins need a SQL-level user backfill or a
+forced re-login after cutover. Per-project auth config (SMTP, `SITE_URL`,
+redirect URLs, rate limits, `jwt_exp`) does not follow a cutover either -
+re-apply it to the standby via the Management API as part of the
+procedure below (measured: the diff is readable verbatim from
+`GET /v1/projects/{ref}/config/auth`).
 
 ### 4.3 Cutover procedure
 
-1. Confirm replication lag is near zero (canary insert appears < 2s).
+1. Confirm replication lag is near zero (canary insert appears < 2s;
+   measured ~245-276ms immediately after a 1M-row initial sync).
 2. Freeze writes on the primary (fail closed, not open - never dual-write).
-3. Resync sequences on the standby (sequences do not replicate):
+3. Resync sequences on the standby (sequences do not replicate - the
+   first insert without this step fails with a verbatim duplicate-key
+   error, measured):
 
 ```sql
 select setval(pg_get_serial_sequence('public.<t>','id'),
@@ -299,7 +326,20 @@ the file to object storage outside the incident blast radius.
   `cache.put` or the Cache API refuses silently.
 - **Cloudflare Workers wraps TCP failures to unroutable IPs as a 403
   response**, not a JS exception - stale-fallback `catch` blocks never see
-  it. Branch on status too.
+  it. Branch on status too. For failover logic this means the trip
+  condition must include 403, or an unroutable primary never fails over
+  (measured 2026-08-16).
+- **Cache-first and failover do not compose.** A cache HIT carries no
+  origin information, so a failover mode behind a cache-first read gets
+  masked by warm entries. If the worker fails over between origins, skip
+  the cache while failing over and tag every response with the origin
+  that served it (`x-drill-origin` in the lab worker). A holdover window
+  (hold on standby for N ms after a failure) damps flapping; persist the
+  last-failure timestamp in the Cache API if it must survive redeploys.
+- **PostgREST 400s on unknown query params** (treated as column filters).
+  A `?_bust=` cache-buster forwarded to the origin 400s every request -
+  strip probe-only params from the origin URL, keep them only in the
+  cache key (measured 2026-08-16; the Part 3 example does this).
 - **Standby REST reads need the standby's own publishable key**, not the
   primary's. They look interchangeable and are not.
 - **Hosted signup is not a scriptable probe surface** - the default email
@@ -310,7 +350,9 @@ the file to object storage outside the incident blast radius.
 
 | File | Role |
 | --- | --- |
-| `experiments/edge-resilience/worker/worker.ts` | Reference Worker (cache + outage drill) |
-| `experiments/edge-resilience/tests/w05-standby-replication.ts` | The standby drill, runnable |
-| `experiments/edge-resilience/FAILURE-MATRIX.md` | The full failure-point inventory |
-| `RELIABILITY.md` (repo root) | The incident-class reference this guide implements |
+| [`experiments/edge-resilience/worker/worker.ts`](https://github.com/erfianugrah/supabase-lab/blob/main/experiments/edge-resilience/worker/worker.ts) | Reference Worker (cache + outage drill + failover mode) |
+| [`experiments/edge-resilience/tests/w05-standby-replication.ts`](https://github.com/erfianugrah/supabase-lab/blob/main/experiments/edge-resilience/tests/w05-standby-replication.ts) | The standby drill, runnable |
+| [`experiments/edge-resilience/tests/w24-edge-failover-proxy.ts`](https://github.com/erfianugrah/supabase-lab/blob/main/experiments/edge-resilience/tests/w24-edge-failover-proxy.ts) | The failover + flap-damping drill, runnable |
+| [`experiments/edge-resilience/FAILURE-MATRIX.md`](https://github.com/erfianugrah/supabase-lab/blob/main/experiments/edge-resilience/FAILURE-MATRIX.md) | The full failure-point inventory |
+| [`experiments/edge-resilience/RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/main/experiments/edge-resilience/RUNLOG.md) | Every measured number, per module |
+| [`RELIABILITY.md`](https://github.com/erfianugrah/supabase-lab/blob/main/RELIABILITY.md) (repo root) | The incident-class reference this guide implements |
