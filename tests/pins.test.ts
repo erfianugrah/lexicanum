@@ -49,6 +49,7 @@ const PRIVATELINK = "reference/supabase-aws-privatelink";
 const PRIVATELINK_TOFU = "guides/supabase-aws-privatelink-tofu";
 const MONTOPO = "reference/self-hosted-monitoring-topology";
 const MONGUIDE = "guides/monitor-compose-postgres-prometheus";
+const WEATHER = "guides/singapore-weather-ha-grafana";
 const MEMSTORE = "reference/agent-memory-store";
 const SBRESIDENCY = "reference/supabase-data-residency";
 
@@ -679,10 +680,53 @@ const pins: Pin[] = [
       "4533ms",
       // W13: the wall clock number.
       "IDLE_TIMEOUT",
+      // Class 12: Realtime quota events (the misfiled-as-outage class).
+      "tenant_events",
+      // Class 4: the billing restriction belongs on the incident list.
+      "overdue invoices restrict the whole org",
+      // Break-glass: rotate-after (the secret stays live until rotated).
+      "rotate the secret after any break-glass use",
       // Public links, not machine-relative paths (this is a public site).
       "github.com/erfianugrah/supabase-lab",
     ],
-    linksTo: ["guides/supabase-resilience-runbook"],
+    linksTo: ["guides/supabase-resilience-runbook", "reference/supabase-dr-tiers"],
+  },
+  {
+    // The commercial half (PITR / backups / Fair Use / cost), keyed on
+    // RPO/RTO/spend. Every number below is doc-cited in footnotes; the pins
+    // are the figures a pricing page change would silently invalidate.
+    doc: "reference/supabase-dr-tiers",
+    mustContain: [
+      // The PITR price ladder and its two gates.
+      "~\\$100, ~\\$200 or ~\\$400 per month for 7, 14 or 28 days",
+      "explicitly NOT covered",
+      "at least Small compute",
+      // The two restore traps most likely to be forgotten mid-incident.
+      "Enabling PITR stops the daily backups",
+      "only the Realtime slot is exempted and handled",
+      // Daily backup retention by plan.
+      "7, 14 and 30 days of retention respectively",
+      // The storage/password holes (line-wrapped in prose; pin the
+      // single-line fragment).
+      "restoring an old backup does not bring back objects deleted",
+      "reset custom-role passwords afterwards",
+      // Fair Use: the signature and the org-wide scope.
+      "402",
+      "projects paused, databases switched to read-only, new launches blocked",
+      // The standby tier's measured lag.
+      "34ms-1057ms",
+      // SLA scope.
+      "generally-available features only",
+    ],
+    sections: [
+      /^## The tiers on one axis$/m,
+      /^## Class zero: your own billing state$/m,
+      /^## Which do I pick$/m,
+    ],
+    linksTo: [
+      "reference/supabase-incident-resilience",
+      "guides/supabase-resilience-runbook",
+    ],
   },
   {
     doc: "guides/supabase-resilience-runbook",
@@ -691,10 +735,18 @@ const pins: Pin[] = [
       "zero changes stream at any tested size",
       // 4.2: the backfill caveat - admin API cannot carry password_hash.
       "password_hash` is not portable via the admin API",
+      // 4.2: the enterprise IdP escape hatch.
+      "is an external IdP",
       // 4.1 Aside: standby-first DDL ordering with the resume number.
       "migrate the standby first",
       // Gotchas: the ordered wedged-subscription recovery.
       "slot_name = none",
+      // Part 1: the 402 billing row is in the signal table.
+      "| 402 | billing restriction",
+      // Part 3: the staleness trade is stated, not left implicit.
+      "origin-first with cache fallback",
+      // Gotchas: rotate after break-glass.
+      "rotate it after any break-glass use",
       // Part 3: the param-strip is IN the code example, not only the gotchas.
       "PostgREST treats unknown query params as column filters",
       // Gotchas: the failover trip condition includes 403 (line-wrapped in
@@ -704,6 +756,31 @@ const pins: Pin[] = [
       "github.com/erfianugrah/supabase-lab/blob/main/experiments/edge-resilience/worker/worker.ts",
     ],
     linksTo: ["reference/supabase-incident-resilience"],
+  },
+  {
+    doc: WEATHER,
+    mustContain: [
+      // The 502 root cause. If this softens to "a header issue", the next
+      // person loses hours to what looks like a network problem.
+      "application/json;q=0.9,text/plain",
+      // The empty-result parser split.
+      "no results found",
+      "frontend",
+      // The multi-word-name verification bug - Pioneer was the WRONG pick.
+      "mis-picked Pioneer",
+      // Endpoint paths that are not guessable.
+      "weather?api=lightning",
+      // The distance-math constant and its ground-truth pair.
+      "12392.1",
+      "20.92 km",
+    ],
+    sections: [
+      /^## Constants$/m,
+      /^## Verification$/m,
+      /^## Gotchas and lessons learned$/m,
+      /^## File reference$/m,
+    ],
+    linksTo: ["reference/home-iot-network", "guides/airgradient-one-esphome-local"],
   },
 ];
 
