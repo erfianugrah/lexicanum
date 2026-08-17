@@ -686,6 +686,15 @@ const pins: Pin[] = [
       "overdue invoices restrict the whole org",
       // Break-glass: rotate-after (the secret stays live until rotated).
       "rotate the secret after any break-glass use",
+      // Reader gating: the page must route a Pro single-project reader.
+      "Which classes apply to you",
+      // The standby/logical-corruption asymmetry, on the reference page too.
+      "replicates the mistake in 34ms",
+      // Class 13: the SLA boundary with its actual numbers.
+      "99.9% per product per month",
+      "24/7x365 on Enterprise Standard",
+      // Class 6: billing demoted to a pointer, render path is the class.
+      "is a commercial decision, not an incident class",
       // Public links, not machine-relative paths (this is a public site).
       "github.com/erfianugrah/supabase-lab",
     ],
@@ -743,8 +752,13 @@ const pins: Pin[] = [
       "slot_name = none",
       // Part 1: the 402 billing row is in the signal table.
       "| 402 | billing restriction",
-      // Part 3: the staleness trade is stated, not left implicit.
-      "origin-first with cache fallback",
+      // Part 3: the example code IS origin-first (not just an aside).
+      "Origin-first: fresh reads in normal operation",
+      // Part 3: SWR named as the third posture.
+      "stale-while-revalidate",
+      // Part 1: the non-engineering half of detection.
+      "status.supabase.com",
+      "at least 2 weeks' notice",
       // Gotchas: rotate after break-glass.
       "rotate it after any break-glass use",
       // Part 3: the param-strip is IN the code example, not only the gotchas.
