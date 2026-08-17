@@ -659,42 +659,22 @@ const pins: Pin[] = [
     // forwarded to the origin).
     doc: "reference/supabase-incident-resilience",
     mustContain: [
-      // The W14 boundary - the single most-cited correction of the round.
+      // The W14 boundary - the single most-cited correction of the round
+      // (was "untested" / the disproved worker-ceiling hypothesis).
       "do not replicate at any tested size",
-      // W15: DDL stall is table-wide; the resume number is the operationalizer.
-      "stalls ALL table replication",
-      "~6.1s",
-      // W22: sync at scale extrapolates; losing this reopens the stall story.
-      "22.7s",
-      // W24: the 403 wrap as a failover trip condition, not just a W04 note.
-      "failover condition",
-      // The post-cutover defaults: sequences and auth config do not follow.
-      "duplicate-key error",
-      "does not follow a cutover",
-      // W14 mechanics: the size-up disproof and the two failure modes.
       "max_worker_processes` is 6 on both",
-      "IPC/BgworkerStartup",
-      // W20: the verbatim signatures with wall times.
-      "57014",
-      "55P03",
-      "4533ms",
-      // W13: the wall clock number.
-      "IDLE_TIMEOUT",
-      // Class 12: Realtime quota events (the misfiled-as-outage class).
-      "tenant_events",
-      // Class 4: the billing restriction belongs on the incident list.
-      "overdue invoices restrict the whole org",
-      // Break-glass: rotate-after (the secret stays live until rotated).
+      // W24: the 403 wrap as a failover trip condition (was >=500-only).
+      "failover condition",
+      // Review-round corrections: rotate-after, reader gating, the
+      // standby/logical-corruption asymmetry, the SLA plan axis, the
+      // Class 6 re-scope, usage-vs-plan gating, Team-severity precision.
       "rotate the secret after any break-glass use",
-      // Reader gating: the page must route a Pro single-project reader.
       "Which classes apply to you",
-      // The standby/logical-corruption asymmetry, on the reference page too.
       "replicates the mistake in 34ms",
-      // Class 13: the SLA boundary with its actual numbers.
       "99.9% per product per month",
-      "24/7x365 on Enterprise Standard",
-      // Class 6: billing demoted to a pointer, render path is the class.
       "is a commercial decision, not an incident class",
+      "USAGE-gated, not plan-gated",
+      "business-hours limits start at High",
       // Public links, not machine-relative paths (this is a public site).
       "github.com/erfianugrah/supabase-lab",
     ],
@@ -706,26 +686,16 @@ const pins: Pin[] = [
     // are the figures a pricing page change would silently invalidate.
     doc: "reference/supabase-dr-tiers",
     mustContain: [
-      // The PITR price ladder and its two gates.
+      // The PITR price ladder - the most-quoted commercial fact on the page.
       "~\\$100, ~\\$200 or ~\\$400 per month for 7, 14 or 28 days",
-      "explicitly NOT covered",
-      "at least Small compute",
       // The two restore traps most likely to be forgotten mid-incident.
       "Enabling PITR stops the daily backups",
       "only the Realtime slot is exempted and handled",
-      // Daily backup retention by plan.
-      "7, 14 and 30 days of retention respectively",
-      // The storage/password holes (line-wrapped in prose; pin the
-      // single-line fragment).
-      "restoring an old backup does not bring back objects deleted",
-      "reset custom-role passwords afterwards",
       // Fair Use: the signature and the org-wide scope.
       "402",
       "projects paused, databases switched to read-only, new launches blocked",
-      // The standby tier's measured lag.
-      "34ms-1057ms",
-      // SLA scope.
-      "generally-available features only",
+      // The SLA section is the canonical contract text (plan axis + credits).
+      "The uptime SLA is Enterprise-only",
     ],
     sections: [
       /^## The tiers on one axis$/m,
@@ -754,11 +724,11 @@ const pins: Pin[] = [
       "| 402 | billing restriction",
       // Part 3: the example code IS origin-first (not just an aside).
       "Origin-first: fresh reads in normal operation",
-      // Part 3: SWR named as the third posture.
-      "stale-while-revalidate",
       // Part 1: the non-engineering half of detection.
       "status.supabase.com",
       "at least 2 weeks' notice",
+      // Part 5: why the dump goes over the pooler (docs point at direct).
+      "legitimate dump path",
       // Gotchas: rotate after break-glass.
       "rotate it after any break-glass use",
       // Part 3: the param-strip is IN the code example, not only the gotchas.

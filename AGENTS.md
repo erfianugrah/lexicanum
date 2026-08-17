@@ -3,6 +3,12 @@
 Astro + Starlight docs site (MDX). This file is the authoring system: doc types,
 skeletons, the citation convention, and house style. Follow it for every new doc
 and every edit. Build with `bun run build`; dev with `bun dev` (localhost:4321).
+Deploy with `bun run deploy` - it is `wrangler deploy` PLUS a zone cache purge
+(`scripts/purge-cache.ts`): the Workers assets platform serves HTML from a
+per-PoP cache (`cf-cache-status: HIT` even on `max-age=0, must-revalidate`
+HTML), and without the purge some PoPs serve the previous deploy for tens of
+minutes (observed 2026-08-17). The purge needs CLOUDFLARE_API_TOKEN, or
+CLOUDFLARE_API_KEY + CLOUDFLARE_EMAIL, in env; it skips silently without them.
 
 ## Pipeline facts (load-bearing)
 
