@@ -14,16 +14,16 @@ authentication, metric scraping, and a pre-built dashboard over 200+ metrics -
 on every plan including free.[^sb-launch] This covers that path, the manual
 equivalents, how to read the dashboard, and the alert rules worth running.
 
-**Prerequisites**: a Supabase project, and for the manual paths a Secret API
-key (`sb_secret_...` from Project Settings > API Keys). No credit card on
-either side for the free tiers.
+**Prerequisites**: a Supabase project, and for the manual paths the project's
+**legacy `service_role` JWT** (Project Settings > API Keys > Legacy API keys).
+No credit card on either side for the free tiers.
 
 ## Constants
 
 | Thing | Value | Where it comes from |
 |---|---|---|
 | Metrics endpoint | `https://YOUR_PROJECT_REF.supabase.co/customer/v1/privileged/metrics` | The Supabase Metrics API, one endpoint per project |
-| Auth | HTTP basic, username `service_role`, password `sb_secret_...` | Secret API key, Project Settings > API Keys |
+| Auth | HTTP basic, username `service_role`, password = the legacy `service_role` JWT | Verified live 2026-08-18: the endpoint 401s on the new-format `sb_secret_...` keys (as basic-auth password AND as bearer token); the JWT is the working credential |
 | Recommended scrape interval | 1 minute | Upstream refreshes about every 60s, so faster scrapes mostly re-read the same values[^sb-docs-gc] |
 | Metric volume | ~200 families, with per-CPU and per-device label fan-out | The full list is in the repo's `docs/metrics.md`[^sb-metrics-list] |
 | Grafana Cloud free tier | 10k active series/mo, 14-day retention, 3 users | Enough for several projects' worth of this endpoint[^g-free] |
@@ -100,8 +100,10 @@ credential handling you want to control.[^sb-docs-gc]
 1. Sign in to [Grafana Cloud](https://grafana.com/auth/sign-in), create or
    select a stack with Prometheus metrics enabled.
 2. **Connections > Add new connection > Supabase**. Provide the project ref,
-   the Metrics API endpoint, and the Secret API key as the basic-auth
-   password. Name the scrape job after the environment
+   the Metrics API endpoint, and the legacy `service_role` JWT as the
+   basic-auth password (the new-format `sb_secret_...` Secret API keys are
+   NOT accepted by the endpoint as of 2026-08-18 - verified 401 against a
+   live project). Name the scrape job after the environment
    (`production-ap-southeast-1`), not the project - the name is what alert
    labels carry.
 3. Set the scrape interval to 1 minute, test the connection, save. Grafana
@@ -129,7 +131,7 @@ scrape_configs:
     scrape_interval: 30s        # see the rate-interval gotcha below
     basic_auth:
       username: service_role
-      password_file: /run/secrets/sb_metrics_key   # or password: sb_secret_...
+      password_file: /run/secrets/sb_metrics_key   # file holds the legacy service_role JWT
     static_configs:
       - targets: ['YOUR_PROJECT_REF.supabase.co:443']
 ```
@@ -145,6 +147,41 @@ do not.
 If you run more than a couple of projects, generate the jobs rather than
 hand-editing: one job per project, each with its own 0600 credential file, so
 no secret sits in `prometheus.yml`.
+
+### Multi-project: names in the dropdown, not refs
+
+Two small additions make a multi-project setup livable. First, give each job a
+static **name** label next to the ref label:
+
+```yaml
+    static_configs:
+      - targets: ['YOUR_PROJECT_REF.supabase.co:443']
+        labels:
+          supabase_project_ref: 'YOUR_PROJECT_REF'
+          supabase_project_name: 'production'      # what humans call it
+```
+
+Second, make the dashboard's `$project` variable display the name while
+filtering by the ref - `query_result` with a JS-syntax named-group regex
+(`(?<text>...)`, NOT the RE2/Python `(?P<text>...)` form - the frontend
+compiles the variable regex in JavaScript and rejects the latter with
+"invalid regexp group"):
+
+```
+query_result(max by (supabase_project_name, supabase_project_ref) (node_load1{job=~"supabase-.*"}))
+regex: /supabase_project_name="(?<text>[^"]+)".*supabase_project_ref="(?<value>[^"]+)"/
+```
+
+And if the dashboard filters on a SECOND variable (`supabase_identifier` in
+the stock dashboard), cascade it off the project or the two filters disagree
+and every panel goes empty:
+
+```
+label_values(node_load1{supabase_project_ref="$project"}, supabase_identifier)
+```
+
+Both variables are then fully dynamic - adding a project is one scrape job,
+zero dashboard edits.
 
 ## Part 4: reading the dashboard
 
@@ -169,7 +206,20 @@ Used, SWAP Total, Data Disk Total, Uptime. Then:
 
 The remaining rows - Memory Meminfo, System Timesync, System Processes,
 Systemd, Network Sockstat/Netstat, Node Exporter - are node-exporter deep
-cuts. Leave them collapsed until a headline panel points at one.
+cuts. Leave them collapsed until a headline panel points at one. Expect many
+of them to be empty permanently: the endpoint serves a CURATED subset of
+node_exporter, not the full collector set. Measured 2026-08-18 against a live
+free-tier project: 87 of the 148 panels have data; the empty 60 are mostly
+those deep cuts (sockstat, netstat, timex, softnet, entropy, systemd,
+conntrack, interface speed), plus panels that depend on project features -
+the Supavisor row only has data on projects that run Supavisor (pgbouncer
+projects stay empty there), and the realtime replication panels need realtime
+replication in use. Empty there means "not served", not "broken scrape".
+The **Uptime** stat is the one visible casualty in the stock headline row:
+`node_boot_time_seconds`/`node_time_seconds` are not served, so it shows N/A
+- swap the query for `time() -
+process_start_time_seconds{service_type="postgresql"}` (postgres process
+uptime as the compute-uptime proxy) if you want it back.
 
 Two habits make the dashboard pay off:
 
@@ -409,13 +459,35 @@ Some obvious candidates are traps:
 - **Disk fill projection** - `predict_linear` extrapolates an auto-expansion
   as a cliff; the series has to be segmented on resize events first, which
   PromQL cannot do.
-- **Connection ceiling %** - the denominator (`max_connections` from
-  `pg_settings`) is not on the scrape, so the ratio needs a baked-in literal
-  per project.
+- **Connection ceiling %** - was a trap when the denominator was not
+  exported; as of 2026-08-18 the endpoint serves the configured limit as
+  `max_connections_connection_count` (verified live: 60 on free-tier
+  projects), so a ceiling line or ratio IS now possible. Note the name - it
+  is NOT `pg_settings_max_connections`.
 - **Deadlocks** - the counter is cumulative since stats reset; a threshold on
   it fires forever after the first event.
 
 A pack that alerts on what Prometheus cannot see is worse than no pack.
+
+### Wiring alerts self-hosted (Alertmanager)
+
+On the self-hosted path the wiring is: Prometheus `alerting:` block pointing
+at an Alertmanager, `alerts.yml` mounted as a `rule_files:` entry, and a
+receiver for delivery. Any email API with an SMTP relay works as the receiver
+- with Resend for example: smarthost `smtp.resend.com:587` (STARTTLS;
+465/2465 are implicit TLS, 25/587/2587 STARTTLS), username literally `resend`,
+password = the API key, `smtp_from` on a domain verified in the Resend
+account. One routing note that will bite you: group by `supabase_project_ref`
+so alerts from different projects do not coalesce into one notification. And
+verify end-to-end with a synthetic alert POSTed straight to Alertmanager's
+`/api/v2/alerts` - that exercises the whole chain except the rule engine.
+
+Scoping note for multi-project rule files: if the same Prometheus also scrapes
+other node/postgres exporters (edge routers, other databases), an unscoped
+rule file fires the Supabase node_* rules on THOSE hosts too. Require the
+project label instead: generate with a label-present matcher
+(`supabase_project_ref=~".+"` - pg-analyser's `alerts-init --ref '~.+'` emits
+exactly this) so the rules cover every project job and nothing else.
 
 ### Wiring alerts in Grafana Cloud
 
@@ -467,9 +539,13 @@ scraping.** Trends exist only from the moment a scraper runs, and on the free
 tier they age out after 14 days. If you need month-scale trends for capacity
 calls, that decides Pro vs self-hosted for you.
 
-**A 401 is a key problem, not a network problem.** Rotate or create a Secret
-API key in Project Settings > API Keys and update the scrape credentials; the
-managed agent and manual jobs fail identically here.
+**A 401 is a key problem, not a network problem.** Check which credential you
+handed the scrape first: verified 2026-08-18, the endpoint accepts the legacy
+`service_role` JWT and returns 401 for the new-format `sb_secret_...` Secret
+API keys - as basic-auth password and as bearer token alike. If Supabase
+extends the endpoint to the new key format later, prefer a dedicated
+`sb_secret_` key for the scraper (it rotates independently and the JWTs are
+on the deprecation path); until then the JWT is the working credential.
 
 **The one-click path hides the scrape entirely.** Convenient until you need to
 change the interval or relabel - then you are in the manual path anyway, and
