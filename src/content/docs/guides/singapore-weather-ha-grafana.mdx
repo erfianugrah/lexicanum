@@ -1,6 +1,6 @@
 ---
 title: "Singapore weather alerts and live maps with Home Assistant and Grafana"
-description: Pull NEA's keyless data.gov.sg feeds (2-hr forecast, rainfall, lightning, PM2.5) into Home Assistant REST sensors, derive a home-area view, fire companion-app alerts, and plot live lightning strikes and rainfall stations on Grafana geomaps - including the two Infinity plugin defects you will hit on the way.
+description: Pull NEA's keyless data.gov.sg feeds (2-hr forecast, rainfall, lightning, PM2.5, air temperature, relative humidity) into Home Assistant REST sensors, derive a home-area view, fire companion-app alerts (rain, lightning, worth-opening-windows), and plot live lightning strikes and rainfall stations on Grafana geomaps - including the Infinity plugin defects and the silently-ignored Grafana fieldConfig key you will hit on the way.
 author: Erfi Anugrah
 category: homelab
 ---
@@ -20,11 +20,13 @@ The fixed facts every later step depends on:
 | API base | `https://api-open.data.gov.sg/v2/real-time/api/` | keyless, no auth header |
 | Forecast endpoint | `two-hr-forecast` | per-area, ~30 min refresh upstream |
 | Rainfall endpoint | `rainfall` | per-station mm, 5 min cadence[^dgs-rainfall] |
+| Air temperature endpoint | `air-temperature` | per-station deg C, 5 min cadence |
+| Relative humidity endpoint | `relative-humidity` | per-station %, same 16-station set as air-temperature |
 | Lightning endpoint | `weather?api=lightning` | NOT `/lightning` (that path 403s); 2 min cadence[^dgs-lightning] |
 | UV index | v1 only: `https://api.data.gov.sg/v1/environment/uv-index` | no v2 path exists |
 | Home coordinates | from `zone.home` in HA | no hardcoded lat/lon in config |
 | Nearest forecast area | Jurong West | computed from `zone.home` vs `area_metadata` - yours will differ |
-| Nearest rain station | S44 (Nanyang Avenue, ~1 km) | computed from `zone.home` vs `stations` - yours will differ |
+| Nearest station | S44 (Nanyang Avenue, ~1 km) | nearest in the rain AND the temp/RH station sets - computed from `zone.home` vs `stations`, yours will differ |
 | Distance constant | 111.32 km/deg, both axes | at lat 1.34 the equirectangular cos term is 0.9997, error under 0.1% |
 | Rate limit | per source IP, keyless | ALL home egress shares one WAN IP - every poller shares one bucket |
 
@@ -57,7 +59,7 @@ digraph {
 
 ## Part 1: Pull the feeds into Home Assistant
 
-Four `rest` resources. Poll cadences are chosen to sit well under the shared rate limit - the 120 s lightning poll matches the Lightning Detection System's own 2-minute update cadence[^dgs-lightning], so polling faster only burns quota.
+Six `rest` resources. Poll cadences are chosen to sit well under the shared rate limit - the 120 s lightning poll matches the Lightning Detection System's own 2-minute update cadence[^dgs-lightning], so polling faster only burns quota. The four weather-resources-in-chief are below; PM2.5 (30 min poll, five regions as attributes) and the temp/RH pair follow after.
 
 ```yaml
 rest:
@@ -132,6 +134,30 @@ Three design decisions in that block, each load-bearing:
 
 The `value_json.data['items']` bracket syntax in the forecast sensor is deliberate: in Jinja, `.items` resolves to the dict *method*, not the key, so dot access renders `unknown` while the attributes still populate. `data` is not a dict method, so `value_json.data.records` is safe.
 
+Air temperature and relative humidity are the rainfall shape exactly - per-station readings on a 5-minute cadence, one attribute carrying the list. Both endpoints serve the identical 16-station set, so one station list covers both:
+
+```yaml
+  - resource: https://api-open.data.gov.sg/v2/real-time/api/air-temperature
+    scan_interval: 300
+    sensor:
+      - name: NEA air temperature
+        unique_id: nea_air_temperature
+        value_template: "{{ value_json.data.readings[0].timestamp }}"
+        json_attributes_path: "$.data.readings[0]"
+        json_attributes: ["data"]
+
+  - resource: https://api-open.data.gov.sg/v2/real-time/api/relative-humidity
+    scan_interval: 300
+    sensor:
+      - name: NEA relative humidity
+        unique_id: nea_relative_humidity
+        value_template: "{{ value_json.data.readings[0].timestamp }}"
+        json_attributes_path: "$.data.readings[0]"
+        json_attributes: ["data"]
+```
+
+Split the stations out the same way the PM2.5 regions are split - one template sensor per station per quantity (32 total), generated from a single station list. The per-station availability template checks the station is present in the payload (`| list | count > 0`) so a station dropping out renders `unavailable` instead of a fake 0.
+
 ## Part 2: Derive the home view
 
 Template sensors split the home-area slice out of the raw resources. The forecast area and station id were picked once by computing nearest-to-`zone.home` over the API's own metadata (the exact commands are in Verification).
@@ -165,6 +191,32 @@ template:
 ```
 
 The binary sensor's substring set (`rain`, `shower`, `thundery`) covers the NEA forecast vocabulary - Light Rain, Passing Showers, Thundery Showers - without a regex dependency.
+
+For the temp/RH pair, split out the home station (S44 again) and define indoor-minus-outdoor deltas against your indoor sensor (an AirGradient ONE here). Positive delta = indoor higher. They answer "is it worth opening the windows": opening helps only when the outside is BOTH cooler (temp delta > 0) and drier (RH delta > 0) - in aircon season the RH delta is usually negative, which is the keep-them-closed signal. Codify the judgment as a binary sensor so both the alert pair and dashboards can read it:
+
+```yaml
+      - name: Air temperature indoor-outdoor delta
+        unique_id: aq_temp_indoor_outdoor_delta
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state_class: measurement
+        state: >
+          {{ (states('sensor.airgradient_one_1_temperature') | float(0)
+              - states('sensor.nea_temperature_home') | float(0)) | round(1) }}
+        availability: >
+          {{ has_value('sensor.airgradient_one_1_temperature')
+             and has_value('sensor.nea_temperature_home') }}
+      # aq_rh_indoor_outdoor_delta is the identical shape on the humidity pair
+  - binary_sensor:
+      - name: Worth opening windows
+        unique_id: windows_worth_opening
+        state: >
+          {{ states('sensor.air_temperature_indoor_outdoor_delta') | float(0) > 0.5
+             and states('sensor.air_humidity_indoor_outdoor_delta') | float(0) > 2
+             and is_state('binary_sensor.rain_expected_home', 'off') }}
+```
+
+The margins (0.5 deg, 2 RH points) and the rain gate keep the evening sea-breeze hover from flapping the alerts; the 15-minute `for:` on the alert triggers does the rest. S44 updates on a 5-minute cadence, so a shorter `for:` would re-decide on stale data.
 
 ## Part 3: Alerts
 
@@ -209,11 +261,25 @@ Alert/clear pairs share a notification `tag` so the clear replaces the alert on 
 
 The two clear automations mirror these: rain fires on the binary sensor going `off`, lightning clear fires on the count staying below 1 for 15 minutes. Strikes are transient, so the alert itself takes no `for:` duration - one would mean it never fires.
 
+A third pair rides `binary_sensor.worth_opening_windows` (tag `weather-windows`, 15-minute `for:` BOTH ways - this condition is not transient like a strike, it hovers). The alert message carries both sides of the comparison so the notification alone justifies the trip to the window:
+
+```yaml
+        title: "Worth opening windows"
+        message: >
+          Outside {{ states('sensor.nea_temperature_home') }}C /
+          {{ states('sensor.nea_humidity_home') }}% vs indoor
+          {{ states('sensor.airgradient_one_1_temperature') | round(1) }}C /
+          {{ states('sensor.airgradient_one_1_humidity') | round(0) }}%
+          - cooler AND drier outside
+```
+
 ## Part 4: Grafana time series and live maps
 
 ### Time series: nothing new to configure
 
-If Prometheus already scrapes Home Assistant's `/api/prometheus` endpoint, the new sensors flow in automatically. HA's Prometheus exporter names metrics from the unit[^ha-prometheus]: rainfall lands as `<namespace>_sensor_unit_mm`, the strike count as `<namespace>_sensor_unit_strikes`, and the unitless nearest-distance sensor as `<namespace>_sensor_state`. The non-numeric sensors (forecast text, `binary_sensor`) are skipped by the exporter - expected, since they are alert inputs rather than series.
+If Prometheus already scrapes Home Assistant's `/api/prometheus` endpoint, the new sensors flow in automatically. HA's Prometheus exporter names metrics from the unit[^ha-prometheus]: rainfall lands as `<namespace>_sensor_unit_mm`, the strike count as `<namespace>_sensor_unit_strikes`, and the unitless nearest-distance sensor as `<namespace>_sensor_state`. Sensors with a `device_class` get device-class-named metrics instead: temperature and RH land as `<namespace>_sensor_temperature_celsius` and `<namespace>_sensor_humidity_percent` - so indoor, outdoor, and the deltas all share one metric name each and split by the `entity` label. The non-numeric sensors (forecast text, `binary_sensor`) are skipped by the exporter - expected, since they are alert inputs rather than series.
+
+Two panel-building notes from the temp/RH addition. For a by-station panel (16 series), `legendFormat: "{{entity}}"` renders the raw `sensor.nea_temperature_nanyang_avenue` ids; use `{{friendly_name}}` plus a `renameByRegex` transformation (`NEA temperature (.+)` -> `$1`) to get clean `Nanyang Avenue` legends. And a dashboard whose stat/gauge panels color by thresholds benefits from a plain text panel documenting what the colors mean and which standard each band comes from - much cheaper than rediscovering the basis six months later.
 
 ### Maps: the Infinity datasource
 
@@ -309,6 +375,8 @@ What remains untested by construction: the alert notifications only fire on real
 
 **Endpoint paths are not guessable.** Lightning lives at `/v2/real-time/api/weather?api=lightning`, not `/lightning`. UV index exists only on the v1 host. The dataset page on data.gov.sg is the authority - the API spec link on each page names the real path.
 
+**A bogus `fieldConfig` key fails silently - the axis-scale field is `scaleDistribution`.** A timeseries panel configured with `custom.scale: {type: log, log: 10}` renders LINEAR forever: `scale` is not a field in Grafana's schema (the timeseries `AxisConfig` lives in `packages/grafana-schema/src/common/mudball.cue`, and the log-scale option is `custom.scaleDistribution`). No error appears anywhere - the unknown key is simply never read. The suspects that burn hours first: zeros in the data, the browser's cached dashboard JSON, the Grafana version - all red herrings here. The definitive loop when a panel option "does nothing": run the same Grafana image locally with the same dashboard JSON provisioned and a reachable Prometheus, then headless-screenshot the panel (`chromium --headless=new --screenshot=/tmp/p.png 'http://localhost:3000/d/<uid>?viewPanel=<id>&kiosk'`) and bisect the config against what actually renders. Zeros are a real secondary concern on log axes - a series that hits exact 0 cannot plot at log(0) - so clamp the query (`clamp_min(..., 0.1)`) and pin `custom.axisSoftMin` to floor those readings instead of gapping them.
+
 **Verify nearest-neighbor picks over TSV, not whitespace-split reads.** The `read name lat lon` failure mode from Verification applies anywhere names contain spaces, and it fails *silently* - the garbage rows compute a huge distance and sink to the bottom of the sort, so the top row looks plausible while being wrong. Compute the distance in the same awk that prints the name.
 
 **Stations and areas have no friendly names worth displaying.** Rainfall stations are bare ids (`S44`); forecast areas are the only human-readable geography. Pick your nearest once, write the id into config with a comment, and move on.
@@ -317,12 +385,12 @@ What remains untested by construction: the alert notifications only fire on real
 
 | Piece | Where | What |
 |---|---|---|
-| REST resources | `configuration.yaml` -> `rest:` | the four API pollers |
-| Home-view sensors | `configuration.yaml` -> `template:` | forecast/rainfall home, rain binary sensor |
-| Automations | YAML automations (or the UI) | rain + lightning alert/clear pairs |
+| REST resources | `configuration.yaml` -> `rest:` | the six API pollers |
+| Home-view sensors | `configuration.yaml` -> `template:` | forecast/rainfall/temp/RH home, per-station fan-out, indoor/outdoor deltas, rain + windows binary sensors |
+| Automations | YAML automations (or the UI) | rain + lightning + windows alert/clear pairs |
 | Infinity install | Grafana env | `GF_PLUGINS_PREINSTALL_SYNC` |
 | Datasource | `provisioning/datasources/infinity.yaml` | uid `infinity`, pinned allowedHosts |
-| Dashboard | provisioned dashboard JSON | stats, time series, two geomaps |
+| Dashboard | provisioned dashboard JSON | stats, time series (incl. by-station temp/RH), threshold-color legend panel, two geomaps |
 
 [^dgs-lightning]: NEA, "Lightning Observation," data.gov.sg. https://data.gov.sg/datasets/d_08238953fe0f6dd13f10714ebfbcb9f9/view
 [^dgs-rainfall]: NEA, "Rainfall across Singapore," data.gov.sg. https://data.gov.sg/datasets/d_6580738cdd7db79374ed3152159fbd69/view
