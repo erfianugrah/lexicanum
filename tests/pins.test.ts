@@ -742,6 +742,20 @@ const pins: Pin[] = [
     linksTo: ["reference/supabase-incident-resilience"],
   },
   {
+    doc: "guides/supabase-grafana-monitoring",
+    mustContain: [
+      // The vantage correction: the pack covers resource/process state,
+      // and that is NOT every incident - review proved this was missing.
+      "When the pack helps, and when it cannot",
+      "Coverage is a property of vantage points, not of rule count",
+      // PG17 verified empirically 2026-08-17: the endpoint still serves
+      // bgwriter checkpoint counters. Pin so nobody "fixes" the rule to
+      // the upstream pg_stat_checkpointer naming.
+      "pg_stat_bgwriter_checkpoints_req_total",
+    ],
+    linksTo: ["guides/supabase-resilience-runbook"],
+  },
+  {
     doc: WEATHER,
     mustContain: [
       // The 502 root cause. If this softens to "a header issue", the next
