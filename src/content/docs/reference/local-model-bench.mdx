@@ -1,0 +1,160 @@
+---
+title: "Benchmarking local models for agent work"
+description: How the llm-compose bench measures presets across perf, sensor-gated agent tasks, HumanEval, and a research-agent protocol suite - the measured numbers behind the loop/chat/small-track model picks, the MTP speculative-decoding adoption, and what it took to make bfcl-eval run against a local endpoint
+author: Erfi Anugrah
+category: workstations
+---
+
+How the local LLM stack picks its models: a bench harness that runs four suites against OpenAI-compatible presets, and the numbers that decided which model runs agent loops, which one answers interactively, and which ones fit the small GPU on the server. Written for anyone benchmarking GGUFs for agent-shaped work rather than leaderboard-shaped work.
+
+**Provenance.** All numbers measured 2026-08-15 to 2026-08-17 on an RTX 5090 (32GB), llama.cpp b10362, Q4_K_M quants, through the stack's own proxy - so every measurement carries the sampling params the model actually serves with. Small-track numbers are the same harness on the same GPU; the target hardware (a 3080 Ti) is called out where it matters. Community-reported behaviors are marked as such and were not re-measured here.
+
+**TL;DR**
+
+- Agent loop engine: Gemma 26B-A4B MoE. 199 tok/s decode, ties the 27B dense models on real loop tasks, and a doomed task costs 10-45 minutes instead of 75.
+- Interactive coding and thinking: Qwen3.8 27B with MTP speculation on - gen +15.1%, prompt processing +38.1%, TTFT -20%, still fits the 196k-context production config at 31.9GB.
+- Small track (server GPU): gemma4-12b ties the qwen35-9b incumbent at 0.944 case-hit rate with fewer wasted steps. Deploy-fit check pending.
+- Qwen3.8 defaults to `reasoning_effort: xhigh`, which is 15k-40k thinking tokens per nontrivial prompt; `medium` is a couple thousand. Every number below was measured at the xhigh default.
+- BFCL was dropped after five harness bugs: the remaining crash is inside bfcl-eval's own leaderboard formatter, and the suite answers a question that was already answered. The fixes are committed if it gets revisited.
+
+## Which model for which job
+
+| Role | Model | Why |
+|---|---|---|
+| Unattended agent loops | Gemma 26B-A4B MoE | 2.7x the decode speed of the dense options at equal task-suite score; failure is cheap |
+| Interactive coding / thinking | Qwen3.8 27B + MTP | Best HumanEval (0.451 vs 0.293 / 0.116), 196k context, 85 tok/s with speculation |
+| Chat / vision | Qwen3.8 27B + MTP | Same preset; vision smokes pass, 3x the context of the dense Gemma |
+| Server-side research agent | qwen35-9b, pending gemma4-12b | Tie on hit rate; gemma4-12b wins on steps (1.67 vs 2.30) and forced-final rate |
+| Eliminated | qwen36-moe, lfm25-8b, qwen35-4b | Fast-but-shallow (196 tok/s, pp 57.9), protocol-fragile (0.722 hit), small-but-sloppy (0.870) |
+
+## The harness
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  llmc [label="llmc bench <suite>"];
+  proxy [label="model_proxy\n(preset lock, owner=bench)"];
+  server [label="llama-server\n(one preset GGUF at a time)"];
+  store [label="runs.jsonl\n(append-only trend store)"];
+  evalbox [label="bench-eval container\n(evalplus / lm-eval / bfcl)"];
+
+  llmc -> proxy [label="switch + lock"];
+  proxy -> server [label="load preset"];
+  llmc -> server [label="perf / tasks / gumshoe"];
+  llmc -> evalbox [label="evals via endpoint"];
+  evalbox -> proxy [label="OpenAI API"];
+  llmc -> store [label="record + preset hash"];
+}
+```
+
+Presets are TOML files; the proxy hot-reloads them and enforces a lock so a benchmark and an interactive session never share the GPU. Every record in the trend store carries the llama.cpp build and a hash of the preset, so a tuning change shows up as a new provenance rather than silently rewriting history. Suites:
+
+- **perf** - TTFT p50/p95, gen and prompt-processing tok/s, VRAM. The cheap one.
+- **tasks** - six sensor-gated agent tasks (scoped edits, fixes, write-new-tests) run through the real loop engine with exit-code sensors. This is the suite that measures what the loop engine actually does all day.
+- **eval** - HumanEval via evalplus[^evalplus], HellaSwag via lm-eval, BFCL via bfcl-eval[^bfcl], in one container.
+- **gumshoe** - an 18-case research-agent protocol suite against stub tools; measures case-hit rate and JSON protocol validity. Used for the small models that serve the research stack.
+
+## The numbers
+
+Perf (b10362, RTX 5090):
+
+| preset | TTFT p50 | gen tok/s | pp tok/s | VRAM MiB | ctx | slots |
+|---|---|---|---|---|---|---|
+| loop (Gemma 26B-A4B MoE) | 160.7 | 199.2 | 178.7 | 22536 | 196608 | 2 |
+| gemma4 (Gemma 31B dense) | 363.2 | 63.0 | 306.8 | 26689 | 65536 | 1 |
+| qwen3.8 (27B dense) | 373.2 | 74.0 | 19.7 | 27259 | 196608 | 2 |
+| qwen3.8 + MTP | 297.1 | 85.2 | 27.2 | 30072 | 196608 | 2 |
+| qwen36-moe (eliminated) | 202.1 | 196.0 | 57.9 | 27078 | 163840 | 1 |
+
+Task suite, 6 tasks x 3 runs each:
+
+| preset | scoped edits | fixes | write-new-tests | total |
+|---|---|---|---|---|
+| loop | 6/6 | 6/6 | 0/6 | 12/18 |
+| gemma4 | 6/6 | 6/6 | 0/6 | 12/18 |
+| qwen3.8 | 6/6 | 6/6 | 1/6 | 13/18 |
+
+Every preset one-shots scoped edits and every preset stalls on write-new-tests - that is the ceiling case of the current suite, not a model differentiator. With the score tied, the loop-engine pick falls to economics: a task that will never pass burns 10-45 minutes on the MoE versus up to 75 on qwen3.8.
+
+HumanEval, greedy, through the proxy:
+
+| preset | pass@1 |
+|---|---|
+| loop (MoE) | 0.116 |
+| gemma4 (dense) | 0.293 |
+| qwen3.8 (dense, thinking) | 0.451 |
+
+Gumshoe small track, 18 cases x 3 repeats:
+
+| preset | case-hit | json valid | mean steps | forced final |
+|---|---|---|---|---|
+| qwen35-9b (incumbent) | 0.944 | 0.983 | 2.30 | 0.111 |
+| gemma4-12b | 0.944 | 0.917 | 1.67 | 0.093 |
+| qwen35-4b | 0.870 | 0.930 | 2.43 | 0.259 |
+| lfm25-8b | 0.722 | 0.854 | 3.02 | 0.389 |
+
+One case (`g15-chain`, a multi-tool dependency chain) is 0/3 for every preset - the discriminator the suite keeps in reserve.
+
+## MTP speculative decoding
+
+Qwen3.8 ships a multi-token-prediction head that llama.cpp can run as a self-draft: the main model's MTP head proposes continuations and the full model verifies them, no separate drafter file needed[^llamacpp]. One preset line (`spec_type = "draft-mtp"`) buys gen +15.1% and prompt processing +38.1% at +10.3% VRAM. The two things that could have killed it did not: the context ceiling held (196608 x 2 slots fits at 31948 MiB, just under the card), and the accuracy guard passed 4/4 loop tasks at 12-31s each. It is now on by default in the qwen3.8 preset.
+
+The spike surfaced one proxy constraint worth knowing: presets are deduplicated by model id, which derives from the GGUF filename - two presets pointing at one file crash-loop the proxy at startup. An A/B preset for the same weights needs its own filename; a hardlink gives that at zero extra disk.
+
+## Running Qwen3.8 in practice
+
+The model's reasoning is steerable, and the steering matters more than any sampling param. Community findings[^qwen38-effort], consistent with what the bench saw:
+
+- **`reasoning_effort` is prompt-level soft steering with three trained levels.** xhigh (the default) injects "think carefully, validate assumptions, consider alternatives" language; medium injects nothing; low injects a brevity instruction. On llama.cpp the level goes in as chat-template kwargs: `--chat-template-kwargs '{"reasoning_effort": "medium"}'`, or the same key per request.
+- **The level swing is 10-20x of thinking tokens.** Community reports put xhigh at 15k-40k thinking tokens on a one-shot coding prompt, medium at a couple thousand - less than the previous generation. Every number in this doc was measured at the xhigh default: the humaneval 0.451 is an xhigh number, and the 74-token/s effective speed is an xhigh speed. Medium is the obvious interactive default, but re-measure before trusting that the quality holds.
+- **It "re-reads" files by decoding them.** In agentic harnesses the model will say "let me read X" and then reproduce a file it was already given, verbatim, inside its reasoning trace - a learned attention re-weighting behavior (a cited copy in the trace gets more weight than the distant original), not a tool call. It reportedly lowers code hallucination, but it burns decode tokens at decode speed and inflates the context; effort level does not disable it.
+- **Budget cuts are not effort cuts.** llama.cpp's `--reasoning-budget N` truncates the trace mid-thought and appends a budget message; the effort levels are trained-in and end cleanly. Truncation risks the degraded-answer failure mode; the opposite failure mode is worse for loops: a small `max_tokens` plus a long trace yields an empty final response, which breaks agentic loops that expect content. Size `max_tokens` for the trace plus the answer.
+- **Thinking traces interact with compaction.** In a harness that compacts context, long traces crowd out earlier file contents and tool outputs. With 196k of context and 2 slots this is comfortable; on smaller budgets it is the first thing to watch.
+
+## Reading the numbers
+
+Absolute HumanEval scores here run far below the published model-card numbers, because greedy decoding through the proxy uses the preset's serving params rather than a tuned eval config. The ranking is the usable signal, not the magnitude - and the ranking matches the task-suite ordering.
+
+The MoE-versus-dense split is the axis that mattered. The MoE gives 199 tok/s and cheap failure but is visibly weaker on synthetic codegen (0.116 vs 0.293 for its own dense sibling). The dense thinking model is the slowest thing on the card at 74 tok/s unaccelerated, and still the right interactive model: on the identical 164-problem codegen run it took 34:48 against the MoE's 11:37, and the quality shows up exactly where the loop engine never goes (0.451 on codegen it was never asked to do unattended).
+
+What generalizes: measure models against the job's actual protocol (the task suite caught nothing the perf suite predicted, and vice versa), and treat unattended-loop economics as a first-class metric - cost-of-failure, not just cost-of-success. What does not: any of these absolute numbers off this rig.
+
+## The bfcl-eval landmines
+
+BFCL did not produce a number. Getting bfcl-eval 2026.3.23 to run at all against a local endpoint took five fixes, and the sixth crash lives inside its leaderboard CSV formatter. In the order they bit:
+
+1. **Uninstallable dependency pin.** bfcl-eval pins faiss-cpu==1.11.0, which PyPI no longer carries - install with `--no-deps` and relax faiss by hand.
+2. **A tree-sitter ABI split.** evalplus requires tree-sitter>=0.22 and calls `Language(capsule)`; bfcl's java parser calls the legacy 2-arg `Language(capsule, "java")`, which only exists on 0.21.x[^pytreesitter]. No single install satisfies both - the answer is two virtualenvs in one image.
+3. **An undeclared transitive import.** qwen_agent imports soundfile at module top without declaring it; with `--no-deps` that is a crash on first invocation.
+4. **A renamed test taxonomy.** The `ast` category is gone; `non_live` is the same static set. The live/web_search/agentic categories need external API keys - skip them for local models.
+5. **A hard model registry.** `--model` resolves through a 175-entry config map and KeyErrors on anything else, and the evaluate path applies an underscore-to-slash conversion meant for vendor model ids, which mangles GGUF stems like `Q4_K_M`. A sitecustomize shim registers local model ids (both spellings) to the generic OpenAI handler at interpreter start.
+6. **The open one:** scoring completes, then the leaderboard writer crashes multiplying a `None` latency column - locally registered models carry no cost or latency data. The per-category score files are written before that step, so the fix is parsing those instead of the aggregate CSV.
+
+The call to stop here: the open model decisions were already answered by the other suites, and the gumshoe suite measures tool-use protocol validity - closer to how these models are actually driven than BFCL's AST matching. The fixes are committed, so the door stays open.
+
+## Reproducing
+
+Everything lives in the llm-compose repo (public). `llmc bench perf|tasks|gumshoe --presets ...` for the fast suites; `llmc bench eval --presets ... --humaneval` for evalplus. The full harness writeup, including the dual-venv Dockerfile layout and the sitecustomize shim, is in `docs/reference/eval-harness.md`; the decision record is `docs/plans/2026-08-16-p3-matrix-results.md`.
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| Perf numbers (all presets) | measured | `llmc bench perf`, runs 20260816-091630 / 20260817-033645 |
+| Task-suite matrix | measured | 6 tasks x 3 runs x 3 presets, sensor exit codes |
+| HumanEval pass@1 | measured | evalplus greedy, 164 problems per preset, xhigh effort |
+| Gumshoe rates | measured | 18 cases x 3 repeats per preset |
+| MTP deltas and fit | measured | perf A/B + ctx-ceiling probe + 4/4 guard tasks |
+| HumanEval below model-card values | asserted | consistent with greedy-through-proxy config; not re-derived per model |
+| reasoning_effort levels and token swing | community-reported | Qwen/Unsloth discussion and r/LocalLLaMA, 2026-08; not re-measured |
+| Verbatim re-read behavior | community-reported | same; not observed systematically here |
+| BFCL landmines 1-5 | measured | each reproduced and fixed in the image, fixes re-verified in-container |
+| BFCL landmine 6 | measured | crash reproduced twice; fix designed, not implemented |
+
+[^evalplus]: EvalPlus, "EvalPlus: rigorous evaluation of LLM-synthesized code," GitHub. https://github.com/evalplus/evalplus
+[^bfcl]: Shishir Patil et al., "The Berkeley Function Calling Leaderboard (BFCL)," GitHub. https://github.com/ShishirPatil/gorilla
+[^llamacpp]: ggml-org, "llama.cpp," GitHub. https://github.com/ggml-org/llama.cpp
+[^pytreesitter]: tree-sitter, "py-tree-sitter," GitHub. https://github.com/tree-sitter/py-tree-sitter
+[^qwen38-effort]: Unsloth, "Why the reasoning so much?" (Qwen3.8-27B-GGUF discussion 20), Hugging Face. https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/discussions/20
