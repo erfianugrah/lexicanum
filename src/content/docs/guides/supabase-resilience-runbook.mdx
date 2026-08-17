@@ -103,6 +103,17 @@ curl -s -w '\n%{http_code}' \
 | 520/521/522 from CF front | gateway path | retry with backoff; cache serves reads |
 | 402 | billing restriction (Fair Use Policy: quota, spend cap, overdue invoice) | fix billing - card, cap toggle, or usage - not the platform; details in [the DR tiers reference](/reference/supabase-dr-tiers/) |
 
+**The non-engineering half of detection.** Subscribe to
+[status.supabase.com](https://status.supabase.com/) so a platform
+incident reaches you before your probes finish arguing about it. Know
+what your plan buys on the support path: Pro gets access to the support
+team; Team and Enterprise carry support SLAs (Urgent: 24h on Team, 1h
+24/7 on Enterprise - the full severity table is on the SLA page). And
+on Team or Enterprise, give support at least 2 weeks' notice before a
+launch or heavy load event via the support form - the documented
+channel for getting eyes on your project during the window you are most
+likely to need them.
+
 ## Part 2: Exposure reduction - the jwt_exp lever
 
 A JWT-skew incident only rejects tokens minted during the skew window.
@@ -139,10 +150,18 @@ Trade-off: longer-lived tokens are longer-lived if leaked. 12h is a
 reasonable incident posture for apps whose enterprise clients already hold
 day-long sessions.
 
-## Part 3: Read survival - the cache-first edge Worker
+## Part 3: Read survival - the edge Worker cache
 
-A cache-first Worker makes an origin outage invisible for warm reads.
-Measured: 200 with a byte-identical body while the origin was hard-down.
+An edge Worker with a cache makes an origin outage invisible for warm
+reads. Measured: 200 with a byte-identical body while the origin was
+hard-down. There are two postures and the choice matters: ORIGIN-FIRST
+(fetch the origin, serve cache only on failure) keeps reads fresh and
+still absorbs the outage - the right default for a Data API serving live
+rows. CACHE-FIRST (hit short-circuits before the origin) serves stale
+reads for up to max-age in NORMAL operation - right only for
+mostly-static paths. The example below is origin-first; the lab's drill
+worker is the cache-first posture, because its job is outage survival,
+not freshness.
 
 ```ts
 export default {
@@ -152,17 +171,18 @@ export default {
 
     const cache = caches.default;
     const key = new Request(url.toString(), { headers: req.headers });
-    const hit = await cache.match(key);
-    if (hit) return hit;
 
     // PostgREST treats unknown query params as column filters and 400s.
     // Strip probe-only params (this example: anything starting with "_")
-    // from the origin URL; keep the full URL only in the cache key above.
+    // from the origin URL; keep the full URL only in the cache key.
     const originUrl = new URL(url);
     for (const k of [...originUrl.searchParams.keys()]) {
       if (k.startsWith("_")) originUrl.searchParams.delete(k);
     }
 
+    // Origin-first: fresh reads in normal operation, cache as the outage
+    // fallback. (For a mostly-static path, check cache.match(key) first
+    // and short-circuit on a hit - that is the cache-first posture.)
     let origin: Response;
     try {
       origin = await fetch(new Request(env.UPSTREAM + originUrl.pathname + originUrl.search, req));
@@ -170,6 +190,9 @@ export default {
       const stale = await cache.match(key);
       return stale ?? new Response('{"error":"origin unreachable"}', { status: 503 });
     }
+    // CF Workers wraps TCP failures to unroutable origins as a 403
+    // RESPONSE, not a throw - include 403 here if an unroutable origin
+    // is your failure mode (it is the drill's).
     if (origin.status >= 500) {
       const stale = await cache.match(key);
       if (stale) return stale;
@@ -187,6 +210,11 @@ export default {
   },
 };
 ```
+
+A third option is stale-while-revalidate (serve the hit, refresh in the
+background) when you want both freshness and latency. Whichever posture:
+neither invalidates on write - if clients write through the same Worker,
+delete the cache key on mutations.
 
 Deploy with wrangler (`wrangler deploy`); set `UPSTREAM` to
 `https://<ref>.supabase.co`. Scope the cache to read-only paths you mean to
@@ -210,15 +238,12 @@ expired window). Full code:
 the drill that drives it end to end:
 [w24-edge-failover-proxy.ts](https://github.com/erfianugrah/supabase-lab/blob/main/experiments/edge-resilience/tests/w24-edge-failover-proxy.ts).
 
-<Aside type="caution" title="Cache-first means stale reads in NORMAL operation">
-A cache-first Worker with a 24h max-age never consults the origin for a
-warm URL for up to a day - the right trade for mostly-static read paths
-and pure outage survival, the wrong one for a Data API serving live
-rows. For live rows, flip the order: fetch the origin first, serve the
-cache only when the origin fails (origin-first with cache fallback) -
-you keep fresh reads and still absorb the outage, losing only the
-cold-cache case. Neither variant invalidates on write: if clients write
-through the same Worker, delete the cache key on mutations.
+<Aside type="caution" title="Cache-first masks more than failover">
+The W24 drill measured cache-first masking failover (a HIT carries no
+origin information). The same shape masks FRESHNESS on the happy path:
+a cache-first proxy serves up to max-age-old reads in normal operation,
+and that one bites outside a drill. Origin-first loses only the
+cold-cache case, which cache-first loses anyway.
 </Aside>
 
 ## Part 4: Full HA - warm standby with session-portable cutover
