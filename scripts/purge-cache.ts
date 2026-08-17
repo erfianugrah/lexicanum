@@ -40,12 +40,18 @@ const api = async (path: string, init?: RequestInit) => {
   return body.result;
 };
 
-const zones = (await api(`/zones?name=${ZONE_NAME}`)) as { id: string }[];
-const zoneId = zones[0]?.id;
-if (!zoneId) throw new Error(`purge-cache: zone ${ZONE_NAME} not visible to these credentials`);
+try {
+  const zones = (await api(`/zones?name=${ZONE_NAME}`)) as { id: string }[];
+  const zoneId = zones[0]?.id;
+  if (!zoneId) throw new Error(`zone ${ZONE_NAME} not visible to these credentials`);
 
-await api(`/zones/${zoneId}/purge_cache`, {
-  method: "POST",
-  body: JSON.stringify({ purge_everything: true }),
-});
-console.log(`purge-cache: purged zone ${ZONE_NAME} (${zoneId})`);
+  await api(`/zones/${zoneId}/purge_cache`, {
+    method: "POST",
+    body: JSON.stringify({ purge_everything: true }),
+  });
+  console.log(`purge-cache: purged zone ${ZONE_NAME} (${zoneId})`);
+} catch (e) {
+  // A failed purge (e.g. the deploy token lacks Zone:Cache Purge) must not
+  // fail the deploy - the site is already live; the cache ages out on its own.
+  console.warn(`purge-cache: ${e instanceof Error ? e.message : e} - continuing without purge`);
+}
