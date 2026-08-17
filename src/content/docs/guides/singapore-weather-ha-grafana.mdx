@@ -1,0 +1,328 @@
+---
+title: "Singapore weather alerts and live maps with Home Assistant and Grafana"
+description: Pull NEA's keyless data.gov.sg feeds (2-hr forecast, rainfall, lightning, PM2.5) into Home Assistant REST sensors, derive a home-area view, fire companion-app alerts, and plot live lightning strikes and rainfall stations on Grafana geomaps - including the two Infinity plugin defects you will hit on the way.
+author: Erfi Anugrah
+category: homelab
+---
+
+A guide to local-first weather awareness for a Singapore home: NEA's real-time feeds into Home Assistant, alerts on the phone for rain and nearby lightning, and a Grafana dashboard with time series plus live maps. Everything here is keyless - no data.gov.sg account, no API key, no cloud dependency beyond the public feeds themselves.
+
+Prerequisites: Home Assistant (2025.x or newer) with the companion app on a phone for alerts, and - only for the maps - a Grafana 13 instance with Prometheus already scraping Home Assistant. The alert half stands alone without Grafana.
+
+The network design this lands on is the same one as [Home IoT: an ESPHome fleet on a Flint-bridged VLAN](/reference/home-iot-network/), and the air-quality side of the same setup is in [AirGradient ONE on ESPHome, fully local](/guides/airgradient-one-esphome-local/) - the outdoor PM2.5 comparison there is what this guide generalizes.
+
+## Constants
+
+The fixed facts every later step depends on:
+
+| Fact | Value | Why |
+|---|---|---|
+| API base | `https://api-open.data.gov.sg/v2/real-time/api/` | keyless, no auth header |
+| Forecast endpoint | `two-hr-forecast` | per-area, ~30 min refresh upstream |
+| Rainfall endpoint | `rainfall` | per-station mm, 5 min cadence[^dgs-rainfall] |
+| Lightning endpoint | `weather?api=lightning` | NOT `/lightning` (that path 403s); 2 min cadence[^dgs-lightning] |
+| UV index | v1 only: `https://api.data.gov.sg/v1/environment/uv-index` | no v2 path exists |
+| Home coordinates | from `zone.home` in HA | no hardcoded lat/lon in config |
+| Nearest forecast area | Jurong West | computed from `zone.home` vs `area_metadata` - yours will differ |
+| Nearest rain station | S44 (Nanyang Avenue, ~1 km) | computed from `zone.home` vs `stations` - yours will differ |
+| Distance constant | 111.32 km/deg, both axes | at lat 1.34 the equirectangular cos term is 0.9997, error under 0.1% |
+| Rate limit | per source IP, keyless | ALL home egress shares one WAN IP - every poller shares one bucket |
+
+## Architecture
+
+Two data paths, kept separate on purpose. The alert path lives entirely in Home Assistant. The map path cannot: point geometries (strike coordinates, station locations) are not time series, so they never touch Prometheus - Grafana queries the API directly at panel-render time via the Infinity datasource plugin.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  nea [label="data.gov.sg\n(NEA feeds)"];
+  ha [label="Home Assistant\nREST + template sensors"];
+  app [label="Companion app\n(alerts)"];
+  prom [label="Prometheus"];
+  graf [label="Grafana"];
+  inf [label="Infinity\ndatasource"];
+
+  nea -> ha [label="REST poll"];
+  ha -> app [label="automations"];
+  ha -> prom [label="/api/prometheus"];
+  prom -> graf [label="time series"];
+  nea -> inf [label="direct, per refresh"];
+  inf -> graf [label="geomaps"];
+}
+```
+
+## Part 1: Pull the feeds into Home Assistant
+
+Four `rest` resources. Poll cadences are chosen to sit well under the shared rate limit - the 120 s lightning poll matches the Lightning Detection System's own 2-minute update cadence[^dgs-lightning], so polling faster only burns quota.
+
+```yaml
+rest:
+  - resource: https://api-open.data.gov.sg/v2/real-time/api/two-hr-forecast
+    scan_interval: 900
+    sensor:
+      - name: NEA forecast 2hr
+        unique_id: nea_forecast_2hr
+        value_template: "{{ value_json.data['items'][0].timestamp }}"
+        json_attributes_path: "$.data.items[0]"
+        json_attributes: ["forecasts", "valid_period"]
+
+  - resource: https://api-open.data.gov.sg/v2/real-time/api/rainfall
+    scan_interval: 300
+    sensor:
+      - name: NEA rainfall
+        unique_id: nea_rainfall
+        value_template: "{{ value_json.data.readings[0].timestamp }}"
+        json_attributes_path: "$.data.readings[0]"
+        json_attributes: ["data"]
+
+  - resource: "https://api-open.data.gov.sg/v2/real-time/api/weather?api=lightning"
+    scan_interval: 120
+    sensor:
+      - name: NEA lightning ground strikes within 5km
+        unique_id: nea_lightning_ground_within_5km
+        unit_of_measurement: strikes
+        state_class: measurement
+        value_template: >
+          {% set ns = namespace(n=0) %}
+          {% set hlat = state_attr('zone.home', 'latitude') | float(0) %}
+          {% set hlon = state_attr('zone.home', 'longitude') | float(0) %}
+          {% for rec in value_json.data.records %}
+            {% for r in rec.item.readings %}
+              {% if r.type == 'G' %}
+                {% set dlat = r.location.latitude | float - hlat %}
+                {% set dlon = r.location.longitude | float - hlon %}
+                {% if (dlat * dlat + dlon * dlon) * 12392.1 <= 25 %}
+                  {% set ns.n = ns.n + 1 %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+          {% endfor %}
+          {{ ns.n }}
+      - name: NEA lightning nearest ground strike
+        unique_id: nea_lightning_nearest_ground_km
+        unit_of_measurement: km
+        device_class: distance
+        state_class: measurement
+        value_template: >
+          {% set ns = namespace(min=999999.0) %}
+          {% set hlat = state_attr('zone.home', 'latitude') | float(0) %}
+          {% set hlon = state_attr('zone.home', 'longitude') | float(0) %}
+          {% for rec in value_json.data.records %}
+            {% for r in rec.item.readings %}
+              {% if r.type == 'G' %}
+                {% set dlat = r.location.latitude | float - hlat %}
+                {% set dlon = r.location.longitude | float - hlon %}
+                {% set d2 = (dlat * dlat + dlon * dlon) * 12392.1 %}
+                {% if d2 < ns.min %}{% set ns.min = d2 %}{% endif %}
+              {% endif %}
+            {% endfor %}
+          {% endfor %}
+          {{ (ns.min | sqrt) | round(1) if ns.min < 999999 else 'unknown' }}
+```
+
+Three design decisions in that block, each load-bearing:
+
+- **Lightning is reduced in the REST template, not carried as attributes.** An active storm returns thousands of readings (one 2026-08-16 storm: 3,789 across 25 records), and Home Assistant's recorder caps state attributes at 16 KB. The count and nearest-distance are computed over `value_json` before anything becomes state.
+- **Ground strikes only (`type == 'G'`).** Cloud-to-cloud strikes (`C`) never threaten anything on the ground and outnumber ground strikes about 20:1; they are noise for alerting.
+- **The distance math is equirectangular with a shared constant.** 111.32 km/deg on both axes; the threshold check compares squared distance against 25 (5 km squared) so no `sqrt` runs per strike. Validated against an independent jq haversine over a real captured payload - 20.92 km vs 20.91 km, the difference being the rounding in the constant.
+
+The `value_json.data['items']` bracket syntax in the forecast sensor is deliberate: in Jinja, `.items` resolves to the dict *method*, not the key, so dot access renders `unknown` while the attributes still populate. `data` is not a dict method, so `value_json.data.records` is safe.
+
+## Part 2: Derive the home view
+
+Template sensors split the home-area slice out of the raw resources. The forecast area and station id were picked once by computing nearest-to-`zone.home` over the API's own metadata (the exact commands are in Verification).
+
+```yaml
+template:
+  - sensor:
+      - name: NEA forecast home 2hr
+        unique_id: nea_forecast_home_2hr
+        state: >
+          {{ state_attr('sensor.nea_forecast_2hr', 'forecasts')
+             | selectattr('area', 'eq', 'Jurong West')
+             | map(attribute='forecast') | list | first | default('unknown') }}
+        availability: "{{ state_attr('sensor.nea_forecast_2hr', 'forecasts') is not none }}"
+      - name: NEA rainfall home
+        unique_id: nea_rainfall_home
+        unit_of_measurement: mm
+        state_class: measurement
+        state: >
+          {{ state_attr('sensor.nea_rainfall', 'data')
+             | selectattr('stationId', 'eq', 'S44')
+             | map(attribute='value') | list | first | default(0) | float(0) }}
+        availability: "{{ state_attr('sensor.nea_rainfall', 'data') is not none }}"
+  - binary_sensor:
+      - name: Rain expected home
+        unique_id: rain_expected_home
+        state: >
+          {% set f = states('sensor.nea_forecast_home_2hr') | lower %}
+          {{ 'rain' in f or 'shower' in f or 'thundery' in f }}
+        availability: "{{ states('sensor.nea_forecast_home_2hr') not in ['unknown', 'unavailable'] }}"
+```
+
+The binary sensor's substring set (`rain`, `shower`, `thundery`) covers the NEA forecast vocabulary - Light Rain, Passing Showers, Thundery Showers - without a regex dependency.
+
+## Part 3: Alerts
+
+Alert/clear pairs share a notification `tag` so the clear replaces the alert on the phone instead of stacking. Declared as YAML automations; UI-built automations keep working alongside.
+
+```yaml
+- alias: "Weather: rain expected"
+  id: weather_rain_expected
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.rain_expected_home
+      to: "on"
+  action:
+    - action: notify.mobile_app_<your_phone>
+      data:
+        title: "Rain expected"
+        message: >
+          Jurong West 2-hr forecast: {{ states('sensor.nea_forecast_home_2hr') }}.
+          Rainfall at nearest station (S44) now: {{ states('sensor.nea_rainfall_home') }} mm
+        data:
+          tag: weather-rain
+
+- alias: "Weather: lightning nearby"
+  id: weather_lightning_nearby
+  mode: single
+  trigger:
+    - platform: numeric_state
+      entity_id: sensor.nea_lightning_ground_strikes_within_5km
+      above: 0
+  action:
+    - action: notify.mobile_app_<your_phone>
+      data:
+        title: "Lightning nearby"
+        message: >
+          {{ states('sensor.nea_lightning_ground_strikes_within_5km') }} ground
+          strikes within 5 km, nearest
+          {{ states('sensor.nea_lightning_nearest_ground_strike') }} km
+        data:
+          tag: weather-lightning
+```
+
+The two clear automations mirror these: rain fires on the binary sensor going `off`, lightning clear fires on the count staying below 1 for 15 minutes. Strikes are transient, so the alert itself takes no `for:` duration - one would mean it never fires.
+
+## Part 4: Grafana time series and live maps
+
+### Time series: nothing new to configure
+
+If Prometheus already scrapes Home Assistant's `/api/prometheus` endpoint, the new sensors flow in automatically. HA's Prometheus exporter names metrics from the unit[^ha-prometheus]: rainfall lands as `<namespace>_sensor_unit_mm`, the strike count as `<namespace>_sensor_unit_strikes`, nearest distance as `<namespace>_sensor_unit_km`. The non-numeric sensors (forecast text, `binary_sensor`) are skipped by the exporter - expected, since they are alert inputs rather than series.
+
+### Maps: the Infinity datasource
+
+Point geometries need a query-time JSON source, which is the Infinity plugin's job[^infinity]. Install it on Grafana 13 with `GF_PLUGINS_PREINSTALL_SYNC=yesoreyeram-infinity-datasource` (the older `GF_INSTALL_PLUGINS` is deprecated), then provision a datasource with the API hosts pinned:
+
+```yaml
+apiVersion: 1
+datasources:
+  - name: Infinity
+    uid: infinity
+    type: yesoreyeram-infinity-datasource
+    access: proxy
+    jsonData:
+      allowedHosts:
+        - https://api-open.data.gov.sg
+        - https://api.data.gov.sg
+```
+
+The lightning geomap's query target, carrying the two fixes this guide exists partly to document:
+
+```json
+{
+  "type": "json",
+  "source": "url",
+  "url": "https://api-open.data.gov.sg/v2/real-time/api/weather?api=lightning",
+  "url_options": { "method": "GET", "headers": [ { "key": "Accept", "value": "*/*" } ] },
+  "parser": "frontend",
+  "format": "table",
+  "root_selector": "$.data.records[*].item.readings[*]",
+  "columns": [
+    { "selector": "location.latitude", "text": "latitude", "type": "number" },
+    { "selector": "location.longitude", "text": "longitude", "type": "number" },
+    { "selector": "type", "text": "type", "type": "string" },
+    { "selector": "datetime", "text": "time", "type": "timestamp" }
+  ]
+}
+```
+
+The geomap panel consumes it with a markers layer, `location.mode: coords` pointing at the latitude/longitude fields, and a value mapping on `type` (G red, C yellow). The rainfall map joins the stations list against the latest readings on `id` with a `joinByField` transformation and sizes/colors markers by mm. Two cheap wins: inline the 77-station list as a static `inline` query (metadata that changes rarely - zero API calls per refresh), and set the dashboard refresh to 5 minutes, because every URL target fires its API request once per panel refresh against the shared per-IP rate limit.
+
+## Verification
+
+Every claim in this guide was checked against a live system before it was written down.
+
+**Template features exist on your HA.** Render `sqrt` through the template API before writing config that depends on it:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"template":"{{ 25 | sqrt }}"}' http://<ha-host>:8123/api/template
+# -> 5.0
+```
+
+**Nearest area and station, computed not guessed.** Emit the API metadata as TSV and let awk do both the distance and the name handling - a `while read name lat lon` loop splits multi-word names ("Jurong West" becomes name=Jurong, lat=West) and silently mis-ranks. That bug mis-picked Pioneer (0.0009 deg^2 away) over Jurong West (0.0003) on the first pass of this very setup:
+
+```bash
+curl -s "https://api-open.data.gov.sg/v2/real-time/api/two-hr-forecast" \
+  | jq -r '.data.area_metadata[] | [.name, .label_location.latitude, .label_location.longitude] | @tsv' \
+  | awk -F'\t' -v ha=<home-lat> -v ho=<home-lon> \
+    '{printf "%.6f %s\n", ($2-ha)^2+($3-ho)^2, $1}' | sort -n | head -3
+
+curl -s "https://api-open.data.gov.sg/v2/real-time/api/rainfall" \
+  | jq -r '.data.stations[] | [.id, .location.latitude, .location.longitude] | @tsv' \
+  | awk -F'\t' -v ha=<home-lat> -v ho=<home-lon> \
+    '{printf "%.6f %s\n", ($2-ha)^2+($3-ho)^2, $1}' | sort -n | head -3
+```
+
+Then confirm the winning station actually reports readings - a few station ids exist in metadata but not in every readings payload:
+
+```bash
+curl -s "https://api-open.data.gov.sg/v2/real-time/api/rainfall" \
+  | jq -r '.data.readings[0].data[] | select(.stationId=="S44") | "\(.stationId) = \(.value)"'
+```
+
+**Entities after deploy.** Read every one back through the API. Expected quiet-weather states: forecast text populated, rainfall `0.0`, strikes `0`, nearest strike `unavailable` (it has no value until a real ground strike), all four automations `on`.
+
+**Distance math against ground truth.** Capture an active storm's payload (`?date=YYYY-MM-DDTHH:MM:00` returns all records for the day), compute nearest distance with jq independently, and compare against the template logic - this guide's numbers: 20.91 km (jq haversine) vs 20.92 km (template equirectangular).
+
+**The maps.** Grafana's `/api/ds/query` endpoint replays any Infinity query without opening the dashboard - it is how the two defects below were isolated.
+
+What remains untested by construction: the alert notifications only fire on real weather, and the nearest-strike sensor only populates on a real ground strike within 5 km. The message templates follow a pattern already proven on the same phone, but the first thunderstorm is the real acceptance test.
+
+## Gotchas and lessons learned
+
+**Infinity v4.0.0's default Accept header gets a 502 from Cloudflare.** The plugin sends `Accept: application/json;q=0.9,text/plain`, and Cloudflare in front of api-open.data.gov.sg answers that specific header with `502 Bad Gateway` - while curl, wget, and a plain Go client from the same network namespace all get 200. Proven with a static Go probe inside the Grafana container's network namespace (plain GET 200, GET with that header 502, `server: cloudflare`) plus a request-echo container capturing the plugin's exact outgoing headers. The `url_options.headers` override replaces the default rather than appending. Note the failure shape: every other client works, so it looks like a network problem for hours.
+
+**The backend parser hard-errors on an empty result.** With `parser: backend`, a selector that matches nothing (no lightning in quiet weather) surfaces `error evaluating JSONata expression: no results found` as a panel error - the v4.0.0 source has no swallow-empty option on that path. `parser: frontend` (browser-side) treats empty as no data. Any query that is legitimately empty sometimes must use `frontend`; queries that always have rows can stay on `backend`.
+
+**The keyless rate limit is per source IP, and a home shares one.** Every poller behind the same NAT - HA's REST sensors, Grafana's Infinity panels, ad-hoc curl probes - draws from one bucket. Empirically about six rapid requests trips a 429. Steady state after the cadences above is roughly 1.5 requests/minute with the dashboard open, which is comfortable. If you ever need headroom, a data.gov.sg account gets higher limits.
+
+**`.items` is a dict method in Jinja.** Dot access on a key named `items` resolves to the method, not the key - the sensor renders `unknown` while its attributes populate correctly, which is a confusing split. Use bracket syntax for that key: `value_json.data['items']`.
+
+**Endpoint paths are not guessable.** Lightning lives at `/v2/real-time/api/weather?api=lightning`, not `/lightning`. UV index exists only on the v1 host. The dataset page on data.gov.sg is the authority - the API spec link on each page names the real path.
+
+**Verify nearest-neighbor picks over TSV, not whitespace-split reads.** The `read name lat lon` failure mode from Verification applies anywhere names contain spaces, and it fails *silently* - the garbage rows compute a huge distance and sink to the bottom of the sort, so the top row looks plausible while being wrong. Compute the distance in the same awk that prints the name.
+
+**Stations and areas have no friendly names worth displaying.** Rainfall stations are bare ids (`S44`); forecast areas are the only human-readable geography. Pick your nearest once, write the id into config with a comment, and move on.
+
+## File reference
+
+| Piece | Where | What |
+|---|---|---|
+| REST resources | `configuration.yaml` -> `rest:` | the four API pollers |
+| Home-view sensors | `configuration.yaml` -> `template:` | forecast/rainfall home, rain binary sensor |
+| Automations | YAML automations (or the UI) | rain + lightning alert/clear pairs |
+| Infinity install | Grafana env | `GF_PLUGINS_PREINSTALL_SYNC` |
+| Datasource | `provisioning/datasources/infinity.yaml` | uid `infinity`, pinned allowedHosts |
+| Dashboard | provisioned dashboard JSON | stats, time series, two geomaps |
+
+[^dgs-lightning]: NEA, "Lightning Observation," data.gov.sg. https://data.gov.sg/datasets/d_08238953fe0f6dd13f10714ebfbcb9f9/view
+[^dgs-rainfall]: NEA, "Rainfall across Singapore," data.gov.sg. https://data.gov.sg/datasets/d_6580738cdd7db79374ed3152159fbd69/view
+[^ha-prometheus]: Home Assistant, "Prometheus," Home Assistant Integrations. https://www.home-assistant.io/integrations/prometheus/
+[^infinity]: Yesoreyeram, "Grafana Infinity data source plugin," GitHub. https://github.com/yesoreyeram/grafana-infinity-datasource
