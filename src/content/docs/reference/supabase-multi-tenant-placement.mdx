@@ -362,6 +362,16 @@ on always-warm responsiveness, and loses on isolation strength and per-tenant
 portability - which is exactly why you keep **Tier D** for tenants that have
 earned (and are paying for) those properties.
 
+The SfP column is the only one with scale-to-zero, and it is Nano-only:
+measured 2026-08-17 on a normal paid org, Nano is rejected at project
+creation (`400 Minimum instance size on paid plans is Micro`), at the addon
+mutation (`400 addon_variant: Invalid input`), and is absent from the
+project's `available_addons` entitlement list entirely - the paid-org floor
+really is Micro, always-on. One more edge: a project created while an org
+was on the free plan keeps its paused state after the upgrade, but once
+restored it cannot be re-paused (`400 Project is not free-tier`) - pause
+eligibility follows the org's current plan, not the project's lineage.
+
 ## What you are trading away
 
 :::caution[Honest trade-offs]
@@ -381,6 +391,81 @@ earned (and are paying for) those properties.
 - **Per-tenant operations are harder.** "Export just this tenant" or "restore
   just this tenant" are filtered dumps, not a whole-project backup.
 :::
+
+## Two ways to give your users a backend
+
+If your product gives its users a backend (an AI app builder, a white-label
+SaaS), there are two integration shapes, and they differ on who owns the
+Supabase organization and the billing relationship.
+
+**Path A - you provision on their behalf.** Your platform owns a Supabase
+organization and stamps out one project per tenant through the Management
+API. Users never see Supabase. This is the shape the rest of this doc is
+about (and what SfP formalizes, with scale-to-zero economics behind a
+contract). The embedded dashboard (Platform Kit) works here because it
+needs a Management API token server-side - which you have, because the
+projects are yours.[^platform-kit]
+
+**Path B - bring your own backend.** Your user connects THEIR OWN Supabase
+organization to your app via the Management API OAuth2 flow: register an
+OAuth app, the user approves, you get an access/refresh token pair that
+acts on their orgs and projects, and they keep the direct billing
+relationship with Supabase.[^oauth-integration] The management surface is
+the same API; the credential is scoped to what the user approved. Platform
+Kit does not apply - it wants a PAT, and the user's PAT is not yours to
+hold.
+
+Measured on the OAuth surface (2026-08-17, normal paid org):
+
+- an unknown `client_id` at `/v1/oauth/authorize` answers
+  `422 {"message":"Unrecognized client_id"}` - client validation fires
+  before session validation, so there is no redirect to probe until a real
+  client_id exists.
+- `POST /v1/oauth/authorize/project-claim` - the claim flow that hands a
+  platform-provisioned project to the end user's own org - answers
+  `404 {"message":"Cannot POST /v1/oauth/authorize/project-claim"}`: the
+  route does not exist for a normal org's credential class, it is not
+  merely forbidden.
+- the `jwt-bearer` token grant validates parameters before any gating
+  (`422 Required parameter: client_id`).
+
+Pick Path A when your users are less technical and you want the billing
+relationship (and its margin) - the white-label row in the table above.
+Pick Path B when your users already have Supabase projects and want to keep
+them, at the cost of a narrower integration and no embedded kit. Offering
+both is legitimate; the claim flow is the contract-gated bridge from A to B
+when a tenant outgrows you. Any revenue share on usage is a commercial
+conversation with Supabase, not an API.
+
+## Metering per-tenant usage
+
+"White-label / own billing: yours to build" has a metering half: how do you
+know what one tenant consumed? There is no org-scoped billing read on the
+Management API, so you build it from three signals, all measured on
+2026-08-17/18:
+
+- **Ground truth, exact.** Ask the tenant project directly:
+  `pg_database_size()` over `POST /v1/projects/{ref}/database/query`, and
+  the Storage object listing for bucket bytes - the listing matched an
+  uploaded 262144-byte object to the byte. One trap: `pg_database_size`
+  deltas compress - a `repeat()`-generated 8 MB payload moved the size by
+  ~180 KB because TOAST eats compressible text. Size storage tests with
+  random payloads.
+- **Request volumes, exact at minute-scale lag.** The per-project
+  `usage.api-counts` analytics endpoint returned 13 for exactly 13 REST
+  requests sent, visible after 61 s. Good enough for billing rollups, not
+  for real-time enforcement.
+- **Observability metrics.** The per-project Prometheus endpoint answers a
+  plain PAT with 300+ metric families - observability-grade, not
+  billing-grade.
+
+If you meter at your own gateway instead, the numbers are exact and
+real-time for anything that transits it - and the credentials stop being
+the weak point: measured end-to-end, a credential-proxy gateway (the PAT
+stored server-side, scoped keys minted per tenant) served a project's
+metrics to a key allowed `metrics:read` on exactly that project (200, 278
+families) while the same key got 403 on an unclassified path and on any
+other project, with every proxied call in an audit feed within ~1 s.
 
 ## Decision
 
@@ -477,17 +562,25 @@ tested the same way.
 | Create -> healthy, and healthy is not writable | **Measured 2026-08-04, n=5** (supersedes a single 138 s run). Create -> `ACTIVE_HEALTHY` 131-159 s, median 131; delete ~2 s; all 5 projects then refused their first `admin/users` write with `500 unexpected_failure` and accepted the second, one poll tick later |
 | Hub key rotation is survivable | **Refuted 2026-08-03.** A trusting project accepted no new-key token within 20 minutes and honoured a `revoked` key for 15. Re-creating the integration does not help - the issuer's own JWKS lags as well. Rotation is a maintenance window, which is a design input for choosing this pattern at all. **Re-measured 2026-08-04** with both key sets re-read at every probe: the issuer published the new key in about 7 minutes while the trusting project never re-resolved at all in 37, so the window is the consumer's cache rather than the issuer's publication - which is also why re-creating the integration cannot fix it |
 | A promoted tenant can be made independent | **Measured 2026-08-03.** Copying one `auth.users` row gives the dedicated project its own issuance; adding identities, sessions and refresh_tokens with a sequence resync ports the live session, so promotion costs zero re-logins. Unsupported (writes into the `auth` schema) but tested |
-| A promoted tenant is independent *by default* | **Refuted 2026-08-03.** The dedicated project verifies the hub's tokens but cannot mint them - refresh returns `400 refresh_token_not_found`, and after deleting the hub its already-issued tokens kept working while nothing new could be issued. The hub is on the availability critical path; blast radius is one token lifetime (3600 s default) |
+| A promoted tenant is independent *by default* | **Refuted 2026-08-03.** The dedicated project verifies the hub's tokens but cannot mint them - refresh returns `400 refresh_token_not_found`, and after deleting the hub its already-issued tokens kept working while nothing new could be issued. The hub is on the availability critical path; blast radius is one token lifetime (3600 s default). **Re-measured 2026-08-18** with a reproducible module: a hub-minted refresh token presented to the trusting project answers `{"code":400,"error_code":"refresh_token_not_found","msg":"Invalid Refresh Token: Refresh Token Not Found"}` while the same token kind succeeds at the issuer |
 | A tenant cannot forge its `tenant_id` (`app_metadata` admin-only) | Proof 3 - live project, 3/3 attacks fail; re-measured 2026-08-03 on two fresh projects - `PUT /auth/v1/user` returns `403 Updating app_metadata requires admin privileges`, signup silently drops the field, and an admin write moves the boundary as a positive control |
 | Third-party auth: any JWKS issuer + `role` claim works | Measured 2026-08-03 - `oidc_issuer_url` and `jwks_url` both resolve on the create response, `custom_jwks` never resolves, and one project's token is accepted by another only while the integration exists |
 | SfP is gated, Nano-only scale-to-zero | [supabase-for-platforms](https://supabase.com/docs/guides/integrations/supabase-for-platforms) |
+| Nano unreachable on a normal paid org | **Measured 2026-08-17.** Create with `desired_instance_size: "nano"` -> `400 Minimum instance size on paid plans is Micro`; `ci_nano` addon PATCH -> `400 addon_variant: Invalid input`; `ci_nano` absent from `available_addons` entirely |
+| Legacy free-era project: one-way pause door | **Measured 2026-08-18.** A project created under the free plan keeps its paused state after the org upgrade; restore accepted (wake beyond a 20-min bound, healthy later); `POST /pause` after the wake -> `400 Project is not free-tier. Please downgrade it to free-tier first and try again.` |
+| Smart region selection on a normal paid org | **Measured 2026-08-17.** `region_selection: {type: "smartGroup", code: "apac"}` accepted (201), the platform picked `ap-northeast-2`, healthy in 135 s - deferred city placement is not SfP-gated |
+| Management API rate-limit surface | **Measured 2026-08-17.** `x-ratelimit-limit/remaining/reset` on every response; limit 120 with a 1:1 decrement on a scoped read; a burst trips JSON `429 {"message":"ThrottlerException: Too Many Requests"}` with `retry-after: 60` and recovers after the window |
+| OAuth authorize surface (Path B) | **Measured 2026-08-17.** Bogus `client_id` -> `422 Unrecognized client_id` (client validation before session validation); project-claim -> 404 for a normal org's credential class; `jwt-bearer` grant validates params before gating |
+| DIY per-tenant usage metering | **Measured 2026-08-17/18.** Storage listing exact to the byte; `usage.api-counts` exact (13/13) at 61 s lag; Prometheus endpoint 326+ families via PAT; scoped-key gateway scrape 200 with 278 families, 403 deny-by-default on unclassified path and other refs, audit feed ~1 s |
 
 _All live measurements were taken on throwaway projects, created and deleted for
-the run that produced them. They span three dates rather than one: the cost
+the run that produced them. They span five dates rather than one: the cost
 figures and Proofs 1-3 are from 2026-07-09 (Postgres 17.6), the trust,
-promotion and rotation results from 2026-08-03, and the discovery, ref-hiding,
-MFA, retirement and provisioning results from 2026-08-04 - the last two dates in
-`ap-southeast-1` on Micro compute. The `for all` policy behaviour noted above was
+promotion and rotation results from 2026-08-03, the discovery, ref-hiding,
+MFA, retirement and provisioning results from 2026-08-04, and the Nano,
+legacy-pause, smart-region, rate-limit, OAuth-surface and metering results
+from 2026-08-17/18 - the last four dates in `ap-southeast-1` on Micro
+compute. The `for all` policy behaviour noted above was
 checked separately on Postgres 17.10. Where a row says documented rather than
 measured, it was read from the platform docs on the date given and not executed._
 
@@ -500,3 +593,6 @@ measured, it was read from the platform docs on the date given and not executed.
 | I already have a project per customer | [Consolidating one Supabase project per customer onto a shared project](/guides/supabase-tenant-consolidation/) |
 | A tenant converted, give it its own project | [Promoting a tenant to its own Supabase project](/guides/supabase-tenant-promotion/) |
 | I just want one bill | [Consolidating Supabase accounts into one organization](/guides/supabase-org-consolidation/) - not a tenancy move: it changes the billing and admin container and leaves the tenant-to-project mapping alone |
+
+[^platform-kit]: [Platform Kit](https://supabase.com/library/docs/platform/platform-kit) - the embeddable dashboard block; the default wiring puts a Management API personal access token server-side.
+[^oauth-integration]: [Build a Supabase OAuth integration](https://supabase.com/docs/guides/integrations/build-a-supabase-oauth-integration) - the Management API OAuth2 flow (authorize, token exchange, refresh, revoke).
