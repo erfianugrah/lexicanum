@@ -1,0 +1,181 @@
+---
+title: "Supabase Storage image transformations: billing, runtime behavior, and the abuse surface"
+description: How Supabase bills Storage image transformations - per distinct origin image per billing cycle, in 1,000-image packages past a 100-image quota - measured end to end on scratch Pro and Free orgs. Which URL surfaces actually transform, where the documented limits disagree with the runtime, how the edge cache behaves, and the denial-of-wallet surface on public buckets with ranked mitigations.
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Supabase bills Storage image transformations per **distinct origin image per billing cycle**, not per transformation and not per request.[^sb-imgt-billing] That metric has non-obvious consequences: re-rendering is free, the 101st image in a cycle costs \$5, and on a public bucket the count is influenceable by anyone who can read your HTML. This doc covers the billing mechanics, the measured runtime behavior (which disagrees with the docs in three places), the caching layer, and the abuse surface with mitigations.
+
+**Provenance.** Runtime claims below were measured 2026-08-18 in `ap-southeast-1`, in two passes: an ad-hoc ~90-request matrix against two hand-created scratch projects (one Pro-plan org, one Free-plan org; fixtures 1200x800 JPEG, 4000x3000 JPEG, 56MP JPEG, 28.8MB PNG), then a scripted battery against a third project provisioned with OpenTofu (generated PNG/GIF/BMP/SVG fixtures, including a >25MB noise PNG and a >50MP flat PNG, so the two limits are tested independently). All three projects have been deleted. Billing-mechanics claims are from the Supabase docs and cited; where the docs and the runtime disagree, both are stated and the disagreement is marked. The one thing not observable from outside is the billing counter itself - see [What was not provable](#what-was-not-provable).
+
+**TL;DR:**
+
+- The billable unit is the distinct origin image transformed in a cycle: `cost = $5 x ceil(max(0, N - 100) / 1000)`. The 101st image costs \$5; images 102-1,100 are then free.
+- Only the four `/render/image/*` surfaces transform. Params appended to `/object/public` or `/object/sign` URLs are silently ignored - you get the full original and no error.
+- The docs' dimension limit (1-2500px) is wrong at runtime: 2501 is accepted, and out-of-range requests silently clamp instead of erroring. The 25MB and 50MP source limits are enforced as documented.
+- The docs say image resizing is Pro-plan-only; a Free-plan org renders fine at runtime.
+- On a public bucket the render endpoint needs no auth. Rate limiting exists but is high: ~2% 429s at 500 parallel fresh renders, ~9% at 1,000. Every image name in your site's markup is a billable unit an attacker can activate - whether or not you use transformations yourself.
+- The only real fix is private buckets with signed render URLs. Everything else is a posture decision between bill shock (spend cap off) and transform availability (spend cap on).
+
+---
+
+## How billing works
+
+The pipeline, end to end:
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  client [label="Client\n(any HTTP)"];
+  render [label="/render/image/*\n(render endpoint)"];
+  imgproxy [label="Image renderer\n(imgproxy)"];
+  cdn [label="Smart CDN\n(Cloudflare edge)"];
+  counter [label="Origin-image counter\n(org-level, per cycle)"];
+  packages [label="Packages\nceil(overage / 1000)"];
+  invoice [label="Invoice\n$5 per package"];
+
+  client -> render [label="GET + params"];
+  render -> cdn [label="cache key:\norigin + variant"];
+  cdn -> imgproxy [label="miss only"];
+  imgproxy -> counter [label="first transform of\norigin this cycle"];
+  counter -> packages [label="past 100 quota"];
+  packages -> invoice;
+}
+```
+
+Three facts define the whole model.[^sb-imgt-billing]
+
+1. **The unit is the distinct origin image, not the transformation.** One image resized fifty ways and requested a million times in a cycle is one unit. A second image transformed once is a second unit.
+2. **The count resets every billing cycle.** The same image transformed again next month counts again. You are renting transformation rights per image per month, not buying them once.
+3. **Overage is sold in packages of 1,000 at \$5, ceiling-rounded,** past a 100-image quota on Pro and Team.[^sb-imgt-billing]
+
+| Origin images in cycle | Overage past 100 | Packages | Charge |
+|---|---|---|---|
+| 100 | 0 | 0 | \$0 |
+| 101 | 1 | 1 | \$5 |
+| 1,100 | 1,000 | 1 | \$5 |
+| 1,101 | 1,001 | 2 | \$10 |
+| 5,000 | 4,900 | 5 | \$25 |
+
+The quota (100) and the package size (1,000) do not align, so the marginal price of the 101st image is \$5 and the marginal price of every image after that, up to 1,100, is zero. Effective per-image cost across a full package is half a cent. The practical consequence: if you are going to exceed the quota at all, the cost of exceeding it by a little and by 1,000 is identical.
+
+What does not move this metric: number of variants, number of requests, cache hits or misses, egress. The only lever on the origin-image count is how many distinct files get rendered in the cycle. The docs' own "Optimize usage" section (pre-generate variants, CDN caching, Cache-Control) reduces compute and egress but does nothing for this line item - worth knowing before spending effort there.[^sb-imgt-billing]
+
+## Which URL surfaces actually transform
+
+Measured against the scratch Pro project, same source image, `width=200&height=200`:
+
+| Surface | Auth required | Transform applied? |
+|---|---|---|
+| `/render/image/public/<bucket>/<file>` | none, on a public bucket | yes |
+| `/render/image/authenticated/<bucket>/<file>` | service key or user JWT | yes |
+| `/render/image/sign/<bucket>/<file>` | signed token | yes, when the transform was embedded at sign time |
+| `/object/sign/<bucket>/<file>` + appended params | signed token | no - full original served |
+| `/object/public/<bucket>/<file>` + appended params | none | no - full original served |
+| `/render/image/public/<private-bucket>/<file>` | none | blocked, 400 |
+
+The two silent-ignore rows are the integration trap. `getPublicUrl()` without the `transform` option, or hand-appending `?width=200` to an `/object/public` or `/object/sign` URL, returns the full original with a 200 and no error - you find out from your egress bill, not from logs. supabase-js does this correctly when you use the option: `createSignedUrl(path, expiresIn, { transform })` POSTs the transform into the sign body and returns a `/render/image/sign/...` URL with the transform embedded in the token.[^sb-imgt]
+
+The billable event can only be the GET on a render surface: creating a signed URL is a server-side signing POST that moves no image bytes, and nothing renders until the URL is fetched. Whether the platform's counter increments at URL creation or at render is not observable from outside (see [What was not provable](#what-was-not-provable)); the architecture only permits the render.
+
+## Where the docs disagree with the runtime
+
+Three measured disagreements, all reproducible with one curl each.
+
+**Dimension bounds.** The docs say width and height must be integers between 1 and 2500.[^sb-imgt] At runtime, `width=2501` on a 4000x3000 source returns a 2501px render. The actual ceiling is 3000px: requests above that silently clamp to 3000, and requests above the source dimensions silently clamp to the source (no upscaling, no error). So the documented bound is wrong in both directions - too low as a limit, and wrong about erroring.
+
+**Free plan.** The docs say "Image Resizing is currently enabled for Pro Plan and above."[^sb-imgt] The scratch Free-plan org rendered a 200x200 transform with a 200 on the first request. Either the doc is stale or free-plan rendering is gated by Fair Use rather than a hard entitlement - but nothing at the render surface checks the plan. The billing page's quota table also omits the Free plan entirely.[^sb-imgt-billing]
+
+**Invalid parameters.** `width=abc` returns a 400 ("must be integer"), but `width=0` and a render with no params at all are accepted and return a processed near-identity of the source. Unknown junk parameters (`&bust=xyz`) are ignored entirely - which matters for caching, below.
+
+The two limits that are enforced exactly as documented:[^sb-imgt] a source file over 25MB returns 400 "The source image file is too large to process", and a source over 50 megapixels returns 400 "The source image resolution is too large to process". Both are render-time checks - the same files upload to Storage without complaint.
+
+## Caching behavior
+
+Renders sit behind the Smart CDN on Cloudflare's edge.[^sb-smart-cdn] Measured on the same variant requested repeatedly:
+
+- First render of a variant: ~0.25s. Repeat requests: ~0.05s, with `cf-cache-status: HIT` on the response.
+- The response carries `cache-control: no-cache` **and** gets cached at the edge anyway. The header is decorative for the CDN's purposes; the cache key is the render URL.
+- **Junk query parameters do not bust the cache.** `&bust=<random>` returned the cached variant, same bytes, warm latency. Unknown parameters are normalized out of the cache key, so the classic cache-busting amplification attack fails closed here.
+- Each real variant (a new width/height/quality combination) is a separate cache entry and a separate cold render.
+- HEAD requests work and return the rendered variant's headers.
+- **Overwrite invalidation is unreliable.** Across five trials of overwriting an object (confirmed `x-upsert` 200) and re-rendering the same variant, one invalidated within 60s and four served the stale variant past the poll window (three full 60-second polls, one 15-second poll). The Smart CDN docs describe purge-on-update; the runtime does not reliably match within a minute. If your flow overwrites images in place, version the object path (`img-v2.jpg`) instead of relying on invalidation. `empirically-proven`
+- Render responses carry **no `Vary: Accept`** despite honoring Accept negotiation (`Accept: image/webp` yields webp on the same URL that yields png without it). Whoever warms a URL first fixes its format at the edge until TTL - a webp-capable browser and a jpeg-only client can be served each other's format. `empirically-proven`
+
+For the billing metric none of this matters - per-origin counting is request-independent. For egress and latency it matters a lot: a hot variant serves from the edge, and an attacker cannot force re-renders by mutating query strings.
+
+## The abuse surface
+
+Measured properties of the render endpoint on a public bucket:
+
+- **No authentication.** A plain curl with no `Authorization` header renders any object in a public bucket.
+- **Rate limiting exists but the floor is high.** 200 parallel fresh renders all returned 200; at 500 parallel, 11 came back 429 (~2%); at 1,000 parallel, 88 (~9%). Refusals ramp rather than cut off, so a determined burst still lands most of its requests. `empirically-proven`
+- **Enumeration requires a key.** Listing a bucket without an `Authorization` header is rejected; listing with the anon key returns only what RLS allows (empty in the test). But enumeration is not the practical barrier it looks like - see below.
+
+Those three properties combine into a denial-of-wallet vector with an unusual shape: **the billing unit itself is attacker-influenceable.** Every object name visible in your site's markup - every `<img src=".../storage/v1/object/public/...">`, every URL in a CSS or JS bundle - is an origin image an attacker can activate with one unauthenticated GET to the render endpoint. One GET per name, 200 names in parallel, done in seconds.
+
+The sharper version: **the owner does not need to use transformations at all.** If your site serves images straight from `/object/public/` untransformed, an attacker hitting `/render/image/public/` on those same names creates billable origin images you never asked for. A 5,000-image public bucket is 5,000 origin images - about \$25 over quota - whether or not a single legitimate transform ever ran. And because the count resets each cycle, the attack is repeatable every month at zero marginal cost to the attacker.
+
+The spend-cap posture forks the outcome:[^sb-cost-control]
+
+- **Spend cap off** (or Team plan and above): you pay the overage. The attack is a bill-inflation attack.
+- **Spend cap on** (the Pro default): you do not pay, but quota exhaustion pushes the org into the Fair Use grace period and eventual restriction.[^sb-fair-use] The attack becomes an availability attack on your legitimate transformations.
+
+Variants of the same image are not a vector - extra sizes of an already-counted origin add no billable units, and cache-busting does not work (above). Egress amplification is also blunted by the edge cache.
+
+## Mitigations and workarounds
+
+Ranked by how completely they close the vector:
+
+| Mitigation | Closes | Residual risk |
+|---|---|---|
+| Private buckets + signed render URLs, short expiry | the whole vector - the render surface requires a token | a leaked signed URL is replayable for its exact signed variant until expiry; keep expiries in minutes. (Measured: edited transform params on a signed URL are ignored - the token's transform is what renders - and expiry is enforced. The authenticated render surface also enforces storage RLS.) |
+| Your own edge in front (Cloudflare proxy/WAF/rate rules) | rate and pattern control on the render path | origin images rendered through it still count; you are buying request control, not count control |
+| Unguessable object names (UUIDs) | farming of unlinked objects | any name already in your markup is still farmable |
+| Spend cap on | bill shock | converts the attack into quota exhaustion / transform unavailability |
+| Monitoring the org usage page for origin-image spikes | nothing - detection only | you find out after the units exist |
+
+The honest read: for a bucket that must stay public, there is no configuration that prevents origin-image farming, because the render endpoint is unauthenticated by design and the billing unit counts exactly what the attacker can touch. The decision is which failure mode you prefer - pay the overage, or lose the feature under Fair Use - plus detection so the cycle repeats are visible. If the assets are not genuinely public-content, moving them to a private bucket with signed render URLs is the only structural fix.
+
+Two workarounds that do **not** work, despite appearing in the docs' optimization advice:[^sb-imgt-billing] pre-generating variants (the origin still counts the first time anything renders it, and serving stored variants only helps if you stop using the render endpoint entirely) and CDN caching (per-origin counting is request-independent).
+
+## What was not provable
+
+The origin-image counter is only visible on the dashboard usage page, which does not accept a Personal Access Token (the Management API exposes no usage endpoint for this metric, and the dashboard's platform API returns 401 to a PAT). So the correlation "a GET on a render surface increments the counter by one per distinct origin per cycle" is inferred from the billing docs[^sb-imgt-billing] plus the measured render behavior - not observed. Cross-cycle reset and any dedup window are likewise unverified. Confirm on the usage page after a controlled burst before relying on the exact increment semantics for cost estimation.
+
+## Evidence
+
+| Claim | How it was checked |
+|---|---|
+| Billing unit, quota, package size, reset | Documented - Supabase billing page,[^sb-imgt-billing] not tested against the counter |
+| `/render/image/public` transforms without auth | Measured - 200, resized JPEG, no Authorization header |
+| Signed render URL tampering fails closed; expiry enforced | Measured - edited params ignored, token's transform rendered; expired token rejected |
+| Authenticated render enforces storage RLS | Measured - user JWT denied without select policy, allowed with one |
+| Overwrite invalidation unreliable | Measured - 4 of 5 trials stale past the poll window (up to 60s) after confirmed overwrite |
+| No `Vary: Accept` on render responses | Measured - webp and png at one URL, `vary` header absent |
+| Rate ceiling | Measured - 0/200 at 200 parallel, 11/500, 88/1000 429s |
+| `/object/public` and `/object/sign` ignore appended params | Measured - full original bytes returned, 200 |
+| `createSignedUrl` with transform embeds it in a `/render/image/sign` URL | Measured - sign POST with transform body, fetched URL returns resized image |
+| Dimension clamp at 3000 / source dims, no error | Measured - width 2500/2501/3000/3001/5000 on a 4000x3000 source |
+| 25MB and 50MP source limits enforced | Measured - 400s on a 28.8MB PNG and a 56MP JPEG |
+| Docs' 1-2500 bound wrong | Measured - `width=2501` renders |
+| Free-plan org renders | Measured - 200 with resized output on a Free-plan scratch project |
+| Edge cache HIT despite `cache-control: no-cache` | Measured - `cf-cache-status: HIT`, ~0.05s warm vs ~0.25s cold |
+| Junk params do not bust cache | Measured - same bytes, warm latency, with random `&bust=` |
+| No rate limiting below the ceiling | Measured - 50 sequential + 200 parallel fresh renders, all 200 |
+| Bucket listing needs auth; anon listing is RLS-filtered | Measured - rejected without header, `[]` with anon key |
+| Counter increment event | Not observable - dashboard-only metric, PAT returns 401 |
+
+[^sb-imgt-billing]: Supabase, "Manage Storage Image Transformations usage," Supabase Docs. https://supabase.com/docs/guides/platform/manage-your-usage/storage-image-transformations
+[^sb-imgt]: Supabase, "Image Transformations," Supabase Docs. https://supabase.com/docs/guides/storage/serving/image-transformations
+[^sb-smart-cdn]: Supabase, "Smart CDN," Supabase Docs. https://supabase.com/docs/guides/storage/cdn/smart-cdn
+[^sb-cost-control]: Supabase, "Cost control," Supabase Docs. https://supabase.com/docs/guides/platform/cost-control
+[^sb-fair-use]: Supabase, "Fair Use Policy," Supabase Docs. https://supabase.com/docs/guides/platform/billing-faq#fair-use-policy
