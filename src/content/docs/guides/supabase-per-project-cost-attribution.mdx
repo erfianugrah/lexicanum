@@ -1,0 +1,133 @@
+---
+title: Per-project cost attribution on Supabase
+description: How to answer "what did this project cost us" when the org has one bill - whether the projects are tenant backends or one company's own fleet. The invoice itemizes usage per project ref; the estimator between invoices is a small poller over public endpoints. Every number measured against the live API.
+author: Erfi Anugrah
+category: supabase
+group: operations
+featured: true
+blurb: "Per-project cost attribution on a single-org bill: the invoice settlement layer, the hourly estimator, and gateway metering - measured, not quoted."
+---
+
+Two different situations need the same answer - "what did this project
+cost?" - and neither gets it from a dashboard:
+
+- **A platform** billing its users for per-tenant backends (one Supabase
+  project per tenant).
+- **One company** that consolidated many projects into a single org for a
+  unified bill and lost per-project visibility - internal chargeback,
+  showback, or a cost review before a commit decision.
+
+There is no org-scoped billing read on the Management API. What exists is
+enough to build attribution yourself, in three layers. Every number below
+was measured against the live API on 2026-08-17/18 on a Pro org; the
+invoice structure was read off a real Pro invoice.
+
+## Layer 1 - the invoice is the settlement layer, and it already itemizes per project ref
+
+Every usage-based line on the invoice breaks out per 20-char project ref
+with quantity and rate: compute hours, branching compute, disk GB-hrs,
+point-in-time recovery, cached and uncached egress, storage GB-hrs, custom
+domains. The per-project usage data is on the invoice itself - anonymously
+(refs, not names), but present.
+
+What does NOT itemize per project: the plan fee, MAU, function invocations,
+realtime messages and peak connections, and discounts. These are org-level
+aggregates with no project dimension, and no amount of tooling changes
+that - they get an allocation policy (equal split, weighted by another
+signal, or eaten by the platform), not data.
+
+So the monthly reconciliation is: map ref -> owner, then apply the policy
+to the pooled lines. The plan fee and MAU are the big ones.
+
+## Layer 2 - between invoices, the estimator
+
+A control-plane poller builds the same picture hourly from public
+endpoints. Measured behavior of each signal:
+
+- **Compute cost per project**: `GET /v1/projects/{ref}/billing/addons`
+  returns the selected compute SKU. On paid plans nothing suspends
+  (measured: pause is refused with `400 Project is not free-tier`), so
+  compute-hours are provisioned wall time. SKU rate x hours at the
+  invoice's own rates - Micro measured at \$0.01344/hr there.
+- **Database size, exact**: `pg_database_size()` over
+  `POST /v1/projects/{ref}/database/query`. One trap: the deltas compress -
+  a `repeat()`-generated 8 MB payload moved the measured size by ~180 KB
+  because TOAST eats compressible text. Use random payloads when validating
+  your own pipeline.
+- **Storage bytes, exact**: the Storage object listing matched an uploaded
+  262144-byte object to the byte.
+- **Request volumes per service, exact at minute-scale lag**:
+  `GET /v1/projects/{ref}/analytics/endpoints/usage.api-counts?interval=15min`
+  returned 13 for exactly 13 REST requests sent, visible after 61 s.
+  Billing-rollup grade; not real-time-enforcement grade.
+- **The honest gap: no per-service egress bytes.** The per-project
+  Prometheus endpoint (300+ metric families via a plain PAT) is
+  infrastructure-grade - `node_`, `pg_`, `pgbouncer_` families with
+  host-level network counters only. Per-project egress per service exists
+  on the invoice per ref and nowhere in the public per-project API. If
+  egress allocation matters between invoices, it has to come from layer 3.
+
+The poller's budget matters at fleet scale: the Management API answers
+~120 requests/min per user per scope with `x-ratelimit-remaining` on every
+response (measured), so pace by the header rather than a guessed constant.
+
+## Layer 3 - real time: meter at your own gateway
+
+If requests to tenant projects transit your own ingress (a proxy, a
+gateway, an edge worker), metering there is exact and immediate. The
+credential story improves at the same time: measured end-to-end against a
+live credential-proxy gateway (PAT stored server-side, scoped keys minted
+per project), a key allowed `metrics:read` on exactly one project scraped
+its metrics (200, 278 families) while the same key got 403 on an
+unclassified path and on any other project, with every proxied call
+visible in an audit feed within ~1 s. Scoped, revocable keys beat handing
+a god-mode PAT to every scraper.
+
+Direct Postgres connections bypass any gateway - they are covered by
+layers 1 and 2 instead.
+
+## The build
+
+Deliberately boring:
+
+1. A `tenant/owner -> project_ref` map in your control-plane DB, written at
+   provision time.
+2. An hourly row per project: compute SKU, status, DB size, storage bytes,
+   request-count deltas. (At ~170 projects this is a few hundred API calls
+   per sweep - well inside the rate budget if you read
+   `x-ratelimit-remaining`.)
+3. A monthly join of that table against the invoice's per-ref lines.
+
+If the join disagrees, the invoice wins - it is the settlement document.
+The estimator exists to see the month before it closes, not to replace it.
+
+## What this does not give you
+
+- **Attribution of pooled org-level lines** (plan fee, MAU, functions,
+  realtime, discounts) - a policy decision, never data.
+- **History before you start polling** - the estimator sees forward from
+  when it is built; the invoice archive is the only backwards view.
+- **Enforcement** - no spend caps or exhaustion webhooks exist to push
+  against; detecting a runaway project and acting on it is your own
+  poll-and-act loop on layer 2/3 signals.
+
+## Verified / tested
+
+| Claim | How it was checked |
+|---|---|
+| Invoice itemizes usage lines per project ref; plan/MAU/functions/realtime/discounts do not itemize | Read off a real Pro invoice, 2026-08 |
+| Compute SKU per project via `billing/addons`; pause refused on paid plans | Measured 2026-08-17/18 - `400 Project is not free-tier` |
+| Micro rate \$0.01344/hr | Read off the invoice's compute line |
+| `pg_database_size` + Storage listing exact | Measured 2026-08-17 - byte-exact storage; TOAST compression caveat on DB size |
+| `usage.api-counts` exact (13/13) at 61 s lag | Measured 2026-08-17/18, reproduced after accounting fix |
+| No per-service egress bytes in the per-project API | Metrics endpoint enumerated 2026-08-18 - `node_`/`pg_`/`pgbouncer_` families only |
+| Scoped-key gateway metering: 200/278 families, 403 deny-by-default, ~1 s audit | Measured 2026-08-18 against a live credential-proxy deployment |
+| ~120 req/min per user per scope, headers on every response | Measured 2026-08-17 - burst to the JSON 429 boundary |
+
+## Related
+
+| If you are asking | Go to |
+|---|---|
+| Should tenants share an instance or get their own projects? | [Tenant placement](/reference/supabase-multi-tenant-placement/) |
+| What does each Management API operation cost in downtime? | [Platform operation costs](/reference/supabase-platform-operation-cost/) |
+| The full platform build (provision, size, rate budget, OAuth) | [Running a platform on the Management API](/guides/supabase-platform-management-api/) |
