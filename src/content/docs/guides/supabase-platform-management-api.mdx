@@ -1,0 +1,210 @@
+---
+title: Running a platform on the Supabase Management API
+description: The end-to-end platform build - provision tenants, size them, budget the rate limit, meter usage, let users bring their own backend, and operate the fleet - with every load-bearing number measured against the live API, not quoted from docs.
+author: Erfi Anugrah
+category: supabase
+group: tenancy
+featured: true
+blurb: "Provision, size, meter, and operate tenant projects through the Management API - the full platform layer, with measured numbers instead of doc quotes."
+---
+
+The Management API is a complete platform substrate: projects, keys, config,
+usage, and lifecycle are all programmable. What the docs never assemble is
+the platform layer on top - the provisioning loop, the rate budget, the
+metering, the OAuth paths, the pause playbook. This guide is that assembly.
+Every number in it was measured against the live API on 2026-08-17/18 on
+throwaway projects; where something is gated or untested, it says so.
+
+The shape being built:
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.35; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  app [label="Your product\n(tenant-facing UI)"];
+  cp [label="Control plane\nprovisioning service + tenant->ref map\nusage poller + rate-budgeted client"];
+  gw [label="Credential-proxy gateway\n(optional; PAT stays server-side,\nscoped keys go out)"];
+  api [label="api.supabase.com/v1\nprojects / config / addons / analytics"];
+  pool [label="Tenant pool\none project per tenant\n(or shared tier - see placement doc)"];
+
+  app -> cp;
+  cp -> gw;
+  gw -> api;
+  cp -> api [label="direct is fine at small scale"];
+  api -> pool;
+}
+```
+
+## 1. Decide who owns the project
+
+Two integration shapes, differing on who owns the Supabase organization and
+the billing relationship:
+
+- **You provision on their behalf** - your org, your PAT, one project per
+  tenant, users never see Supabase. White-label, you hold the billing
+  relationship. The rest of this guide is this shape.
+- **They bring their own backend** - the user's org, connected to your app
+  through the Management API OAuth2 flow. You get a scoped token; they keep
+  the direct billing relationship. Section 5 has the measured surface.
+
+You can offer both; the project-claim flow is the (gated) bridge from the
+first to the second when a tenant outgrows you - measured: on a normal paid
+org the claim route answers
+`404 {"message":"Cannot POST /v1/oauth/authorize/project-claim"}`, it does
+not exist for the credential class rather than merely being forbidden.
+
+## 2. Provision a tenant
+
+One call creates a project; the details are where the platforms get built:
+
+- `POST /v1/projects` with `organization_slug`, a strong generated `db_pass`,
+  and a region. Create -> `ACTIVE_HEALTHY` measured 131-159 s on paid Micro,
+  12-13 s on a free org.
+- **Smart region selection works on a normal paid org**:
+  `region_selection: {type: "smartGroup", code: "apac"}` was accepted (201)
+  and the platform picked `ap-northeast-2`. Defer the city choice instead of
+  pinning per tenant.
+- **Healthy is not writable.** Fresh projects can refuse their first
+  `/auth/v1/admin/users` write with `500 unexpected_failure` for ~10 s.
+  Retry the first write with backoff; do not treat it as a finding.
+- Fetch keys with `GET /v1/projects/{ref}/api-keys?reveal=true` and select by
+  `name` OR `type` - new projects carry both legacy JWTs and the new
+  `sb_publishable_`/`sb_secret_` shapes.
+- Configure services with the config endpoints (auth, PostgREST, storage,
+  realtime, functions + secrets). The OAuth server flips on with
+  `PATCH /v1/projects/{ref}/config/auth`
+  `{oauth_server_enabled: true, oauth_server_authorization_path: ...}` -
+  measured 200.
+
+## 3. Know the sizing floors
+
+Measured across three org classes:
+
+| Org class | Nano | Floor | Pause |
+|---|---|---|---|
+| Paid (Pro) org | rejected three ways: create `400 Minimum instance size on paid plans is Micro`, addon PATCH `400 addon_variant: Invalid input`, absent from `available_addons` | Micro, always-on | `400 Project is not free-tier` |
+| Free org | accepted (201) - and there is NO compute addon catalogue at all | shared/free compute | full lifecycle: pause -> INACTIVE, restore wakes in 162-204 s, data API answers `HTTP 540 Project paused` while parked |
+| Legacy free-era project inside a paid org | n/a | keeps its paused state after the upgrade | **one-way door**: once restored it cannot be re-paused - pause follows the org's current plan, not the project's lineage |
+
+Scale-to-zero pricing is Nano-only and gated (the
+[Supabase for Platforms](https://supabase.com/docs/guides/integrations/supabase-for-platforms)
+programme) - on a normal paid org there is no idle discount, which is the
+cost premise the
+[tenant placement doc](/reference/supabase-multi-tenant-placement/) is built
+on.
+
+## 4. Budget the rate limit
+
+Measured on a normal paid org, on a cheap scoped read:
+
+- Every response carries `x-ratelimit-limit`, `x-ratelimit-remaining`,
+  `x-ratelimit-reset`. The limit read 120, decrementing 1:1 per call. Read
+  the header; never infer the budget.
+- A deliberate burst tripped
+  `429 {"message":"ThrottlerException: Too Many Requests"}` at request 118
+  with `retry-after: 60` and recovered after the window. The breach on this
+  endpoint is the API's own machine-readable JSON - but aggressive polling
+  elsewhere has produced a non-JSON interstitial from the edge layer, so
+  treat "non-JSON body" and "JSON 429" as the same back-off signal.
+- Whether the budget is per-PAT or cumulative across a user's PATs is
+  untested here (the probe exists, gated on a second token).
+
+At fleet scale the client is a queue with a token bucket, not a fetch loop.
+
+## 5. Let users bring their own backend
+
+The OAuth2 flow for the Management API:
+[register an OAuth app, user approves, you hold a scoped access/refresh
+pair](https://supabase.com/docs/guides/integrations/build-a-supabase-oauth-integration).
+Measured surface on a normal paid org:
+
+- Unknown `client_id` at `/v1/oauth/authorize` ->
+  `422 {"message":"Unrecognized client_id"}`. Client validation fires
+  before session validation, so the no-session redirect is only observable
+  with a real client_id.
+- The token lifecycle (refresh shape, Management API access with the OAuth
+  token, revoke time-to-effect) is probe-ready but gated on an interactive
+  consent click - untested here.
+- The `jwt-bearer` token grant validates parameters before any gating
+  (`422 Required parameter: client_id`).
+
+A related but distinct surface: the project's OWN OAuth 2.1 server
+(Supabase-as-IdP for third-party apps) is fully headless-automatable and its
+tokens carry `client_id`, which RLS can read. Measured 2026-08-18:
+`auth.jwt() ->> 'client_id'` in a policy showed a row to the matching
+client's token and hid it from a second client of the same user - per-client
+permissions on a shared project, not just per-user.
+
+## 6. Meter what tenants consume
+
+Three layers, all measured - the full breakdown is in the
+[placement doc's metering section](/reference/supabase-multi-tenant-placement/#metering-per-tenant-usage):
+
+1. **The invoice already itemizes usage per project ref** (compute, disk,
+   egress, storage, PITR, custom domains) with quantity and rate. The plan
+   fee, MAU, function invocations, realtime, and discounts are org-level
+   aggregates - they get an allocation policy, not data.
+2. **The estimator between invoices**: compute SKU from `billing/addons`,
+   `pg_database_size()` and the Storage listing (exact to the byte),
+   `usage.api-counts` (exact, ~1 min lag). Honest gap: no per-service
+   egress bytes in the public per-project API.
+3. **Real time at your own gateway**: exact for anything transiting it, and
+   scoped keys mean no god-mode PAT in scrapers (measured: 200 with 278
+   metric families for the allowed key, 403 deny-by-default elsewhere,
+   ~1 s audit flush).
+
+## 7. Move tenants when they outgrow the placement
+
+Cross-project trust (third-party JWKS) makes a tenant's tokens verifiable on
+their new project, with two measured edges: refresh only works at the
+issuing project (`400 refresh_token_not_found` verbatim at the trusting
+one), and key rotation is a maintenance window, not an event (the trusting
+project's cache does not re-resolve on any observed timeline). The build
+recipes:
+[shared tier](/guides/supabase-shared-tenancy/),
+[promotion](/guides/supabase-tenant-promotion/),
+[consolidation](/guides/supabase-tenant-consolidation/); the decision
+framework is the
+[placement doc](/reference/supabase-multi-tenant-placement/), and what each
+operation costs in client-visible downtime is in
+[platform operation costs](/reference/supabase-platform-operation-cost/).
+
+## 8. The ops playbook
+
+- **Deleting a project has a tail** - a delete returns ~2 s but the project
+  lingers in lists briefly; batch deletes deserve canary batches.
+- **A paused project answers `HTTP 540 Project paused`** on the data API -
+  a distinct, machine-readable state worth mapping to your own 503.
+- **Restores are slow**: a legacy project exceeded a 20-min wake bound
+  before coming healthy; free-org restores measured 162-204 s. Wake ahead
+  of the user, not on their click.
+- **Two-PAT and consent-gated items** in this guide are the only untested
+  claims left; everything else carries a measured status.
+
+## Verified / tested
+
+| Claim | How it was checked |
+|---|---|
+| Create -> healthy 131-159 s paid / 12-13 s free | Measured 2026-08-17/18, n=5+ on paid |
+| Smart region accepted on a paid org, picked `ap-northeast-2` | Measured 2026-08-17 |
+| Nano rejected three ways on paid, accepted (201) on free | Measured 2026-08-17/18 |
+| Legacy project: paused survives upgrade, cannot re-pause | Measured 2026-08-18 - `400 Project is not free-tier` |
+| Rate-limit headers + JSON 429 with `retry-after: 60` | Measured 2026-08-17 - burst to the boundary |
+| OAuth authorize: 422 client validation first; claim flow 404 | Measured 2026-08-17 |
+| Project IdP: `client_id` claim usable in RLS | Measured 2026-08-18 - headless PKCE flow, two-client isolation |
+| Metering: exact ground truth, exact 13/13 analytics at 61 s lag, no per-service egress in the API | Measured 2026-08-17/18 |
+| Scoped-key gateway: 200/278 families, 403 deny-by-default, ~1 s audit | Measured 2026-08-18 against a live credential-proxy deployment |
+| Refresh only at the issuing project | Measured 2026-08-18 - `400 refresh_token_not_found` verbatim |
+
+## Related
+
+| If you are asking | Go to |
+|---|---|
+| Where should a tenant live, and what does it cost? | [Tenant placement](/reference/supabase-multi-tenant-placement/) |
+| What does each operation cost in downtime? | [Platform operation costs](/reference/supabase-platform-operation-cost/) |
+| Build the shared tier | [Shared tenancy guide](/guides/supabase-shared-tenancy/) |
+| Move a tenant to its own project | [Tenant promotion](/guides/supabase-tenant-promotion/) |
+| Merge many projects into one | [Tenant consolidation](/guides/supabase-tenant-consolidation/) |
