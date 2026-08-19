@@ -10,10 +10,10 @@ blurb: "Policy shape decides plan shape. Measured: the (select auth.uid()) wrap,
 
 Row Level Security policy text is a query plan input. The shape you pick decides
 whether your lookup helper runs once per statement or once per row, and whether
-the optimizer can even see an index. This is the measured version of the two
-rewrites Supabase projects keep deferring: `(select auth.uid())` and
-`SECURITY DEFINER` helpers, plus the grant-target and client-filter shapes
-people treat as synonyms and are not.
+the optimizer can even see an index. This is the measured version of the three
+shapes Supabase projects keep deferring: the `(select auth.uid())` wrap, the
+`SECURITY DEFINER` helper, and the joined-table `EXISTS` - plus the grant-target
+and client-filter shapes people treat as synonyms and are not.
 
 **Provenance.** Fixtures and runs come from the `supabase-lab` OpenTofu repo
 (disposable `supabase_project`, micro, ap-southeast-1; Postgres 17.6; SQL
@@ -35,7 +35,6 @@ directional. The full SQL and output are linked below.
   Postgres may decorrelate the `EXISTS` into a hashed subplan (`loops=1`), in
   which case the wrap inside the `EXISTS` hoists too. At other sizes the same
   statement can come back as a correlated `SubPlan` evaluated per outer row.
-  The mechanism is fixed; the plan form is a choice.
 - Predicate shape does not decide grant visibility; the grant target does.
   `TO public` on a SELECT policy exposes it to `anon`. `TO authenticated`
   does not.
@@ -45,12 +44,12 @@ directional. The full SQL and output are linked below.
 
 ## Which shape to pick
 
-| Policy shape | When it wants to be |
-| --- | --- |
-| `owner = auth.uid()` (bare) | Never. Call per row evaluated |
-| `owner = (select auth.uid())` | Default for the helper-is-a-stable-query pattern |
-| `EXISTS` over a joined table | Fine - index the joined column; the joined table's own RLS still applies |
-| `SECURITY DEFINER` helper | When the policy joins another table and you want the join off the RLS path (see Supabase RLS guidance[^sb-rls]) |
+| Shape | What it costs | Pick it when |
+| --- | --- | --- |
+| `owner = auth.uid()` (bare) | Helper call per row scanned | Never. Rewrite or index |
+| `owner = (select auth.uid())` | Helper once per statement (`InitPlan`) | Default for `auth.uid()` / `auth.jwt()` predicates |
+| `EXISTS` over a joined table | Joined table's own RLS, recursively; cost depends on plan form | Fine - index the joined column, wrap the helper |
+| `SECURITY DEFINER` helper | Join runs off the RLS path; pin `search_path` | Policy needs another table's data (see Supabase RLS guidance[^sb-rls]) |
 
 ## The hoist: bare vs `(select auth.uid())`
 
@@ -75,9 +74,8 @@ Once `items(owner)` has an index, the bare form's stable helper becomes an
 index condition evaluated O(1) times per scan rather than per tuple: 2 calls
 here against 1 for the wrapped form. Timing converged (24.1ms / 24.2ms on this
 run). Read that two ways: the wrap is still strictly better, and deferring the
-rewrite on a column you just indexed buys real quality time. The policy side
-policy shape still loses to the index on the per-row filter path - index the
-columns your policies filter on.
+rewrite on a column you just indexed buys real time. The ordering that pays:
+index the columns your policies filter on, then wrap the helpers.
 
 ## Nested EXISTS policies
 
@@ -95,13 +93,28 @@ hashed subplan at 300x2000 fixture scale (`loops=1`), and the wrap inside the
 calls versus 1 wrapped. Index the joined column; the hashed build narrows to
 the caller's rows (`Index Cond` off the join policy's own wrapping).
 
+The plan form is a choice, not a guarantee. A correlated `SubPlan` at larger
+scale or different statistics evaluates the subquery per outer row, and there
+the bare form's helper cost is per row of the outer table - the rewrite case
+is strongest exactly there. If a policy looks like this shape and the table is
+growing, wrap the helper before you need to.
+
 ## Grant target, not predicate
 
 `TO public` admits the `anon` role; `TO authenticated` does not. Measured on
 the same predicate both ways: `anon` read 5,250 rows through `TO public`, 0
-through `TO authenticated`. Audit by grant target. The danger has a coupling
-in Realtime too: a `TO authenticated` read path silently yields nothing to
-anonymous subscribers while the REST path keeps working through a function.
+through `TO authenticated`. Audit by grant target, not by reading predicates.
+
+## Realtime multiplies the policy cost by subscribers
+
+Postgres Changes authorizes every event against each subscriber: one change on
+a table with 100 subscribers performs 100 authorization checks, so throughput
+scales with subscriber count, not write rate[^sb-pg-changes]. Every read-path
+cost above therefore also prices the delivery path. A policy that is cheap to
+read is cheap to authorize; a policy that seq-scans a joined table per event
+does it per subscriber. The grant-target coupling cuts the other way too: a
+`TO authenticated` read path delivers nothing to anonymous subscribers while
+the REST path keeps working through a function.
 
 ## Client filters compose safely
 
@@ -110,6 +123,16 @@ conjunction. Measured with policy `owner = auth.uid()` OR `tag = 'public'`
 and an other-user filter: 90,250 visible unfiltered; owner-drifted filter
 returns the other user's 250 public rows - never more; `private`-drifted
 filter returns 0. Bad client-side duplication only ever narrows.
+
+## Reading the numbers
+
+What generalizes: plan shapes (`InitPlan` vs per-row `Filter`, recursive RLS,
+grant-target gating, conjunction) and call counts, because both follow from
+planner mechanics, not hardware. What does not: the milliseconds (single
+sample, micro instance, cold cache), the specific plan form chosen for the
+`EXISTS` (statistics-dependent), and fixture sizes (100k/2k/300 rows chosen
+to make the effects visible, not to model any real workload). Re-run the
+matrix at your own row counts before quoting a number to anyone.
 
 ## Decision guide
 
@@ -120,19 +143,18 @@ digraph {
     node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
     edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
 
-    start [label="policy uses auth helper"];
-    idx [label="policy column indexed?"];
-    wrap [label="wrap: (select auth.uid())"];
-    still [label="still wrap - cheap, semantics-neutral"];
-    defer [label="deferrable - gap is noise"];
-    join [label="policy joins a table?"];
-    sd [label="SECURITY DEFINER helper"];
+    start [label="Reading a policy"];
+    helper [label="auth helper in predicate?"];
+    wrap [label="Wrap it: (select auth.uid())\nInitPlan, once per statement"];
+    join [label="Joins another table?"];
+    sd [label="SECURITY DEFINER helper\n+ index the joined column"];
+    plain [label="Index filter columns\naudit TO targets"];
 
-    start -> idx;
-    idx -> still [label="no"];
-    idx -> defer [label="yes"];
-    start -> join [label="joined table"];
+    start -> helper;
+    helper -> wrap [label="yes"];
+    helper -> join [label="no"];
     join -> sd [label="yes"];
+    join -> plain [label="no"];
 }
 ```
 
