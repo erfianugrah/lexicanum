@@ -1,0 +1,106 @@
+---
+title: "Qwen3.8-27B for agentic work: speculative decoding and reasoning effort"
+description: Measured answers for running Qwen3.8-27B under an agentic loop harness - why MTP speculative decoding degrades within minutes of agentic churn, why the draftless ngram-mod replaces it, what reasoning_effort=medium actually costs and buys, and which popular config advice from the release-week threads fails on contact with measurement
+author: Erfi Anugrah
+category: workstations
+---
+
+How the daily-driver Qwen3.8-27B preset got its current shape: MTP speculative decoding disqualified by a decode-degradation bug, the draftless ngram-mod measured and adopted instead, and the xhigh-vs-medium reasoning-effort question settled with a sensor-gated task suite. Picks up where [the bench numbers](/reference/local-model-bench/) left off; written for anyone serving this model to an agent harness rather than a chat box.
+
+**Provenance.** All numbers measured 2026-08-18 to 2026-08-19 on an RTX 5090 (32 GB), llama.cpp b10362 then b10472, Qwen3.8-27B Q4_K_M (unsloth GGUF), 196608-token context x 2 slots, model-card sampling (temp 1.0, top_p 0.95, top_k 20, min_p 0). Every claim below is measured unless marked community-reported; the upstream bugs are cited to their llama.cpp issues.
+
+**TL;DR**
+
+- MTP (`--spec-type draft-mtp`) gives +15% generation on short bursts, then degrades to ~0.5 tok/s within about 10 minutes of agentic task traffic. Restart restores it; the degradation returns. Not usable for loops.
+- `ngram-mod` (draftless, a ~16 MB hash pool over the server's own history) measured +93-100% generation on a cold pool with none of the draft-state failure modes. Adopted as the default.
+- `reasoning_effort = "medium"` is quality-neutral on the task suite (the ceiling tasks fail identically at both efforts) and removes the thinking-binge lottery: xhigh once spent 1308.5 s on a task that also completed in 19.7 s.
+- Bump your llama.cpp pin: b10472 fixes an abandoned-stream slot-parking bug that freezes slots under harnesses that timeout-kill their clients.
+
+## Which config for which workload
+
+| Workload | spec_type | effort | Why |
+|---|---|---|---|
+| Agentic loops, benches, unattended runs | `ngram-mod` | medium | no draft state to degrade; no thinking binges |
+| Interactive coding/chat, babysat | `draft-mtp` | xhigh | +15% gen while the server is fresh; watch for drift |
+| Anything long-lived on b10362 | none | - | slot parking on abandoned streams; upgrade |
+
+## The MTP degradation
+
+The symptom: decode collapses from ~60 tok/s to ~0.5 tok/s, while prompt processing stays fast (~1500 tok/s), MTP draft acceptance stays healthy (0.79-0.99), and the GPU idles at ~100 W draw with 100% "utilization" (idle-clock). Restarting the server restores full speed; the degradation returns after roughly 10 minutes of agentic task churn. Reproduced on both b10362 and b10472.
+
+The control: the identical suite with speculation disabled sustains 55-66 tok/s indefinitely - one 5433-second, 8-iteration task ran at full speed past request id 216000. The failure lives in the MTP draft path, not the harness or the model.
+
+Fresh-server synthetic requests never reproduce it. Long prompts (53k tokens), long generations (3500 tokens), streaming, tools, cache-prefix reuse, and long tool-call arguments all decode at 60-104 tok/s. Only a lived-in server crawls, which is why every short benchmark of this model's MTP looks fine.
+
+Upstream matches both halves of the symptom: acceptance decay over server lifetime with restore-on-restart[^issue-27151], and draft-context corruption after mixed long/short prompt sequences on this exact model[^issue-27296]. Both issues open as of 2026-08-19.
+
+MTP survives in one variant preset (`qwen38-xhigh`) for babysat interactive work, where sessions are short and a restart is cheap.
+
+## The slot-parking bug, fixed by the pin bump
+
+Separately, on b10362: a client that abandons a streaming request (a loop iteration killed by its timeout wrapper, a dead curl) leaves its slot frozen at `is_processing=true` with `n_decoded` static, and the slot never frees. With `parallel 2`, two abandoned streams park the whole server. Verified fixed in b10472: the slot releases about 20 seconds after the client disconnects. If you are on b10362 and run any harness that kills clients, this alone justifies the bump.
+
+## ngram-mod: the draftless replacement
+
+`ngram-mod` keeps an LCG-hashed n-gram -> next-token pool (~16 MB, constant memory) and drafts from it; the pool is shared across server slots and accumulates accepted tokens over the server lifetime[^llamacpp-spec]. No draft model, no draft context, nothing stateful enough to degrade. Priority is fixed in llama.cpp: ngram implementations draft before draft-model implementations when both are configured, each serving sequences the other has no draft for.
+
+Measured against a no-speculation baseline of 73.2 tok/s generation:
+
+| variant | cold pool | warm pool | TTFT p50 |
+|---|---|---|---|
+| defaults (`n-match 24`, `n-min 48`, `n-max 64`) | 141.1 (+93%) | 462.1 (+531%) | 351.0-361.8 ms |
+| small-n (`n-min 4`, `n-max 8`, `n-match 32`) | 146.3 (+100%) | 262.6 (+259%) | 252.7-259.2 ms |
+
+Defaults won the warm-pool peak (long drafts land when content repeats verbatim); small-n won TTFT by ~100 ms. The defaults are the keeper: the TTFT gap is a rounding error next to a 20-minute thinking binge, and the peak gap is not. The small-n recommendation comes from community testing on consumer GPUs[^overbring-comments]; it is worth its own run if your workload is TTFT-bound.
+
+Two honest caveats on the warm-pool number. The perf harness reuses canned prompts, so a warm pool is maximally matched to them - 462.1 tok/s is the mechanism's ceiling, not an agentic-workload expectation. And the pool dies with the server process: any model switch resets it, so the first minutes after a switch run at cold-pool speed.
+
+Known upstream issue to watch: an ngram-mod draft that fails verification can be re-drafted and fail again in a stuck loop[^pr-25819]; the mitigation PR is open. Not observed in this stack's suite, but if the server ever hangs mid-generation with ngram-mod on, that is the first suspect.
+
+## Reasoning effort: xhigh vs medium
+
+The A/B ran the sensor-gated task suite with both arms speculation-free, isolating the effort lever.
+
+Quality gate: neutral. The two ceiling tasks (write-new-tests) fail at both efforts - t3 in 5433 s at xhigh vs 5108 s at medium, t6 in 3000-4079 s historical at xhigh vs 1852 s at medium. Same outcomes, cheaper failures.
+
+Speed gate, wall seconds per run (every run passed):
+
+| task | xhigh | medium |
+|---|---|---|
+| t1 (go, add fn) | 42.5, 39.0, 44.0, 25.4 | 31.4, 19.3, 20.2, 12.7 |
+| t2 (go, fix fn) | 19.7, 1308.5, 35.9, 11.5 | 12.5, 19.6, 10.8, 17.2, 25.3, 17.7 |
+| t4 (ts, add fn) | 49.1, 14.2, 38.8, 19.6 | 13.1, 10.8, 11.2, 10.6, 9.8, 10.7 |
+| t5 (ts, fix fn) | 11.3, 18.7, 13.6, 12.4 | 10.5, 10.3, 10.6, 11.5, 9.6, 11.3 |
+
+The xhigh t2 row is the argument: the same one-iteration task measured 19.7 s in one run and 1308.5 s in another - a single ~80k-token thinking binge at decode speed. Medium's entire distribution fits in 9.6-31.4 s. For an unattended loop, that predictability is throughput.
+
+The community read on this is genuinely split: one set of reports runs xhigh unattended overnight with zero failures and sees no reason to drop; another reports endless re-thinking even at medium; a measurement thread puts medium at roughly the previous generation's default quality[^overbring]. The task-suite answer for this stack: identical failure outcomes on the hard tasks, no binges on the easy ones. xhigh stays one preset away for babysat work where the extra thinking is worth supervising.
+
+Mechanics, for llama.cpp: the level goes in as a chat-template kwarg, `--chat-template-kwargs '{"reasoning_effort":"medium"}'` (compact JSON; the flag word-splits). xhigh is the server default and injects "think carefully" language; community reports put it at 15k-40k thinking tokens per one-shot prompt[^qwen-card].
+
+## Claims checked and rejected
+
+From the release-week config threads, measured here and rejected:
+
+- **"Official / recommended" sampling at temp 0.4, top_p 0.90, top_k 15, min_p 0.02.** The thread author sourced it from a chat model. The model card's thinking-mode recommendation is temp 1.0, top_p 0.95, top_k 20, min_p 0[^qwen-card].
+- **Quantizing the KV cache to stretch context** (q4_1 main, 73k context on 16 GB). A 16 GB workaround; at 32 GB the full 196k x 2 slots fit without it, and q4 main KV costs long-context recall.
+- **Quantizing the MTP drafter's KV.** Draft KV quantization only lowers draft acceptance - fewer accepted tokens means slower, never wronger; the target model verifies everything. It also saves almost no VRAM. One Vulkan user reports the opposite ordering, which reads as backend-specific[^overbring-comments].
+- **Tuning `--spec-draft-p-min` to raise acceptance rate.** One scripted test showed p-min 0.85 lifting acceptance from 76.5% to 92.5% while dropping throughput 7.4%: higher p-min suppresses drafts instead of improving them. Optimize tok/s, not acceptance.
+
+## Reading the numbers
+
+- The synthetic perf suite (TTFT/gen/pp on canned prompts) is noisy across repetitions: the same preset measured 46-96 tok/s gen across days. Trust task-suite wall times and same-session compares; treat any single perf pass as indicative only.
+- MTP's short-burst +15% (and medium's +29% on top of it, 110.5-111.6 vs 85.9-86.5 tok/s) is real but describes the first minutes of a server's life - exactly the regime the degradation finding disqualifies for loops.
+- ngram-mod's warm-pool ceiling is inflated by the harness, as covered above. The cold-pool +93-100% is the trustworthy number, and it is already decisive.
+
+## Reproducing
+
+The bench harness is the `llmc bench` module of the llm-compose stack: `llmc bench perf --presets a,b` for the synthetic suite, `llmc bench tasks --presets a,b --tasks t3,t6 --runs 1` for the sensor-gated suite. Preset A/B variants need distinct GGUF filenames because presets deduplicate by model id (derived from the filename stem) - a hardlink costs zero disk. The p5 bench script embeds a `/slots` watchdog that respawns the server when a slot stops making progress, which is what made the long suite runs survivable while the degradation was live.
+
+[^llamacpp-spec]: ggml-org, "Speculative decoding," llama.cpp docs. https://raw.githubusercontent.com/ggml-org/llama.cpp/master/docs/speculative.md
+[^issue-27151]: ggml-org, "MTP draft acceptance collapses over server lifetime," llama.cpp issue #27151. https://github.com/ggml-org/llama.cpp/issues/27151
+[^issue-27296]: ggml-org, "MTP breaks long/short inference (Qwen3.8-27B)," llama.cpp issue #27296. https://github.com/ggml-org/llama.cpp/issues/27296
+[^pr-25819]: ggml-org, "server: stuck-loop escape for ngram-mod (WIP)," llama.cpp PR #25819. https://github.com/ggml-org/llama.cpp/pull/25819
+[^overbring]: Isaak Tsalicoglou, "Qwen3.8-27B: slower tokens, faster and better results," OVERBRING Labs. https://overbring.com/blog/2026-08-17-qwen3-8-27b-wall-clock/
+[^overbring-comments]: r/LocalLLaMA, Qwen3.8-27B config thread and comment discussion (small-n guidance, draft-KV quantization), August 2026 (mirror). https://shoftech.com/question/qwen-3-8-27b-pushing-1m-tokens-on-16gb-vram-whats-your-llama-cpp-config-for-similar-agentic-coding-73k-context/
+[^qwen-card]: Qwen, "Qwen3.8-27B model card," Hugging Face. https://huggingface.co/Qwen/Qwen3.8-27B
