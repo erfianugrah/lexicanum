@@ -1,0 +1,167 @@
+---
+title: "RLS policy cost, measured"
+description: "Which RLS policy shape to pick, and what each shape actually costs - measured InitPlan hoisting, index interaction, nested EXISTS policies, and grant targets on a disposable Supabase project."
+author: Erfi Anugrah
+category: supabase
+group: architecture
+featured: true
+blurb: "Policy shape decides plan shape. Measured: the (select auth.uid()) wrap, index interaction, nested EXISTS policies, grant targets, and client filters."
+---
+
+Row Level Security policy text is a query plan input. The shape you pick decides
+whether your lookup helper runs once per statement or once per row, and whether
+the optimizer can even see an index. This is the measured version of the two
+rewrites Supabase projects keep deferring: `(select auth.uid())` and
+`SECURITY DEFINER` helpers, plus the grant-target and client-filter shapes
+people treat as synonyms and are not.
+
+**Provenance.** Fixtures and runs come from the `supabase-lab` OpenTofu repo
+(disposable `supabase_project`, micro, ap-southeast-1; Postgres 17.6; SQL
+issued over the session-mode pooler at port 5432). Fixture sizes: 100k-row
+`items`, 2k-row `threads`, 300-row `posts`; two fake user UUIDs. Timings are
+single-sample on a micro - plan shapes are the findings, milliseconds are
+directional. The full SQL and output are linked below.
+
+**TL;DR**
+
+- `(select auth.uid())` changes only the plan, not the access decision. It
+  hoists the stable helper to an `InitPlan` evaluated once per statement.
+  Measured on 100k rows, unindexed: 100,001 helper calls -> 1 call, and the
+  row digests (count + sum) are identical in both directions.
+- With an index on the policy column, the bare form already evaluates O(1)
+  per query (2 calls vs 1 here). The wrap still wins, but the remaining gap
+  is noise; deferring the rewrite on already-indexed columns is defensible.
+- A table joined inside a policy's `EXISTS` enforces its own RLS recursively.
+  Postgres may decorrelate the `EXISTS` into a hashed subplan (`loops=1`), in
+  which case the wrap inside the `EXISTS` hoists too. At other sizes the same
+  statement can come back as a correlated `SubPlan` evaluated per outer row.
+  The mechanism is fixed; the plan form is a choice.
+- Predicate shape does not decide grant visibility; the grant target does.
+  `TO public` on a SELECT policy exposes it to `anon`. `TO authenticated`
+  does not.
+- Client-side filters combine with the policy by conjunction. A client filter
+  that drifted from the policy can only return rows the policy already
+  admits - drift hides rows, it cannot reveal them.
+
+## Which shape to pick
+
+| Policy shape | When it wants to be |
+| --- | --- |
+| `owner = auth.uid()` (bare) | Never. Call per row evaluated |
+| `owner = (select auth.uid())` | Default for the helper-is-a-stable-query pattern |
+| `EXISTS` over a joined table | Fine - index the joined column; the joined table's own RLS still applies |
+| `SECURITY DEFINER` helper | When the policy joins another table and you want the join off the RLS path (see Supabase RLS guidance[^sb-rls]) |
+
+## The hoist: bare vs `(select auth.uid())`
+
+`auth.uid()` is a STABLE function. As a plain filter term it evaluates once per
+row. Wrapped as `(select auth.uid())` the subquery references no column of the
+target table, so Postgres hoists it to an `InitPlan` that runs once per
+statement[^sb-rls]. Measured on the 100k-row fixture as an authenticated role
+with an unindexed `owner` column:
+
+- bare: `Filter: (owner = auth.uid())` - 100,001 helper calls, 252.9ms
+- wrapped: `Filter: (owner = (InitPlan 1).col1)` - 1 call, 22.2ms
+
+Row digests are identical in both forms (count 90,000; sum 4,500,010,000). The
+wrap is access-control-neutral by construction. A caveat: if the wrapped
+subquery references a row column, it becomes a correlated `SubPlan` and the
+win disappears - the hoist only applies where the helper is genuinely row-
+independent, which `auth.uid()` is.
+
+## What an index does to the win
+
+Once `items(owner)` has an index, the bare form's stable helper becomes an
+index condition evaluated O(1) times per scan rather than per tuple: 2 calls
+here against 1 for the wrapped form. Timing converged (24.1ms / 24.2ms on this
+run). Read that two ways: the wrap is still strictly better, and deferring the
+rewrite on a column you just indexed buys real quality time. The policy side
+policy shape still loses to the index on the per-row filter path - index the
+columns your policies filter on.
+
+## Nested EXISTS policies
+
+A read policy like
+
+```sql
+exists (select 1 from threads i where i.topic = posts.topic and i.user_id = auth.uid())
+```
+
+does not skip `threads`' own RLS: the joined table's policy evaluates inside
+the subquery (recursive), and the visibility matrix measured exactly that
+(180 / 120 / 0 / 0 across four subjects, anon included). The plan chose a
+hashed subplan at 300x2000 fixture scale (`loops=1`), and the wrap inside the
+`EXISTS` hoisted into the subplan's InitPlan there too - 2,003 bare helper
+calls versus 1 wrapped. Index the joined column; the hashed build narrows to
+the caller's rows (`Index Cond` off the join policy's own wrapping).
+
+## Grant target, not predicate
+
+`TO public` admits the `anon` role; `TO authenticated` does not. Measured on
+the same predicate both ways: `anon` read 5,250 rows through `TO public`, 0
+through `TO authenticated`. Audit by grant target. The danger has a coupling
+in Realtime too: a `TO authenticated` read path silently yields nothing to
+anonymous subscribers while the REST path keeps working through a function.
+
+## Client filters compose safely
+
+Supabase composes a client query's own `WHERE` with the policy predicate by
+conjunction. Measured with policy `owner = auth.uid()` OR `tag = 'public'`
+and an other-user filter: 90,250 visible unfiltered; owner-drifted filter
+returns the other user's 250 public rows - never more; `private`-drifted
+filter returns 0. Bad client-side duplication only ever narrows.
+
+## Decision guide
+
+```dot
+digraph {
+    rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+    fontname="Helvetica,Arial,sans-serif";
+    node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+    edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+    start [label="policy uses auth helper"];
+    idx [label="policy column indexed?"];
+    wrap [label="wrap: (select auth.uid())"];
+    still [label="still wrap - cheap, semantics-neutral"];
+    defer [label="deferrable - gap is noise"];
+    join [label="policy joins a table?"];
+    sd [label="SECURITY DEFINER helper"];
+
+    start -> idx;
+    idx -> still [label="no"];
+    idx -> defer [label="yes"];
+    start -> join [label="joined table"];
+    join -> sd [label="yes"];
+}
+```
+
+## Evidence
+
+| Claim | How it was checked |
+| --- | --- |
+| Wrapping hoists to InitPlan; call count 100,001 -> 1; digests match | Measured (EXPLAIN ANALYZE + sequence-counted helper) |
+| Index collapses bare/filter cost; 2 vs 1 calls | Measured (same method, after CREATE INDEX) |
+| Joined table inside EXISTS enforces own RLS; matrix 180/120/0/0 | Measured (role-switch count matrix) |
+| Wrap hoists inside EXISTS (2,003 -> 1 at hashed-subplan form) | Measured (sequence counter inside policy) |
+| `TO public` admits anon; `TO authenticated` denies | Measured (anon subject, same predicate) |
+| Client-filter drift only narrows | Measured (OR-tagged policy, owner-drifted filter) |
+| Realtime authorizes per subscriber per event | Documented in Supabase Realtime scaling notes[^sb-pg-changes], not tested here |
+
+## Reproducing
+
+The full SQL matrix and run output live in the
+[supabase-lab repo](https://github.com/erfianugrah/supabase-lab/tree/main/experiments/rls-policy-cost)
+(`make up`, then `make destroy`; the project is gone). The method: log in as
+`postgres` over the session-mode pooler (port 5432; transaction mode drops
+session GUCs), then `SET ROLE authenticated` and
+`set "request.jwt.claims" = '{"sub":"<fixture-uuid>"}'`. Call counts use a
+PL/pgSQL helper that increments a sequence alongside `auth.uid()`, which
+survives the pooler because the sequence is ordinary DDL. RLS tests run as
+`postgres` prove nothing - that role carries `BYPASSRLS` on Supabase.
+
+## References
+
+[^sb-rls]: Supabase, "Row Level Security," Supabase Docs. https://supabase.com/docs/guides/database/postgres/row-level-security
+
+[^sb-pg-changes]: Supabase, "Using Postgres Changes," Supabase Docs. https://supabase.com/docs/guides/realtime/postgres-changes
