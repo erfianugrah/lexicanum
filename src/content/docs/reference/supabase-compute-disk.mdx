@@ -1,46 +1,68 @@
 ---
 title: Supabase compute and disk sizing
-description: What every compute size costs, what the disk autoscaler actually does, and the doc-vs-runtime divergences measured in the lab - answer the sizing questions the docs leave open.
+description: Every compute size, both disk types, resize timing, and the disk autoscaler - with the places where runtime disagrees with the docs marked per claim.
 author: Erfi Anugrah
 category: supabase
 group: operations
 featured: true
-blurb: "Every compute/disk question, with the parts the docs get interesting measured on real projects: autoscale has no public API surface, free read-only fires past the documented 500 MB, and the Large-compute disk-perf gate is dashboard-only."
+blurb: "Compute sizes and disk mechanics, end to end: per-size limits, autoscale defaults, the modification quota, read-only triggers - and what turns out to be dashboard-only or just inconsistent with the docs."
 ---
 
-Compute size and disk behavior decide how a Supabase project dies when it
-outgrows itself: throttled, read-only, or fine. This reference answers the
-sizing questions the docs leave open, then marks the places where what
-happens disagrees with what the docs say.
+A Supabase project stops being affordable or available for one of four
+reasons: compute throttle, disk throttle, quota, or read-only. This
+reference covers every compute size and both disk types, then marks per
+claim whether the behavior comes from the docs or from a live test here -
+because some of the interesting parts disagree.
 
-Measured numbers here come from supabase-lab's `compute-disk` experiment
-(modules D01-D09, AWS `ap-southeast-1`, 2026-08-19), run on throwaway
-projects in free, pro, and team orgs, with each project deleted in the same
-run. Where a claim was not tested it says so.
+The measured numbers come from a battery written against throwaway
+projects on the Management API (free, pro, and team orgs; AWS
+`ap-southeast-1`; 2026-08), each project deleted in the same run. Claims
+that were not run are still cited to the docs and labeled as such.
 
 ## TL;DR
 
-- Compute never auto-upgrades. Disk never shrinks. Both changes are manual
-  and quick (resize settle ~= 1-2 minutes, sampled) - but disk decrease is
-  rejected outright and compute resize is still a real outage window.
-- Disk autoscale (90% -> +50% default) cannot be read or written through the
-  Management API at all (measured) - the dashboard toggles are the only
-  surface.
-- Free-plan read-only is not at the documented 500 MB: measured ~726 MB db
-  size before `ERROR: 25006 cannot execute INSERT in a read-only
-  transaction` hit. TRUNCATE is blocked too; recovery needs DELETE.
-- Disk modification quota is enforced as 429 `Database disk can only be
-  modified once per four hours` (measured), regardless of the documented
-  "four modifications per rolling 24-hour window". Enforcement was
-  nondeterministic across runs.
-- The "Large compute or above" gate on disk IOPS/throughput is a dashboard
-  gate only: the API accepted AND applied elevated IOPS on a Micro project
-  (measured, verified by follow-up GET).
+- Compute never upgrades itself; disk never shrinks. Compute resize is a
+  1-2 minute window (measured); disk decrease is rejected outright.
+- Disk autoscale grows at 90% usage by a configurable percent (default
+  50%). That config cannot be read or written through the Management API
+  at all (measured) - the dashboard is the only surface.
+- The free-plan read-only wall is not the documented 500 MB: measured
+  reads accepted to ~726 MB db size, then
+  `ERROR: 25006: cannot execute INSERT in a read-only transaction`.
+  Recover with DELETE (TRUNCATE is also blocked), not vacuum alone.
+- The disk modification quota answered 429 with text "once per four
+  hours" (measured) - the docs describe four modifications per rolling
+  24 hours. Enforcement was nondeterministic across runs.
+- The "Large compute or above" gate on disk IOPS/throughput is UI-only:
+  the API accepted AND applied elevated IOPS on a Micro project
+  (measured, confirmed by follow-up read).
+
+## Pick the pressure first
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  symptom [label="what hurts?"];
+  cpu [label="CPU at cap in rush / jobs"];
+  io [label="Disk IO % consumed > 0"];
+  size [label="running out of db room"];
+  cost [label="bill over quota"];
+  cpu -> comp [label="grow compute size"];
+  io -> io2 [label="raise IOPS / io2"];
+  size -> grow [label="grow disk (manual first)"];
+  cost -> cap [label="spend cap?"];
+}
+```
+
+Every section below answers one of those branches, with the measured
+number in the section body.
 
 ## Compute sizes
 
-Prices and recommended db size from the docs.[^sb-compute] Measured rows
-marked.
+Prices and recommended db size from the docs.[^sb-compute]
 
 | Size | Hourly | Monthly | CPU | Memory | Max db (recommended) |
 |---|---|---|---|---|---|
@@ -57,138 +79,207 @@ marked.
 | 16XL | \$5.12 | ~\$3,730 | 64-core dedicated | 256 GB | 10 TB |
 | >16XL | - | - | custom | custom | custom |
 
-Micro through 2XL is shared and burstable; once burst credits drain the
-baseline governs. Large and above are dedicated.[^sb-compute]
+Micro through 2XL is shared and burstable; Large and above are
+dedicated.[^sb-compute] Burstable means spikes are fine until burst
+credits drain; then baseline governs.
 
-Nano on paid orgs is rejected with `400 Minimum instance size on paid plans
-is Micro` (measured, supabase-lab I01). On a free org, pause/restore works
-and a restore wake measured ~162-204 s (supabase-lab I04).
+Nano cannot start on a paid org: the try was rejected with
+`400 Minimum instance size on paid plans is Micro` (measured, create +
+PATCH + catalogue). On a free org, Nano pauses and restores fine; wake
+measured ~162-204 s.
 
-Per-size pg limits measured (D01) and checked against the docs' "Limits and
-constraints" table:[^sb-compute]
+### Per-size IO ceiling (docs, unmeasured here)
 
-| | micro | small |
-|---|---|---|
-| max_connections | 60 | 90 |
-| max_wal_senders | 10 | 10 |
-| max_replication_slots | 10 | 10 |
-| shared_buffers | 256 MB | 512 MB |
+Baseline = sustained. Max = burst until credits drain.[^sb-compute]
 
-Downgrading below your current replication-slot usage is rejected (the
-server will not start) - a documented constraint validator.[^sb-compute]
+| Size | Baseline MB/s | Max MB/s | Baseline IOPS | Max IOPS |
+|---|---|---|---|---|
+| Nano | 5 | 261 | 250 | 11,800 |
+| Micro | 11 | 261 | 500 | 11,800 |
+| Small | 22 | 261 | 1,000 | 11,800 |
+| Medium | 43 | 261 | 2,000 | 11,800 |
+| Large | 79 | 594 | 3,600 | 20,000 |
+| XL | 149 | 594 | 6,000 | 20,000 |
+| 2XL | 297 | 594 | 12,000 | 20,000 |
+| 4XL | 594 | 594 | 20,000 | 20,000 |
+| 8XL | 1,188 | 1,188 | 40,000 | 40,000 |
+| 12XL | 1,781 | 1,781 | 50,000 | 50,000 |
+| 16XL | 2,375 | 2,375 | 80,000 | 80,000 |
 
-### Resize durations + downtime (measured)
+The docs go further up to 24XL/48XL at 3,750 / 5,000 MBs baseline.[^sb-compute]
 
-| op | settle time | REST max contiguous outage | Auth max outage |
+### Per-size pg limits (docs; micro and small measured here)
+
+| Size | rep slots | wal senders | max connections | pooler clients |
+|---|---|---|---|---|
+| Nano | 5 | 5 | 60 | 200 |
+| Micro | 5 | 5 | 60 | 200 |
+| Small | 5 | 5 | 90 | 400 |
+| Medium | 5 | 5 | 120 | 600 |
+| Large | 8 | 8 | 160 | 800 |
+| XL | 24 | 24 | 240 | 1,000 |
+| 2XL | 80 | 80 | 380 | 1,500 |
+| 4XL | 80 | 80 | 480 | 3,000 |
+| 8XL | 80 | 80 | 490 | 6,000 |
+| 12XL | 80 | 80 | 500 | 9,000 |
+| 16XL | 80 | 80 | 500 | 12,000 |
+
+Measured micro: 60/60/10/10 (settings, wal_senders, rep_slots), small
+90/90/10/10 - the wal senders and rep slots above are the docs' plan-wide
+ceilings; pg's own floor per size sits lower.[^sb-compute] Downgrading
+below your replication-slot usage is rejected because the server will not
+start.[^sb-compute]
+
+### Resize: duration + downtime (measured)
+
+The order micro -> small -> large -> small -> micro was run with REST
+(anon table read) and Auth health sampled every 250 ms:
+
+| op | settle | REST max contiguous outage | Auth max outage |
 |---|---|---|---|
 | upgrade micro->small | 105 s | 1.0 s | 0 s |
 | upgrade small->large | 61 s | 17.0 s | 0 s |
 | downgrade large->small | 61 s | 0 s | 0 s |
 | downgrade small->micro | 73 s | 0 s | 0 s |
 
-Adjacent resize PATCHes are rate-limited: the second one returns `429 We
-are still processing addon changes, please try again in N minute(s)`
-(measured D09). The platform-downtime experiment (AWS runner, 500 ms)
-measured resize pooler windows at ~131-207 s.[^sb-resilience] Docs cite
-"typically less than 2 minutes" for a compute change.[^sb-compute]
+Adjacent resize PATCHes are rate-limited independent of rebuild: the
+second within a window answered 429 `We are still processing addon
+changes, please try again in N minute(s)`. A separate experiment (500 ms
+sampling from AWS) measured the resize pooler window at ~131-207 s.[^lab-downtime]
+Docs cite "typically less than 2 minutes".[^sb-compute]
 
-## Disk types and pricing
+### Compute billing
+
+Compute is billed hourly (paused projects don't accrue) and is NOT spend-
+cap eligible - the cap only bounds eligible usage items.[^sb-cost]
+
+## Disk
+
+### Types (defaults doc-verified)
 
 | | gp3 | io2 |
 |---|---|---|
 | Price/GB-month | \$0.125 | \$0.195 |
 | IOPS price | \$0.024/IOPS-month | \$0.119/IOPS-month |
-| Throughput | incl 125 MBs, then \$0.95/MBs | scales with IOPS |
-| Max IOPS | 16,000 | 80,000 |
+| Throughput | 125 MBs incl, then \$0.95/MBs (max 1,000) | scales with IOPS |
+| Max IOPS | 16,000 (from 32 GB size) | 80,000 (from 80 GB size) |
 | Max size | 16 TB | 60 TB |
-| Default | gp3, 3000 IOPS / 125 MBs | opt-in |
+| Effective ceiling | min(compute size, provisioned disk) | |
 
-The docs treat io2 as a Large-compute-opt-in option; the lab measured the
-gate to be dashboard-only (below).[^sb-compute]
+Provision more than baseline per GB: gp3 +500 IOPS/GB and +0.25 MBs/IOPS;
+io2 +1,000 IOPS/GB.[^sb-compute] The lab measured the "Large compute"
+gate to be UI-only (below).[^sb-compute]
 
-## Database size vs disk size
+### Database size vs disk size
 
-Database size is the sum of `pg_database_size()` - tables, indexes,
-materialized views. Disk size is that plus WAL, system files, and the
-empty-project baseline (~40-60 MB). The distinction decides which quota
-trips you.[^sb-db-size]
+Database size = `pg_database_size()` (tables + indexes + materialized
+views). Disk = that + WAL + system files + an empty baseline of ~40-60
+MB.[^sb-db-size] Free plan quota is on the FIRST; paid-plan read-only
+trips on the SECOND at 95%.[^sb-db-size]
 
-- Deletes do not shrink db size automatically - dead tuples need vacuum;
-  TRUNCATE frees pages instantly (measured, D06b).
-- Monitor disk usage via `GET /v1/projects/{ref}/config/disk/util` (measured
-  working on free AND pro, D05).
+- Delete data: db size does not drop until vacuum runs (dead tuples);
+  TRUNCATE drops instantly. Both measured.
+- Disk util endpoint (`GET /config/disk/util`) answered 200 on free AND
+  pro (measured) - usable in org-wide cost probes.
 
-## Disk autoscale (no public API surface)
+### Autoscale: defaults and the missing surface
 
-The paid-disk autoscaler defaults: grow at 90% usage by growth percent
-(default 50%), in a minimum increment (default 1 GB), bounded by a max size
-(default 8 GB when the Pro spend cap is on).[^sb-db-size]
+Docs describe: trigger 90% usage, grow by growth percent (default 50%),
+min increment 1 GB, bounded by max size default 8 GB with the spend cap
+on.[^sb-db-size]
 
-The critical finding is that this has no public API surface: on both Pro
-AND Team orgs `GET /config/disk/autoscale` returned an empty shape and
-PUT/POST/PATCH all returned 404 (supabase-lab D04/D07). The dashboard shows
-editable fields; the public v1 surface does not. Track the values manually
-in IaC or they are invisible to automation.
+Measured: the whole thing is invisible to the Management API. On both
+Pro and Team orgs the autoscale GET returned an empty shape and PUT/POST
+/PATCH all answered 404. The dashboard's editable growth/min/max fields
+are the only mutation surface - the same pattern the http-tier-lockdown
+experiment found for the Data API toggle. Tracking these values is a
+manual IaC exercise.
 
-On the free start-point: measured baseline was 2 GB, not the documented
-1 GB; the disk did not grow at 90%+ through the fill (D05).[^sb-db-size]
+On the free tier: measured baseline disk was 2 GB (docs claim 1 GB) and
+the disk did NOT grow at 90%+ through a fill - here autoscale did not
+save you from the read-only anyway.[^sb-db-size]
 
-## Manual expansion and the quota
+### Manual expansion + modification quota
 
-Decrease attempts are rejected HTTP 400 (measured D02). Increases are
-accepted HTTP 201, capped at +200 GB per modification.[^sb-db-size]
+Increase is OK (HTTP 201, +200 GB cap per change); decrease is refused
+(HTTP 400, measured).[^sb-db-size]
 
-Quota, measured (D03): the runtime emits `429 Database disk can only be
-modified once per four hours. Last modified at <UTC>`. The docs describe
-"four modifications within a rolling 24-hour window".[^sb-db-size] One
-battery run accepted five consecutive increases in a burst; the next run
-rejected the second. Treat the cooldown as non-schedulable and plan bulk
-imports by raising the disk manually first.
+Modification quota measured: 429 `Database disk can only be modified
+once per four hours. Last modified at <UTC>` - directly contradicting
+the docs' "four modifications within a rolling 24-hour
+window".[^sb-db-size] One run also accepted 5 consecutive increases in
+one burst; plan for a cooldown you cannot schedule around, and raise
+the disk before bulk imports bigger than ~1.5x the current db size.
 
-## Read-only mode
+### Read-only mode
 
-Free plan, measured (D06): read-only tripped at ~726 MB db size (docs say
-500 MB),[^sb-db-size] with the verbatim error `ERROR: 25006: cannot
-execute INSERT in a read-only transaction`. SELECT still answered on the
-management query endpoint (HTTP 201). Recovery in read-only: TRUNCATE is
-rejected (D06b), so recover via DELETE + vacuum, or flip
-`set default_transaction_read_only = 'off'` once below the threshold.[^sb-db-size]
+Free plan (measured): accepts to ~726 MB db size, then a write fails
+with `ERROR: 25006: cannot execute INSERT in a read-only transaction`;
+a SELECT on the management endpoint answered 201 the whole time. The
+documented 500 MB was not the boundary in this run,[^sb-db-size] and
+recovery required DELETE (TRUNCATE was rejected) or the override GUC
+`set default_transaction_read_only = 'off'` once below the
+threshold.[^sb-db-size]
 
-Paid plans: read-only trips at 95% disk util (documented, not run in the
-lab).[^sb-db-size]
+Paid plans: docs trigger at 95% disk util (not run here).[^sb-db-size]
 
-## IOPS/throughput gate (dashboard-only)
+### Disk IOPS/throughput gate (dashboard-only)
 
-The dashboard states "Adjusting your disk configuration requires LARGE
-Compute size or above." The Management API accepted AND applied elevated
-IOPS/throughput on a Micro project (measured D08, verified by follow-up
-GET). The gate is UI-only: a PAT bypasses it and IOPS billing kicks in
-regardless.
+Dashboard: "Adjusting your disk configuration requires LARGE Compute
+size or above." Measured: the raise was accepted AND stuck on Micro,
+verified by follow-up GET. The gate is a UI gate; a PAT bypasses it
+silently, and IOPS billing starts regardless.
 
-## Spend cap and plan differences
+## Spend cap (and where compute/disk escape it)
 
-- Spend cap ON: eligible overages are blocked at quota after notification +
-  grace period, ending in Fair Use restriction. It is a billing-path
-  enforcement, NOT a request-path breaker (measured, supabase-lab W21).
-- Exclusions (not spend-cap eligible): compute hours, disk throughput,
-  disk IOPS-hours, custom domains, PITR, read replicas, IPv4, branching,
-  advanced MFA/SSO, log drains.[^sb-cost]
-- Team plan has no spend cap at all - overages are simply billed; the disk
-  8 GB autoscale cap (spend-cap related) falls away accordingly.[^sb-cost]
+Spend cap ON = eligible overages blocked past quota after notification +
+grace period, ending in Fair Use restriction; it is billing-path
+enforcement, not a request-path breaker (measured).[^sb-cost]
+
+Exclusions (never capped): compute hours, disk throughput, disk
+IOPS-hours, custom domains, PITR, read replicas, IPv4, branching,
+advanced MFA/SSO, log drains.[^sb-cost] Team plan has no spend cap at
+all - overages are simply billed.[^sb-cost]
 
 ## Ops playbook
 
-- Bulk import bigger than 1.5x current db size: expand disk manually
-  first, or the quota caps it mid-import and the project goes read-only
-  (measured path through D02/D03/D06).
-- Resize sequencing: leave >= 2 minutes between adjacent resize PATCHes or
-  the platform rejects the second (`429`, measured D09).
-- Sizing cues: CPU util, and `Disk IO % consumed` (burst-budget indicator;
-  anything >0 means past baseline).[^sb-compute]
-- Treat the autoscale settings as IaC-managed-by-hand: they cannot be
-  observed through the API (measured D04/D07).
+- **Pre-bulk-import**: measure; if the import is larger than ~1.5x the
+  current db size, expand the disk manually first (single POST), or the
+  quota kills it mid-import and read-only follows. Then re-check the
+  quota status before a second attempt.
+- **Resize sequencing**: wait >= 2 minutes between adjacent resize
+  PATCHes, or the second returns 429 with `still processing`.
+- **Sizing cues**: CPU utilization + `Disk IO % consumed` (the
+  burst-budget drain metric: >0 means past baseline). Over it ->
+  upgrade.[^sb-compute]
+- **Autoscale settings**: cannot be observed via API; pin their intended
+  state in IaC and audit the dashboard manually.
+
+## Where the docs disagree with runtime
+
+| Doc claim | Runtime measured | Severity |
+|---|---|---|
+| read-only at 500 MB db (free) | read-only at ~726 MB, reads survivor | docs stale |
+| 4 modifications / 24 h | 429 once/4h, nondeterministic | docs text differs, quota exists |
+| free disk starts 1 GB | started 2 GB | docs understate |
+| Large-only for IOPS/throughput | accepted + applied on Micro | UI-only gate |
+| autoscale config via API | verbs 404; GET empty | surface gap |
+
+Each row is reproducible: run a probe against `experiments/compute-disk`
+in supabase-lab.[^lab-cd]
+
+## Reading the numbers
+
+- Settle seconds are measured from PATCH -> ACTIVE_HEALTHY status flip.
+  Treat them as a floor; longer providers and disks stretch it.
+- contiguous-outage values in the resize table are the MAX visible gap
+  across sampled clients - percent-ok inside a window can dip below that
+  without creating an officially long gap.
+- Disk quota behavior varied run to run (bursts accepted, then reject);
+  treat it as volatile, not a number to schedule against.
 
 [^sb-compute]: Supabase, "Compute and Disk," Supabase Docs. https://supabase.com/docs/guides/platform/compute-and-disk
 [^sb-db-size]: Supabase, "Database Size," Supabase Docs. https://supabase.com/docs/guides/platform/database-size
-[^sb-cost]: Supabase, "Cost Control," Supabase Docs. https://supabase.com/docs/guides/platform/cost-control
-[^sb-resilience]: supabase-lab, "Platform-downtime experiment," supabase-lab runlog. https://github.com/erfianugrah/supabase-lab/tree/main/experiments/platform-downtime
+[^sb-cost]: Supabase, "Cost Control - Spend Cap," Supabase Docs. https://supabase.com/docs/guides/platform/cost-control
+[^lab-cd]: supabase-lab, "Compute-disk experiment," supabase-lab runlog. https://github.com/erfianugrah/supabase-lab/tree/main/experiments/compute-disk
+[^lab-downtime]: supabase-lab, "Platform-downtime experiment," supabase-lab runlog. https://github.com/erfianugrah/supabase-lab/tree/main/experiments/platform-downtime
