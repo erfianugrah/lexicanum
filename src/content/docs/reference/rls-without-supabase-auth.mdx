@@ -1,0 +1,275 @@
+---
+title: "RLS without Supabase Auth: JWT claims over the wire"
+description: Row-level security without PostgREST or GoTrue - RLS reads session GUCs, not HTTP headers, so any client that can run SQL can set request.jwt.claims itself and keep per-user policies working over a raw Postgres connection. The pattern, the two sharp edges (unprivileged GUCs, RLS-blind query caches), what leaving the Supabase HTTP layer actually costs, and which incident classes it removes.
+author: Erfi Anugrah
+category: supabase
+group: architecture
+featured: true
+blurb: "RLS is a Postgres feature, not a PostgREST one - set request.jwt.claims yourself over the wire and per-user policies keep working with your own auth."
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+A recurring question after any PostgREST-layer incident: can you keep
+row-level security while dropping both Supabase Auth and the Data API,
+talking to the database over the wire protocol instead? Yes - because RLS
+never belonged to the HTTP layer in the first place. The price is that the
+client becomes the claims authority, and that is a real security
+reassignment, not a config tweak.
+
+**Provenance.** Behavior claims are doc-verified against the Cloudflare,
+Supabase, and Postgres docs cited inline (checked 2026-08-20). The GUC form
+`set "request.jwt.claims" = '{"sub": ...}'` driving `auth.uid()` is
+additionally measured in this site's own lab (see
+[the RLS policy cost reference](/reference/supabase-rls-policy-cost/)). The
+end-to-end Worker pattern below is design-only - assembled from verified
+parts, not yet run green against a live project.
+
+**TL;DR:**
+
+- RLS is enforced by Postgres for any non-`BYPASSRLS`, non-owner role on any
+  connection - raw wire included. What the HTTP layer adds is the *claims
+  context*: PostgREST validates the JWT and sets `request.jwt.claims` so
+  `auth.uid()` resolves. Nothing stops your own backend from setting the
+  same GUC.
+- The pattern: verify your own JWT in app code, then per request run
+  `BEGIN; SELECT set_config('request.jwt.claims', '<claims>', true); <queries>; COMMIT;`
+  connecting as a dedicated non-superuser role. Per-user RLS policies work
+  unchanged.
+- Two sharp edges: the GUC is **unprivileged** (anyone with SQL access can
+  set any claims, so the connection credential is now the security
+  boundary), and Hyperdrive's query cache is **RLS-blind** (identical SQL
+  from two users shares one cache entry - use a cache-disabled binding for
+  claims-scoped queries).[^cf-hd-cache]
+- This works from any runtime with a Postgres driver, not just Cloudflare
+  Workers, and against any Postgres with RLS - the Supabase-specific part
+  is only the GUC name and the `auth.*` helper functions.
+- You gain independence from the PostgREST/Kong incident classes (routing
+  misconfigurations, PGRST303 JWT clock-skew rejections). You lose the Data
+  API, GoTrue, Storage API enforcement, and Realtime.
+
+---
+
+## The mechanism: RLS reads GUCs, not HTTP
+
+Postgres row-level security is a property of the table and the connecting
+role.[^pg-rls] A policy like `owner = auth.uid()` is just SQL evaluated per
+row, and on Supabase `auth.uid()` is a STABLE function that reads a session
+configuration parameter - the `sub` claim out of the `request.jwt.claims`
+GUC (JSON form), with `auth.jwt()` returning the whole JSON and
+`auth.role()` reading its `role` claim.[^sb-rls]
+
+In the managed stack, the chain that populates that GUC is:
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  client [label="Client", shape=box, style=rounded];
+
+  subgraph cluster_http {
+    label="Supabase HTTP layer (the part you are leaving)"; style=rounded; fontsize=12; margin=12;
+    kong [label="Kong gateway"];
+    pgrst [label="PostgREST\nvalidates JWT,\nsets request.jwt.claims"];
+  }
+
+  pg [label="Postgres\nRLS reads the GUC", shape=cylinder];
+
+  client -> kong [label="HTTPS + JWT"];
+  kong -> pgrst;
+  pgrst -> pg [label="SQL + claims GUC"];
+
+  subgraph cluster_wire {
+    label="Your backend (the replacement)"; style=rounded; fontsize=12; margin=12;
+    app [label="Worker / server\nverifies own JWT"];
+  }
+
+  app -> pg [label="wire protocol + set_config(...)", style=dashed];
+}
+```
+
+PostgREST is a claims *setter*, not the enforcer. Any client that can run
+SQL can set the same GUC - which is both the opportunity and the hazard.
+
+The claims form that `auth.uid()` resolves is the JSON GUC, measured in
+this site's lab while testing policy shapes:
+
+```sql
+set "request.jwt.claims" = '{"sub":"<user-uuid>","role":"authenticated"}';
+select auth.uid();  -- returns <user-uuid>
+```
+
+Policies that branch on `auth.role()` (for example
+`auth.role() = 'authenticated'`) need the `role` key present in the JSON -
+over the wire the claim is just data; nothing maps it to the actual
+connecting role the way PostgREST's role switching does.
+
+## The pattern
+
+1. **Run your own auth.** Issue and verify JWTs yourself (or via an
+   external provider). Verification happens in app code, before any SQL.
+2. **Connect as a dedicated role** - not `postgres`, not `service_role`
+   (both carry `BYPASSRLS`), not the table owner. Grant it only the
+   schemas, tables, and functions the app needs. RLS then enforces for
+   every query it runs.
+3. **Set claims per transaction, then query:**
+
+```ts
+// Worker / server, postgres.js driver
+const claims = JSON.stringify({ sub: userId, role: "authenticated" });
+const rows = await sql.begin(async (tx) => {
+  // set_config(name, value, is_local=true) == SET LOCAL: scoped to this
+  // transaction. Use set_config, not `SET LOCAL x = $1` - SET does not
+  // accept bind parameters, so interpolating claims into SET text is a
+  // SQL-injection surface. set_config parameterizes cleanly.
+  await tx`SELECT set_config('request.jwt.claims', ${claims}, true)`;
+  return tx`SELECT * FROM pastes`;  // RLS sees auth.uid() = userId
+});
+```
+
+`SET LOCAL` semantics: the setting holds until transaction end, then
+reverts.[^pg-set-local] Never use bare `SET` outside a transaction - it
+persists for the session, and on a pooled connection the next tenant gets
+the previous user's claims.
+
+<Aside type="caution" title="Hyperdrive: per-query or per-transaction, never per-session">
+Hyperdrive's pooler runs in transaction mode and supports `SET` for the
+duration of a transaction or a single multi-statement query
+(`SET x; SELECT ...;`), resetting the connection on return to the
+pool.[^cf-hd-set] It explicitly recommends *against* holding one
+transaction open across many operations just to keep the `SET` state - the
+connection cannot be reused while you hold it. Structure claims as
+`set_config(..., true)` at the top of each transaction, exactly like the
+pattern above. The per-query multi-statement form works too, and has a
+useful side effect: multi-statement queries are marked uncacheable
+(`cacheStatus: multiplestatements`), which sidesteps the cache hazard
+below for that query.
+</Aside>
+
+## Sharp edge 1: the GUC is unprivileged
+
+`request.jwt.claims` is an ordinary configuration parameter. PostgREST's
+validation is what makes it trustworthy; the GUC itself accepts anything.
+Two consequences:
+
+- **The database credential becomes the claims authority.** Whoever holds
+  the connection string your backend uses can `SET` themselves into any
+  user. Treat that credential as equivalent to a service key: server-side
+  only, rotatable, never in a client bundle. There is no defense in depth
+  left in the database layer - the JWT you verified in app code is the only
+  thing standing between a caller and someone else's rows.
+- **Defense in depth moves into the DB schema where you can still have
+  it.** Prefer policies that combine the claims GUC with data invariants
+  (tenant columns, membership tables) so a claims mistake degrades to a
+  smaller blast radius than "any user as anyone".
+
+This is strictly worse isolation than the default stack, where a leaked
+anon key can only do what RLS allows *and* the JWT is validated by
+infrastructure you do not control. It is strictly better than the
+alternative raw-SQL shape - a `BYPASSRLS` role with authorization purely
+in app code, where a SQL-injection bug in one query has no policy layer
+behind it at all. The
+[Cloudflare + Supabase architecture reference](/reference/cloudflare-supabase-architecture/)
+covers that `BYPASSRLS`-by-role variant and its measured behavior; this doc
+is the third option between the two.
+
+## Sharp edge 2: RLS-blind query caches
+
+Any query cache keyed on SQL text + parameters cannot see session GUCs.
+Hyperdrive's cache is exactly that, and it does not invalidate on
+writes.[^cf-hd-cache] Two users running the same deterministic
+`SELECT * FROM pastes` with different claims produce one cache entry -
+whoever warms it leaks to the other.
+
+The documented fix is the split-binding pattern: one Hyperdrive
+configuration with caching for queries that are claims-independent
+(reference data, public reads), a second created with
+`--caching-disabled` for every query whose result depends on
+`request.jwt.claims` - the same split Cloudflare already recommends for
+auth, sessions, permissions, and read-after-write paths.[^cf-hd-cache]
+When in doubt, a query is claims-dependent. The per-query `SET; SELECT`
+multi-statement form is never cached, but do not rely on that as the
+policy - the cache-disabled binding is the explicit control.
+
+## What leaving the HTTP layer actually costs
+
+The connection string is the same one Supabase documents for every external
+client; nothing here needs platform changes.[^sb-connect] What you stop
+getting is the rest of the product surface that rides HTTP:
+
+| Surface | Over the wire | Leaving it means |
+|---|---|---|
+| PostgREST Data API | gone | every `.from()` call becomes SQL you write |
+| GoTrue (Auth) | gone | you own signup, OAuth, magic links, token mint/refresh, revocation |
+| Storage API | gone | signed URLs and `storage.objects` RLS are enforced by the Storage service, not by Postgres on a raw connection - object downloads need a new authz story |
+| Realtime | gone | the WS layer authorizes by JWT; replicating it is its own project |
+| Edge Functions | unaffected | separate runtime, still callable |
+
+Keeping Supabase Auth while dropping only PostgREST is also coherent:
+verify the GoTrue-issued JWT in your backend (JWKS, cached - measured ~0ms
+per verify at the edge in the
+[architecture reference](/reference/cloudflare-supabase-architecture/)),
+then set the claims it carried. That keeps GoTrue's user management and
+removes only the Data API.
+
+## Not just Cloudflare
+
+Nothing in the pattern is Workers-specific:
+
+- **Any runtime with a Postgres driver** - Vercel functions, Lambda, Deno
+  Deploy, a VM - can run the same `set_config` per transaction. The only
+  runtime requirements are TCP to the database (direct `5432`, or the
+  Supavisor pooler) and a transaction-scoped API.[^sb-connect]
+- **Any Postgres with RLS**, not just Supabase. On a plain Postgres (Neon,
+  RDS, self-hosted) there is no `auth` schema, so define your own
+  convention - `SET LOCAL app.user_id = ...` read via
+  `current_setting('app.user_id', true)` in policies. The mechanism,
+  hazards, and pooler rules are identical; only the GUC name changes.
+- **Pooler compatibility** is the one thing to check per platform.
+  Transaction-mode poolers (Supavisor 6543, PgBouncer transaction mode,
+  Hyperdrive) all scope session state to the transaction, which is what the
+  pattern needs; a pooler in *session* mode would also work but is the
+  wrong tool for serverless fan-out.
+
+## What this buys during incidents
+
+Two of the recurring classes in the
+[incident resilience reference](/reference/supabase-incident-resilience/)
+live entirely in the layer this pattern removes:
+
+- **PostgREST/Kong routing and config rollouts** - regional regional Data API 503 incidents cannot affect a connection that never traverses them.
+- **PGRST303 JWT clock-skew rejections** - PostgREST validating `iat`/`exp`
+  is gone; your verifier is the only clock that matters.
+
+Everything below the HTTP layer is unchanged: compute lifecycle events,
+Supavisor failures (if you route through it), and the database itself still
+take you down. You are removing one failure domain out of several - worth
+doing when you already own auth, not as a rewrite justified by a single
+outage.
+
+## Which do I pick
+
+| Your situation | Pick |
+|---|---|
+| Standard app, Supabase Auth, SDK ergonomics matter | `supabase-js` over PostgREST - the default, nothing here beats it |
+| Own auth already, want per-user RLS kept, edge/serverless runtime | claims over the wire (this doc), cache-disabled binding for user-scoped reads |
+| Own auth, RLS is coarse (role-level, not per-user) | `BYPASSRLS` role + app authz, per the architecture reference - simpler, fewer GUC mechanics |
+| Only the PostgREST layer is the problem, Auth is fine | GoTrue JWTs + claims over the wire - keeps user management, drops the Data API |
+| Leaving Supabase entirely | same pattern on plain Postgres with `app.*` GUCs |
+
+## References
+
+[^cf-hd-set]: Cloudflare, "How Hyperdrive works," Cloudflare Docs. https://developers.cloudflare.com/hyperdrive/concepts/how-hyperdrive-works/
+
+[^cf-hd-cache]: Cloudflare, "Query caching," Cloudflare Docs. https://developers.cloudflare.com/hyperdrive/concepts/query-caching/
+
+[^sb-rls]: Supabase, "Row Level Security," Supabase Docs. https://supabase.com/docs/guides/database/postgres/row-level-security
+
+[^sb-connect]: Supabase, "Connecting to your database," Supabase Docs. https://supabase.com/docs/guides/database/connecting-to-postgres
+
+[^pg-rls]: PostgreSQL Global Development Group, "Row Security Policies," PostgreSQL Documentation. https://www.postgresql.org/docs/current/ddl-rowsecurity.html
+
+[^pg-set-local]: PostgreSQL Global Development Group, "SET," PostgreSQL Documentation. https://www.postgresql.org/docs/current/sql-set.html
