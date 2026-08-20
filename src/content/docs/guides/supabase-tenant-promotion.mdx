@@ -50,7 +50,33 @@ consumer's cache lag. Timings quoted for those three runs come from the run itse
 
 | Fact | Value |
 |---|---|
-| JWKS refresh | cached in project config; **measured: a trusting project did not accept new-key tokens within 20 minutes of a rotation, and honoured a revoked key for 15** - see [Rotating the hub's key](#rotating-the-hubs-key-is-a-maintenance-window) |
+| JWKS refresh | cached in project config; **measured: a trusting project did not accept new-key tokens within 20 minutes of a rotation, and honoured a revoked key for 15** - see [Part 4: rotating the hub's key](#part-4-rotating-the-hubs-key-is-a-maintenance-window) |
+
+## Architecture overview
+
+The hub issues every tenant's token; the shared and the dedicated project each
+resolve the hub's key set once and verify against it, and the `tenant_id` claim
+in the token is what RLS scopes the read by.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  hub [label="hub project\nissues every tenant's token"];
+  shared [label="shared project\nverifies the hub's key set\nRLS on tenant_id"];
+  dedicated [label="dedicated project\nverifies the hub's key set\n(after promotion)"];
+  client [label="client\npresents the hub's token"];
+
+  hub -> client [label="access token"];
+  client -> shared [label="request + token"];
+  client -> dedicated [label="request + token"];
+  shared -> hub [label="resolves key set, caches it"];
+  dedicated -> hub [label="resolves key set, caches it"];
+}
+```
 
 ## Part 1: promote the tenant to its own project
 
@@ -111,7 +137,7 @@ curl -s "https://<dedicated-ref>.supabase.co/rest/v1/items?select=tenant_id,body
 # [{"tenant_id":"tenant-a","body":"a-row-1"},{"tenant_id":"tenant-a","body":"a-row-2"}]
 ```
 
-No re-login, no token reissue, no password reset. The issuer never changed.
+No re-login or token reissue. The issuer never changed.
 
 **5. Reap.** The rows stay on the shared instance until you remove them - promotion is
 not destructive by itself, so keep them through a validation window, then:
@@ -120,7 +146,7 @@ not destructive by itself, so keep them through a validation window, then:
 delete from public.items where tenant_id = 'tenant-a';
 ```
 
-## How clients learn where a tenant lives
+## Part 2: how clients learn where a tenant lives
 
 A tenant's project ref changes at promotion, and the ref appears in the URL the client
 calls. Two ways to absorb that:
@@ -132,8 +158,8 @@ calls. Two ways to absorb that:
   injecting keys, so they never see a ref at all. More moving parts and it sits in the
   data path.
 
-The token is valid against both projects either way, which removes the hardest thing a
-gateway would otherwise have to do - it never needs to reissue or rewrite tokens.
+The token is valid against both projects either way, which removes the gateway's
+token-reissue job.
 
 **Measured 2026-08-04: the discovery endpoint is enough, and the gateway is not
 needed.** A client that read its `{ref, publishable key}` from a registry at request
@@ -167,31 +193,7 @@ One caveat the same run surfaced: after the move, the shared project keeps servi
 tenant's original token. Promotion is a copy, so both placements answer until the
 source identity is retired - see below.
 
-## Verification
-
-Run these against the same two-tenant fixture immediately after a promotion. Each
-check confirms that one property of the move survived - the token, the copied rows,
-the source project's state - rather than that access was ever denied; the negative
-controls for that are the build guide's
-[Verification table](/guides/supabase-shared-tenancy/#verification), not this one's.
-
-| Check | How | Expected |
-|---|---|---|
-| Token portable | same token against the dedicated project | accepted (`[]` before copy) |
-| Promotion complete | after the copy, same token, dedicated project | the tenant's rows |
-| Promotion non-destructive | same token, shared project | rows still present until reaped |
-| Vault survives | `select decrypted_secret from vault.decrypted_secrets` on the target | plaintext, no `invalid ciphertext` |
-| Sequences reset | insert on the target | no PK collision |
-
-## Gotchas and lessons learned
-
-- **Identical schemas on both tiers.** Promotion becomes a data copy. Keep RLS enabled
-  on dedicated projects even with one tenant - it costs nothing and means the two
-  tiers never diverge.
-- **Vault does not survive the copy** unless you move the encryption root key first,
-  and the source must still exist when you do.
-
-## Promotion moves the data, not the identity
+## Part 3: promotion moves the data, not the identity
 
 A promoted tenant keeps its session, and that is the point of the trust wiring. It
 does not become independent, and the difference is measurable.
@@ -243,7 +245,7 @@ against the new project. No re-login anywhere.
 
 ```sql
 -- On the target, per table, in FK order: users, identities, sessions, refresh_tokens.
--- `select *` does NOT work - see the generated-column trap below.
+-- `select *` does NOT work - see Gotchas and lessons learned.
 do $mig$
 declare cols text;
 begin
@@ -259,32 +261,6 @@ end $mig$;
 select setval('auth.refresh_tokens_id_seq',
               (select coalesce(max(id), 1) from auth.refresh_tokens), true);
 ```
-
-Three traps, each of which broke a run:
-
-- **`insert ... select *` cannot work.** `auth.users.confirmed_at` and
-  `auth.identities.email` are `GENERATED ALWAYS`, and Postgres rejects any
-  non-DEFAULT value for them (`428C9`). Enumerating columns from the catalog is also
-  what makes the copy tolerant of the two projects running different auth schema
-  versions, which any pair of projects created months apart will.
-- **The `bigserial` sequence does not follow the rows.** After landing a row with
-  `id = 1` the sequence still reported `last_value = 1, is_called = false`, so the
-  next `nextval()` hands out an id that already exists. GoTrue rotates the refresh
-  token on every use, so this detonates on the tenant's first refresh and looks like
-  session porting being unsupported. It is not; it is a missing `setval`.
-- **A fresh project 500s for a while after it reports healthy.** `500` with
-  `SQLSTATE 57P01` on the first call is Postgres restarting inside the settle window,
-  not an answer. Retry before you believe a failure. Measured across five projects on
-  2026-08-04: create to `ACTIVE_HEALTHY` took 131-159 s, and all five then refused
-  their first `admin/users` write with `500 unexpected_failure` and accepted the
-  second, one poll later. It is not a race you can get lucky with - budget the retry.
-- **Do not carry the source's `auth.refresh_tokens.id` into a target that has already
-  seen a login.** The `setval` above assumes the target is pristine, which it is for a
-  project provisioned for this promotion. Copy into one that has any prior auth
-  activity and the insert dies on `refresh_tokens_pkey` instead, because the low ids
-  are taken. Either let the target assign the id (the token string is what the client
-  presents, and the `setval` then becomes belt-and-braces) or reconcile the ids
-  yourself. Found on 2026-08-04 by running this copy twice against the same pair.
 
 Two of the three unexercised parts were measured on 2026-08-04, on three runs that
 agreed.
@@ -306,7 +282,9 @@ separate, deliberate step.
 Still not exercised: OAuth and SAML identities. That needs a real external provider,
 and a lab that fakes one is measuring the fake.
 
-## Rotating the hub's key is a maintenance window
+<a id="rotating-the-hubs-key-is-a-maintenance-window"></a>
+
+## Part 4: rotating the hub's key is a maintenance window
 
 Every project that trusts the hub caches the hub's key set. That cache is the whole
 story, and it makes rotation slow in both directions.
@@ -330,37 +308,81 @@ new `kid` in its own JWKS in about 7 minutes. The trusting project's cached set 
 exactly one `kid` on all 282 probes and never re-resolved at all, across 37 minutes
 after the rotation. So the window is the consumer's cache, not the issuer's
 publication - which is also the second reason the `DELETE` + re-`POST` mitigation
-cannot work: a consumer forced to re-resolve early would have re-cached a key set that
+cannot work - the first is in [Gotchas and lessons learned](#gotchas-and-lessons-learned):
+a consumer forced to re-resolve early would have re-cached a key set that
 did not yet list the new key. The same run re-read each key's status immediately before
 each request, so "revoked but still honoured" is now measured on both sides rather
 than inferred from a `PATCH` that returned earlier.
 
-Two consequences, and the second is the one that matters.
+**Revocation does not revoke.** Supabase's signing-keys documentation says
+asymmetric revocation
+["is automatic via the key discovery endpoint"](https://supabase.com/docs/guides/auth/signing-keys),
+which is true of the issuing project and false of a third-party consumer inside its
+cache window. During an incident the hub can rotate and revoke in seconds, and for
+the next half hour every trusting project will accept the compromised key and reject
+its replacement.
 
 **New sessions break first.** Anyone who signs in or refreshes after the rotation
 gets a token no trusting project will accept, while everyone holding an older token
 carries on. That is the opposite of the usual rollout shape, where new code paths
 fail and old ones keep working - here the *fresh* credential is the broken one.
 
-**Revocation does not revoke.** Supabase's signing-keys documentation says
-asymmetric revocation "is automatic via the key discovery endpoint", which is true
-of the issuing project and false of a third-party consumer inside its cache window.
-During an incident the hub can rotate and revoke in seconds, and for the next half
-hour every trusting project will accept the compromised key and reject its
-replacement.
-
-<Aside type="caution">
-The obvious fix does not work. There is no `PATCH` on the third-party-auth endpoint,
-so `DELETE` + re-`POST` is the only lever - and the re-created integration reported
-`resolved: true` while caching the OLD key again, because the hub's own
-`/auth/v1/.well-known/jwks.json` was still advertising only that key minutes after
-the rotation. Two lags are stacked: the issuer's JWKS publication and the consumer's
-cache. Forcing the consumer to re-resolve buys nothing while the issuer still
-publishes the old key set.
-</Aside>
-
 Plan a hub rotation as a scheduled window with sessions drained, or avoid the hub
 pattern where key rotation has to be fast. Nothing measured here makes it quick.
+
+## Verification
+
+Run these against the same two-tenant fixture immediately after a promotion. Each
+check confirms that one property of the move survived - the token, the copied rows,
+the source project's state - rather than that access was ever denied; the negative
+controls for that are the build guide's
+[Verification table](/guides/supabase-shared-tenancy/#verification), not this one's.
+
+| Check | How | Expected |
+|---|---|---|
+| Token portable | same token against the dedicated project | accepted (`[]` before copy) |
+| Promotion complete | after the copy, same token, dedicated project | the tenant's rows |
+| Promotion non-destructive | same token, shared project | rows still present until reaped |
+| Vault survives | `select decrypted_secret from vault.decrypted_secrets` on the target | plaintext, no `invalid ciphertext` |
+| Sequences reset | insert on the target | no PK collision |
+
+## Gotchas and lessons learned
+
+- **Identical schemas on both tiers.** Promotion becomes a data copy. Keep RLS enabled
+  on dedicated projects even with one tenant - it costs nothing and means the two
+  tiers never diverge.
+- **Vault does not survive the copy** unless you move the encryption root key first,
+  and the source must still exist when you do.
+- **`insert ... select *` cannot work.** `auth.users.confirmed_at` and
+  `auth.identities.email` are `GENERATED ALWAYS`, and Postgres rejects any
+  non-DEFAULT value for them (`428C9`). Enumerating columns from the catalog is also
+  what makes the copy tolerant of the two projects running different auth schema
+  versions, which any pair of projects created months apart will.
+- **The `bigserial` sequence does not follow the rows.** After landing a row with
+  `id = 1` the sequence still reported `last_value = 1, is_called = false`, so the
+  next `nextval()` hands out an id that already exists. GoTrue rotates the refresh
+  token on every use, so this detonates on the tenant's first refresh and looks like
+  session porting being unsupported. It is a missing `setval`.
+- **A fresh project 500s for a while after it reports healthy.** `500` with
+  `SQLSTATE 57P01` on the first call is Postgres restarting inside the settle window,
+  not an answer. Retry before you believe a failure. Measured across five projects on
+  2026-08-04: create to `ACTIVE_HEALTHY` took 131-159 s, and all five then refused
+  their first `admin/users` write with `500 unexpected_failure` and accepted the
+  second, one poll later. It is not a race you can get lucky with - budget the retry.
+- **Do not carry the source's `auth.refresh_tokens.id` into a target that has already
+  seen a login.** The `setval` in Part 3 assumes the target is pristine, which it is
+  for a project provisioned for this promotion. Copy into one that has any prior auth
+  activity and the insert dies on `refresh_tokens_pkey` instead, because the low ids
+  are taken. Either let the target assign the id (the token string is what the client
+  presents, and the `setval` then becomes belt-and-braces) or reconcile the ids
+  yourself. Found on 2026-08-04 by running this copy twice against the same pair.
+- **The obvious fix for a stuck trusting project does not work.** There is no
+  `PATCH` on the third-party-auth endpoint, so `DELETE` + re-`POST` is the only
+  lever - and the re-created integration reported `resolved: true` while caching the
+  OLD key again, because the hub's own `/auth/v1/.well-known/jwks.json` was still
+  advertising only that key minutes after the rotation. Two lags are stacked: the
+  issuer's JWKS publication and the consumer's cache. Forcing the consumer to
+  re-resolve buys nothing while the issuer still publishes the old key set.
 
 ## What this does not settle
 
@@ -403,6 +425,21 @@ rather than a proxy. See the section above.
 | Promotion works without re-login | Copied one tenant's rows, re-read with the same token | Measured - rows returned, no re-auth |
 | Promotion is non-destructive | Re-read the shared project after the copy | Measured - rows still present |
 | Vault survives a transfer but not a copy | Cross-referenced from the transfer lab | Measured - decrypts after transfer, `invalid ciphertext` after `pg_dump` |
+
+## File reference
+
+The harness for these runs lives in the [supabase-lab repo](https://github.com/erfianugrah/supabase-lab) under
+`experiments/tenant-promotion/`:
+
+| File | What it holds |
+|---|---|
+| `tests/p01-promotion-follows.ts` | the discovery-endpoint client following a promotion with the refresh token it already held |
+| `tests/p02-mfa-survives.ts` | the TOTP factor copied with `auth.mfa_factors` and verified at the target |
+| `tests/p03-retire-source-identity.ts` | retiring the source user: both issuing paths fail at the source, target unaffected |
+| `tests/p04-vanity-subdomain.ts` | the `check-availability` + `activate` calls and the bare-label rule |
+| `lib/promote.ts` | the `auth` table copy and the `setval` resync |
+| `RUNLOG.md` | the per-test narrative |
+| `evidence/` | the captured probes from the 2026-08-04 runs |
 
 ## Related
 
