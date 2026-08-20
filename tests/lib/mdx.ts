@@ -32,6 +32,11 @@ export interface Table {
   /** 1-indexed line of the last row. */
   endLine: number;
   rowCount: number;
+  /**
+   * Whether the run carries a delimiter row. GFM only renders a pipe run as a
+   * table when one is present; a run without it is literal pipe text.
+   */
+  hasSeparator: boolean;
 }
 
 export interface Fence {
@@ -178,18 +183,30 @@ export function parseMdx(path: string, raw: string): Doc {
   // ends the run, which is exactly the failure mode worth reporting: markdown
   // stops the table there and renders everything after it as a paragraph.
   const tables: Table[] = [];
-  let cur: { start: number; rows: number } | null = null;
+  let cur: { start: number; rows: number; hasSeparator: boolean } | null = null;
   for (const l of lines) {
     const isRow = l.kind === "prose" && TABLE_ROW.test(l.raw);
     if (isRow) {
-      if (!cur) cur = { start: l.n, rows: 0 };
-      if (!TABLE_SEP.test(l.raw)) cur.rows++;
+      if (!cur) cur = { start: l.n, rows: 0, hasSeparator: false };
+      if (TABLE_SEP.test(l.raw)) cur.hasSeparator = true;
+      else cur.rows++;
     } else if (cur) {
-      tables.push({ startLine: cur.start, endLine: l.n - 1, rowCount: cur.rows });
+      tables.push({
+        startLine: cur.start,
+        endLine: l.n - 1,
+        rowCount: cur.rows,
+        hasSeparator: cur.hasSeparator,
+      });
       cur = null;
     }
   }
-  if (cur) tables.push({ startLine: cur.start, endLine: lines.length, rowCount: cur.rows });
+  if (cur)
+    tables.push({
+      startLine: cur.start,
+      endLine: lines.length,
+      rowCount: cur.rows,
+      hasSeparator: cur.hasSeparator,
+    });
 
   // A definition is line-anchored; a reference can appear anywhere, including
   // immediately before a colon that is ordinary sentence punctuation. Matching
@@ -231,24 +248,35 @@ export function parseMdx(path: string, raw: string): Doc {
   };
 }
 
-/** Tables broken in half by a blank line, reported as the pair of runs. */
+/**
+ * Tables broken in half, reported as the pair of runs. Two shapes ship this
+ * way: a blank line between the two halves, and a prose paragraph the
+ * orphaned rows lazy-continue (rows, blank line, paragraph, then more rows
+ * with no blank line - guides/supabase-postgres-major-upgrade-e2e shipped the
+ * second). In GFM a pipe run is a table only if it carries a delimiter row,
+ * so a second run that lacks one renders as literal pipe text regardless of
+ * what sits between the runs - while a second run with one is always a
+ * genuine table (reference/caching.mdx has two in a row with different
+ * columns).
+ */
 export function splitTables(doc: Doc): { first: Table; second: Table }[] {
   const out: { first: Table; second: Table }[] = [];
   for (let i = 0; i < doc.tables.length - 1; i++) {
     const a = doc.tables[i]!;
     const b = doc.tables[i + 1]!;
-    const between = doc.lines.slice(a.endLine, b.startLine - 1);
-    if (between.length === 0 || !between.every((l) => l.raw.trim() === "")) continue;
-    // Adjacent tables separated only by a blank line are legitimate and render
-    // fine - reference/caching.mdx has two in a row with different columns. The
-    // discriminator is the separator row: every genuine table opens with one, so
-    // a run that lacks it is the orphaned tail of a table a blank line cut in two.
-    const secondHasSeparator = doc.lines
-      .slice(b.startLine - 1, b.endLine)
-      .some((l) => TABLE_SEP.test(l.raw));
-    if (!secondHasSeparator) out.push({ first: a, second: b });
+    if (!b.hasSeparator) out.push({ first: a, second: b });
   }
   return out;
+}
+
+/**
+ * The first run in a doc lacking a delimiter row, with no preceding table to
+ * pair it with. GFM never renders it as a table, so it is the same defect as a
+ * split tail - splitTables just cannot name a pair.
+ */
+export function headlessTableRuns(doc: Doc): Table[] {
+  const first = doc.tables[0];
+  return first && !first.hasSeparator ? [first] : [];
 }
 
 /**
@@ -338,6 +366,20 @@ export const LLM_MARKERS: Marker[] = [
   { name: "cutting-edge", re: /\bcutting-edge\b/i, hit: "a cutting-edge approach to caching" },
   { name: "game-changer", re: /\bgame[- ]chang\w*/i, hit: "the pooler is a game changer" },
   { name: "worth-noting", re: /worth noting/i, hit: "it is worth noting that the pooler drops" },
+  {
+    name: "worth-flagging",
+    re: /worth flagging/i,
+    hit: "it is worth flagging that the clone bills at mirrored compute",
+    // The bare word is legitimate: "a copy's worth of WAL" is a quantity, not a tell.
+    miss: "set maxRetainedWalMb generous enough to hold a full copy's worth of WAL",
+  },
+  {
+    name: "worth-reading-twice",
+    re: /worth reading twice/i,
+    hit: "the carries-over table is worth reading twice",
+    // "Worth reading" alone is an ordinary recommendation.
+    miss: "the migration guide is worth reading before the window",
+  },
   { name: "important-to-note", re: /important to note/i, hit: "it is important to note the TTL" },
   { name: "dive-into", re: /\b(dive|deep dive) into\b/i, hit: "let us dive into the schema" },
   { name: "in-todays", re: /in today's\b/i, hit: "in today's cloud landscape" },
@@ -367,8 +409,23 @@ export const LLM_MARKERS: Marker[] = [
   // AGENTS.md house-style bans: rating your own points, and the SmartyPants
   // en-dash trap.
   { name: "the-big-win", re: /the big win/i, hit: "the big win is fewer round trips" },
+  {
+    name: "the-big-one",
+    re: /\bthe big one(s)?\b/i,
+    hit: "the big one is the schema restore",
+    miss: "one of the big pieces is the reconfiguration",
+  },
   { name: "the-nasty-one", re: /the nasty one/i, hit: "the nasty one is DNS" },
   { name: "the-trap-that", re: /the trap that/i, hit: "the trap that bites last is MTU" },
+  {
+    name: "the-trap-label",
+    // The colon is what makes it a heading or TL;DR prefix. "That framing is
+    // the trap." and "explaining the trap" are in the corpus without it, so a
+    // bare-word ban would flag ordinary prose.
+    re: /the trap\s*:/i,
+    hit: "**The trap:** the pooler drops idle connections",
+    miss: "that framing is the trap",
+  },
   { name: "lock-it-in", re: /lock it in/i, hit: "lock it in before the cutover" },
   {
     name: "double-hyphen",
