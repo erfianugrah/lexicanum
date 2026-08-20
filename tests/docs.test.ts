@@ -12,7 +12,13 @@
  */
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
-import { markerLines, mathRiskLines, smartPunctLines, splitTables } from "./lib/mdx";
+import {
+  headlessTableRuns,
+  markerLines,
+  mathRiskLines,
+  smartPunctLines,
+  splitTables,
+} from "./lib/mdx";
 import { join } from "node:path";
 import { builtPages, builtPath, CHECK_BUILT, collectDocs, DIST } from "./lib/corpus";
 import { buildRedirects, buildSidebar } from "../src/lib/taxonomy.mjs";
@@ -72,6 +78,14 @@ describe.each(docs.map((d) => [d.path, d] as const))("%s", (_path, doc) => {
       (s) => `rows ${s.first.startLine}-${s.first.endLine} then ${s.second.startLine}-${s.second.endLine}`,
     );
     expect(splits).toEqual([]);
+  });
+
+  test("no leading pipe run is headless", () => {
+    // A pipe run without a delimiter row never renders as a table in GFM; it
+    // is literal pipe text. The split check pairs a tail with the table before
+    // it, but a run at the top of the doc has nothing to pair with.
+    const headless = headlessTableRuns(doc).map((t) => `rows ${t.startLine}-${t.endLine}`);
+    expect(headless).toEqual([]);
   });
 
   test("no smart punctuation outside code", () => {
