@@ -744,9 +744,11 @@ const pins: Pin[] = [
   {
     doc: "guides/supabase-grafana-monitoring",
     mustContain: [
-      // The vantage correction: the pack covers resource/process state,
+      // The vantage correction: the rule set covers resource/process state,
       // and that is NOT every incident - review proved this was missing.
-      "When the pack helps, and when it cannot",
+      // (Heading renamed pack -> rule set 2026-08-20 when the doc standardized
+      // the term; the pinned thing is the section existing, not its label.)
+      "When the rule set helps, and when it cannot",
       "Coverage is a property of vantage points, not of rule count",
       // PG17 verified empirically 2026-08-17: the endpoint still serves
       // bgwriter checkpoint counters. Pin so nobody "fixes" the rule to

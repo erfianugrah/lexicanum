@@ -7,6 +7,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   LLM_MARKERS,
+  headlessTableRuns,
   markerLines,
   mathRiskLines,
   parseMdx,
@@ -121,6 +122,34 @@ describe("tables", () => {
   test("a tail with no separator row is a split", () => {
     const doc = parseMdx("t.mdx", fm("| a | b |\n|---|---|\n| 1 | 2 |\n\n| 3 | 4 |\n"));
     expect(splitTables(doc)).toHaveLength(1);
+  });
+
+  test("rows, blank line, a paragraph, then more rows is a split", () => {
+    // guides/supabase-postgres-major-upgrade-e2e shipped this shape: the
+    // trailing rows lazy-continue the paragraph, so GFM renders them as
+    // literal pipe text. The gap between the runs is not blank-only, which is
+    // what the old check required - and what let it through.
+    const doc = parseMdx(
+      "t.mdx",
+      fm("| a | b |\n|---|---|\n| 1 | 2 |\n\nprose paragraph\n| 3 | 4 |\n"),
+    );
+    const splits = splitTables(doc);
+    expect(splits).toHaveLength(1);
+    expect(splits[0]!.second.startLine).toBeGreaterThan(splits[0]!.first.endLine);
+  });
+
+  test("a leading run with no separator row is headless, not a split", () => {
+    // No preceding table to pair it with, so splitTables cannot name it - the
+    // headless helper is the only check that catches it.
+    const doc = parseMdx("t.mdx", fm("| 1 | 2 |\n| 3 | 4 |\n"));
+    expect(headlessTableRuns(doc)).toHaveLength(1);
+    expect(splitTables(doc)).toHaveLength(0);
+  });
+
+  test("a real table is neither a split nor headless", () => {
+    const doc = parseMdx("t.mdx", fm("| a | b |\n|---|---|\n| 1 | 2 |\n"));
+    expect(headlessTableRuns(doc)).toHaveLength(0);
+    expect(splitTables(doc)).toHaveLength(0);
   });
 
   test("a pipe table inside a fence is not a table", () => {
