@@ -73,7 +73,7 @@ test("every grandfathered path still exists", () => {
 });
 
 describe.each(docs.map((d) => [d.path, d] as const))("%s", (_path, doc) => {
-  test("no table is split by a blank line", () => {
+  test("no table renders as literal pipe text", () => {
     const splits = splitTables(doc).map(
       (s) => `rows ${s.first.startLine}-${s.first.endLine} then ${s.second.startLine}-${s.second.endLine}`,
     );
