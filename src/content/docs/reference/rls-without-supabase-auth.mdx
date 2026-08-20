@@ -1,6 +1,6 @@
 ---
 title: "RLS without Supabase Auth: JWT claims over the wire"
-description: Row-level security without PostgREST or GoTrue - RLS reads session GUCs, not HTTP headers, so any client that can run SQL can set request.jwt.claims itself and keep per-user policies working over a raw Postgres connection. The pattern, the two sharp edges (unprivileged GUCs, RLS-blind query caches), what leaving the Supabase HTTP layer actually costs, and which incident classes it removes.
+description: Row-level security without PostgREST or GoTrue - RLS reads session GUCs, not HTTP headers, so any client that can run SQL can set request.jwt.claims itself and keep per-user policies working over a raw Postgres connection. The pattern (with its measured SECURITY DEFINER prerequisite), the two sharp edges (unprivileged GUCs, SQL-text-keyed caches), what leaving the Supabase HTTP layer actually costs, and which incident classes it removes.
 author: Erfi Anugrah
 category: supabase
 group: architecture
@@ -96,7 +96,8 @@ PostgREST is a claims *setter*, not the enforcer. Any client that can run
 SQL can set the same GUC - which is both the opportunity and the hazard.
 
 The claims form that `auth.uid()` resolves is the JSON GUC, measured in
-this site's lab while testing policy shapes:
+this site's lab (as `postgres`, which owns schema `auth`; a custom role
+cannot call it directly - the grant caveat is in the pattern section):
 
 ```sql
 set "request.jwt.claims" = '{"sub":"<user-uuid>","role":"authenticated"}';
@@ -161,8 +162,9 @@ connection cannot be reused while you hold it. Structure claims as
 `set_config(..., true)` at the top of each transaction, exactly like the
 pattern above. The per-query multi-statement form works too, and has a
 useful side effect: multi-statement queries are marked uncacheable
-(`cacheStatus: multiplestatements`), which sidesteps the cache hazard
-below for that query.
+(`cacheStatus: multiplestatements`), which sidesteps the cache question below for that query. Measured through a
+probe Worker (C03): the transaction form and the multi-statement form both
+resolve claims, and a bare `SET` was reset on pool return.
 </Aside>
 
 ## Sharp edge 1: the GUC is unprivileged
@@ -187,7 +189,9 @@ anon key can only do what RLS allows *and* the JWT is validated by
 infrastructure you do not control. It is strictly better than the
 alternative raw-SQL shape - a `BYPASSRLS` role with authorization purely
 in app code, where a SQL-injection bug in one query has no policy layer
-behind it at all. The
+behind it at all. Measured concretely (C02): a claims GUC carrying a
+`tampered` sub (a valid uuid belonging to no user) is enforced exactly as
+written - zero rows, no error, no validation anywhere in the database. The
 [Cloudflare + Supabase architecture reference](/reference/cloudflare-supabase-architecture/)
 covers that `BYPASSRLS`-by-role variant and its measured behavior; this doc
 is the third option between the two.
@@ -233,9 +237,12 @@ getting is the rest of the product surface that rides HTTP:
 | Realtime | gone | the WS layer authorizes by JWT; replicating it is its own project |
 | Edge Functions | unaffected | separate runtime, still callable |
 
-Keeping Supabase Auth while dropping only PostgREST is also coherent:
-verify the GoTrue-issued JWT in your backend (JWKS, cached - measured ~0ms
-per verify at the edge in the
+keeping Supabase Auth while dropping only PostgREST is also coherent -
+and now measured: the lab's C02 created a real user via the Auth admin
+API, signed it in via password grant, and set the claims from the GoTrue
+JWT's `sub` over the wire; per-user RLS resolved exactly as it would have
+through PostgREST. Verify the GoTrue-issued JWT in your backend (JWKS,
+cached - measured ~0ms per verify at the edge in the
 [architecture reference](/reference/cloudflare-supabase-architecture/)),
 then set the claims it carried. That keeps GoTrue's user management and
 removes only the Data API.
@@ -275,6 +282,24 @@ Supavisor failures (if you route through it), and the database itself still
 take you down. You are removing one failure domain out of several - worth
 doing when you already own auth, not as a rewrite justified by a single
 outage.
+
+## Measured results (2026-08-20)
+
+The pattern above was run green against throwaway projects and a probe
+Worker (supabase-lab `experiments/rls-wire-claims`, modules C01-C03,
+deleted after):
+
+| Claim | Result |
+|---|---|
+| Claims GUC drives per-user RLS as a custom role | pass - A sees A's row, B sees B's, no claims sees 0 (5432, 6543, Hyperdrive tx + multi) |
+| `GRANT USAGE ON SCHEMA auth` to a custom role | **silently no-ops**; `auth.uid()` then errors `permission denied for schema auth`. SECURITY DEFINER wrapper is the working shape |
+| GoTrue-issued `sub` over the wire | pass - per-user RLS resolves with no PostgREST anywhere |
+| Tampered sub enforced as-is | pass - the GUC-is-unprivileged hazard, concrete |
+| Session pooler (5432) bare-`SET` leak | no leak across 5 invocations (resets on return) |
+| Transaction pooler (6543) bare-`SET` leak | **leaks** - next invocation saw the first's rows |
+| Hyperdrive cache replays across claims | **not observed** - B's claims got B's (empty) result, not A's cached row |
+| Hyperdrive bare `SET` | reset on pool return (0 rows on the next query) |
+| Prepared statements over 6543 | pass (parity with the lab's T11) |
 
 ## Which do I pick
 
