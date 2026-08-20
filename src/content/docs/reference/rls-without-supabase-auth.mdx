@@ -17,13 +17,10 @@ never belonged to the HTTP layer in the first place. The price is that the
 client becomes the claims authority, and that is a real security
 reassignment, not a config tweak.
 
-**Provenance.** Behavior claims are doc-verified against the Cloudflare,
-Supabase, and Postgres docs cited inline (checked 2026-08-20). The GUC form
-`set "request.jwt.claims" = '{"sub": ...}'` driving `auth.uid()` is
-additionally measured in this site's own lab (see
-[the RLS policy cost reference](/reference/supabase-rls-policy-cost/)). The
-end-to-end Worker pattern below is design-only - assembled from verified
-parts, not yet run green against a live project.
+**Provenance.** Measured end to end against throwaway Supabase projects
+and a probe Worker on 2026-08-20 (supabase-lab `experiments/rls-wire-claims`,
+modules C01-C03). The doc's design was run green live; three of its claims
+needed correction from the measurements, marked below.
 
 **TL;DR:**
 
@@ -32,15 +29,19 @@ parts, not yet run green against a live project.
   context*: PostgREST validates the JWT and sets `request.jwt.claims` so
   `auth.uid()` resolves. Nothing stops your own backend from setting the
   same GUC.
-- The pattern: verify your own JWT in app code, then per request run
+- The pattern: verify your own JWT in app code, create a SECURITY DEFINER
+  wrapper for `auth.uid()` (schema `auth` is not grantable on managed
+  Supabase), then per request run
   `BEGIN; SELECT set_config('request.jwt.claims', '<claims>', true); <queries>; COMMIT;`
   connecting as a dedicated non-superuser role. Per-user RLS policies work
-  unchanged.
+  unchanged - measured end to end (supabase-lab `rls-wire-claims`,
+  2026-08-20) on both Supavisor modes and through Hyperdrive.
 - Two sharp edges: the GUC is **unprivileged** (anyone with SQL access can
   set any claims, so the connection credential is now the security
-  boundary), and Hyperdrive's query cache is **RLS-blind** (identical SQL
-  from two users shares one cache entry - use a cache-disabled binding for
-  claims-scoped queries).[^cf-hd-cache]
+  boundary), and any SQL-text-keyed query cache cannot see claims -
+  Hyperdrive's cache did not replay across claims in the measured probe,
+  but the split-binding (cache-disabled for claims-scoped queries) stays
+  the documented control because that behavior is not contractual.[^cf-hd-cache]
 - This works from any runtime with a Postgres driver, not just Cloudflare
   Workers, and against any Postgres with RLS - the Supabase-specific part
   is only the GUC name and the `auth.*` helper functions.
@@ -115,7 +116,19 @@ connecting role the way PostgREST's role switching does.
    (both carry `BYPASSRLS`), not the table owner. Grant it only the
    schemas, tables, and functions the app needs. RLS then enforces for
    every query it runs.
-3. **Set claims per transaction, then query:**
+3. **Set claims per transaction, then query.** One measured prerequisite
+   first: on managed Supabase, `GRANT USAGE ON SCHEMA auth` to a custom role
+   silently no-ops, so the policy cannot call `auth.uid()` directly -
+   `permission denied for schema auth` at runtime. Create a SECURITY DEFINER
+   wrapper owned by `postgres` and point the policy at it:
+
+```sql
+create or replace function public.claims_uid() returns uuid
+  language sql stable security definer set search_path = auth, public
+  as $$ select auth.uid() $$;
+grant execute on function public.claims_uid() to claims_user;
+-- policy: using (owner = public.claims_uid())
+```
 
 ```ts
 // Worker / server, postgres.js driver
@@ -131,9 +144,12 @@ const rows = await sql.begin(async (tx) => {
 ```
 
 `SET LOCAL` semantics: the setting holds until transaction end, then
-reverts.[^pg-set-local] Never use bare `SET` outside a transaction - it
-persists for the session, and on a pooled connection the next tenant gets
-the previous user's claims.
+reverts.[^pg-set-local] Never use bare `SET` outside a transaction - and
+this is now measured, not just principled: on the session pooler (5432) a
+bare `SET` was reset on return (no leak across 5 subsequent invocations),
+but on the transaction pooler (6543) a bare `SET` **leaked across
+invocations** - the next psql session saw the first's rows. Claims belong in
+a transaction, never a bare `SET`.
 
 <Aside type="caution" title="Hyperdrive: per-query or per-transaction, never per-session">
 Hyperdrive's pooler runs in transaction mode and supports `SET` for the
@@ -180,9 +196,18 @@ is the third option between the two.
 
 Any query cache keyed on SQL text + parameters cannot see session GUCs.
 Hyperdrive's cache is exactly that, and it does not invalidate on
-writes.[^cf-hd-cache] Two users running the same deterministic
-`SELECT * FROM pastes` with different claims produce one cache entry -
-whoever warms it leaks to the other.
+writes.[^cf-hd-cache] The doc's original warning was that two users running
+the same deterministic `SELECT * FROM pastes` with different claims would
+share one cache entry.
+
+Measured on 2026-08-20 (supabase-lab C03): Hyperdrive did **not** replay
+across claims in the probe. An identical parameterized query under user A's
+claims warmed the cache; the same SQL text and parameter under user B's
+claims returned B's filtered result (0 rows), not A's cached row. Either the
+cache key includes claims-relevant session state or claims-carrying
+transactions are excluded from caching. **Do not rely on this** - the
+split-binding control below stays the documented pattern, because the
+behavior is not contractual and could change.
 
 The documented fix is the split-binding pattern: one Hyperdrive
 configuration with caching for queries that are claims-independent
@@ -228,11 +253,12 @@ Nothing in the pattern is Workers-specific:
   convention - `SET LOCAL app.user_id = ...` read via
   `current_setting('app.user_id', true)` in policies. The mechanism,
   hazards, and pooler rules are identical; only the GUC name changes.
-- **Pooler compatibility** is the one thing to check per platform.
-  Transaction-mode poolers (Supavisor 6543, PgBouncer transaction mode,
-  Hyperdrive) all scope session state to the transaction, which is what the
-  pattern needs; a pooler in *session* mode would also work but is the
-  wrong tool for serverless fan-out.
+- **Pooler compatibility** is the one thing to check per platform, and the
+  two Supabase pooler modes are now measured to differ on GUC hygiene:
+  session mode (5432) reset a bare `SET` on return (no leak), transaction
+  mode (6543) let a bare `SET` leak to the next invocation. The pattern
+  needs transaction-scoped claims everywhere, but the failure mode for
+  getting it wrong is worse on 6543.
 
 ## What this buys during incidents
 
