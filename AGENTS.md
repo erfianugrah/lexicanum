@@ -94,7 +94,7 @@ TL;DR bullets
 Topology / architecture diagram (```dot fences via @beoe/rehype-graphviz)
 Early decision/payoff table ("which do I pick")
 Body sections (concept-ordered; tables over prose; Asides for gotchas)
-Reading-the-numbers / what-generalizes - if measured
+Reading-the-numbers / what-generalises - if measured
 Decision guide (closing diagram)
 Reproducing / Evidence table (tested vs design-only) - if measured
 References  (auto-rendered from footnotes; see Citations)
@@ -180,8 +180,12 @@ Cite the source path when answering from docs.erfi.io in chat, too.
   longer applies, drop it in its own commit with the reason - not as a side
   effect of tightening prose. This corpus is worth reading because of its
   numbers; a sentence that reads better without them is a worse sentence.
-- **Spelling: American -ize** (normalize, organize, optimize). The corpus
-  convention; note it diverges from British -ise used in email/reply writing.
+- **Spelling: British -ise** (normalise, organise, optimise). The corpus
+  convention, same as email/reply writing. Existing docs still carry
+  American -ize in places - normalise opportunistically when touching a
+  section, do not bulk-rewrite for style alone. Product/API terms are
+  exempt: Supabase's "organization", OAuth's "authorize", product names
+  like Vectorize stay verbatim.
 - **Headings: sentence case.** Capitalize only the first word and proper nouns /
   product names / acronyms. Keep: Cloudflare, Supabase, Hyperdrive, Postgres,
   Traefik, Vaultwarden, Grafana, Prometheus, Docker, Nix, Go, VyOS, KEDA, etc.;
