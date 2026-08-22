@@ -1,0 +1,158 @@
+---
+title: Query Supabase project logs through the Management API after logs.all
+description: The logs.all analytics endpoint is removed on 2026-09-23; its replacement is ClickHouse-only, GET-only, and filters by the source column - not source_name as the official migration guide says. The full conversion, measured live.
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+Supabase is removing the Management API's `analytics/endpoints/logs.all`
+endpoint on 2026-09-23.[^changelog] Anything that queries project logs
+programmatically - a log-tail script, a SIEM pull, an audit check - has to
+move to the replacement `analytics/endpoints/logs` endpoint before then.
+Dashboard log exploration is unaffected.
+
+The migration is more than a path rename: the backend moved from BigQuery
+to ClickHouse, per-source tables collapsed into one unified `logs` table,
+and nested-field access changed shape. And the official migration guide has
+a bug in its own example - it tells you to filter by `source_name`, a
+column that does not exist. Everything below was measured against the live
+endpoint on 2026-08-22 on a project with real traffic.
+
+## The one thing the migration guide gets wrong
+
+The changelog's worked example says:
+
+```sql
+SELECT timestamp, event_message
+FROM logs
+WHERE source_name = 'edge_logs'
+ORDER BY timestamp DESC
+LIMIT 100
+```
+
+Run that against the real endpoint and it fails:
+
+```json
+{"result": null, "error": "Field \"source_name\" does not exist."}
+```
+
+The column is `source`. The OpenAPI description of the endpoint says
+`source`;[^api-ref] the changelog example is the outlier. The working
+form:
+
+```sql
+SELECT timestamp, event_message
+FROM logs
+WHERE source = 'edge_logs'
+ORDER BY timestamp DESC
+LIMIT 100
+```
+
+If you migrated early by following the guide verbatim and concluded the
+endpoint was broken, this is why.
+
+## The full query
+
+The endpoint is GET-only (POST returns a 404), takes the SQL in the `sql`
+query parameter, and requires an explicit timestamp window - without one it
+defaults to the last minute, and a window cannot span more than 24 hours:
+
+```bash
+REF=<project-ref>
+curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  "https://api.supabase.com/v1/projects/$REF/analytics/endpoints/logs?sql=$(jq -rn --arg q "SELECT timestamp, event_message FROM logs WHERE source = 'auth_logs' ORDER BY timestamp DESC LIMIT 50" '$q|@uri')&iso_timestamp_start=$(date -u -d '15 minutes ago' +%Y-%m-%dT%H:%M:%SZ)&iso_timestamp_end=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+```
+
+Timestamps need a timezone suffix (`...T%H:%M:%SZ`); a bare
+`2026-08-22T00:00:00` is rejected with `Invalid ISO datetime`.
+
+## Converting old queries
+
+Three conversions cover every query that worked on `logs.all`.
+
+**Per-source table to a `source` filter.** There is no `edge_logs` or
+`auth_logs` table anymore - every source lives in the one `logs` table,
+keyed by the `source` column. Sources observed on live projects: `edge_logs`,
+`postgres_logs`, `pgbouncer_logs`, `auth_logs`, `storage_logs`,
+`realtime_logs`, `postgrest_logs`. A quick inventory of what a project
+actually emits:
+
+```sql
+SELECT source, count() AS n FROM logs GROUP BY source ORDER BY n DESC
+```
+
+**`unnest(metadata)` to `log_attributes` map access.** BigQuery-era queries
+reached nested fields by unnesting the `metadata` array one level at a time.
+Those joins are gone - fields are flat keys on a `log_attributes` map:
+
+```sql
+-- before (BigQuery, logs.all)
+SELECT timestamp, r.method
+FROM edge_logs
+CROSS JOIN unnest(metadata) AS m
+CROSS JOIN unnest(m.request) AS r
+
+-- after (ClickHouse, logs)
+SELECT timestamp, log_attributes['request.method'] AS method
+FROM logs
+WHERE source = 'edge_logs'
+```
+
+For Postgres logs the parsed fields keep their `parsed.` prefix:
+`log_attributes['parsed.error_severity']`, `log_attributes['parsed.backend_type']`.
+
+**Dialect, not just shape.** The SQL is ClickHouse now. `count()` not
+`count(*)`, ClickHouse date functions, and so on. An old BigQuery query run
+unchanged against the new endpoint fails - but see the error-handling trap
+below, because it does not fail the way you expect.
+
+## Traps, each measured
+
+| # | Trap |
+|---|---|
+| 1 | **Errors return HTTP 200.** A dialect or parse failure is a `{"result": null, "error": "Backend error! Retry your query."}` envelope with status 200. If your script checks the status code only, every query failure looks like a transient blip - and the generic "Backend error" text is the same for a bad dialect, a bad column, and a genuinely transient failure. Parse the `error` field. |
+| 2 | **`SELECT *` fails.** The endpoint requires an explicit column list; `SELECT * FROM logs LIMIT 1` returns the generic backend error. The usable columns include at least `timestamp`, `id`, `event_message`, `source`, `log_attributes`. |
+| 3 | **`timestamp` changed type.** `logs.all` returned microsecond integers; the new endpoint returns ISO strings (`"2026-08-22T00:13:07.000000"`). A parser doing `new Date(ts / 1000)` silently produces garbage dates instead of erroring. |
+| 4 | **No deprecation or sunset header.** `logs.all` serves BigQuery queries today exactly as before, with no `Deprecation`/`Sunset` header announcing the removal. Monitoring for deprecation headers will not warn you about this one - the changelog is the only signal. |
+| 5 | **Rate limit is 10.** `x-ratelimit-limit: 10` per window on both endpoints, so a polling loop that worked at the old budget needs spacing out. |
+
+The old endpoint rejects ClickHouse SQL (`count()` fails on `logs.all`), so
+you cannot write one query that works on both - during a migration window,
+run the two dialects side by side.
+
+## Auth logs still carry full audit detail
+
+For anything built on the auth log stream, the unified table preserves the
+structured detail. A failed login, a failed refresh, and a signup against an
+existing email were each captured within a minute under
+`source = 'auth_logs'`, with the full attribute set flat on the
+`log_attributes` map: `error_code`, `grant_type`, `method`, `path`,
+`remote_addr`, `referer`, `request_id`, `status`, `duration`. The same JSON
+also arrives in `event_message`, so either extraction path works:
+
+```sql
+SELECT timestamp, log_attributes['error_code'] AS error_code,
+       log_attributes['remote_addr'] AS remote_addr
+FROM logs
+WHERE source = 'auth_logs'
+ORDER BY timestamp DESC
+LIMIT 50
+```
+
+## Evidence
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| `source_name` does not exist; the column is `source` | measured | `GROUP BY source_name` -> `Field "source_name" does not exist`; `GROUP BY source` returns per-source counts, live project, 2026-08-22 |
+| New endpoint is ClickHouse-only | measured | `SELECT count() FROM logs` -> 200 with count; same query shape on `logs.all` -> generic backend error |
+| GET-only | measured | POST to `/analytics/endpoints/logs` -> 404 `Cannot POST` |
+| `SELECT *` fails | measured | generic backend error; explicit column list succeeds |
+| `unnest(metadata)` no longer works | measured | generic backend error on the old pattern; `log_attributes['key']` returns values |
+| `timestamp` is ISO string, not microsecond int | measured | response rows on both endpoints compared |
+| Errors return HTTP 200 | measured | every failing query above was status 200 with an `error` body |
+| Auth events land in the unified table with full attributes | measured | generated failed-login, nonexistent-user, duplicate-signup, and bad-refresh events; all four appeared under `source = 'auth_logs'` within a minute |
+| Rate limit 10, no deprecation header | measured | response headers on both endpoints |
+
+[^changelog]: Supabase, "Migration of Supabase Management API logs.all analytics endpoint to logs endpoint," Supabase Changelog, 2026-07-23. https://supabase.com/changelog/48235-migration-of-supabase-management-api-logs-all-analytics-endpoint-to-logs-endpoint
+[^api-ref]: Supabase, "Get project logs," Management API reference. https://supabase.com/docs/reference/api/v1-get-project-logs
