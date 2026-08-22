@@ -1,0 +1,135 @@
+---
+title: Diagnosing a reasoning cliff in an agentic model
+description: A step-by-step method for telling whether your coding agent's model stopped reasoning because of your harness config or because of the provider's serving side, with the Kimi K3 August 2026 cliff as the worked example.
+author: Erfi Anugrah
+category: workstations
+---
+
+An agent model that quietly stops reasoning mid-session produces exactly the complaints you would blame on the model itself: it asserts instead of verifying, asks answered questions, skips the tool built for the job. This guide shows how to separate "the model is weak" from "your config broke it" from "the serving side changed", using only the session logs your harness already writes and a handful of paid API probes. The worked example is the Kimi K3 cliff of 2026-08-19/20, where a model that had reasoned on 90-100% of turns for a month dropped to 23-30% in two days.
+
+Prerequisites: a harness that logs, per assistant turn, the model id, the provider, the reasoning token count and the total context size (pi writes all four into its session jsonl); `jq`; and a few dollars of API credit for the probe ladder.
+
+## Constants preamble
+
+Everything the method reads from a pi session file, per assistant message:
+
+| Field | Meaning | Used for |
+|---|---|---|
+| `.message.model` | model id that produced the turn | split multi-model sessions before computing any rate |
+| `.message.provider` | provider the request went through | rule out a provider switch |
+| `.message.usage.reasoning` | reasoning tokens reported for the turn | the dependent variable |
+| `.message.usage.totalTokens` | full context size of the request | the context-length axis |
+| `.message.content[].type == "thinking"` | whether a thinking block was stored | distinguishes "did not think" from "thought but misreported" |
+| `.timestamp` | turn time (UTC) | the date axis and the transition-window audit |
+
+Fixed facts about the worked example, measured from these fields unless stated:
+
+| Fact | Value | How it was checked |
+|---|---|---|
+| K3 think-rate Jul 20 - Aug 18 | 87-99% of turns per day | session logs, all sessions, provider constant (OpenRouter) |
+| K3 think-rate Aug 20-22 | 23-30% per day | same query |
+| Transition window | between 2026-08-19 00:10 and 08:00 UTC | per-turn scan of Aug 19; 00:00-00:09 healthy at 230-268k context, 08:00-08:45 degraded at every size |
+| Harness binary | pi 0.84.2, installed 2026-08-18 07:19 +08, unchanged through the cliff | `pi --version`, binary mtime |
+| User-side config changes in the window | none touching the K3 request shape | `git log` of the dotfiles repo over the window |
+
+## Step 1: extract the per-turn reasoning flag
+
+```bash
+for f in ~/.pi/agent/sessions/*/*.jsonl; do
+  jq -rc 'select(.type=="message" and .message.role=="assistant"
+        and .message.model=="moonshotai/kimi-k3" and .message.usage != null)
+    | [(.timestamp[0:10]), (.message.usage.totalTokens // 0),
+       (if ((.message.usage.reasoning // 0) > 0) then 1 else 0 end)] | @tsv' "$f"
+done
+```
+
+Substitute your model id. Two gotchas at this step:
+
+- Filter on `.message.model`. A session that switched models mid-run (common when one model dies mid-task) otherwise blends two behaviours into one misleading rate.
+- `usage.reasoning == 0` can be a reporting artefact on some providers. Cross-check a sample of zero-reasoning turns for thinking blocks in `.message.content`: if the block is absent, the model genuinely did not think; if it is present with zero reported tokens, you are measuring a usage-accounting bug, not a behaviour change.
+
+## Step 2: the per-day table finds the cliff
+
+Aggregate step 1 by date. A healthy model shows a stable daily think-rate; a cliff is a day-over-day halving. In the worked example the rate ran 87-99% through Aug 18, 70% on Aug 19, 23% on Aug 20. The per-day table is also the first thing an upstream provider will ask for, so keep it.
+
+Do not stop at the per-day table. Daily rates conflate context size, turn type and session shape, and every one of those can change on the same day your workload changes (the worked example's cliff week was also a large migration week with 3-4x longer sessions).
+
+## Step 3: the date x context-size cross-tab separates causes
+
+Bucket each turn by context size and cross it with date:
+
+```bash
+... | awk -F'\t' '{
+  b = ($2<50000) ? "<50k" : ($2<100000) ? "50-100k" : ($2<150000) ? "100-150k" : ">150k";
+  key = $1 " " b; tot[key]++; th[key] += $3 }
+END { for (k in tot) printf "%s %d/%d (%.0f%%)\n", k, th[k], tot[k], 100*th[k]/tot[k] }'
+```
+
+Read it two ways:
+
+- Down a date column: if one size bucket collapses while others hold, the cause is context-dependent.
+- Across dates within one size bucket: this controls for your workload changing. The worked example's >150k bucket ran 88-100% through Aug 18 and 4-15% from Aug 20 - the same size range, opposite behaviour, so the longer-sessions confound is ruled out by the table itself.
+
+Run the same cross-tab for your other models over the same dates. In the worked example deepseek-v4-pro held 97% at >=100k on the cliff days while K3 ran 4-15% at >150k: same harness, same extensions, same days, one model affected. That single comparison rules out the entire "my tools broke it" hypothesis class, which is usually the first suspicion and the most expensive to chase.
+
+## Step 4: audit the transition window against user-side changes
+
+The cross-tab gives you a transition day. The per-turn data gives you a transition window (step 1 at full timestamp resolution). Now list every user-side change that landed inside the window and check each against the request path:
+
+1. Harness binary: version and mtime (`pi --version`, `stat` the binary). If the binary predates the window and the model was healthy after the install, the harness is exonerated. If you suspect a specific upstream commit, compare its commit timestamp to the binary mtime - a binary cannot contain commits newer than itself.
+2. Config repo: `git log --since/--until` over the window, then read each commit and ask whether it touches anything that reaches the request (model overrides, sampling params, system prompt, extensions that inject context). Docs-only commits about unrelated stacks do not count as candidates however well their dates line up.
+3. Session resume vs restart: a harness that reloads model config on an explicit action (pi reloads models.json when the model selector opens) will keep sending a removed param across a session resume. Any "I removed X and nothing changed" observation made without a full restart is not evidence about X.
+
+In the worked example this step killed three hypotheses in sequence: the harness binary (installed before the cliff, healthy after install on the same binary), a sampling-param workaround (added after degradation was already visible in the logs), and the system prompt (no prompt-surface commits in the window).
+
+## Step 5: the probe ladder
+
+Session logs tell you what happened; probes tell you what happens now under controlled variables. Send each probe at least three times - single samples are noise, and the worked example's repetition-penalty A/B flipped direction between two single samples before a 3v3 showed mild suppression and a long-context pair showed none.
+
+| Probe | Isolates | Worked-example result |
+|---|---|---|
+| Short single-turn, effort high | baseline: can the route think at all | 19-173 reasoning tokens, every provider tried |
+| Long context (~160k), single-turn | raw context length | still thinks (43-61 tokens) on Moonshot and DeepInfra |
+| Long context + replayed thinking history and tool calls | the harness's multi-turn replay shape | still thinks (14-16 tokens) |
+| Same long probe via a second gateway | gateway translation layer | thinks via both |
+| Effort max vs high | provider-side effort semantics | no difference on trivial tasks |
+
+The ladder's payoff is the divergence: every probe shape thinks, yet live multi-turn sessions at the same sizes do not. The cause therefore lives in a request property the probes do not replicate (the full tool-definition set and system prompt of a real session) or in serving-side behaviour conditioned on session shape - either way, it is not your config, because your config was constant across the cliff and the probes carry your config's parameters.
+
+## Step 6: kill the list, then file upstream
+
+A diagnosis is done when every candidate cause is either falsified by a step above or promoted with a mechanism. The worked example's final list:
+
+| Candidate | Verdict | Falsified by |
+|---|---|---|
+| Model is weak | no | 87-99% think-rate for a month on the same model |
+| Harness config / extensions | no | other models healthy in same sessions; no request-path change in the window |
+| Provider switch | no | `.message.provider` constant across the cliff |
+| Sampling-param workaround | no | degradation precedes the commit that added it; probes inconsistent |
+| Serving-side change at the provider | promoted | transition window matches the vendor's own incident reports[^vllm-51039]; length-dependent suppression; model-vendor documented sensitivity to long-context serving[^moonshot-k3-launch] |
+
+File the promoted cause where the serving side can answer it: per-generation feedback APIs accept individual bad generations[^or-feedback], and a support ticket or email carries the cross-tab. The date x context-size table is the artifact that makes such a report actionable; "the model feels dumber" is not.
+
+## Verification
+
+The diagnosis is trustworthy when three controls hold:
+
+1. A same-harness control model is healthy over the cliff dates (step 3).
+2. The transition window contains no user-side change that reaches the request (step 4).
+3. Probes reproduce thinking under every isolated variable, leaving the divergence in the one property you cannot replicate (step 5).
+
+If any control fails, the diagnosis is not done - the failing control is the next hypothesis.
+
+## Gotchas and lessons learned
+
+- Tool-call-only turns think less than prose turns even in a healthy model. A daily rate drop can therefore be partly a turn-mix shift; the cross-tab's `<50k` bucket is your turn-mix control.
+- Compaction rewrites history through a summariser. If the compaction ran under a different (weaker) model, everything the session "knows" afterwards passed through that model's summary - split rates at the compaction boundary too.
+- A model vendor's marketing name is not a model card. The worked example's first wrong hypothesis ("K3 is the lite sibling") came from recalling the naming scheme instead of querying the provider's models API. Query the API; it returns context window, modality and price.
+- Reasoning effort is a ceiling, not a floor, on some models. A probe that returns 14 reasoning tokens has not proven the model "thinks when asked" in any operational sense; it has proven the route is not hard-suppressing.
+- Keep the raw cross-tab. Every hypothesis in the worked example was killed by re-slicing the same extracted data, not by collecting new data.
+
+## References
+
+[^moonshot-k3-launch]: Moonshot AI, "Kimi K3: Open Frontier Intelligence," Kimi blog. https://www.kimi.com/blog/kimi-k3
+[^vllm-51039]: vLLM project, "Kimi-K3: all requests degenerate to a repeated token after long-context prefill (NaN logits; packed KDA prefill suspected)," issue 51039. https://github.com/vllm-project/vllm/issues/51039
+[^or-feedback]: OpenRouter, "Report Feedback - Submit Bug Reports for Generations," OpenRouter Docs. https://openrouter.ai/docs/guides/overview/report-feedback
