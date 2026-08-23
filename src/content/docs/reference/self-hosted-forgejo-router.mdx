@@ -1,0 +1,160 @@
+---
+title: "Self-hosted Forgejo on the NixOS edge router"
+description: "Migrating from Gitea on Unraid to Forgejo 16 on a NixOS router with PostgreSQL 17, a self-hosted Actions runner, 248 GitHub pull mirrors, and a systemd timer for mirror enrolment."
+author: "Erfi Anugrah"
+category: homelab
+---
+
+import { LinkCard } from "@astrojs/starlight/components";
+
+## Why Forgejo
+
+Forgejo is a self-hosted Git forge -- a community-governed hard fork of Gitea
+maintained by Codeberg e.V. It runs git.erfi.io, serving as a disaster-recovery
+mirror of GitHub (248 repos) and a self-hosted CI/CD platform (Forgejo Runner)
+on hardware that is already paid for.
+
+## The cutover
+
+Gitea ran on the Unraid server (`servarr`, 10.0.71.56) with PostgreSQL 17, a
+macvlan LAN IP, and host-volume data under `/mnt/user/gitea/`. In August 2026,
+the Unraid box began a migration to a new NixOS server. With the server's Docker
+daemon down, git.erfi.io went 502.
+
+The fix: move the forge to the MS-01 NixOS edge router -- the same machine that
+runs the edge Caddy reverse proxy, the kea DHCP server, and the nftables
+firewall. The router has 20 cores and 32 GB of RAM; the forge stack uses 4.
+
+The old compose file (`docker-compose.yml`) is untouched and serves as a
+rollback path when the new server is ready. The live stack is
+`docker-compose.router.yml`.
+
+## Architecture
+
+```
+forgejo0 bridge (172.20.6.0/24)
+  .2  Forgejo 16.0.3-rootless   :3000 HTTP, :2222 SSH
+  .3  PostgreSQL 17             :5432
+  .10 Forgejo Runner v13        docker.sock, labels ubuntu-latest/ubuntu-22.04
+
+Edge Caddy (host network, same machine)
+  git.erfi.io:443            -> 172.20.6.2:3000
+  :2223 (L4 TCP proxy, SSH)  -> 172.20.6.2:2222
+```
+
+### Why a pinned bridge
+
+The router's nftables forward chain is policy-drop. Every Docker bridge must be
+listed in `dockerBridges` in `configuration.nix` to let traffic pass. The bridge
+name `forgejo0` is pinned via Docker `driver_opts` so it survives container
+restarts and compose down/up cycles.
+
+### Why no macvlan
+
+Gitea needed a first-class LAN IP (`10.0.71.56`) because the edge Caddy ran on a
+different machine (servarr). The edge Caddy now runs on the router,
+`network_mode: host`, so it can reach the bridge IP directly -- no macvlan or
+VyOS NAT needed.
+
+### Why Forgejo, not Gitea
+
+Forgejo is a hard fork of Gitea maintained by Codeberg e.V. (a non-profit). At
+the time of migration, the comparison looked like this:
+
+| Attribute | Forgejo 16 | Gitea |
+|---|---|---|
+| Governance | Community non-profit (Codeberg e.V.) | For-profit |
+| CVE patch latency | Median 2 days | Median 13 days |
+| Actions compatibility | Slightly better | Compatible |
+| Federation | Under development | None planned |
+| Data format | Identical (same Postgres schema) | Identical |
+
+Since the instance was a fresh install (all repos are GitHub pull mirrors with
+no issues, PRs, or metadata to migrate), there was no data migration to perform.
+
+## Forgejo Runner
+
+```yaml
+runner:
+  image: data.forgejo.org/forgejo/runner:13.0.0
+  group_add: ["131"]  # docker gid on the NixOS router
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+  labels:
+    - ubuntu-latest:docker://ghcr.io/catthehacker/ubuntu:act-22.04
+    - ubuntu-22.04:docker://ghcr.io/catthehacker/ubuntu:act-22.04
+  capacity: 2
+```
+
+Runner jobs run in ephemeral Docker containers on the router's daemon. The
+`group_add: 131` grants access to `/var/run/docker.sock` without running as
+root. Capacity 2 means two jobs can run concurrently -- enough for the current
+workload while leaving headroom for the router's other containers.
+
+**Wart:** mirrored repos do not discover `.forgejo/workflows/` because mirror
+sync is git-data-only. Workflows on mirrored GitHub repos must run via GitHub
+Actions or via a Forgejo Action that clones from GitHub.
+
+## Mirror enrolment
+
+New GitHub repos are automatically enrolled as Forgejo pull mirrors by a systemd
+timer on the router:
+
+```
+mirror-forgejo.timer (every 6h)
+  -> mirror-forgejo.service (oneshot)
+       -> mirror-github.sh
+            Lists Forgejo repos (admin API token, generated at runtime)
+            Lists GitHub repos (PAT from /root/mirror-gh-token, chmod 600)
+            POST /api/v1/repos/migrate (for each missing repo)
+```
+
+The timer replaced a GitHub Actions workflow. The script is the same
+`mirror-github.sh` that ships in the forgejo-compose repo. Ongoing content sync
+is Forgejo's own mirror scheduler (every 8 hours), not the enrolment timer.
+The timer only catches repos created since the last run.
+
+## Secrets
+
+All secrets live in `.env` (SOPS-encrypted with age):
+
+- Postgres credentials
+- Forgejo internal secrets (`SECRET_KEY`, `INTERNAL_TOKEN`, `LFS_JWT_SECRET`)
+- Resend API key for transactional mail
+- `FORGEJO_RUNNER_TOKEN` for runner self-registration
+- GitHub PAT for mirror enrolment (in `/root/mirror-gh-token`, separate file)
+
+Secrets are injected via `GITEA__*` / `FORGEJO__*` environment variables at
+container startup. The `app.ini` contains no secrets.
+
+## Deployment
+
+Push to main on GitHub -> Composer webhook fires -> git-sync on the router ->
+`docker compose -f docker-compose.router.yml up -d`. Manual trigger:
+
+```bash
+ssh nixos "curl -sf -X POST -H 'X-API-Key: \$COMPOSER_API_KEY' \
+  'localhost:8080/api/v1/stacks/forgejo/up?async=true'"
+```
+
+The stack is defined in `~/infra/forgejo-compose` on the dev box
+(`erfianugrah/forgejo-compose` on GitHub). The old `docker-compose.yml` (servarr
+Gitea) stays as the rollback path.
+
+## What's not here
+
+- **No backups** -- the backup sidecar was removed because its MinIO target is
+  on the downed servarr. All repos are git-only mirrors of GitHub, so data loss
+  means re-running `mirror-github.sh`. Backups to be re-added when MinIO moves
+  to the new server.
+- **No issues, PRs, or metadata** -- mirrors are git-data-only. This is a hard
+  limit of Forgejo's `POST /api/v1/repos/migrate` with `"mirror": true`.
+- **No CI on mirrored repos** -- mirror sync is git-only, so
+  `.forgejo/workflows/` files are not discovered.
+
+## References
+
+- Repo: `erfianugrah/forgejo-compose` on GitHub
+- Live instance: https://git.erfi.io
+- Router config: `~/infra/router` (bridge + timer)
+- Edge Caddy: `~/infra/ergo/caddy-compose` (site block + L4 SSH)
