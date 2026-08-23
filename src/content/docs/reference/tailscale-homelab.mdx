@@ -9,30 +9,31 @@ blurb: "NixOS authkey provisioning, multi-path SSH aliases, and the failure mode
 
 import { Aside } from "@astrojs/starlight/components";
 
-How Tailscale runs in this homelab: as a parallel overlay alongside the site-to-site IPsec/GRE tunnels (covered in [Magic WAN interop](/guides/magic-wan-interop/)), with its own job - out-of-band management, a third path when LAN and tunnel routes are both unavailable, and an identity layer for SSH. Covers the NixOS authkey pattern, the Unraid plugin, the multi-path SSH alias scheme, and every failure mode observed in production. Hostnames, addresses, and paths are anonymized; the patterns are exactly as built.
+How Tailscale runs in this homelab: as a parallel overlay alongside the site-to-site IPsec/GRE tunnels (covered in [Magic WAN interop](/guides/magic-wan-interop/)), with its own jobs - out-of-band management, a third path when LAN and tunnel routes are both unavailable, an identity layer for SSH, and since 2026-08-21 a subnet router that reaches VLAN-only devices from any network. Covers the NixOS authkey pattern, the subnet-router cutover, the Unraid plugin, the multi-path SSH alias scheme, and every failure mode observed in production. Hostnames, addresses, and paths are anonymized; the patterns are exactly as built.
 
-**TL;DR:** Tailscale earns its place for OOB access and per-device identity, not for bulk site-to-site traffic (IPsec/GRE wins there). The two configurations to copy are the NixOS `authKeyFile` pattern (a rebuilt node rejoins unattended) and SSH Host pattern lists (one identity block, three addresses). The failures to avoid: placeholder authkeys, stale tailnet entries in a WSL-generated `/etc/hosts`, and an overlay node that was never authenticated in the first place.
+**TL;DR:** Tailscale earns its place for OOB access, per-device identity, and - since the 2026-08-21 cutover - a subnet router that puts every local VLAN one tunnel away from any network; not for bulk site-to-site traffic (IPsec/GRE wins there). The configurations to copy are the NixOS `authKeyFile` pattern (a rebuilt node rejoins unattended), SSH Host pattern lists (one identity block, three addresses), and the scoped subnet-router firewall rule (tailnet source in, local destinations only, never the WAN). The failures to avoid: placeholder authkeys, stale tailnet entries in a WSL-generated `/etc/hosts`, an overlay node that was never authenticated in the first place, and routes that are advertised but not forwarded.
 
 <Aside type="note" title="Provenance">
-  Every failure mode in this document was observed on the live tailnet and is labeled with its evidence (repo comment, README, or session). External behavioral claims (flag persistence, key expiry, check mode) are cited to the Tailscale documentation, and the nixpkgs module behavior was checked against the module source. Live state quoted below was re-verified against the running nodes on 2026-08-15.
+  Every failure mode in this document was observed on the live tailnet and is labeled with its evidence (repo comment, README, or session). External behavioral claims (flag persistence, key expiry, check mode) are cited to the Tailscale documentation, and the nixpkgs module behavior was checked against the module source. Live state quoted below was re-verified against the running nodes on 2026-08-15; subnet-routing state was re-verified live on 2026-08-23 (router advertising every local VLAN, dev-box client accepting them, `tailscale ping` to two admin-VLAN hosts answering via the router).
 </Aside>
 
 ---
 
 ## What the tailnet is for
 
-Three jobs, in order of how much they matter day to day:
+Four jobs, in order of how much they matter day to day:
 
 1. **Out-of-band management.** When the edge router, the IPsec/GRE tunnel, or local DNS is broken, the tailnet is the path that still works - it shares no fate with any of them. PiKVMs and the second-site Pi stay reachable even when the primary network does not.
 2. **A third path for SSH.** Every host alias carries a `10.0.x` address (LAN or site-to-site), a `10.68.x` address (cross-tunnel), and the MagicDNS name. The tailnet path works from arbitrary networks - a hotel line, a phone hotspot - where neither RFC1918 path exists.
 3. **Identity for SSH.** Tailscale SSH on the Unraid box replaces `authorized_keys` distribution with tailnet policy, and check mode adds browser re-authentication for high-risk connections.[^ts-ssh]
+4. **Reaching devices that cannot run tailscaled.** The router advertises every local VLAN as a subnet route, so the switch, BMCs, and other VLAN-only gear are reachable from any network a tailnet client sits on - enabled 2026-08-21 (see [subnet routing](#subnet-routing)).
 
 What it is not for: bulk traffic between sites. The IPsec/GRE tunnels move more data at lower latency because they are routed, not relayed, and do not depend on fallback via DERP (Designated Encrypted Relay for Packets, Tailscale's relay network) when NAT traversal fails.
 
 | Decision | Payoff | Cost |
 |---|---|---|
 | Tailscale alongside IPsec/GRE, not instead of | Independent failure domain for OOB | Two overlays to reason about |
-| Box-level tailscale on the router (subnet routing deferred) | Management plane without touching production routing | Devices without tailscaled stay unreachable from the tailnet for now |
+| Subnet routing on the router, every local VLAN | VLAN-only devices (switch, BMCs) reachable from any client network | Console approval after each re-advertisement; per-client route acceptance |
 | Tailscale SSH on Unraid only | Kills key-distribution toil where it hurt most | Check-mode re-auth URLs interrupt automation |
 | Authkey file on the NixOS appliance | Rebuilt node rejoins unattended | Key material on disk; 90-day max key lifetime[^ts-authkeys] |
 
@@ -49,7 +50,7 @@ digraph tailnet {
 
   subgraph cluster_site1 {
     label="Site 1";
-    router [label="NixOS edge router\n(box-level; subnet routing planned)"];
+    router [label="NixOS edge router\nsubnet router, all local VLANs"];
     unraid [label="Unraid server\nTailscale SSH"];
     pikvm [label="PiKVMs (OOB)"];
   }
@@ -70,7 +71,7 @@ digraph tailnet {
 }
 ```
 
-Every node is box-level today: tailnet devices reach tailnet devices, nothing more. Subnet-router advertising from the router (the site VLAN ranges) is a planned cutover step, deliberately not enabled - the router's Tailscale role is management plane, not production routing. Its firewall treats `tailscale0` as a management interface: SSH, the management UI port, and ping, nothing else.
+Until 2026-08-21 every node was box-level: tailnet devices reached tailnet devices, nothing more. The router now also advertises every local VLAN as subnet routes, so tailnet clients reach VLAN-only devices too (the switch, BMCs, anything without tailscaled) - the cutover story is in [subnet routing](#subnet-routing). Its input firewall still treats `tailscale0` as a management interface - SSH, the management UI port, and ping - and its forward chain carries exactly one rule for subnet-routed traffic, scoped to local destinations only.
 
 ---
 
@@ -92,15 +93,20 @@ Two consequences of the split. First, the authkey-joined node can rebuild and re
 
 ### The two variants
 
-The router gets the minimal form - enable the service, open the management ports on `tailscale0`, authenticate interactively once:
+The router gets the management-plane form - enable the service with the subnet-router flags, open the management ports on `tailscale0` in the input chain, authenticate interactively once:
 
 ```nix
-# router: box-level management plane. First auth is interactive:
+# router: management plane + subnet router. First auth is interactive:
 # `sudo tailscale up` + browser URL (one-time; node key persists
-# under /var/lib/tailscale).
-services.tailscale.enable = true;
+# under /var/lib/tailscale). The advertise-routes flags take effect
+# on the next `tailscale up`, not on rebuild alone.
+services.tailscale = {
+  enable = true;
+  useRoutingFeatures = "server";
+  extraUpFlags = [ "--advertise-routes=<every local VLAN /24, comma-separated>" ];
+};
 
-# nftables: management plane from the tailnet
+# nftables input: management plane from the tailnet
 # iifname "tailscale0" tcp dport { 22, <mgmt-ui-port> } accept
 # iifname "tailscale0" icmp type echo-request accept
 ```
@@ -141,6 +147,35 @@ Verified live after provisioning: `BackendState: Running`, and `tailscaled-autoc
 </Aside>
 
 Authkeys expire after 1-90 days (90 default), so the key on disk is a consumable: if the node ever needs to re-register after the key lapses, generate a new one and drop it in place. An already-registered node stays authorized until its node key expires.[^ts-authkeys] Note that re-registration also means a **new tailnet IP** - when the Pi was re-registered, its old `100.x` address was gone and anything pinned to it (including a stale `/etc/hosts` entry, below) dialed a dead node.
+
+---
+
+## Subnet routing
+
+Box-level reachability ended 2026-08-21, mid-servarr-cutover: the dev box gave its wired switch port to the new server and moved to the wireless VLAN, which has no route to the admin VLAN by design. The switch, the new server's BMC, every VLAN-only device became unreachable. The router now advertises every local VLAN as a subnet route, and the tailnet is the always-on bypass for any network a client sits on. The config is the router variant above; three things make the routes actually carry traffic:
+
+1. **Approval.** Advertised routes are inert until approved in the admin console (Machines -> the router -> Edit route settings -> **Save**). The tailnet policy is not in git, so this is a manual step after every re-advertisement; `autoApprovers.routes` in the policy would remove the click.
+2. **Forwarding.** The nft forward chain (policy drop) needs its own rule - the input rules that define the management plane do nothing for transit traffic:
+
+   ```nix
+   # tailnet -> local VLANs only; no WAN egress via the tailnet
+   # (this box is not an exit node).
+   iifname "tailscale0" ip saddr 100.64.0.0/10 ip daddr 10.0.0.0/8 accept
+   ```
+
+   Source-scoped to the tailnet CGNAT range, destination-scoped to local space: a tailnet client can reach VLAN devices but cannot egress to the WAN through the router. "Use as exit node" stays off in the console.
+3. **Client acceptance.** Off by default, per client: the Windows tray toggle ("Use Tailscale subnets") or `tailscale up --accept-routes`. WSL2 has no tailscaled - it inherits accepted routes through the Windows client's NAT.
+
+Each row below cost time during the enablement, each with a signal that made the step look done when it was not:
+
+| Observation | What it proves | Where to look when it fails |
+|---|---|---|
+| `tailscale ping <vlan-host>` answers | Control plane only - the route is advertised, approved, and accepted | Test TCP; ping passing while TCP fails points at the forward chain |
+| TCP to a VLAN host times out | The forward chain dropped it | `nft list chain inet filter forward` - is the `tailscale0` rule there? |
+| Console machine page lists the route as available | Nothing - the Edit dialog's checkboxes do nothing until Save | Re-open Edit route settings, tick, Save; the machine page's Approved list is the truth |
+| `Get-NetRoute` shows the VLAN route on Windows | Nothing - the OS installs the route before the tunnel accepts it | `tailscale status --json` AllowedIPs on the router peer: VLAN ranges present means accepted, a lone /32 means not |
+
+One cosmetic note: `tailscale up` on the router prints a UDP GRO warning for its NIC - a throughput note, not an error; the ethtool fix is optional.
 
 ---
 
@@ -191,12 +226,12 @@ The hard rules that keep this survivable:
 The idioms in use, all from the policy-file syntax reference:[^ts-policy]
 
 - **`autogroup:internet` as a `dst`** is what permits exit-node use. A device with no grant to `autogroup:internet` cannot use any exit node, and ACLs cannot restrict *which* exit node - that needs grants with `via`.
-- **`autoApprovers.routes`** will matter at the subnet-router cutover: it lets advertised subnets skip the admin-console approval click. Auto-approval only applies when the route is first advertised - editing the policy file does not retroactively approve a pending route; remove and re-advertise it.
+- **`autoApprovers.routes`** removes the manual approval click now that subnet routing is live: the tailnet policy is not in git, so every re-advertisement currently needs a console approval. Auto-approval only applies when the route is first advertised - editing the policy file does not retroactively approve a pending route; remove and re-advertise it.
 - **Tags beat users for servers.** A tagged node authenticates with an authkey, gets key expiry disabled by default,[^ts-authkeys] and its access is governed by the tag rather than by whoever happened to log it in.
 - **`tests`.** A `deny` test on a sensitive subnet fails the policy-file save if a future edit accidentally opens it.
 
 <Aside type="caution" title="Subnet routes do not fail over across prefix lengths">
-  Docs-verified, relevant to the planned cutover: with overlapping advertisements (`10.0.0.0/16` from router A, `10.0.0.0/24` from router B), Tailscale picks the longest prefix and does **not** fall back to the less-specific route when B goes offline - traffic to `10.0.0.1` is dropped. The workaround is to have every router advertise both prefixes.[^ts-subnets]
+  Docs-verified, relevant now that the router advertises live routes: with overlapping advertisements (`10.0.0.0/16` from router A, `10.0.0.0/24` from router B), Tailscale picks the longest prefix and does **not** fall back to the less-specific route when B goes offline - traffic to `10.0.0.1` is dropped. The workaround is to have every router advertise both prefixes.[^ts-subnets]
 </Aside>
 
 ---
@@ -213,6 +248,8 @@ The idioms in use, all from the policy-file syntax reference:[^ts-policy]
 | `ping` shows `tx 1404 rx 0` to dev box | Tailnet healthy, all other peers fine | Windows-side Tailscale broken, not the tailnet | Check `tailscale status --json` `BackendState`, not just ping | session, 2026-07 |
 | WSL2: ping fails, SSH works | `ping <alias>` no replies, `ssh <alias>` fine | Windows does not answer tailnet ICMP on the dev box | Test with the protocol you actually use | session, 2026-07 |
 | Monitoring pipeline died mid-run | Postgres at `100.x:5433` unreachable; 8300-row run lost | tailscaled restarted on the DB host; the tailnet had silently become a production dependency | Treat tailnet IPs in connection strings as dependencies to monitor, not conveniences | session, 2026-08 |
+| Subnet routes advertised but TCP dead | `tailscale ping` to a VLAN host answered, TCP to the same host timed out | nft forward chain (policy drop) had no `tailscale0` rule - the control plane resolved the route, the forwarding plane dropped the packets | One scoped forward rule: tailnet source, local destinations only | session, 2026-08-21 |
+| Client ignored advertised routes | VLAN ranges absent from the router peer's AllowedIPs (its own /32 only); Windows `Get-NetRoute` showed the routes anyway | Per-client route acceptance off (Windows tray setting) | Enable "Use Tailscale subnets" / `tailscale up --accept-routes`; verify AllowedIPs, not the OS route table | session, 2026-08-21 |
 
 ---
 
@@ -230,6 +267,9 @@ After touching anything Tailscale-related on a node:
 | Path selection | `ssh 10.0.x.2` vs `ssh 10.68.x.2` | Same identity, both land on the same host |
 | MagicDNS | `getent hosts <host>.<tailnet>.ts.net` | Current `100.x` address (compare against the admin console after any re-registration) |
 | DERP vs direct | `tailscale netcheck`; `tailscale ping <peer>` | Nearest relay region; `direct` after a few tries |
+| Subnet routes advertised | `tailscale debug prefs \| grep -A8 AdvertiseRoutes` (on the router) | Every local VLAN /24 |
+| Route acceptance (client) | `tailscale status --json \| jq '.Peer[] \| {h: .HostName, a: .AllowedIPs}'` | Router peer lists the VLAN ranges, not just its own /32 |
+| Subnet forwarding plane | TCP to a VLAN-only host, e.g. `Test-NetConnection <ip> -Port 22` | Connects - `tailscale ping` alone proves only the control plane |
 
 [^ts-subnets]: Tailscale, "Subnet routers." https://tailscale.com/kb/1019/subnets
 [^ts-ssh]: Tailscale, "Tailscale SSH." https://tailscale.com/kb/1193/tailscale-ssh
