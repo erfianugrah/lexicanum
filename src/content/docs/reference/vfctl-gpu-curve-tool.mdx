@@ -1,0 +1,128 @@
+---
+title: GPU voltage-frequency curve control without Afterburner
+description: vfctl - a Go CLI that reads and writes NVIDIA VF curves via NVAPI, replacing MSI Afterburner for undervolting. Verified write path, full telemetry, and the Blackwell DVFS findings that explain where the card actually runs.
+author: "Erfi Anugrah"
+category: workstations
+featured: true
+blurb: "GPU undervolting that doesn't fight the curve editor."
+---
+
+vfctl is a Go CLI that reads and writes NVIDIA GPU voltage-frequency curves directly via NVAPI, replacing MSI Afterburner's curve editor. Built after Afterburner's editor repeatedly produced broken curves - notch artifacts at selection boundaries, temperature-stale baselines, and unexpected whole-curve shifts[^afterburner] - on an RTX 5090 FE.
+
+**Provenance**: Curve struct layouts are from the PenguinBurner reverse-engineering effort[^penguinburner], cross-checked against the LACT issue #936 discovery[^lact-936] and verified via ctypes. Telemetry structs are from nvapi-sys[^nvapi-sys] and NVIDIA's official open-source NVAPI reference[^nvapi-docs]. The write path is verified end-to-end on live silicon: a single-point selftest writes +15 MHz, reads it back, and restores. Telemetry (clock, voltage, utilization, temperature, power) is verified across full gaming sessions. Measured on a single RTX 5090 FE with driver 610.88; the curve interfaces are undocumented and could change between driver releases.
+
+## TL;DR
+
+- **Replaces Afterburner for undervolting**: curve write, telemetry, persistence, automated stability search - all in one static binary
+- **Verified write path**: read-modify-write via `ClkVfPointsSetControl`, confirmed by selftest on the card
+- **Full telemetry**: clock, voltage, utilization, temperature, live power draw - CSV logging with a voltage histogram summary
+- **Persistence without a resident process**: a sign-in scheduled task re-applies the curve in ~2s, temperature-correct every boot
+- **The key Blackwell finding**: the curve sets the frequency ceiling per voltage; the DVFS governor picks where the card actually sits - target voltage and actual operating voltage are different things
+
+## Architecture
+
+| Package | What it owns | Key detail |
+|---------|-------------|------------|
+| `internal/vfcurve` | Afterburner blob parse/encode, generation, validation | 12-byte header, 127 points |
+| `internal/curve` | Live-curve math: BuildOffsets, VerifyOffsets, ApplyCurve | bounds guard, read-back verify |
+| `internal/testloop` | TDR-loop logic: Classify, StepFreq, ParseTDRCount | 100% coverage |
+| `internal/profile` | Afterburner .cfg INI read/write | legacy import path |
+| `internal/nvapi` | nvapi64.dll syscall layer | curve writes + telemetry reads |
+| `cmd/vfctl` | CLI dispatch | 14 commands |
+
+Built partly by a self-correcting loop on a local Gemma 4 26B model - the `internal/curve` and `internal/testloop` extractions converged in one iteration each against a `go test` sensor, with human review catching a dropped sentinel guard the tests missed.
+
+## The curve write path (what it took to get right)
+
+Three bugs separated the first attempt from a working write, each caught only by escalating verification:
+
+1. **4-byte struct offset**: the control struct's points start at 0x44, not 0x48 (inherited from a read-only PoC that never exercised a write).
+2. **Mixed struct generations**: the status read used a 128-point layout while the control write used 255 points - different index spaces, so "point 72" in the read wasn't "point 72" in the write.
+3. **Fresh buffer instead of read-modify-write**: the driver silently ignores writes to points whose `type_` field doesn't match what it returned. A zeroed buffer writes nothing that sticks.
+
+The fix that made writes land: GetControl fills the full table (preserving `type_`/`rsvd`), modify one `freq_offset_kHz`, SetControl writes the whole table back. Then verify by read-back - a write that doesn't read back is an error, not a success.
+
+A fourth bug hid in the read path the whole time: the status struct's `freq_kHz` (+4) is the *nominal* frequency (base + applied offset), not the base. The true base is `vf_tuple_base.freq_kHz` (+12). Using the nominal double-counts offsets on any non-stock card. This is why Afterburner profiles "mutate" after apply - the stored frequencies are a temperature-time snapshot, and only the offsets are real.
+
+## Telemetry, and what it revealed
+
+`watch` samples clock, voltage, utilization, temperature, and power every interval, logs CSV, and prints a per-voltage histogram on exit. Full-session data from The Finals on an undervolted 5090:
+
+| Metric | Menu | Full load |
+|--------|------|-----------|
+| Core clock | 2415 MHz | 2433 avg / 2497 max |
+| Voltage | 880-885 mV | 930-935 mV (95.7% of time) |
+| Utilization | 13-17% | 72% avg / 99% peaks |
+| Temperature | 45C | 57 avg / 61 max |
+| Power | 31W | 76W avg / 103W max |
+
+The telemetry answered the question the curve data couldn't: **why does the card sit at 930 mV when the curve targets 860?** Power (103W max of 575W) and temperature (61C) ruled out both limiters. The answer is Blackwell's DVFS governor: it adds voltage margin under sustained load, independent of the curve. The voltage step happens the instant utilization crosses ~85%, before power or clock change - it follows load duration, not demand.
+
+The cost of that margin is ~5W. The heat goal ("stock perf or better, lowest possible") was already met: 2433 MHz avg at 76W average on a 575W card.
+
+## NVAPI interface reference
+
+All accessed via `nvapi_QueryInterface(function_id)` on `nvapi64.dll`. Version field: `(version << 16) | struct_size`.
+
+### Curve (undocumented, verified working)
+
+| ID | Name | Struct | Notes |
+|----|------|--------|-------|
+| `0x507B4B59` | ClkVfPointsGetInfo | InfoV1, 0x182C | active mask + per-point type/voltage_based |
+| `0x21537AD4` | ClkVfPointsGetStatus | StatusV3, 0x15B0C | 255 pts x 348B at 0x68; base at +12, nominal at +4 |
+| `0x23F1B133` | ClkVfPointsGetControl | ControlV1, 0x2420 | 255 pts x 36B at 0x44; offset at +20 |
+| `0x0733E009` | ClkVfPointsSetControl | ControlV1, 0x2420 | read-modify-write ONLY |
+
+Only points with info-struct `type==0 && voltage_based==1` are editable core points - the 255-point buffer also carries memory/other clock domains, and writing those offsets corrupts them.
+
+### Telemetry (documented public APIs)
+
+| ID | Name | Reads |
+|----|------|-------|
+| `0xDCB616C3` | GetAllClockFrequencies | current core/memory clocks (kHz) |
+| `0x60DED2ED` | GetDynamicPstatesInfoEx | utilization % (domain 0) |
+| `0xE3640A56` | GetThermalSettings | temperature - **3-arg call** (gpu, sensorIndex, struct) |
+| `0xEDCF624E` | ClientPowerTopologyGetStatus | **live power draw** |
+| `0x465F9BCF` | ClientVoltRailsGetStatus | voltage (uV at +0x28) |
+
+One trap worth recording: `ClientPowerPoliciesGetStatus` (0x70916171) is one name away from `ClientPowerTopologyGetStatus` and returns the power-limit *policy* (frozen ~100%), not live draw. The symptom is a power reading pinned at exactly 100.0 W that never moves.
+
+## The undervolt algorithm
+
+Stock below the ramp start, linear ramp to the target frequency at the target voltage, flat above. Offsets are computed against the live base (`vf_tuple_base`), so the result is temperature-correct at apply time:
+
+```
+offset = target_freq - base_freq_at_voltage
+```
+
+NVIDIA snaps frequencies to 15 MHz steps. A bounds guard rejects values outside sane envelopes (the catastrophic-typo check: 27970 instead of 2797). Every write is verified by read-back within one step, and `set` self-cleans stale offsets below the ramp region so switching curves never stacks.
+
+## Stability testing methodology
+
+1. **Selftest first**: write +15 MHz to one point, read back, restore - proves the write path before trusting anything
+2. **Game test**: The Finals (Unreal Engine 5, transient-heavy) catches what benchmarks miss
+3. **Step down**: on TDR (Windows Event 4101), -15 MHz and retest - `vfctl test` automates this loop
+4. **Watch the histogram**: where the card *actually sits* under load is the ground truth, not the target you set
+
+On driver 610.88, the stability cliff for a 5090 FE is exactly one 15 MHz step wide: 2812 @ 900 mV is stable, 2827 (the old-driver stable curve) crashes.
+
+## Known limitations
+
+- **Writes require Administrator** (error -137, `NVAPI_INVALID_USER_PRIVILEGE`); reads work unelevated
+- **The curve does not pin the operating voltage**: the DVFS governor adds margin under sustained load. Forcing lower needs a declining curve, which is notch territory
+- **Undocumented curve interfaces** may change between driver releases
+- **Linux not supported**: NVML offers global offsets only
+- **Fan control out of scope**: manual % clamps to 30% minimum; 0 RPM is vBIOS-auto only. FanControl handles it
+- **Single-card tested**: RTX 5090 FE (Blackwell GB202)
+
+## References
+
+[^lact-936]: Loong0x00, "Feature: Per-point V/F curve reading and editing for NVIDIA GPUs via undocumented NvAPI," LACT issue #936. https://github.com/ilya-zlobintsev/LACT/issues/936
+
+[^penguinburner]: jpietek, "hidden_nvapi_vf.py," PenguinBurner. https://github.com/jpietek/PenguinBurner/blob/d8901e64a9c7b479d6ae4ced63b7a2048b61e3ce/hidden_nvapi_vf.py
+
+[^nvapi-sys]: arcnmx, "nvapi-sys," Rust crate. https://docs.rs/nvapi-sys - struct layouts for power/thermal reads
+
+[^nvapi-docs]: NVIDIA, "NVAPI Reference Documentation," Release 590. https://docs.nvidia.com/nvapi - documented clock/thermal APIs
+
+[^afterburner]: st4rdog, "MSI Afterburner curve editor shortcuts," GitHub Gist. https://gist.github.com/st4rdog/d305609977037e64684a7932609446de
