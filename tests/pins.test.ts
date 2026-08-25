@@ -42,6 +42,7 @@ const CONSOLIDATION = "guides/supabase-org-consolidation";
 const SHARED = "guides/supabase-shared-tenancy";
 const PROMOTION = "guides/supabase-tenant-promotion";
 const MULTITENANT = "reference/supabase-multi-tenant-placement";
+const PLATFORM_MGMT = "guides/supabase-platform-management-api";
 const TENANT_MERGE = "guides/supabase-tenant-consolidation";
 const PBKDF2 = "reference/pbkdf2-supabase-auth-migration";
 const OPCOST = "reference/supabase-platform-operation-cost";
@@ -310,13 +311,37 @@ const pins: Pin[] = [
     linksTo: [UPGRADE],
   },
   {
+    doc: PLATFORM_MGMT,
+    // The 2026-08-24 platform-plan correction: nano is the plan's create
+    // default, not a gated catalogue variant. The pre-correction framing
+    // ("Nano-only and gated") is forbidden so it cannot drift back in. This
+    // doc had no pins at all until 2026-08-25 - the only one of the tenancy
+    // four without them, and the one that missed the correction because of it.
+    mustContain: ["the platform plan's create default"],
+    mustNotContain: ["Scale-to-zero pricing is Nano-only and gated"],
+    linksTo: [MULTITENANT],
+  },
+  {
     doc: CONSOLIDATION,
     // Retitled off "Consolidating Supabase accounts...", which read as a
     // near-twin of the tenant-consolidation guide's title while describing an
     // unrelated operation. The sidebar sorts by filename so the two were never
     // adjacent, but both being visible and both opening on "Consolidating" was
     // enough to confuse the two moves.
-    mustNotContain: ["Consolidating Supabase accounts into one organization"],
+    mustContain: [
+      // The 2026-08-24 platform-plan measurements, carried in the prose
+      // rather than only in evidence rows - the 2026-08-25 review found the
+      // table and the paragraphs asserting opposites.
+      "provisions Nano by default",
+      "accepted and echoed",
+    ],
+    mustNotContain: [
+      "Consolidating Supabase accounts into one organization",
+      // Both were true when written, measured false on 2026-08-24; each
+      // contradicted a Measured row in this doc's own evidence table.
+      "we could not test it on this account",
+      "That is untested here and is",
+    ],
     sections: [/^#{2,3} .*Verification/m, /^#{2,3} .*Gotchas/m],
     linksTo: [REGION, SHARED, MULTITENANT],
   },
@@ -333,12 +358,20 @@ const pins: Pin[] = [
       "custom_jwks",
       "PGRST301",
       "app_metadata",
+      // The lede's cost premise, qualified 2026-08-25: pausing exists on the
+      // platform plan (measured 2026-08-24) and the premise holds because
+      // that plan is gated, not because pausing is impossible.
+      "The exception (the `platform` plan",
     ],
     mustNotContain: [
       // True when written, measured false since. Inert here but kept as a
       // regression guard on both halves.
       "Neither approach was built or tested in this run",
       "Neither discovery endpoint nor gateway was built",
+      // The unqualified form of the premise. Measured false on a platform
+      // org 2026-08-24 (this doc's own evidence row L371 said so while the
+      // lede asserted it) - the qualified form scopes it to Pro/Team.
+      "a project on a paid plan cannot be paused",
     ],
     sections: [/^#{2,3} .*Verification/m, /^#{2,3} .*Gotchas/m],
     // The two halves must reach each other. A split guide whose halves do not
@@ -427,9 +460,14 @@ const pins: Pin[] = [
       // sections regex below cannot see it - pin the literal.
       "**TL;DR:**",
       "Where should a tenant live?",
+      // The provenance paragraph must own the 2026-08-24 platform-plan
+      // measurements; "five dates" silently excluded the newest and most
+      // load-bearing rows.
+      "six dates",
     ],
     mustNotContain: [
       "Gateway (stable facade)",
+      "They span five dates",
       // A "not yet tested" section listing three struck-through measured items
       // reads as though the work was never done. The strikethroughs went; the
       // history is one sentence now.
