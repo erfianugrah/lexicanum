@@ -1,0 +1,215 @@
+---
+title: Removing a stuck WinFsp or rclone drive letter on Windows
+description: A mapped network drive letter that net use cannot delete (2250 "could not be found") and cannot reuse (error 85 "already in use") is usually owned by a dead or hidden WinFsp/rclone provider in session 0, not by your logon session. A complete diagnostic ladder - from net use through fsptool to the owning Windows service - ending with the share actually mounted.
+author: "Erfi Anugrah"
+category: workstations
+featured: true
+blurb: "Z: stuck on a dead rclone mount: the full diagnostic ladder, every dead end included."
+---
+
+A Windows network drive letter that refuses to die is one of those problems where every standard fix returns a different, contradictory error. This guide is the complete ladder, in the order to run it, against the canonical symptom pair: `net use X: /delete` says the connection "could not be found" (error 2250) while `net use X: \\new\share` says the letter "is already in use" (system error 85). It was worked end-to-end on 2026-08-25 against a real box: `Z:` held by a `\\server\copyparty` rclone/WinFsp mount whose server had been retired the same day. Every step below was actually executed; the dead ends are documented because they are the steps every forum thread recommends first.
+
+Prerequisites: an elevated (Administrator) Command Prompt or PowerShell on the affected box. Nothing here touches the network or any other machine.
+
+## Constants (read this first)
+
+| Fact | Consequence |
+|---|---|
+| WinFsp mounts are **global** (machine-wide), not per-session[^sshfs-200] | Explorer restart, sign-out, and per-user registry cleanup cannot remove them |
+| A mount created by a **service** lives in session 0 | Your user `net use` can *see* the connection record but cannot delete it - the delete is routed to a provider your session does not own |
+| `net use /delete` -> 2250 + remap -> 85 | The signature of a mount whose owning provider is dead, hidden, or running in another session |
+| The WinFsp **driver** keeps its own volume table | It survives reboots and is invisible to every registry-based fix |
+| This build of `fsptool-x64.exe` has only `lsvol id perm lsdrv load unload ver` | There is no per-volume delete verb in the tool; per-volume removal has to come from whoever owns the mount |
+
+### Error translation table
+
+| Error | Text | What it actually meant here |
+|---|---|---|
+| 2250 (`NET HELPMSG 2250`) | "The network connection could not be found" | Your session's redirector found no connection *it* owns at that letter - it says nothing about other sessions |
+| System error 85 | "The local device name is already in use" | The letter IS claimed - globally - just not by anything that will answer your delete[^ms-error85] |
+| `sc query winfsp` -> 1060 | "The specified service does not exist" | A red herring: the driver can be loaded and holding volumes without a service registered under that exact name |
+
+## Step 1 - Confirm the symptom pair
+
+From a normal (non-elevated) prompt:
+
+```cmd
+net use
+net use Z: /delete
+net use Z: \\10.0.71.3\servarr /user:erfi /persistent:yes
+```
+
+Expected output in the stuck state:
+
+```text
+Status       Local     Remote                    Network
+-------------------------------------------------------------------------------
+             Z:        \\server\copyparty        WinFsp.Np
+
+net use Z: /delete
+The network connection could not be found.        <- 2250
+
+net use Z: \\10.0.71.3\servarr ...
+System error 85 has occurred.                     <- letter held anyway
+```
+
+Two facts to note from the listing: the provider column (`WinFsp.Np` here) tells you this is a WinFsp network-provider mount, not an SMB redirector mount; and the empty `Status` column means the connection record is not associated with a live session you control.
+
+## Step 2 - The user-session fixes (expected to fail; run them to rule them out)
+
+These are the answers every search result leads with. They fix the common case (a stale SMB mapping) and do nothing for a WinFsp/service mount. Five minutes, then move on.
+
+```powershell
+# Stale Explorer-level records
+Remove-PSDrive Z -Force -ErrorAction SilentlyContinue
+Remove-Item 'HKCU:\Network\z' -ErrorAction SilentlyContinue
+Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2' |
+  Where-Object PSChildName -match 'server|copyparty'
+# delete any hits with Remove-Item ... -Recurse, then:
+Stop-Process -Name explorer -Force   # Explorer auto-restarts
+```
+
+On the box in question, the MountPoints2 cleanup did find and remove two stale keys (`##server#copyparty`, `##copyparty.erfi.io@SSL#DavWWWRoot`) - and the letter stayed stuck, because the record that mattered was never in the registry. Also check for anything still starting the mount:
+
+```powershell
+Get-Process | Where-Object { $_.Name -match 'sshfs|winfsp|copyparty|rclone' }
+Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+```
+
+The first command's match list is load-bearing: on the affected box, a search for `sshfs|winfsp|copyparty` returned nothing while `rclone.exe` ran the whole time - the pattern simply did not include the process's real name. Include `rclone` (and any tool you have ever used to mount) in the pattern.
+
+## Step 3 - Delete from the owning session (SYSTEM)
+
+A mount created in session 0 can only be deleted from session 0. The standard way in is PsExec:
+
+```cmd
+psexec -s -i cmd
+net use
+net use Z: /delete
+```
+
+Result on the affected box: `net use` inside the SYSTEM session listed `Z: -> \\server\copyparty WinFsp.Np`, and `/delete` still returned 2250. That is the tell that even the owning *session* is gone - what remains is a provider-level registration with no process to answer deletes. Two more elevated-context checks rule out the classic registry locations:
+
+```cmd
+reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\DOS Devices"
+:: no Z: value here on the affected box - a letter here would be deletable with
+:: reg delete "...\DOS Devices" /v "Z:" /f
+
+reg query "HKLM\SOFTWARE\WinFsp\Services" /s
+reg query "HKLM\SOFTWARE\WOW6432Node\WinFsp\Services" /s
+:: both "unable to find the specified registry key" - no service registration
+```
+
+At this point the letter is held by the WinFsp *driver*, not by any user-mode record. Go to step 4.
+
+## Step 4 - Read the driver's volume table
+
+WinFsp ships `fsptool-x64.exe` under `C:\Program Files (x86)\WinFsp\bin\`. Its `lsvol` verb lists the volumes the driver itself is holding - the one place the zombie cannot hide:
+
+```cmd
+"C:\Program Files (x86)\WinFsp\bin\fsptool-x64.exe" lsvol
+```
+
+```text
+Z:  \Device\Volume{b0b10528-a086-11f1-903e-10b1df761730}\server\copyparty
+```
+
+A line like that proves the driver holds the letter, independent of every user-mode tool. (On this WinFsp build the tool's full verb list is `lsvol id perm lsdrv load unload ver` - there is no `delvol` or `info`, whatever older forum posts suggest. Check `fsptool` with no arguments for your build's list.)
+
+A volume surviving in this table across a reboot means one of two things: a stale registration the driver never flushed, or something re-creating the mount at every driver start. The next step distinguishes them.
+
+## Step 5 - Driver reload: the test that finds a live re-mounter
+
+```cmd
+"C:\Program Files (x86)\WinFsp\bin\fsptool-x64.exe" unload
+"C:\Program Files (x86)\WinFsp\bin\fsptool-x64.exe" load
+"C:\Program Files (x86)\WinFsp\bin\fsptool-x64.exe" lsvol
+```
+
+Two possible outcomes:
+
+- `lsvol` prints nothing -> the registration was stale, the reload flushed it, the letter is free. Skip to step 7.
+- `lsvol` prints the volume again, **with a different GUID** -> something is actively re-mounting. On the affected box the GUID changed from `b0b10528-...` to `b0b107c4-...` across the reload, which is only possible if a process was alive and re-registering the mount the moment the driver came back. That is the case the rest of this guide covers.
+
+Caution: `unload` drops every WinFsp volume on the machine. If you still use other FUSE mounts (sshfs, rclone remotes you care about), they go down too - re-mount them afterwards.
+
+## Step 6 - Find and remove the owning service
+
+The reload test proves a live process. Find it by name, by command line, and by service registration - three queries, because each one can miss what the others catch:
+
+```cmd
+tasklist | findstr /i rclone
+wmic process where "name like '%rclone%'" get ProcessId,CommandLine
+sc query | findstr /i rclone
+```
+
+Output from the affected box:
+
+```text
+rclone.exe                   15244 Services                   0     46,592 K
+
+"%USERPROFILE%\scoop\apps\rclone\current\rclone.exe" mount copyparty: Z:
+  --config C:\ProgramData\rclone\rclone.conf --log-file C:\ProgramData\rclone\logs\copyparty.log
+  --log-level INFO --network-mode --vfs-cache-mode off --dir-cache-time 1m
+  --transfers 8 --buffer-size 32M --copy-links
+
+SERVICE_NAME: rclone-copyparty
+DISPLAY_NAME: rclone copyparty mount
+```
+
+Three details that explain the whole failure chain: the process runs in session 0 (`Services`, session id 0) so no user-session tool could kill it; the service name is `rclone-copyparty`, so `sc query rclone` (exact name) returned "does not exist" while `sc query | findstr` found it; and the mount command runs at every service start, which is why the driver reload produced a fresh mount with a new GUID.
+
+Stop and delete the service (elevated):
+
+```cmd
+sc stop rclone-copyparty
+sc delete rclone-copyparty
+```
+
+`sc stop` here also unmounts cleanly - the rclone process exits and releases the volume. Verify:
+
+```cmd
+"C:\Program Files (x86)\WinFsp\bin\fsptool-x64.exe" lsvol
+net use
+```
+
+Both empty: `lsvol` prints nothing, `net use` prints "There are no entries in the list." The letter is free.
+
+## Step 7 - Map the replacement share from the right session
+
+With the letter free, mount the new share. The one rule that matters: **map it from the session that will use it.** On the affected box, the successful delete left the letter claimed by a *previous* elevated session's `net use` - mappings made from an elevated or SYSTEM shell are global, so your normal session sees error 85 with an empty `net use` list, the mirror image of the original problem.
+
+From a normal (non-elevated) prompt:
+
+```cmd
+net use Z: \\10.0.71.2\servarr /user:erfi /persistent:yes
+```
+
+If that returns 85 despite a clean `net use`, an elevated session is holding the letter - run `net use Z: /delete` from the elevated window, then map again from the normal one.
+
+## Verification
+
+```cmd
+net use
+::   Z:        \\10.0.71.2\servarr     Microsoft Windows Network
+dir Z:\
+::   lists the share root (tank, appdata, scratch, ...)
+```
+
+In Explorer, the drive appears under Network locations with its real capacity. One capacity gotcha: Windows reports the free space of the *share root's filesystem*. If the share root is a directory on the boot pool (rpool) with symlinks into the big pool (tank), the drive shows the boot pool's free space (858 GB on this box) rather than the pool's 28 TB. The fix is server-side - put the share root on the big pool and symlink its subdirectories - not a client problem.
+
+## Gotchas and lessons learned
+
+- **2250 + 85 together mean the provider is dead or in another session.** Stop trying user-session fixes; find the owner (step 6).
+- **Process-name search must include the real binary.** A `sshfs|winfsp|copyparty` pattern missed `rclone.exe` entirely. Search for every tool you have ever used to mount.
+- **`sc query <exact-name>` misses differently-named services.** `sc query rclone` returned "does not exist" while `sc query | findstr /i rclone` found `rclone-copyparty`. Use the substring form.
+- **A driver reload that returns the volume with a *new* GUID proves a live re-mounter** - a stale registration would not come back at all.
+- **WinFsp's `lsvol` is the driver-level truth.** Every user-mode tool (`net use`, registry, Explorer) can disagree with it; it cannot.
+- **This fsptool build has no per-volume delete verb** (`lsvol id perm lsdrv load unload ver` only). Per-volume removal comes from whoever owns the mount.
+- **The setup was documented all along.** The rclone-copyparty service was built in a prior session and recorded in the private session ledger - one `memledger_search "rclone copyparty mount windows service"` would have returned the exact service name and saved the driver-level archaeology. When a self-built artifact fights back, search the setup session before researching the generic problem.
+- **Reboots and sign-outs do not clear a service-owned mount.** The service re-creates it at start. Only stopping and deleting the service frees the letter.
+
+## References
+
+[^sshfs-200]: winfsp/sshfs-win, "Mapped drive cannot be deleted" (issue #200) - documents the session-0/global-mount behaviour and the SYSTEM-context delete path. https://github.com/winfsp/sshfs-win/issues/200
+[^ms-error85]: Microsoft, "System error 85 has occurred" - the local device name is already in use. https://learn.microsoft.com/en-us/troubleshoot/windows-server/networking/system-error-85-has-occurred
