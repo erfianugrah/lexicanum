@@ -1,0 +1,192 @@
+---
+title: "Migrating a NAS without losing a byte: bulk-data moves with migctl"
+description: How-to for migrating off a failing NAS (Unraid -> NixOS + ZFS) with a correctness gate at every step - rsync copy, checksum re-verify, coverage diff, zpool scrub - before the source is wiped. Uses migctl to record every verdict as an event so the gate is derived from state, not memory.
+author: Erfi Anugrah
+category: homelab
+featured: true
+blurb: "A gate you cannot pass until the copy is provably complete, run before the source drives are wiped."
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+How to move a NAS-worth of mixed personal and media data off a box whose SATA controller is throwing exceptions and whose FUSE layer livelocks, onto a fresh ZFS machine - and prove the copy is complete before the source drives are pulled and wiped. The old box is gone at the end of this; anything not copied is unrecoverable, so the correctness gate is the whole point. The tool is `migctl`, a stdlib-only Go binary that records every verification verdict as an append-only event and refuses to flip a gate to CLEAR until the state carries proof.
+
+The destination is the same servarr host whose media stack is hardened in [Docker servarr security](/reference/docker-servarr-security/) and whose GPU is tuned in [vfctl](/reference/vfctl-gpu-curve-tool/) - this guide is how that host's data got onto ZFS in the first place.
+
+**TL;DR:** The migration is four verifications in sequence - rsync copy (P1), rsync checksum re-verify (P2), a coverage diff that answers "is everything there" as a set operation, and a `zpool scrub`[^openzfs-scrub] before wipe - each gated, each recorded. `migctl gate` prints CLEAR only when the state file carries a passing verdict for every phase, a fresh coverage event, a probe event, and a clean scrub. It executes nothing; the wipe is a human hand.
+
+<Aside type="note" title="Provenance">
+  Every number in this guide was measured during the real migration (August 2026, Unraid to NixOS + ZFS). migctl was built *from* that migration's pain - 16 ad-hoc scripts, 11 verdict-line formats, and a status doc that froze two days behind reality. The live migration itself ran on those scripts; migctl is the repeatable version for the next one. Where the docs disagree with memory, the docs win; the migration notes are in `servarr-nixos/docs/migration/` and the tool in `~/infra/migctl`.
+</Aside>
+
+---
+
+## Why the gate matters
+
+The old box was decommissioned with its drives pulled. Two facts made that irreversible:
+
+1. **The source was failing.** Recurring SATA-controller exceptions plus shfs/FUSE livelocks meant the copy had to finish before the hardware gave up, not after.
+2. **The data was not all re-downloadable.** The `anugrah` share (1.4 TB of personal data) is irreplaceable. Most of the rest (9.9 TB of movies, a skip-set of TV) was deliberately left behind as re-downloadable - but that decision had to be made per-tree, and the keep-set had to be proven complete.
+
+A migration that ends with "the rsync finished" is not done. It is done when a verifier that has *caught something before* says the destination holds everything, and a scrub says the destination disks agree.
+
+## The shape of the data
+
+Understand what you are moving before you move it. The old box:
+
+| Share | Size | Re-downloadable? |
+|---|---|---|
+| `anugrah` | 1.4 TB | No - irreplaceable |
+| `music` | 2.5 TB | No |
+| `tv` | 12 TB (166 shows) | Mostly - keep-set of 115 shows pulled, skip-set left |
+| `movies` | 9.9 TB (2108) | Yes - deliberately P1-only, no checksum pass |
+| `appdata` + service state | ~10 GB across ~85 dirs | No - container configs |
+
+The destination is three ZFS pools on the new box:
+
+| Pool | Disks | Holds |
+|---|---|---|
+| `tank` | HDD raidz2, 5-wide growing to 7 | media, anugrah, data, backups |
+| `rpool` | NVMe | NixOS root, docker, arr databases |
+| `scratch` | NVMe, `sync=disabled` | download staging (transient) |
+
+Two constraints drove the layout:
+
+- **Hardlinks only work within one filesystem.** ZFS datasets are separate filesystems, so media and downloads live in a single `tank/media` dataset - the TRaSH Guides layout[^trash-hardlinks] - and the move used `rsync -aH`[^rsync-man] to preserve hardlinks. Split them across datasets and every hardlink becomes a full copy.
+- **`zfs list` is not `zpool list`.** The first is post-parity usable, the second raw. Quote one consistently or your capacity arithmetic is wrong by the parity width.
+
+## The verification chain
+
+Each stage produces a verdict. migctl's job is to make the verdict durable and the gate derived from it.
+
+```dot
+digraph chain {
+  bgcolor="transparent";
+  rankdir=LR;
+  node [shape=box, style=rounded];
+  probe [label="probe\n(plant corruption fixtures)"];
+  p1 [label="P1\nrsync size+mtime"];
+  p2 [label="P2\nrsync -c checksum"];
+  cov [label="coverage\nset diff src vs dst"];
+  scrub [label="scrub\nzpool scrub"];
+  gate [label="gate\nCLEAR / BLOCKED", shape=diamond];
+  wipe [label="wipe\n(human hand)", shape=box, style=dashed];
+  probe -> p1 -> p2 -> cov -> scrub -> gate -> wipe;
+}
+```
+
+### Probe: prove the verifier can catch something
+
+Before any checksum run is trusted, plant failure and check the tool finds it:
+
+```bash
+migctl probe plan.json
+```
+
+This writes truncated, missing, and silent-corruption fixtures into a scratch tree and confirms the verifier flags all three. A verifier that has never caught anything is an assumption, not a check. The gate requires a probe event on file before it will consider P2 verdicts.
+
+### P1 and P2: copy, then re-verify
+
+```bash
+migctl run plan.json --phase media-tv --passes p1,p2
+```
+
+P1 is the copy (rsync size+mtime). P2 is the re-verify (`rsync -c`, full checksum).[^rsync-man] The PASS rule is fixed in code, not judgement: `transferred==0 AND created==0 AND deleted==0 AND rc==0`, parsed from rsync `--stats`. `--repair` reconciles a failed pass instead of just reporting it.
+
+Measured on the real trees: the disk3 `anugrah` local checksum read 153,329 files / 1,071,361,227,820 bytes and came back `transferred=0`. The batch-2 pull of 115 shows (28,067 files, 7,652,108,763,316 bytes) took 21h wall clock for P2 and came back `transferred=0`. No silent-corruption loss was found anywhere in the migration.
+
+### Coverage: "is everything there" as a set operation
+
+```bash
+migctl coverage plan.json
+```
+
+Takes the union of every source file list, diffs it against the destination, and reports missing plus extras. This is the answer to "are we certain it is all there" - a set diff, not a reasoned argument. The gate requires a fresh coverage event with no unexplained extras.
+
+### Scrub: the disks agree
+
+```bash
+migctl scrub plan.json tank
+migctl scrub-status
+migctl scrub-record
+```
+
+`zpool scrub` is the at-rest integrity check before the source is wiped - it reads every block and verifies each checksum, repairing from parity on replicated vdevs.[^openzfs-scrub] It proves the destination pool reads back clean, not just that rsync wrote it. PASS = 0 repaired and no errors in `zpool status`.
+
+### Gate: derived from state, executes nothing
+
+```bash
+migctl gate plan.json pre-wipe
+```
+
+Prints CLEAR or BLOCKED with reasons. It flips CLEAR only when the state file carries proof for each declared item: all phases PASS, fresh coverage, a probe, a clean scrub. It runs no command - wipe, shutdown, and pool-create are always a human hand. The tool holds no destructive capability at the gate boundary.
+
+## The plan file
+
+migctl is driven by one declarative `plan.json`:
+
+```json
+{
+  "name": "servarr-migration",
+  "host": "servarr",
+  "state_dir": "/root/migctl-state",
+  "trees": { "media": { "dst": "/tank/media" } },
+  "phases": [
+    { "id": "media-tv", "tree": "media", "role": "primary",
+      "src": "/staging/media/tv", "passes": ["p1", "p2"] }
+  ],
+  "gates": { "pre-wipe": { "requires": "all-pass", "coverage": true,
+                            "probe": true, "scrub": "tank" } }
+}
+```
+
+Validation is fail-fast at load: unknown trees, a primary phase with a merge strategy, a merge phase without one. The full schema is in `~/infra/migctl/docs/design.md`.
+
+## How state is kept
+
+Every verdict is one JSON line appended to `events.jsonl` under a flock. Status is a fold over the events, so a status view cannot freeze behind reality the way a hand-edited doc does (the live migration's `status.md` sat saying "in progress" for two days after a P2 had passed). A torn last line from a crash is skipped, never fatal. Plan snapshots go into `state_dir/runs/<ts>/` and it is the *snapshot* that executes - which is the fix for the failure mode where someone edited a running overnight script and `sh`, reading the file incrementally, emitted a self-contradictory verdict.
+
+## Cross-check before anything irreversible
+
+migctl orchestrates and records; it is not the only source of truth. Before any irreversible action (the wipe), re-derive the load-bearing verdict with the raw tool, independently:
+
+| migctl verdict | Independent check |
+|---|---|
+| `probe` | `probe-verifier.sh` |
+| `run` PASS | grep the rsync log for a non-zero transferred count |
+| `coverage` | `find | sort | comm` by hand |
+| (no manifest cmd) | `manifest.sh` - the durable sha256 record; migctl has no `manifest` yet |
+
+The shell scripts in the `migrating-bulk-data` skill are the independent control, not a fallback. If migctl and the scripts disagree, trust neither until reconciled. Spot-check a migctl PASS by hand-grepping its own log in `state_dir/logs/` for a non-zero transferred count - the scripts never lie about what rsync did.
+
+## Failure modes that actually happened
+
+- **Verdict lost to a dead pipe.** The first disk3 checksum completed its reads but the verdict was piped to a dead `tail` and never recorded. Rule: verdicts always go to log files.
+- **Editing a running script.** `sh` reads the script incrementally; an edit mid-run produced a verdict that contradicted itself. migctl's answer is the plan snapshot.
+- **`rsync --info=progress2` lies.** The percentage is meaningless until the file list is fully scanned (it showed 97% at 78 GB of 1.4 TB). Watch bytes via `zfs list` USED instead.
+- **Killing the wrapper does not kill the rsync.** The remote `rsync` keeps running. Kill by pid/name where it runs; `migctl stop` SIGTERMs the recorded pid.
+- **rsync won't make intermediate dest dirs.** Exit code 11. `mkdir -p` first.
+- **`+DirName/` builds empty dirs only.** Include patterns need `+DirName/***`.
+- **Byte counts are the fastest full-tree check.** `find | wc -l` + `du -sb` over the whole tree took ~2 minutes and matched every P2 log byte count exactly.
+
+## Verification
+
+The migration is done when, in order:
+
+1. `migctl probe` has PASSed on the current plan.
+2. Every phase reports P2 PASS (`transferred=0`).
+3. `migctl coverage` reports no missing and no unexplained extras.
+4. `migctl scrub` records 0 repaired on the destination pool.
+5. `migctl gate pre-wipe` prints CLEAR.
+
+Only then does a human run `wipefs` on the source drives - never automated, never gated by the tool.
+
+## Related docs
+
+- [Docker servarr security](/reference/docker-servarr-security/) - the media stack that lands on this ZFS host; the hardlink and mount rules above are why its compose layout looks the way it does.
+- [WinFsp rclone stuck drive letter](/guides/winfsp-rclone-stuck-drive-letter/) - the Windows `Z:` mapping onto this NAS's Samba share, and why the credential had to be re-added after the move.
+- [vfctl GPU curve tool](/reference/vfctl-gpu-curve-tool/) - the GPU on the same box, under CDI-only device wiring.
+
+[^openzfs-scrub]: OpenZFS, "zpool-scrub(8) - begin or resume scrub of ZFS storage pools," OpenZFS Man Pages. https://openzfs.github.io/openzfs-docs/man/master/8/zpool-scrub.8.html
+[^trash-hardlinks]: TRaSH Guides, "Hardlinks and Instant Moves (Atomic Moves)." https://trash-guides.info/Hardlinks/Hardlinks-and-Instant-Moves/
+[^rsync-man]: rsync(1) manual page - `-aH` (archive + preserve hard links), `-c` (checksum), `--stats`. https://download.samba.org/pub/rsync/rsync.1

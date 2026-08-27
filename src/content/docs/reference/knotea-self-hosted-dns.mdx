@@ -1,0 +1,131 @@
+---
+title: "knotea: one binary that is both your recursive resolver and your authoritative DNS"
+description: Reference for knotea, the self-hosted DNS system that merged the glory-hole ad-blocking recursive resolver with a Knot authoritative nameserver into one supervised Go binary - public DNS, DoT, and DoH on Fly.io anycast, with TSIG-keyed RFC 2136 live edits via knotctl.
+author: Erfi Anugrah
+category: networking
+featured: true
+blurb: "Authoritative for your zones, recursive for everything else, ad-blocking on the way - one Go binary."
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+`knotea` is a single Go binary that is at once an authoritative nameserver and a recursive, ad-blocking resolver - the Cloudflare model of auth and resolver behind one query path. A query for a name in a served zone is answered authoritatively; anything else is filtered (policy, then ad-block, then cache) and recursed. It owns public `:53` UDP/TCP, `:853` for DNS-over-TLS, and `:8080` for an HTTP dashboard plus DNS-over-HTTPS, and it supervises two specialists as child processes: `unbound` for recursion with DNSSEC, and `knotd` for the authoritative zones. RFC 2136 UPDATE and zone transfers are relayed inward to knotd.
+
+**TL;DR:** One merged binary replaced two projects (glory-hole the resolver, knot-fly the authority) so the authoritative zones live in the same process as the resolver - a query for your own zone never leaves the box, which sidesteps an entire class of hairpin failures. Live record edits go through `knotctl`, a TSIG-signed RFC 2136[^rfc2136] CLI. It runs on Fly.io anycast as the production nameserver for the zones it serves.
+
+This is the big sibling of two smaller DNS setups documented elsewhere here: the [Gloryhole DoT / VyOS interop](/guides/vyos-dot/) guide, which exposes this same resolver over DNS-over-TLS through the edge router, and [Unbound + AdGuard Home on a travel router](/guides/unbound-agh-mt3000/), a standalone recursive resolver for a single device class. knotea is what the resolver grew into once it also took over authoritative duty.
+
+<Aside type="note" title="Provenance">
+  Architecture and versions are from the monorepo (`~/infra/knotea`: README, AGENTS.md, CHANGELOG, and the resolver/authority subproject docs). Measured numbers are from the repo's own perf-harness notes and are labelled with where they were observed. The two real zones are anonymised here as `example.com` and `lab.example.com`, matching the repo docs' own placeholder convention.
+</Aside>
+
+---
+
+## Why merge the two
+
+They started as separate projects - `glory-hole` (the resolver) and `knot-fly` (the authority) - and were merged so the authoritative data sits in the same process as the resolver. The payoff is concrete: when this box is asked for one of its own zones, the query is answered locally instead of recursing out to a public resolver and back. On Fly.io that matters twice over, because Fly blocks inbound UDP to customer-anycast IPs from inside Fly[^fly-anycast] - so a resolver running on Fly that has to recurse *to itself* for a Fly-hosted zone returns SERVFAIL. Running knotd in-process on loopback removes that dependency entirely.
+
+Both subprojects keep their full git history under their subdirectories; each still builds standalone. A root `go.work` links the two modules.
+
+## The query path
+
+```dot
+digraph query {
+  bgcolor="transparent";
+  rankdir=LR;
+  node [shape=box, style=rounded];
+  client [label="client"];
+  knotea [label="knotea\n:53 :853(DoT) :8080(DoH+UI)"];
+  policy [label="policy engine\nexpr rules", shape=note];
+  block [label="ad-block\n~9M-domain lists", shape=note];
+  unbound [label="unbound\n127.0.0.1:5353 recursion+DNSSEC"];
+  knotd [label="knotd\n127.0.0.1:5354 authoritative"];
+  client -> knotea;
+  knotea -> knotd [label="name in served zone"];
+  knotea -> policy [label="otherwise"];
+  policy -> block;
+  block -> unbound [label="recurse"];
+}
+```
+
+## The resolver half (glory-hole)
+
+The recursive side combines ad-blocking, an expression-based policy engine, local zones, and a web dashboard in the one binary, with unbound doing the recursion and DNSSEC validation.
+
+- **Blocklists.** Downloaded, deduplicated, and atomically swapped in; exact, wildcard, and regex patterns with optional auto-update. Defaults are the hagezi and OISD lists. Whitelists short-circuit a block. Reads are lock-free (`atomic.Pointer`) so a list reload never stalls a query.
+- **Policy engine.** `expr` rules[^expr-lang] with helpers like `DomainMatches`, `IPInCIDR`, `InTimeRange`; actions BLOCK, ALLOW, REDIRECT, FORWARD. Compiled once, evaluated in order, with a visual builder and tester in the UI.
+- **Upstream health.** A circuit breaker on the forwarder (opens after consecutive failures, half-opens to probe), plus one TCP retry after a UDP SERVFAIL - that retry exists specifically to work around the Fly UDP hairpin block.
+- **Telemetry.** Prometheus on `:9090/metrics`, a SQLite query log (WAL, batched async writes), and host CPU/memory/temperature in the dashboard. The dashboard is Astro + React, embedded with `go:embed`.
+
+Measured (from the repo's perf harness): a full-handler profile of 166 ns/op at 7 allocs - the UDP socket saturates long before the Go code does. Same-region latency: cached UDP around 4.3 ms, cold recursion around 4.0 ms, DoH warm 3 ms at p50, a fresh DoT handshake around 19.6 ms. ECDSA P-256 DoT handshakes run about 1.8x the rate of RSA-2048, which is why the cert type changed.
+
+## The authority half (knotd)
+
+knotd (Knot DNS)[^knot-dns] serves the two zones, both DNSSEC-signed and validating - ECDSAP256SHA256 with KSK and ZSK, online signing, DS records published at the parent. Zone data is operator state held in knotd's confdb and journal, added at runtime; the declarative source of truth is a set of YAML zonefiles reconciled onto the server.
+
+**TSIG keys are scoped by role**, so no consumer holds more power than it needs:
+
+| Key | May update |
+|---|---|
+| `caddy-acme.` | `_acme-challenge.*` TXT only (the ACME DNS-01 path) |
+| `caddy-ddns.` | A/AAAA dynamic updates |
+| `knotctl.` | general operator records |
+| `axfr-out.` | outbound zone transfers to secondaries |
+
+## Editing records live: knotctl
+
+`knotctl` is the operator CLI. It speaks TSIG-signed RFC 2136 UPDATE[^rfc2136] to the server's public `:53`, which the resolver relays byte-for-byte to the loopback knotd.
+
+```bash
+knotctl add www.example.com A 192.0.2.10
+knotctl ls example.com
+knotctl set example.com TXT "v=spf1 -all"
+knotctl apply zones/example.com.yml --prune
+```
+
+Subcommands: `add`, `rm`, `set`, `ls`, `apply`, `export`, `keys`. The ones with care behind them:
+
+- **`add` polls** until the record is actually queryable and exits non-zero on timeout - so a script that chains on it does not race the zone.
+- **`set` bundles** the delete-rrset and the new records into one UPDATE message, so there is no empty or partial window.
+- **`apply` reconciles** declarative YAML - additive by default, `--prune` removes drift, and it never touches apex NS, SOA, or DNSSEC records. Idempotent; multi-value rrsets are atomic.
+
+Key material lives one-file-per-identity under `~/.config/knotctl/keys/`, mode 0600 or it is refused. Never pass a secret with `-y` on the command line - it lands in shell history.
+
+## Deployment
+
+Runs as a single Fly.io app (region `sin`) on anycast.[^fly-anycast] The port mapping: 80 to the dashboard, 443 to app-terminated TLS, 53 UDP/TCP, 853 DoT. One `shared-cpu` VM with 512 MB. Fly machines pull images server-side and cannot authenticate to ghcr, so deploys pull the CI-built image, retag to the Fly registry, push, and deploy by image reference.
+
+## The Cloudflare -> Knot migration, briefly
+
+The zones were moved off Cloudflare by mirroring over AXFR (CF Enterprise can do outgoing transfers to a TSIG peer), then promoting Knot to primary and swapping the registry NS records. The full runbook is `authority/docs/runbooks/cf-to-knot-migration.md`. The load-bearing lessons:
+
+- **Cloudflare's documented NOTIFY source IPs are wrong.** NOTIFYs arrive from CF's full anycast ranges plus Fly-internal ranges. Allowlist the runtime-fetched CF list, or Knot logs `ACL, denied, action notify` and your IXFR silently falls behind.
+- **The first CF AXFR returns BADKEY for about 30 seconds.** Wait it out; do not roll back.
+- **The registry NS swap is the one irreversible-until-TTL step.** Everything before it is a no-op to roll back; after it you wait out the parent TTL. Add the new NS alongside the old and verify before removing, rather than a full swap.
+- **Any Caddy site still on `dns cloudflare` breaks silently** once recursive caches expire after the cutover - migrate every site block to the `dns rfc2136` provider within the TTL soak window.
+
+## Gotchas worth knowing
+
+- **TSIG rotation is confdb-first.** knotd's confdb is the source of truth; rotate there before consumer stores, verify the old key gets BADSIG, and only then clean up. A past incident baked live TSIG secrets into config comment lines for ~29h via a `sed` that matched placeholders in comments - the entrypoint now fails closed if a secret appears in a comment.
+- **`knotc conf-set` is runtime-only** in file mode; run knotd with `-C <confdb-dir>`[^knot-dns] or your changes vanish on restart.
+- **The ACME ACL shape is easy to get wrong.** `update-owner-match: sub-or-equal` does not match `_acme-challenge.<host>` - use a pattern covering `_acme-challenge` and its wildcard forms.
+- **Single region is a SPOF.** A second Knot machine pulling over Fly's internal network is the recorded plan, not yet built.
+
+## Reading the numbers
+
+The latency figures above are same-region (client and server both in `sin`), so they are the floor, not a promise - a resolver on anycast is only that fast for a client near a PoP, and cross-region recursion is distance-dominated the same way any round trip is. The 166 ns/op handler profile is a single-core microbenchmark; it tells you the Go code is never the bottleneck, not that the box sustains that rate - the UDP socket and the harness saturate first. Treat both as "the software is not the limit" evidence, and size for the network instead.
+
+## Decision guide
+
+Run knotea (or this auth+resolver-in-one pattern) when you want your own zones and your recursive/filtering DNS under one roof with one deploy, and you are comfortable operating DNSSEC and TSIG yourself. Do not take on the authoritative half just to get ad-blocking - if all you want is filtered recursive DNS for clients, the [Unbound + AdGuard Home travel-router setup](/guides/unbound-agh-mt3000/) is far less to run, and if you only need to expose the resolver over DoT through an edge router, [the VyOS interop guide](/guides/vyos-dot/) covers that without touching authoritative DNS. The merge earns its complexity only when the same box genuinely serves both.
+
+## Related docs
+
+- [Gloryhole DoT DNS service interop with Magic WAN and VyOS](/guides/vyos-dot/) - exposing this resolver's DoT listener through the edge router.
+- [Unbound + AdGuard Home on the GL-MT3000](/guides/unbound-agh-mt3000/) - the standalone recursive-resolver counterpart.
+- [Self-hosted Forgejo on the router](/reference/self-hosted-forgejo-router/) - the sibling NixOS-edge service; same anycast-and-self-host instinct.
+
+[^rfc2136]: P. Vixie et al., "Dynamic Updates in the Domain Name System (DNS UPDATE)," RFC 2136, IETF. https://www.rfc-editor.org/rfc/rfc2136
+[^knot-dns]: CZ.NIC, "Knot DNS 3.5 Documentation - Configuration (confdb, TSIG keys, dynamic updates)." https://www.knot-dns.cz/docs/3.5/singlehtml/index.html
+[^fly-anycast]: Fly.io, "Networking on Fly.io (anycast, public/private networking)." https://fly.io/docs/networking/
+[^expr-lang]: expr-lang, "expr - expression language for Go." https://expr-lang.org
