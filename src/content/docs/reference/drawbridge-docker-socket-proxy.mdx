@@ -1,0 +1,134 @@
+---
+title: "drawbridge: an mTLS-gated, route-allowlisted proxy for the Docker socket"
+description: Reference for drawbridge, the reverse proxy that fronts /var/run/docker.sock on a container host so a remote management plane can drive it over a tailnet without a plaintext socket - mTLS, an ordered route allowlist, per-request audit logging, and hot cert reload.
+author: Erfi Anugrah
+category: homelab
+featured: true
+blurb: "Root-equivalent API, so the boundary is mTLS plus an allowlist - with an audit line per request."
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+`drawbridge` fronts the Docker Engine API on a container host so a management plane on another machine can manage that host's containers over a Tailscale tailnet. It exists because the alternatives force a bad trade: a plaintext docker socket on the network is handing out root,[^docker-protect-access] and the off-the-shelf proxies either add no transport authentication or expose the full API surface. drawbridge sits in front of `/var/run/docker.sock`, terminates mTLS, and forwards only the routes on an ordered allowlist - everything else gets `403 drawbridge: route not allowed`.
+
+In this homelab it fronts the servarr NAS docker daemon - the same host whose media stack is hardened in [Docker servarr security](/reference/docker-servarr-security/) - so composer on an MS-01 can drive it without opening the socket to the LAN. The tailnet transport is documented in [Tailscale homelab](/reference/tailscale-homelab/).
+
+**TL;DR:** The docker socket is root-equivalent,[^docker-protect-access] so drawbridge does not pretend UID games will save you - it runs as root, and the security boundary is mTLS (client-cert required, verified against a pinned CA) plus a default-deny route allowlist, with one JSON audit line per request. Stdlib-first Go, two dependencies, static binary, certs hot-reload on a 30-second mtime poll.
+
+<Aside type="note" title="Provenance">
+  Architecture, config surface, and gotchas are from the repo (`~/infra/drawbridge`: README, AGENTS.md, and source). Measured numbers are labelled with where they were observed. The deployment described is the live one - composer on an MS-01 managing the servarr NAS docker daemon through drawbridge over the tailnet.
+</Aside>
+
+---
+
+## The threat model
+
+Whoever can reach the docker socket can run a container that mounts the host root - so the socket is root, and anyone holding the client keys has root on the daemon host.[^docker-protect-access] The proxy must run as root to open it, which means the boundary has to be something other than filesystem permissions. drawbridge makes that boundary two things:
+
+1. **mTLS.** TLS 1.3 minimum, `RequireAndVerifyClientCert`, client certs verified against a single CA that signs exactly two leaves (server + one client). No client cert, no connection; no plaintext path to the API exists at all. Docker's own TLS mode on port 2376 is the same idea but stops at transport auth - it authenticates the client, then lets it at the whole API.[^docker-protect-access] drawbridge adds the second boundary.
+2. **A route allowlist.** Even a valid client only reaches the routes on the manifest. The default denies the dangerous surface: container attach (raw stream hijack), `/auth`, `/secrets`, `/configs`, swarm and node endpoints, image push (an exfil path), every `*/prune` (bulk deletion), and `/distribution`.
+
+Anything not on the list is denied - that is the default, not a configuration you opt into.
+
+## What it is not
+
+Two existing tools were weighed and rejected:
+
+| Tool | Why it did not fit |
+|---|---|
+| docker-socket-proxy | No transport auth - the allowlist is the whole story and it is coarse env flags, with no audit trail |
+| Portainer agent | Shared-secret signing, and it exposes the full API surface |
+
+## How a request flows
+
+```dot
+digraph flow {
+  bgcolor="transparent";
+  rankdir=LR;
+  node [shape=box, style=rounded];
+  composer [label="composer (MS-01)\nmanagement plane"];
+  db [label="drawbridge (servarr)\n:2376 mTLS"];
+  sock [label="/var/run/docker.sock"];
+  al [label="allowlist\nordered rules, default deny", shape=note];
+  audit [label="audit log\none JSON line / request", shape=note];
+  composer -> db [label="DOCKER_HOST=tcp://...:2376"];
+  db -> al [label="match after version-strip"];
+  al -> sock [label="allowed only"];
+  db -> audit [style=dashed];
+}
+```
+
+A request arrives on the mTLS listener, the version prefix (`/vX.Y`) and query string are stripped, and the path is matched against the allowlist top to bottom - first match wins. Only an allowed route is proxied to the unix socket via stdlib `httputil.ReverseProxy`. The proxy is hijack-safe (it implements `http.Hijacker` and `http.Flusher`), so `exec` and `attach` 101 upgrades and log-follow streams pass through, and `ResponseHeaderTimeout` is 0 so `/events` never times out.
+
+## The allowlist
+
+The manifest is YAML - ordered rules of name, methods, path regex - and matched after version-stripping, so rules are written against canonical paths like `^/containers/json$`. The default manifest is embedded with `go:embed` and covers the management-plane surface: ping/info/version/events, container CRUD plus logs and archive, exec (including hijack start and resize), images (list, read, pull, build, tag, delete), buildkit session, networks, and volumes - roughly thirty rules. Override it by pointing `DRAWBRIDGE_ALLOWLIST` at your own file.
+
+```yaml
+rules:
+  - name: container-list
+    methods: [GET]
+    path: ^/containers/json$
+  # ... anything not matched is denied
+```
+
+## Audit and metrics
+
+Every request emits one slog JSON line to stdout - `docker logs drawbridge` *is* the audit trail. Fields include the request id, the client-cert CN (`peer_cn`), the version-stripped path, the matched rule, whether it was allowed, the status, and whether it mutated state. Denials log at WARN, mutations at INFO, reads at DEBUG - so the signal-to-noise on "someone tried something" is high.
+
+Prometheus metrics live at `/metrics` on the same listener: request totals, durations, and a denied counter. Labels use allowlist rule names, never raw paths, because container and image IDs in a label value would explode cardinality.
+
+## Configuration
+
+Env-only, all `DRAWBRIDGE_*`:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DRAWBRIDGE_LISTEN` | `:2376` | Comma-separated multi-address (LAN primary + tailnet backup) |
+| `DRAWBRIDGE_HEALTH_LISTEN` | `127.0.0.1:2377` | Loopback-only `/healthz` for the container healthcheck |
+| `DRAWBRIDGE_SOCKET` | `/var/run/docker.sock` | Upstream |
+| `DRAWBRIDGE_CA_CERT` / `_SERVER_CERT` / `_SERVER_KEY` | `/certs/...` | Cert paths, required at startup |
+| `DRAWBRIDGE_ALLOWLIST` | embedded default | Override manifest path |
+| `DRAWBRIDGE_LOG_LEVEL` | `info` | slog level |
+
+## Certificates
+
+One CA (ECDSA P-256, 10-year) signs two leaves (825 days): the server cert, with SANs for the addresses clients dial, and one client cert whose CN becomes the `peer_cn` in every audit line. `make certgen` mints all three in one shot:
+
+```bash
+make certgen ARGS='--san 100.x.y.z --san servarr.my-tailnet.ts.net --client-cn composer-servarr'
+```
+
+The CA key and client key are archived sops-encrypted (SOPS + age)[^sops-age] under an age identity that belongs to drawbridge alone - not the management plane's key - so a compromised composer cannot mint itself client certs. Rotation is re-running certgen and redistributing; the server polls cert mtimes every 30 seconds and swaps config atomically, so rotation needs no restart and a failed reload keeps the previous config.
+
+## Deploying it
+
+The deploy is deliberately *not* composer-managed: composer reaches docker through drawbridge, so a bad drawbridge deploy managed by composer would sever the very plane needed to roll it back. It runs as a plain `docker run` - host networking, read-only root, `cap_drop ALL`, `no-new-privileges`, 128 MB / 1 CPU limits, the socket mounted (rw - the API is HTTP over the socket, not file reads) and the certs read-only. Static binary, distroless runtime, multi-arch, two dependencies (`prometheus/client_golang`, `yaml.v3`).
+
+On the client side, standard docker TLS env[^docker-protect-access] (rename certgen's `client.pem`/`client-key.pem` to the docker `cert.pem`/`key.pem` convention first):
+
+```bash
+export DOCKER_HOST=tcp://100.x.y.z:2376
+export DOCKER_TLS_VERIFY=1
+export DOCKER_CERT_PATH=~/.docker/drawbridge   # ca.pem, cert.pem, key.pem
+```
+
+## Gotchas, all observed
+
+- **The moby SDK does not read env implicitly.** `NewClientWithOpts(WithHost(host))` ignores `DOCKER_TLS_VERIFY` and `DOCKER_CERT_PATH` - you must add `dockerclient.FromEnv` *before* `WithHost`. The `docker compose` CLI needs no such patch.
+- **Cert filenames.** docker wants `cert.pem`/`key.pem`/`ca.pem` at `DOCKER_CERT_PATH`; certgen emits `client.pem`/`client-key.pem`. Rename.
+- **The bridge-NAT publish failure mode.** The first deploy published to a tailnet IP; at a host reboot dockerd started before tailscaled, the bind silently never materialized, and the container reported healthy while being unreachable. The fix was multi-address `DRAWBRIDGE_LISTEN` plus host networking, which is why both exist.
+- **Root is by design.** The container must be root to open the socket; the hardening is read-only + cap_drop + no-new-privileges + mTLS + allowlist, not a non-root UID.
+- **Denial is exact.** A disallowed route returns `403 drawbridge: route not allowed` - grep that string to distinguish an allowlist hit from a docker error.
+
+## Decision guide
+
+Use drawbridge when you need a remote management plane to drive a docker host over an untrusted or semi-trusted network and you want the socket off the LAN entirely. Stay on SSH (`DOCKER_HOST=ssh://...`, which docker supports natively)[^docker-protect-access] when a single operator reaching one host is the whole job - drawbridge pays for itself when the client is a service (composer) that needs the HTTP API, an audit trail, and a deny-by-default surface rather than an operator with a shell. Do not use it to expose the socket to the public internet; it assumes a tailnet or LAN, not hostile anonymous traffic.
+
+## Related docs
+
+- [Docker servarr security](/reference/docker-servarr-security/) - the media stack on the host drawbridge fronts; the same default-deny instinct applied to the containers themselves.
+- [Tailscale homelab](/reference/tailscale-homelab/) - the tailnet transport drawbridge listens on.
+
+[^docker-protect-access]: Docker, "Protect the Docker daemon socket," Docker Docs. https://docs.docker.com/engine/security/protect-access/
+[^sops-age]: getsops.io, "SOPS: Secrets OPerationS," and age, "Actually Good Encryption." https://getsops.io / https://age-encryption.org
