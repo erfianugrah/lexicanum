@@ -121,7 +121,8 @@ Patterns already established in the repo, reuse them: measurement-provenance +
 measured-vs-asserted separation; per-topic TL;DR; early "which to pick" table;
 "Reading the numbers"; closing decision-guide diagram; "Reproducing" section;
 evidence tables with a "How it was checked" column + a tested-vs-design-only split;
-named "Gotchas and Lessons Learned"; "File Reference" map.
+named "Gotchas and Lessons Learned"; "File Reference" map; inline cross-links to
+the related older docs (and/or a closing "Related docs" list).
 
 The canonical exemplar is `reference/cloudflare-supabase-architecture.mdx`.
 
@@ -220,10 +221,20 @@ lack a Verification or Gotchas section, and older prose contains em/en-dashes
 and other non-ASCII punctuation (the ASCII rule and its guard are newer).
 Do not treat the oldest docs as exemplars - the exemplars are
 `reference/cloudflare-supabase-architecture.mdx` and
-`guides/usb4-10gbe-windows-tuning.mdx`. New docs must conform fully. When
+`guides/usb4-10gbe-windows-tuning.mdx`. The reverse also holds: docs written
+since the AI-assisted era began are not a style source either, and several
+carry AI prose tells (decorative bold, mystery-tease, participle tails) that
+must not propagate - pattern-match the two named exemplars only, regardless of
+a doc's age. New docs must conform fully. When
 making a substantial edit to an older doc, bring the touched sections into
 conformance (heading case, ASCII punctuation, section skeleton); a wholesale
 rewrite just for style is not required.
+
+Cross-reference the corpus: before drafting a new doc, grep `src/content/docs`
+for the systems it touches and read the matches (often the older human-written
+docs), then link them inline or in a closing "Related docs" list. The build
+verifies that links resolve; it does not verify that a new doc established any -
+that check is on the author.
 
 ## Verify before done
 
