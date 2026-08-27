@@ -496,6 +496,13 @@ const pins: Pin[] = [
       // validated against it - no sensor can catch a wrong specification.
       "the same four primitives",
       "Move users through the admin API, not a SQL copy",
+      // Unsourced commercial speculation about the SfP programme's pricing.
+      // The SfP page mentions no fee; the claim appeared in prose with only
+      // the page itself cited. Dropped 2026-08-27 per the cited-or-proven rule.
+      "platform fee",
+      // The fee claim's hedged replacement - a commercial claim has no business
+      // in the cited-or-measured corpus at all, hedged or not.
+      "pays off at your scale",
     ],
     sections: [
       /^#{2,3} .*(TL;DR|Decision)/m,
