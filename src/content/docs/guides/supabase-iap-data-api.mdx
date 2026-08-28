@@ -1,0 +1,91 @@
+---
+title: "Put an IAP over the Supabase Data API"
+description: Make the Data API serve only requests carrying an external identity provider's token - register the IdP as third-party auth and key RLS on a claim only it sets. The plan-agnostic "IAP over the data" that works, with Cloudflare Access as the issuer and a self-minted issuer for testing.
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+You'll make a Supabase project's Data API serve only requests that carry a token from an identity provider you nominate - an Identity-Aware Proxy (IAP) over the data at the authorization layer. This is Move 1 in [Locking down Supabase: the database is the boundary](/reference/supabase-data-surface-lockdown/): the Data API has no network gate, so identity is enforced on the row via [third-party auth](https://supabase.com/docs/guides/auth/jwts), keyed on a claim only the issuer sets. It is plan-agnostic.
+
+Prerequisites: a Supabase project, and an OIDC issuer whose JWKS is reachable over the internet - Cloudflare Access, Auth0, Okta, Authentik, or any standards-compliant provider. Run on a throwaway micro project on 2026-08-28.
+
+<Aside type="note" title="A PAT is not an identity token">
+A Supabase personal access token (`sbp_...`) is a control-plane credential for the Management API. It is not the row-level identity JWT that RLS evaluates, so it cannot stand in for the IAP token here. Only a token signed by the registered issuer is admitted.
+</Aside>
+
+## Step 1: have an issuer with a reachable JWKS
+
+Supabase resolves third-party auth by fetching the issuer's JWKS. Two shapes register; a third does not:
+
+- `oidc_issuer_url` - the issuer's base URL; Supabase reads `<issuer>/.well-known/openid-configuration` for the `jwks_uri`. Resolves in tens of milliseconds.
+- `jwks_url` - a direct JWKS URL. Resolves.
+- `custom_jwks` - an inline key set. Accepted but never resolves; do not use it.
+
+For **Cloudflare Access**, create an Access-for-SaaS OIDC application; its issuer is `https://<team>.cloudflareaccess.com/cdn-cgi/access/sso/oidc/<client_id>`, with a working discovery document. For **testing without an IdP**, mint your own ES256 tokens and serve the public JWKS from an Edge Function (`verify_jwt = false`) at `https://<ref>.supabase.co/functions/v1/jwks` - a project can host its own issuer's keys.
+
+## Step 2: register the issuer as third-party auth
+
+```bash
+curl -s -X POST "https://api.supabase.com/v1/projects/$REF/config/auth/third-party-auth" \
+  -H "Authorization: Bearer $PAT" -H "Content-Type: application/json" \
+  -d '{"oidc_issuer_url": "'"$ISSUER"'"}'
+```
+
+Confirm it resolved - the created integration carries a non-null `resolved_jwks` / `resolved_at`, either on the create response or within a few seconds on `GET .../third-party-auth`.
+
+## Step 3: key RLS on the issuer claim
+
+Enable RLS and admit only a JWT whose `iss` is your issuer. Anon and GoTrue-issued tokens carry a different `iss`, so the same policy filters them out:
+
+```sql
+alter table public.docs enable row level security;
+grant select on public.docs to anon, authenticated;
+create policy iap_only on public.docs for select
+  using ((auth.jwt() ->> 'iss') = 'https://your-issuer');
+```
+
+Key on a group or email claim instead of `iss` when you want per-identity policies rather than "any identity from this IdP".
+
+## Step 4: verify the three credential classes
+
+The request sends the project's anon or publishable key as `apikey` (the gateway routes on it) and the identity token as the bearer:
+
+```bash
+# anon key as bearer -> 200, zero rows (RLS filters)
+curl -s -H "apikey: $ANON" -H "Authorization: Bearer $ANON" \
+  "https://$REF.supabase.co/rest/v1/docs?select=id"
+
+# IAP-issued token as bearer -> 200, rows
+curl -s -H "apikey: $ANON" -H "Authorization: Bearer $IAP_TOKEN" \
+  "https://$REF.supabase.co/rest/v1/docs?select=id"
+```
+
+Measured: anon and a GoTrue user token both return zero rows; a token minted by the trusted issuer returns its rows. The Data API now serves only the IAP identity.
+
+## Step 5: close the other identity paths
+
+The Data API is served; the project can still mint its own identities through GoTrue. `PATCH /v1/projects/{ref}/config/auth` with `{"disable_signup": true}` stops new GoTrue signups, so with the issuer registered and signup off, identity on the project exists only through the IAP's IdP.
+
+## Verification
+
+| Check | Expected |
+|---|---|
+| Third-party auth resolved | `resolved_jwks` non-null after register |
+| Anon key against the RLS table | 200, 0 rows |
+| GoTrue user token | 200, 0 rows |
+| IAP-issued token | 200, rows |
+
+## Gotchas and lessons learned
+
+- `custom_jwks` is accepted and never resolves - the issuer must be a reachable URL, so an inline key set is a dead end.
+- The token needs `role: "authenticated"` for PostgREST to switch roles, and `aud: "authenticated"`. A token missing the role claim is rejected before RLS.
+- `service_role` bypasses RLS, so a backend holding the service key is not subject to this policy - keep the service key server-side and out of the IAP path.
+- Getting a real Cloudflare Access token means completing the interactive one-time-PIN or SSO login; there is no `client_credentials` grant on an Access SaaS OIDC app. For automated tests, the self-minted ES256 issuer (step 1) needs no browser.
+- This gates the Data API only. Auth, Storage, Realtime and Edge Functions keep their own public endpoints; a private HTTP tier is [Move 3](/guides/supabase-own-postgrest/) or self-hosting.
+
+## File reference
+
+The reproducible form is the supabase-lab `iap-lockdown` experiment: `tests/l10-tpa-iap-issuer.ts` (Cloudflare Access issuer, resolution, the anon/GoTrue denials) and `tests/l10e-labissuer-admit.ts` (the self-minted ES256 issuer, JWKS served by an Edge Function, the admit proof).
