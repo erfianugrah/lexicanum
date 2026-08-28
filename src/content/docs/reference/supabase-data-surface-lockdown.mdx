@@ -1,0 +1,181 @@
+---
+title: "Locking down Supabase: the database is the security boundary"
+description: Every "make Supabase private" question - IAP over the instance, IP-restrict the Data API, proxy-only access, private by default - is the same request aimed at a product with no network perimeter. The managed HTTP tier is public by design; the boundary is the database. Three moves follow - push controls into the database, lock the socket, or own the API layer - measured on throwaway projects.
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Supabase's security boundary is the database. The managed HTTP tier - Data API, Auth, Storage, Realtime, Edge Functions - is a stateless public veneer over Postgres: reachable by design, and defended at the row (RLS), the grant, and the token. It keeps a public endpoint on every plan, so a perimeter control has nothing to attach to. Every "make Supabase private" question - an IAP over the instance, an IP allowlist on the Data API, proxy-only access, private by default - is the same request pointed at that fact, and resolves to one of three moves: push the control into the database, lock the database socket, or own the API layer. This is which move fits which goal, and what each costs.
+
+Everything marked **measured** was validated on 2026-08-28 on throwaway **micro** projects in **ap-southeast-1**, plus a self-hosted PostgREST (official image, v16.2) in Docker against the project's session pooler, and a Cloudflare Worker on `workers.dev`. Each lever was applied through the Management API, then every HTTP surface re-probed with three credential classes (no key, anon key, service key). Claims about platform internals not re-tested are marked **asserted** and linked. The reproducible form is the supabase-lab `iap-lockdown` and `security-lockdown` experiments, under Reproducing.
+
+**TL;DR:**
+
+- **The managed HTTP tier has no network perimeter.** Network restrictions and PrivateLink act on the Postgres socket; nothing acts on the Data API, Auth, Storage or Realtime at the network layer, on any plan.[^sb-netrestrict][^sb-privatelink] An IP allowlist for the REST API does not exist, and the DB-layer workaround for it does not fire on hosted.
+- **So there are three moves, not a perimeter to harden:**
+  - **Push the control into the database** - grants, RLS, and claims-keyed identity (third-party auth). The boundary is the row.
+  - **Lock the database socket** - PrivateLink plus "restrict all". The one place a network perimeter exists.
+  - **Own the API layer** - your own PostgREST with the managed Data API off, behind an edge you control.
+- **The managed levers tighten per service; none of them is a gate.** "Data API off" wedges PostgREST only; `verify_jwt` checks key-possession not identity; disabling legacy keys leaves the new publishable keys working; CORS and a custom domain gate nothing server-side.
+
+## Why there is no perimeter to harden
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  client [label="any client\n(browser, curl, backend)"];
+
+  subgraph cluster_managed {
+    label="managed project"; style=rounded; fontsize=12; margin=12;
+    http [label="HTTP tier\nData API / Auth / Storage /\nRealtime / Edge Functions\n<ref>.supabase.co"];
+    sock [label="Postgres socket\n5432 direct / 6543 pooler"];
+  }
+
+  netr [label="network restrictions\nPrivateLink", shape=note];
+  none [label="no network lever", shape=note];
+
+  client -> http [label="always public"];
+  client -> sock;
+  netr -> sock [label="lockable", style=dashed];
+  none -> http [label="per-service tighten only", style=dashed];
+}
+```
+
+The socket has a network perimeter - network restrictions and PrivateLink act on it.[^sb-netrestrict][^sb-privatelink] The HTTP tier has none: it answers a public endpoint and every lever on it is per-service tightening, so hardening it means moving the control off the edge. The per-service levers, measured, each closing one service and leaving the rest answering:
+
+| Lever | What it closes | What stays open |
+|---|---|---|
+| Empty exposed schema ("Data API off") | PostgREST REST + GraphQL (`503 PGRST002`) | Auth, Storage, Realtime, Edge Functions[^sb-securing] |
+| `db_schema` drops `graphql_public` | GraphQL only (`406 PGRST106`) | REST |
+| `max_rows = 1` | caps rows per response | a bulk-read brake, not authz |
+| Realtime `private_only = true` | public-channel joins (refused at join) | the WebSocket still upgrades; anon socket connects[^sb-realtime] |
+| `disable_signup = true` | new signups | an existing user's login |
+| Legacy keys disabled | the legacy anon/service pair | the new publishable key generation still reads |
+| Bucket set private | the public object URL (`400 NoSuchBucket`) | a service-key signed URL still serves the object |
+| Edge Function `verify_jwt = true` | callers with no key (401) | any valid project JWT, incl. the anon key |
+
+The two levers most often mistaken for gates are the two that gate nothing: **CORS** reflects an arbitrary `Origin` and a request with no `Origin` still returns data, so a non-browser client ignores it; a **custom domain** is a branding CNAME, and the origin `<ref>.supabase.co` answers identically before and after.[^sb-customdomain] The only surfaces reachable with no credential at all are a public storage object and a `verify_jwt = false` Edge Function.
+
+## Which move fits the goal
+
+| Goal | Move | Mechanism | Cost |
+|---|---|---|---|
+| Close data to anon, keep the managed tier | into the database | grants, RLS, claims-keyed identity | authz logic lives in Postgres |
+| A private database path | lock the socket | PrivateLink + "restrict all" | Team/Enterprise; AWS VPC in-region[^sb-privatelink] |
+| IP-restricted or rate-limited REST | own the API layer | your own PostgREST, Data API off | you run PostgREST |
+| The whole HTTP tier private | own everything | self-host / BYOC | you run the stack |
+
+## Move 1: push the control into the database
+
+The boundary is the row, so the control belongs on the row. For a table that must shut to anon without a policy migration, `REVOKE SELECT ON <table> FROM anon, authenticated` returns `42501` through the Data API while `service_role` keeps reading. It rots on the next migration - `pg_default_acl` grants `SELECT` on new tables to `anon`, `authenticated` and `service_role`, so a table created after the revoke is anon-readable again. `ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE SELECT ON TABLES FROM anon, authenticated` for the `postgres` grantor closes new tables on arrival (`404 PGRST205`); the `supabase_admin` grantor keeps its own default ACL and the project owner cannot alter it (`42501`), so platform-created objects keep their default anon grants.
+
+RLS is the row-level version of the same move, and its write-side traps are what make "we added RLS" still fail a pen test: a view over an RLS table leaks every row without `security_invoker`, an UPDATE policy gates which rows change but not which columns, and PERMISSIVE policies OR together so an admin-intended policy bleeds onto anon.[^sb-securing]
+
+Identity on the Data API is the same move with the token as the key. Register an external issuer as third-party auth (the `jwks_url` shape resolves; an inline key set never does) and key RLS on a claim only the issuer sets.[^sb-jwts] Measured with Cloudflare Access-for-SaaS as the real issuer: the issuer resolved on registration, and with a policy of `(auth.jwt() ->> 'iss') = '<issuer>'`, the anon key and a GoTrue user token both read zero rows while a token minted by the trusted issuer reads its rows. That is "an IAP over the data" done at the authorization layer, and it is plan-agnostic - the step-by-step is [Put an IAP over the Supabase Data API](/guides/supabase-iap-data-api/). Keeping RLS while dropping the Supabase HTTP layer entirely is [RLS without Supabase Auth](/reference/rls-without-supabase-auth/).
+
+<Aside type="caution" title="The IP filter that does not fire on hosted">
+PostgREST supports `pgrst.db_pre_request`: a function that reads `current_setting('request.headers')` (which carries `x-forwarded-for`) and rejects a request - a DB-layer IP filter.[^pgrst-prereq] On a managed project the role GUC persists after `ALTER ROLE authenticator SET pgrst.db_pre_request` + `NOTIFY pgrst, 'reload config'`, but no pre-request runs on the PostgREST path within 120 seconds. The mechanism is real; it is not activatable via SQL on the hosted tier. It works on your own PostgREST (move 3), where the config is yours.
+</Aside>
+
+## Move 2: lock the database socket
+
+The socket is the one surface with a network perimeter. PrivateLink puts the connection on AWS VPC Lattice, and DB network restrictions narrowed to a break-glass block close the public direct and pooler paths while the endpoint keeps serving - the full public-DB lockout, self-service, on Team or Enterprise. The behaviour, the DNS/TLS pattern, and the latency numbers are in [AWS PrivateLink to Supabase](/reference/supabase-aws-privatelink/).[^sb-privatelink] This move does nothing for the HTTP tier: PrivateLink covers Postgres and the pooler only, and the Data API stays public by design.
+
+## Move 3: own the API layer
+
+When the goal is an IP-restricted, rate-limited, or otherwise network-controlled REST layer, the managed tier has run out and the answer is to take the API layer in-house: turn the Data API off and run PostgREST yourself against the same Postgres, behind an edge you control. Measured end to end - managed REST dark (`503 PGRST002`), a PostgREST v16.2 container connected to the project's session pooler serving the same rows, and its `db-pre-request` filter rejecting a spoofed `x-forwarded-for` with `403` while an allowed request served. The step-by-step build is [Run your own PostgREST against a Supabase project](/guides/supabase-own-postgrest/).
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  user [label="client"];
+  edge_ [label="your edge\nIP allowlist / WAF /\nrate limit"];
+  pgrst [label="your PostgREST\ndb-pre-request"];
+  pg [label="Supabase Postgres\n(pooler, PrivateLink)"];
+  managed [label="managed Data API\nOFF", shape=note];
+
+  user -> edge_ -> pgrst -> pg [label="private path"];
+  managed -> pg [label="wedged", style=dashed];
+}
+```
+
+The proxy-only variant of this move - a Worker in front of the managed origin - is bypassable until you finish the job. A Worker holding the service key does not gate the origin, because `<ref>.supabase.co` keeps answering anyone with a key; direct origin with the anon key returned 200 with the proxy in place. It becomes the only path once the browser-usable keys are revoked (direct origin then `401 Legacy API keys are disabled`), at which point supabase-js from the browser is gone and the Worker owns authorization because `service_role` bypasses RLS - which is a backend in front of a database, the same shape as running your own PostgREST. Rate limiting rides on the edge either way: nginx `limit_req` (2 requests/second, burst 2) in front of the container returned 2 served and 13 rejected on a 15-request burst, and a Cloudflare Worker, WAF rule, or Upstash does the same job.[^sb-ratelimit] It only counts traffic through it, so it works in front of a closed origin, never the managed endpoint that always answers a key-holder.
+
+## Which move to pick
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.6;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q0 [label="What has to be private?", shape=diamond];
+  q1 [label="Just the database socket?", shape=diamond];
+  q2 [label="Identity on the Data API,\nkeep the managed tier?", shape=diamond];
+  q3 [label="IP / rate-limit the REST layer?", shape=diamond];
+
+  pl [label="Move 2:\nPrivateLink + restrict-all"];
+  iss [label="Move 1:\nthird-party auth + claim-keyed RLS"];
+  own [label="Move 3:\nyour own PostgREST, Data API off"];
+  self [label="self-host / BYOC\n(whole stack private)"];
+
+  q0 -> q1;
+  q1 -> pl [label="yes"];
+  q1 -> q2 [label="no"];
+  q2 -> iss [label="yes"];
+  q2 -> q3 [label="no"];
+  q3 -> own [label="yes"];
+  q3 -> self [label="need the whole HTTP tier private"];
+}
+```
+
+## Reading the numbers
+
+The split between the socket and the HTTP tier holds regardless of plan or region: the socket is lockable, the HTTP tier keeps a public endpoint, and a different tier changes neither which surface a lever touches nor that fact. Every "restrict the REST API by IP" request lands in move 3 - it is not a managed capability, the DB-layer workaround does not fire on hosted, so the REST layer has to be one you own. What generalises is the boundary, not the status codes: controls that sit on the row, the grant, or the token travel with the database; controls that assume a network edge have to be rebuilt on an edge you run.
+
+## Reproducing
+
+Every measured claim comes out of two disposable supabase-lab experiments. `iap-lockdown` provisions one micro project and probes the full HTTP surface under each lever, the two IAP patterns (Cloudflare Access-for-SaaS as the real issuer, plus a lab ES256 issuer whose JWKS is served by an Edge Function), and the custom-domain and CORS non-gates. `security-lockdown` adds the platform security advisor, network restrictions applied, auth hardening, and the self-hosted-PostgREST path with a Docker PostgREST against the project pooler and an nginx rate limiter. Both provision, probe, and destroy in one run; region and plan are variables.
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| Data API off = PostgREST 503, other services up | tested | empty `db_schema` via `PATCH /postgrest`, full-surface re-probe |
+| Network restrictions gate the socket, not the HTTP tier | tested | restrictive CIDR applied, REST unchanged ([network restrictions](https://supabase.com/docs/guides/platform/network-restrictions)) |
+| `verify_jwt` passes any project JWT | tested | anon-key call to a `verify_jwt=true` function returns 200 |
+| Legacy-key disable leaves publishable keys working | tested | `PUT /api-keys/legacy?enabled=false`, publishable key still reads |
+| Grants close a table; default privileges reopen new ones | tested | `REVOKE` + `CREATE TABLE` + `ALTER DEFAULT PRIVILEGES`, probed via `/rest/v1` |
+| `db-pre-request` does not fire on hosted | tested | GUC set + `NOTIFY`, no pre-request within 120s; fires on own PostgREST |
+| CORS / custom domain gate nothing server-side | tested | no-`Origin` request returns data; origin serves after custom domain |
+| IAP-as-issuer admits only the IAP token | tested | third-party auth + `iss`-keyed RLS; anon and GoTrue read 0 rows |
+| Own PostgREST + IP filter over the same Postgres | tested | Docker PostgREST v16.2, `db-pre-request` rejects spoofed `x-forwarded-for` |
+| PrivateLink is Team/Enterprise, socket-only | asserted | [PrivateLink docs](https://supabase.com/docs/guides/platform/privatelink); measured in [supabase-aws-privatelink](/reference/supabase-aws-privatelink/) |
+
+## References
+
+[^sb-netrestrict]: Supabase, "Network Restrictions," Supabase Docs. https://supabase.com/docs/guides/platform/network-restrictions
+
+[^sb-securing]: Supabase, "Securing your API," Supabase Docs. https://supabase.com/docs/guides/api/securing-your-api
+
+[^sb-privatelink]: Supabase, "PrivateLink," Supabase Docs. https://supabase.com/docs/guides/platform/privatelink
+
+[^sb-customdomain]: Supabase, "Custom Domains," Supabase Docs. https://supabase.com/docs/guides/platform/custom-domains
+
+[^sb-realtime]: Supabase, "Realtime Authorization," Supabase Docs. https://supabase.com/docs/guides/realtime/authorization
+
+[^sb-jwts]: Supabase, "JSON Web Token (JWT)," Supabase Docs. https://supabase.com/docs/guides/auth/jwts
+
+[^sb-ratelimit]: Supabase, "Rate Limiting Edge Functions," Supabase Docs. https://supabase.com/docs/guides/functions/examples/rate-limiting
+
+[^pgrst-prereq]: PostgREST, "Pre-Request," PostgREST Documentation. https://postgrest.org/en/stable/references/transactions.html#pre-request
