@@ -10,7 +10,23 @@ import { Aside } from "@astrojs/starlight/components";
 
 You'll turn off the managed Data API on a Supabase project and run [PostgREST](https://postgrest.org/) yourself, in Docker, against the same Postgres - then front it with a `db-pre-request` IP filter and an nginx rate limiter. This is move 3 in [Locking down Supabase: the database is the boundary](/reference/supabase-data-surface-lockdown/): the managed HTTP tier has no network perimeter, so an IP-restricted or rate-limited REST layer has to be one you own.
 
-Prerequisites: a Supabase project (any plan), Docker, and the project's database password. Everything below was run on a throwaway micro project in ap-southeast-1 on 2026-08-28.
+Prerequisites: a Supabase project (any plan) and Docker.
+
+## What you need, and where it is
+
+The commands reference these. Run every SQL block in the **SQL Editor** (Dashboard -> SQL Editor).
+
+| Value | Where to get it |
+|---|---|
+| `$REF` - the project ref (a 20-character id) | your project URL, or Settings -> API |
+| `$ANON` - the anon (or publishable) API key | Settings -> API, explained in [Understanding API keys](https://supabase.com/docs/guides/getting-started/api-keys) |
+| A personal access token (PAT) for the Management API calls | the dashboard, under Account -> Access Tokens |
+| The database password | set when you created the project; reset it under Settings -> Database if you do not have it |
+| `$REGION` and the session-pooler connection string | the **Connect** button on the dashboard, Session mode - see [Connecting to Postgres](https://supabase.com/docs/guides/database/connecting-to-postgres) |
+
+Supabase ships three Postgres roles these steps use: `anon` (an unauthenticated caller), `authenticated` (a logged-in user), and `service_role` (bypasses RLS). PostgREST connects as an "authenticator" role and switches to `anon` or `authenticated` per request.
+
+Everything below was run on a throwaway micro project in ap-southeast-1 on 2026-08-28.
 
 ## Component versions
 
@@ -54,21 +70,28 @@ Auth, Storage, Realtime and Edge Functions keep answering - this lever is PostgR
 
 ## Step 2: get the session-pooler connection
 
-PostgREST holds a connection pool, so use the session pooler (port 5432), not the transaction pooler. The connection string is:
+PostgREST holds a connection pool, so connect through the **session pooler** (Supavisor, port 5432), not the transaction pooler. Copy the exact string from the dashboard's **Connect** button, **Session mode** - do not hand-build it, since the pooler hostname and the `postgres.<ref>` username format are project-specific. It has this shape:
 
 ```
 postgres://postgres.<ref>:<db-password>@aws-0-<region>.pooler.supabase.com:5432/postgres
 ```
 
-The direct host `db.<ref>.supabase.co` is IPv6-only; the pooler is IPv4, which is what a default Docker bridge can reach.
+The direct host `db.<ref>.supabase.co` is IPv6-only; the pooler is IPv4, which a default Docker bridge can reach. Step 3 swaps the `postgres` user in this string for a dedicated role.
 
-## Step 3: run PostgREST
+## Step 3: create a connection role, then run PostgREST
 
-PostgREST connects as `postgres` and switches to `anon` for unauthenticated requests. `PGRST_DB_PRE_REQUEST` names the filter function you install in step 5 - set it now, since PostgREST reads it at config load.
+PostgREST connects as an authenticator role and switches to `anon` for unauthenticated requests. Connect as a dedicated NOSUPERUSER role that can only `SET ROLE` to anon/authenticated - never as `postgres`, which is a superuser and bypasses RLS and every grant, so RLS on your own PostgREST would do nothing. Create the role first:
+
+```sql
+create role pgrst_auth noinherit login password 'a-strong-password';
+grant anon, authenticated to pgrst_auth;
+```
+
+Then run PostgREST connecting as it (through the pooler the username is `<role>.<ref>`). `PGRST_DB_PRE_REQUEST` names the filter function you install in step 5 - set it now, since PostgREST reads it at config load.
 
 ```bash
 docker run -d --name own-postgrest -p 3000:3000 \
-  -e PGRST_DB_URI="postgres://postgres.$REF:$DB_PASSWORD@aws-0-$REGION.pooler.supabase.com:5432/postgres" \
+  -e PGRST_DB_URI="postgres://pgrst_auth.$REF:a-strong-password@aws-0-$REGION.pooler.supabase.com:5432/postgres" \
   -e PGRST_DB_SCHEMAS=public \
   -e PGRST_DB_ANON_ROLE=anon \
   -e PGRST_DB_PRE_REQUEST=public.ip_filter \
@@ -150,13 +173,22 @@ A 15-request burst against `:8080` returns 2 served and 13 rejected (429).
 
 - The `db-pre-request` function must exist for the container's whole life. `PGRST_DB_PRE_REQUEST` is read at config load, and PostgREST calls the function on every request - drop it and every request errors. Create it before the container serves traffic, and do not drop it while the container runs.
 - nginx `limit_req` rejects with `503` by default. Set `limit_req_status 429` for the correct status.
-- `service_role` bypasses RLS, and your PostgREST connects as `postgres`. Authorization is now yours to enforce - in the pre-request function, in RLS on the `anon`/`authenticated` roles, or at the edge. The managed platform's role separation does not carry over automatically.
+- Connect as the authenticator role from step 3, never as `postgres`. `postgres` is a superuser that bypasses RLS and every grant, so an RLS-based lockdown on your own PostgREST would be silently defeated; `service_role` bypasses RLS too, so keep it out of the connection and the request path. Authorization is yours to enforce now - RLS on anon/authenticated, the pre-request function, or the edge - and the managed platform's role separation does not carry over automatically.
 - A fresh table is invisible until `notify pgrst, 'reload schema'`. PostgREST caches the schema; grants and new tables need the reload.
+- This wires anonymous reads. For authenticated user requests, point PostgREST's JWT verification (`PGRST_JWT_SECRET`, or `PGRST_JWKS_URI` for asymmetric keys) at your token issuer's key so it validates the bearer token and switches to `authenticated` - your own issuer, or the Supabase-issued tokens if you keep Supabase Auth.
 - Put the pooler behind [PrivateLink](/reference/supabase-aws-privatelink/) to take the database connection itself off the public internet - then both the REST layer and the connection are private.
+
+## Teardown
+
+```bash
+docker rm -f own-postgrest own-ratelimit
+```
+
+Drop the role with `drop role pgrst_auth;`, and re-enable the managed Data API (Settings, or `PATCH .../postgrest` with `db_schema` back to `public`) if you want it back.
 
 ## File reference
 
-The reproducible form is the supabase-lab `security-lockdown` experiment: `tests/s04-self-hosted-postgrest.ts` (Data API off, container, IP filter), `tests/s05-rate-limit.ts` (nginx burst), `ratelimit.nginx.conf`, and the `postgrest-up` / `ratelimit-up` Makefile targets that pin the images and build the pooler connection.
+The reproducible form is the supabase-lab [`security-lockdown`](https://github.com/erfianugrah/supabase-lab/tree/main/experiments/security-lockdown) experiment: [`s04-self-hosted-postgrest.ts`](https://github.com/erfianugrah/supabase-lab/blob/main/experiments/security-lockdown/tests/s04-self-hosted-postgrest.ts) (Data API off, container, IP filter), [`s05-rate-limit.ts`](https://github.com/erfianugrah/supabase-lab/blob/main/experiments/security-lockdown/tests/s05-rate-limit.ts) (nginx burst), [`ratelimit.nginx.conf`](https://github.com/erfianugrah/supabase-lab/blob/main/experiments/security-lockdown/ratelimit.nginx.conf), [`s06-postgrest-role.ts`](https://github.com/erfianugrah/supabase-lab/blob/main/experiments/security-lockdown/tests/s06-postgrest-role.ts) (the connection-role check), and the `postgrest-up` / `ratelimit-up` Makefile targets.
 
 ## References
 
