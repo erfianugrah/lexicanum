@@ -381,6 +381,34 @@ export const LLM_MARKERS: Marker[] = [
     miss: "the migration guide is worth reading before the window",
   },
   { name: "important-to-note", re: /important to note/i, hit: "it is important to note the TTL" },
+  {
+    name: "worth-hedges",
+    // The wider "worth X-ing" importance-announcing family, added after the
+    // 2026-08-28 corpus sweep found the banned "worth noting" reappearing in
+    // costume: "worth knowing", "worth recording", "worth recognising", "worth
+    // raising", "worth a thought". Same tell, same fix: drop the frame, keep
+    // the fact.
+    re: /worth (knowing|recording|mentioning|recognising|recognizing|raising|a thought)\b/i,
+    hit: "two properties worth knowing before the cutover",
+    // "worth reading" and quantity uses ("a copy's worth of WAL") stay legal.
+    miss: "the migration guide is worth reading before the window",
+  },
+  {
+    name: "honest-gap-label",
+    // "the honest gap" as prose is the house move (state what is real, then
+    // the gap); "Honest gap:" as a label stamp is announce-before-stating.
+    re: /honest gap:/i,
+    hit: "Honest gap: no per-service egress bytes",
+    miss: "and one honest gap - no per-service egress bytes in the API",
+  },
+  {
+    name: "the-fix-colon",
+    // Line-anchored: "The fix: X" is a colon-headline stamp; "The fix is to X"
+    // and "The fix was moving X" are ordinary sentences and stay legal.
+    re: /^The fix:\s/,
+    hit: "The fix: disable the UCI-managed service.",
+    miss: "The fix is to convert text to outlines before handoff.",
+  },
   { name: "dive-into", re: /\b(dive|deep dive) into\b/i, hit: "let us dive into the schema" },
   { name: "in-todays", re: /in today's\b/i, hit: "in today's cloud landscape" },
   { name: "heres-the-thing", re: /here's the thing/i, hit: "here's the thing about replication" },
@@ -446,6 +474,12 @@ export const REJECTED_MARKERS = [
   "order of leverage against a distant database",
   "the unlock combo is a keymap feature",
   "requires an elevated ephemeral ID score",
+  // Candidates from the 2026-08-28 sweep, rejected: both phrasings appear in
+  // pre-contract docs that are the author's own blog-era writing
+  // (reference/homebrew-fraud-detection, guides/caddy-compose-waf), so a ban
+  // would flag the voice the corpus calibrates against.
+  "age-aware classification is the key insight",
+  "the pre-commit hook deserves special mention",
 ];
 
 export function markerLines(doc: Doc): { line: Line; name: string; marker: string }[] {
