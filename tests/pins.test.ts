@@ -694,7 +694,7 @@ const pins: Pin[] = [
       /^## The segment design$/m,
       /^## The adoption path that works$/m,
       /^## Reading the numbers$/m,
-      /^## What generalizes$/m,
+      /^## What generalises$/m,
     ],
   },
   {

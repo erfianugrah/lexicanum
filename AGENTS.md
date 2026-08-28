@@ -182,11 +182,13 @@ Cite the source path when answering from docs.erfi.io in chat, too.
   effect of tightening prose. This corpus is worth reading because of its
   numbers; a sentence that reads better without them is a worse sentence.
 - **Spelling: British -ise** (normalise, organise, optimise). The corpus
-  convention, same as email/reply writing. Existing docs still carry
-  American -ize in places - normalise opportunistically when touching a
-  section, do not bulk-rewrite for style alone. Product/API terms are
-  exempt: Supabase's "organization", OAuth's "authorize", product names
-  like Vectorize stay verbatim.
+  convention, same as email/reply writing. Post-contract docs were
+  normalised 2026-08-28; pre-contract docs still carry American -ize in
+  places - normalise those opportunistically when touching a section, do
+  not bulk-rewrite for style alone. Product/API terms are exempt:
+  Supabase's "organization", OAuth's "authorize", the `Authorization`
+  header, HTTP's "Unauthorized", product names like Vectorize stay
+  verbatim.
 - **Headings: sentence case.** Capitalize only the first word and proper nouns /
   product names / acronyms. Keep: Cloudflare, Supabase, Hyperdrive, Postgres,
   Traefik, Vaultwarden, Grafana, Prometheus, Docker, Nix, Go, VyOS, KEDA, etc.;
@@ -222,10 +224,15 @@ and other non-ASCII punctuation (the ASCII rule and its guard are newer).
 Do not treat the oldest docs as exemplars - the exemplars are
 `reference/cloudflare-supabase-architecture.mdx` and
 `guides/usb4-10gbe-windows-tuning.mdx`. The reverse also holds: docs written
-since the AI-assisted era began are not a style source either, and several
-carry AI prose tells (decorative bold, mystery-tease, participle tails) that
-must not propagate - pattern-match the two named exemplars only, regardless of
-a doc's age. New docs must conform fully. When
+since the AI-assisted era began are not a style source either - pattern-match
+the two named exemplars only, regardless of a doc's age. A corpus-wide sweep
+(2026-08-28) removed the known AI prose tells (decorative bold on labels,
+importance-announcing, colon-headline stamps, negative parallelism) from the
+post-contract docs and normalised their prose spelling to British -ise; the
+regex-able subset of those tells gates the build via `LLM_MARKERS` in
+`tests/lib/mdx.ts`, and `REJECTED_MARKERS` there records the candidates
+rejected because the author's own pre-contract writing uses them. New docs
+must conform fully. When
 making a substantial edit to an older doc, bring the touched sections into
 conformance (heading case, ASCII punctuation, section skeleton); a wholesale
 rewrite just for style is not required.
