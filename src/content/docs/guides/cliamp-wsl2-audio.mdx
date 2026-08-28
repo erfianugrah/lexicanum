@@ -1,0 +1,157 @@
+---
+title: Making cliamp play sound on WSL2
+description: cliamp streams and "plays" silently on WSL2 because its ALSA default device cannot open without the pulseaudio-alsa plugin - install it, restart cliamp, and verify the stream appears in pactl. Also covers persisting the audio device choice and wiring Navidrome or another Subsonic-API server into cliamp.
+author: "Erfi Anugrah"
+category: workstations
+---
+
+cliamp on WSL2 often plays (progress bar advances, "Streaming" lights up) while producing no sound. The root cause is not WSLg itself: WSLg ships a working PulseAudio server over RDP that `paplay` can use out of the box. The failure is that cliamp's Linux audio output uses ALSA, and on a default WSL2 distro there is no ALSA device at all - `/dev/snd` is absent. cliamp then opens its `default` PCM, fails silently at startup, and never retries. The fix is the `pulseaudio-alsa` ALSA PCM plugin, which gives cliamp a `default` PCM that routes into WSLg's Pulse server.
+
+Everything here was reproduced on the dev box (Arch WSL2, WSLg, cliamp v1.x): the silent playback state, the missing `/dev/snd`, and the fixed state after installing the plugin.
+
+## Constants (read this first)
+
+| Fact | Consequence |
+|---|---|
+| WSL2 has no sound hardware | `/dev/snd` does not exist. Any ALSA call that opens a hardware card (`hw:0`) fails. |
+| WSLg runs a PulseAudio server in the system distro and projects the socket back as `/mnt/wslg/PulseServer` | A Pulse-native app (`paplay`, `pactl`, ffplay) works with zero setup. The host-side audio is carried over the RDP channel by WSLg's RDPSink plugin.[^wslg-arch] |
+| WSLg pre-sets `PULSE_SERVER=/mnt/wslg/PulseServer` | Do not override `PULSE_SERVER` in shell startup files; overriding it is the most common way to break WSLg audio.[^wslg-issue-29] |
+| cliamp is a Go app built on Beep + Oto | Oto speaks PulseAudio protocol directly for its main backend, but device enumeration and some paths go through ALSA, and the speaker layer opens an ALSA PCM (`snd_pcm_*`).[^oto-readme] |
+| With no ALSA PCM plugin installed, `aplay -l` and cliamp's `default` open fail | cliamp starts with no device, shows the track advancing, and makes no sound. It does not surface the failure. |
+| `pulseaudio-alsa` installs one file: `/etc/alsa/conf.d/99-pulseaudio-default.conf` | That file defines an ALSA `default` PCM of type `pulse`, so any app opening the ALSA default is routed into the running Pulse server. |
+| cliamp reads `~/.config/cliamp/config.toml` at startup and writes back on quit | Settings chosen in the TUI (theme, EQ, visualizer, provider) persist; the audio device can also be pinned explicitly (below). |
+
+## Verify WSLg audio works at all
+
+Rule out the Windows side first. Generate a test tone and play it through the Pulse socket:
+
+```bash
+ffmpeg -f lavfi -i 'sine=frequency=440:duration=2' -f wav /tmp/beep.wav -y
+paplay /tmp/beep.wav
+```
+
+You should hear a 440 Hz tone on the Windows host. While it plays, confirm the stream exists and the sink is running:
+
+```bash
+pactl list short sink-inputs   # should show a paplay entry
+pactl list sinks | grep State  # should show: State: RUNNING
+```
+
+If the beep is audible, WSLg is fine and the problem is downstream of Pulse - i.e. in how cliamp reaches it. If the beep is silent, stop here and fix WSLg first (start with `wsl --shutdown` and a relaunch; check that no shell rc file overrides `PULSE_SERVER`).
+
+## Fix cliamp: install the ALSA-to-Pulse plugin
+
+cliamp opens ALSA's `default` PCM. With no plugin installed, that name resolves to a nonexistent hardware card and the open fails. Install the plugin that maps `default` to Pulse:
+
+```bash
+sudo pacman -S --noconfirm pulseaudio-alsa alsa-utils
+```
+
+`pulseaudio-alsa` provides the PCM routing; `alsa-utils` provides `speaker-test` / `aplay` for verification.
+
+Restart cliamp (it opened its device at startup and never retried), start playback, and confirm cliamp itself now appears as a Pulse stream:
+
+```bash
+cliamp play
+# in another shell, while it plays:
+pactl list short sink-inputs
+```
+
+The list should contain a cliamp entry against `RDPSink`, and the sink should be `RUNNING`. The earlier symptom of this exact failure was an empty `sink-inputs` list and a `SUSPENDED` sink while cliamp's UI claimed to be streaming.
+
+## Diagnosing when it is still silent
+
+Work from the Pulse server outward:
+
+| Check | Command | What it proves |
+|---|---|---|
+| WSLg socket exists | `ls /mnt/wslg/PulseServer` | WSLg is running; if missing, `wsl --shutdown` and relaunch |
+| Pulse reachable | `pactl info \| head -3` | Confirms `Server Name: pulseaudio` and `Default Sink: RDPSink` |
+| `PULSE_SERVER` not overridden | `echo $PULSE_SERVER` | Should be `unix:/mnt/wslg/PulseServer` (WSLg pre-sets it) |
+| ALSA plugin installed | `pacman -Ql pulseaudio-alsa \| grep conf.d` | Should list `/etc/alsa/conf.d/99-pulseaudio-default.conf` |
+| ALSA default opens | `speaker-test -D default -c2 -l1` | Audible pink noise proves the full ALSA -> Pulse -> RDP path |
+| cliamp stream exists | `pactl list short sink-inputs` while cliamp plays | Empty list = cliamp never connected; the UI lies about playback state |
+
+The decisive observation in the original failure was the last two rows combined: `speaker-test` had no ALSA default to open (no plugin), and `pactl list short sink-inputs` stayed empty while cliamp showed "Streaming".
+
+## Persisting the audio device choice
+
+cliamp writes its state back to `~/.config/cliamp/config.toml` on exit, so settings changed in the TUI (theme via `cliamp theme <name>`, visualizer, EQ curve, repeat/shuffle, volume) survive a restart without any extra step.
+
+The audio device is the exception worth pinning explicitly, because on WSL2 you want cliamp to keep using the Pulse-routed default rather than rediscovering a device each launch. Set it once from the CLI:
+
+```bash
+cliamp device list        # shows the available output devices, e.g. RDPSink
+cliamp device RDPSink     # selects it; persisted to config.toml
+```
+
+Or edit `config.toml` directly and add the equivalent key:
+
+```toml
+# ~/.config/cliamp/config.toml
+audio-device = "RDPSink"
+```
+
+A restart then keeps the choice. Verify with `cliamp status` (shows the active device) or by checking that `pactl list short sink-inputs` lists cliamp after playback starts.
+
+## Setting up a Subsonic-API server (Navidrome and friends)
+
+cliamp supports Navidrome natively, and Navidrome speaks the Subsonic API - so any Subsonic-compatible server (Gonic, LMS/Lyrion via its Subsonic bridge, Ampache, Airsonic-Advanced, Navidrome itself) works through the same `[navidrome]` block.[^cliamp-navidrome]
+
+The fastest path is the interactive wizard, which validates the connection and writes the config:
+
+```bash
+cliamp setup
+```
+
+Manual configuration is three keys in `~/.config/cliamp/config.toml`:
+
+```toml
+provider = "navidrome"          # make it the default source at startup
+
+[navidrome]
+url = "http://your-server:4533"
+user = "your-username"
+password = "${NAVIDROME_PASSWORD}"   # read from env, keeps the secret out of the file
+```
+
+cliamp also honours the environment variables `NAVIDROME_URL`, `NAVIDROME_USER`, and `NAVIDROME_PASS` directly - exporting them before launch is enough for a session without touching the config file.
+
+Once configured, `cliamp --provider navidrome` (or just `cliamp` with `provider = "navidrome"` set) opens on the server's playlists. `N` inside the TUI opens the full Navidrome browser (by album, by artist, or artist -> album -> track). Streams arrive as MP3 from the server's Subsonic `/rest/stream` endpoint.
+
+Two notes on the Subsonic surface area:
+
+- cliamp's Navidrome provider uses the Subsonic API (`/rest/getAlbumList2`, `/rest/search3`, `/rest/stream`), which is why any server implementing that API works through the same block - the provider name in cliamp stays `navidrome` regardless of which server sits behind it.
+- Lyrion (formerly Logitech Media Server) has its own native `[lyrion]` block in cliamp; use that rather than the Subsonic bridge if the server is LMS.
+
+## Gotchas and lessons learned
+
+- **The UI says "Streaming" but no sound plays.** cliamp does not surface an ALSA open failure - the track timer advances and the UI reports streaming while no Pulse stream exists. `pactl list short sink-inputs` is the ground truth; trust it over the UI.
+- **Audio worked once, then stopped after a restart.** cliamp opened its device at startup and never retried. After installing `pulseaudio-alsa`, fully quit and relaunch cliamp - toggling play/pause in the running instance does not reopen the device.
+- **Do not set `PULSE_SERVER` yourself.** WSLg pre-populates it to `unix:/mnt/wslg/PulseServer`; a stray `export PULSE_SERVER=...` in `.zshrc`/`.bashrc` pointing at a TCP or wrong socket is the classic way to break all WSLg audio.[^wslg-issue-29]
+- **`speaker-test` plays but cliamp is still silent.** Check that cliamp's selected device is the Pulse-routed one (`cliamp device list` / `cliamp device RDPSink`), not a stale hardware name left over from before the plugin was installed.
+- **WSLg audio crackles or underruns under load.** A known WSLg issue with no userspace fix; the RDPSink plugin drops samples under buffer pressure.[^wslg-issue-1429] It is separate from the no-sound-at-all problem this guide fixes.
+
+## Command reference
+
+| Command | Purpose |
+|---|---|
+| `paplay /tmp/beep.wav` | Smoke-test the WSLg Pulse path end to end |
+| `pactl list short sink-inputs` | Show live playback streams (cliamp should appear here) |
+| `pactl list sinks` | Show sink state (`RDPSink`, `RUNNING` vs `SUSPENDED`) |
+| `speaker-test -D default -c2 -l1` | Prove the ALSA default PCM opens and reaches Pulse |
+| `sudo pacman -S pulseaudio-alsa alsa-utils` | Install the ALSA -> Pulse plugin (the fix) |
+| `cliamp device list` / `cliamp device <name>` | Inspect / persist the output device |
+| `cliamp status` | Show the active device and playback state |
+| `cliamp setup` | Interactive wizard for Navidrome and other providers |
+| `cliamp --provider navidrome` | Launch straight into the Subsonic provider |
+
+## Related docs
+
+- [Reclaiming disk space from WSL2 and Docker Desktop](/guides/wsl2-disk-reclaim/) - the other WSL2-on-this-box guide; same distro, different subsystem
+
+[^wslg-arch]: microsoft/WSLg, project README (PulseAudio server in the system distro, RDPSink plugin, PULSE_SERVER preconfiguration). https://github.com/microsoft/WSLg
+[^wslg-issue-29]: microsoft/WSLg, issue #29 ("No audio") - overriding PULSE_SERVER breaks WSLg audio; do not set it in shell rc files. https://github.com/microsoft/wslg/issues/29
+[^oto-readme]: hajimehoshi/oto, README (Linux: PulseAudio primary, pure-Go ALSA fallback via libasound). https://github.com/hajimehoshi/oto
+[^cliamp-navidrome]: bjarneo/cliamp, docs/navidrome.md (Subsonic API integration, env vars, provider controls). https://github.com/bjarneo/cliamp/blob/main/docs/navidrome.md
+[^wslg-issue-1429]: microsoft/WSLg, issue #1429 ("WSLg audio crackling and latency - RDPSink underruns"). https://github.com/microsoft/wslg/issues/1429
