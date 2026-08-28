@@ -1,0 +1,163 @@
+---
+title: "Run your own PostgREST against a Supabase project"
+description: Turn the managed Data API off and serve the same Postgres through a PostgREST you control - so you can put the REST layer behind an IP allowlist, a rate limiter, and a db-pre-request IP filter, none of which the managed Data API offers. Steps, the pooler connection, the pre-request filter, and an nginx rate limiter, all reproducible on a throwaway project.
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+You'll turn off the managed Data API on a Supabase project and run [PostgREST](https://postgrest.org/) yourself, in Docker, against the same Postgres - then front it with a `db-pre-request` IP filter and an nginx rate limiter. This is move 3 in [Locking down Supabase: the database is the boundary](/reference/supabase-data-surface-lockdown/): the managed HTTP tier has no network perimeter, so an IP-restricted or rate-limited REST layer has to be one you own.
+
+Prerequisites: a Supabase project (any plan), Docker, and the project's database password. Everything below was run on a throwaway micro project in ap-southeast-1 on 2026-08-28.
+
+## Component versions
+
+| Component | Version | Note |
+|---|---|---|
+| PostgREST | `postgrest/postgrest:v16.2` | official image |
+| nginx | `nginx:1.31.4-trixie` | the rate limiter |
+| Supabase Postgres | 17.6 | reported by the PostgREST connect log |
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  client [label="client"];
+  nginx [label="nginx limit_req\n:8080"];
+  pgrst [label="PostgREST :3000\ndb-pre-request filter"];
+  pool [label="session pooler\naws-0-<region>.pooler.supabase.com:5432"];
+  managed [label="managed Data API\nOFF (503)", shape=note];
+
+  client -> nginx -> pgrst -> pool;
+  managed -> pool [label="wedged", style=dashed];
+}
+```
+
+## Step 1: turn the managed Data API off
+
+Empty the exposed schema so the managed PostgREST stops answering. Through the Management API (`PATCH /v1/projects/{ref}/postgrest` with `{"db_schema": ""}`), or the Dashboard's Data API toggle. Confirm it wedges:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "apikey: $ANON" "https://$REF.supabase.co/rest/v1/your_table?select=id"
+# -> 503 (PGRST002) within a few seconds
+```
+
+Auth, Storage, Realtime and Edge Functions keep answering - this lever is PostgREST-only, which is the whole reason you are replacing it.
+
+## Step 2: get the session-pooler connection
+
+PostgREST holds a connection pool, so use the session pooler (port 5432), not the transaction pooler. The connection string is:
+
+```
+postgres://postgres.<ref>:<db-password>@aws-0-<region>.pooler.supabase.com:5432/postgres
+```
+
+The direct host `db.<ref>.supabase.co` is IPv6-only; the pooler is IPv4, which is what a default Docker bridge can reach.
+
+## Step 3: run PostgREST
+
+PostgREST connects as `postgres` and switches to `anon` for unauthenticated requests. `PGRST_DB_PRE_REQUEST` names the filter function you install in step 5 - set it now, since PostgREST reads it at config load.
+
+```bash
+docker run -d --name own-postgrest -p 3000:3000 \
+  -e PGRST_DB_URI="postgres://postgres.$REF:$DB_PASSWORD@aws-0-$REGION.pooler.supabase.com:5432/postgres" \
+  -e PGRST_DB_SCHEMAS=public \
+  -e PGRST_DB_ANON_ROLE=anon \
+  -e PGRST_DB_PRE_REQUEST=public.ip_filter \
+  postgrest/postgrest:v16.2
+docker logs own-postgrest | grep 'Successfully connected'
+# -> Successfully connected to PostgreSQL 17.6
+```
+
+## Step 4: grant anon and reload the schema cache
+
+PostgREST cached the schema at start with `anon` holding no grants. Grant read on the tables you expose and reload:
+
+```sql
+grant usage on schema public to anon;
+grant select on public.your_table to anon;
+notify pgrst, 'reload schema';
+```
+
+`GET http://localhost:3000/your_table?select=id` now returns rows the managed endpoint no longer will.
+
+## Step 5: the db-pre-request IP filter
+
+This is the control the managed tier will not run. The function reads the forwarding header and raises with a `PT`-prefixed SQLSTATE, which PostgREST maps to the matching HTTP status.[^pgrst-prereq] An IP ban (block one address) keeps the filter out of the way of trusted callers:
+
+```sql
+create or replace function public.ip_filter() returns void language plpgsql as $$
+declare xff text := current_setting('request.headers', true)::json ->> 'x-forwarded-for';
+begin
+  if xff is not null and xff like '%203.0.113.9%' then
+    raise sqlstate 'PT403' using message = 'ip banned: ' || xff;
+  end if;
+end$$;
+grant execute on function public.ip_filter() to anon;
+```
+
+Verify the ban and the pass:
+
+```bash
+curl -s -o /dev/null -w 'banned=%{http_code}\n' \
+  -H 'x-forwarded-for: 203.0.113.9' 'http://localhost:3000/your_table?select=id'   # -> 403
+curl -s -o /dev/null -w 'allowed=%{http_code}\n' 'http://localhost:3000/your_table?select=id'  # -> 200
+```
+
+For an allowlist instead of a ban, invert the test (`raise` unless `xff` is in your set). Read the client IP from `x-forwarded-for` only if the edge in front overwrites it; if the edge appends, a client can spoof it.
+
+## Step 6: rate limit at the edge
+
+Rate limiting lives in front of PostgREST - nginx, a Cloudflare Worker, or Upstash all work; nginx `limit_req` is the self-contained one. It only counts traffic through it, which is why it works now (the origin is closed) and could not work in front of the managed endpoint.
+
+```nginx
+events {}
+http {
+  limit_req_zone $binary_remote_addr zone=rl:10m rate=2r/s;
+  limit_req_status 429;
+  server {
+    listen 8080;
+    location / { limit_req zone=rl burst=2 nodelay; proxy_pass http://host.docker.internal:3000; }
+  }
+}
+```
+
+```bash
+docker run -d --name own-ratelimit --add-host=host.docker.internal:host-gateway \
+  -p 8080:8080 -v "$PWD/ratelimit.nginx.conf:/etc/nginx/nginx.conf:ro" nginx:1.31.4-trixie
+```
+
+A 15-request burst against `:8080` returns 2 served and 13 rejected (429).
+
+## Verification
+
+| Check | Expected |
+|---|---|
+| Managed REST | `503 PGRST002` |
+| Your PostgREST direct | 200 with rows |
+| Spoofed `x-forwarded-for` at the filter | 403 |
+| Burst through nginx | some 429, some 200 |
+
+## Gotchas and lessons learned
+
+- The `db-pre-request` function must exist for the container's whole life. `PGRST_DB_PRE_REQUEST` is read at config load, and PostgREST calls the function on every request - drop it and every request errors. Create it before the container serves traffic, and do not drop it while the container runs.
+- nginx `limit_req` rejects with `503` by default. Set `limit_req_status 429` for the correct status.
+- `service_role` bypasses RLS, and your PostgREST connects as `postgres`. Authorization is now yours to enforce - in the pre-request function, in RLS on the `anon`/`authenticated` roles, or at the edge. The managed platform's role separation does not carry over automatically.
+- A fresh table is invisible until `notify pgrst, 'reload schema'`. PostgREST caches the schema; grants and new tables need the reload.
+- Put the pooler behind [PrivateLink](/reference/supabase-aws-privatelink/) to take the database connection itself off the public internet - then both the REST layer and the connection are private.
+
+## File reference
+
+The reproducible form is the supabase-lab `security-lockdown` experiment: `tests/s04-self-hosted-postgrest.ts` (Data API off, container, IP filter), `tests/s05-rate-limit.ts` (nginx burst), `ratelimit.nginx.conf`, and the `postgrest-up` / `ratelimit-up` Makefile targets that pin the images and build the pooler connection.
+
+## References
+
+[^pgrst-prereq]: PostgREST, "Pre-Request," PostgREST Documentation. https://postgrest.org/en/stable/references/transactions.html#pre-request
