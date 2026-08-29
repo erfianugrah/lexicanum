@@ -1,10 +1,12 @@
 ---
-title: Tuning a USB4 10GbE adapter on Windows
-description: A bus-powered USB4/Thunderbolt 10GbE adapter (Alpine Ridge + Marvell AQC113) on Windows - stop RTD3 link flapping, lift the single-flow TX cap with jumbo frames and driver knobs, align L2 and L3 MTU across the link, and assert the whole configuration afterwards so drift shows up as a failure rather than a slow link.
+title: Tuning a 10GbE link end to end
+description: Getting a 10GbE link to its actual ceiling on both ends of the wire - a bus-powered USB4/Thunderbolt adapter (Alpine Ridge + Marvell AQC113) on Windows, and Intel NICs on Linux. Stop RTD3 link flapping, lift the single-flow TX cap, size the descriptor rings, align L2 and L3 MTU, tell a physical fault from a full buffer by its counters, and assert the whole configuration afterwards so drift shows up as a failure rather than a slow link.
 author: "Erfi Anugrah"
 category: workstations
 featured: true
-blurb: "Getting real 10GbE out of a USB4 adapter - the exemplar guide."
+blurb: "Getting a 10GbE link to its real ceiling, on Windows and on Linux."
+aliases:
+  - "/guides/usb4-10gbe-windows-tuning"
 ---
 
 A bus-powered USB4 10GbE adapter is the only sane way to get 10G onto a small-form-factor board with no free PCIe slot. It is also a stack of four vendor firmwares (host TB controller, cable, adapter TB controller, NIC) that Windows power management treats as optional. This guide takes one such adapter from "flaps off the bus every 60 seconds" to a stable 9.6+ Gbps. Each step includes the measurement that justifies it and the command to reproduce that measurement.
@@ -208,6 +210,73 @@ Operational iperf3 gotchas, learned the hard way:
 ### Localize loss before tuning
 
 During retransmit-heavy TX runs, take deltas on every node in the path: router NIC (`ethtool -S`, watch `rx_missed_errors`), switch port counters (RX/TX discards, FCS), Windows NIC discard counters. On this rig every external node was provably clean; the "loss" was **spurious retransmits** - tunnel completion/ACK-return jitter makes Windows TCP declare loss on merely-late packets and clamp cwnd. That is the sawtooth. You cannot fix a clamp with a bigger pipe; you fix it by changing what the sender pays per packet (Part 4) and how it reacts to jitter (CTCP, below).
+
+When a node is *not* clean, the counter that moved tells you which class of problem you have. This is the cheapest diagnostic in the guide and it is often skipped in favour of swapping cables.
+
+| Counter moving | Class | What it means |
+|---|---|---|
+| `rx_fcs_error`, `rx_symbol_error`, `rx_runts`, `rx_false_carrier`, `tx_late_collisions` | Physical | Corrupted or mis-timed frames. Cable, keystone jack, DAC, transceiver, port PHY. |
+| `rx_discarded` (switch), `rx_missed_errors` (Linux NIC) | Buffer | The frame arrived intact and was then dropped for want of somewhere to put it. |
+
+The two do not overlap, and that is what makes the test worth running first: corrupted copper cannot produce clean CRCs, so an all-zero physical column exonerates every cable and optic in the path in one command. Link flap count is the companion check - `cat /sys/class/net/<if>/carrier_changes` on Linux, and expect exactly 2 per boot (one down, one up).
+
+One caution on reading a switch's own flap history: a port number is not a machine identity. A port that logged hundreds of link events last month may have had a different host, with a different NIC, plugged into it. Match on the NIC, not the port label, before treating old flap data as evidence about the machine there now.
+
+### Descriptor rings on Linux (`rx_missed_errors`)
+
+`rx_missed_errors` growing means the NIC received a frame and had no free descriptor to put it in. Both Intel NICs measured here shipped with **512** descriptors against hardware maximums of 8160 (i40e / X710) and 32768 (ixgbe / X550) - about 6% and 1.6% of capacity respectively.
+
+The arithmetic for why 512 is not enough at this speed: 9.4 Gbps at MTU 1500 is roughly 810,000 packets per second, so a 512-entry ring holds well under a millisecond of traffic. Any scheduling delay on the core servicing that queue overruns it.
+
+```bash
+ethtool -g enp2s0f0np0                     # Pre-set maximums vs Current
+ethtool -G enp2s0f0np0 rx 4096 tx 4096     # resets the link, ~1s blip
+ethtool -S enp2s0f0np0 | grep rx_missed    # sample twice, 10s apart
+```
+
+Measured A/B on one 10G path, identical load per arm (30s 4-stream each direction plus five 5-second single-stream runs):
+
+| Metric | RX ring 512 | RX ring 4096 |
+|---|---|---|
+| `rx_missed_errors` delta | +11316 | **+0** |
+| Single-stream, 5 runs (Gbps) | 8.59 8.53 8.36 8.99 8.92 | 9.30 9.22 9.28 9.23 9.18 |
+| Spread | 0.63 Gbps | 0.12 Gbps |
+| 4-stream aggregate | 9.35 Gbps | 9.39 Gbps |
+
+The aggregate barely moves because it was already at the framing ceiling. What the rings buy is the single-stream floor (up 0.82 Gbps) and the run-to-run spread (narrower by 5.25x). Sizing rings is a fix for loss and jitter, not for headline throughput.
+
+This also disproved the obvious first hypothesis. Before the change, NET_RX softirq during a single-stream run was 46% concentrated on one core, which reads like RSS single-queue saturation. After the change that concentration is essentially unchanged (36%) while throughput is stable - one core was always sufficient, it just needed descriptors. Softirq concentration was a correlate, not the cause, and the A/B is what separated them.
+
+Make it survive a reboot. On NixOS there is no `networking.interfaces.<if>` option for ring depth (that submodule carries exactly one link-level knob, `mtu`), so it goes in as a systemd `.link` **drop-in**:
+
+```
+# /etc/systemd/network/40-<iface>.link.d/rings.conf
+[Link]
+RxBufferSize=4096
+TxBufferSize=4096
+```
+
+A drop-in rather than a new `.link` file, because per `man systemd.link` "the first (in lexicographic order) of the link files that matches a given device is applied" - first-match-wins, no merging. If the distro already generates a `.link` for that interface carrying its MTU, a lower-numbered file of your own wins the match and silently drops the MTU setting; a higher-numbered one is never read. Drop-in `.conf` files are the documented exception and are merged after the main file.
+
+One trap that cost a deploy here: `.link` files are applied by udev at **device appearance**, so a config-management run that does not re-appear the NIC leaves the correct file on disk and the old value in the kernel. Verify with `ethtool -g`, not by the presence of the file. Either reboot, `udevadm trigger --action=add --subsystem-match=net --attr-match=address=<mac>`, or pair the drop-in with an idempotent unit that pushes the value at activation time.
+
+### Switch discards that are not a fault
+
+A switch port counting `rx_discarded` under load is not automatically a defect. Sweep the offered rate before concluding anything - the shape of the curve is the diagnosis:
+
+| Shape | Achieved | Volume | Switch discards |
+|---|---|---|---|
+| 1 stream, paced to 8G | 8 Gbps | 30 GB | +0 |
+| 4 streams, paced to 8G total | 8 Gbps | 30 GB | +0 |
+| 1 stream, uncapped | 9.03-9.26 Gbps | ~34 GB | +3526 |
+| 4 streams, uncapped | 9.38 Gbps | 35.2 GB | +21919 |
+| 8 streams, uncapped | 9.38 Gbps | 35.2 GB | +51102 |
+
+Every arm moves comparable volume, so the discards do not track bytes. They track whether the sender left headroom: paced 1.41 Gbps below the 9.41 Gbps framing ceiling, the ingress buffer always drains and the count is zero. Uncapped, TCP's congestion window probes past line rate in bursts, the buffer fills, frames drop, cwnd backs off, repeat - and more concurrent flows means more independent probes colliding, which is why the count scales with stream count rather than with data transferred. An idle control window is worth taking too: the same port passed 186,505 packets with +0 discards when no benchmark was running.
+
+Before blaming buffers, confirm nothing is policing the port. On the switch used here that was `show storm-control` (a broadcast pps limiter that unicast never touches), `show bandwidth-control`, `show flow-control` and `show port-isolation` - all off or irrelevant, which is what left saturation as the only explanation.
+
+The tempting fix is 802.3x pause frames, and on a **trunk** it is the wrong one: a pause frame is link-global with no VLAN awareness, so pausing one host's bulk transfer stalls every VLAN sharing that trunk. Trading head-of-line blocking across five segments for a buffer drop on one is a bad deal; the per-priority mechanism that would do this correctly is PFC (802.1Qbb), which small managed switches generally do not implement.
 
 ## Part 4: the tuning ladder
 
