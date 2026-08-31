@@ -10,7 +10,7 @@ import { Aside } from "@astrojs/starlight/components";
 
 Supabase's security boundary is the database. The managed HTTP tier - Data API, Auth, Storage, Realtime, Edge Functions - is a stateless public veneer over Postgres: reachable by design, and defended at the row (RLS), the grant, and the token. It keeps a public endpoint on every plan, so a perimeter control has nothing to attach to. Every "make Supabase private" question - an IAP over the instance, an IP allowlist on the Data API, proxy-only access, private by default - is the same request pointed at that fact, and resolves to one of three moves: push the control into the database, lock the database socket, or own the API layer. This is which move fits which goal, and what each costs.
 
-Everything marked **measured** was validated on 2026-08-28 on throwaway **micro** projects in **ap-southeast-1**, plus a self-hosted PostgREST (official image, v16.2) in Docker against the project's session pooler, and Cloudflare Workers - an Access-gated proxy on the `erfi.dev` zone, and a local `wrangler dev` instance for the rate limiter. Each lever was applied through the Management API, then every HTTP surface re-probed with three credential classes (no key, anon key, service key). Claims about platform internals not re-tested are marked **asserted** and linked. The reproducible form is the supabase-lab `iap-lockdown` and `security-lockdown` experiments, under Reproducing.
+Everything marked **measured** was validated on 2026-08-28 on throwaway **micro** projects in **ap-southeast-1**, plus a self-hosted PostgREST (official image, v16.2) in Docker against the project's session pooler, and Cloudflare Workers - an Access-gated proxy on the `erfi.dev` zone, and a local `wrangler dev` instance for the rate limiter. Each lever was applied through the Management API, then every HTTP surface re-probed with three credential classes (no key, anon key, service key). A 2026-08-31 follow-up run on the same micro shape added the column-grant, Auth switch-on, and Storage/Realtime-reach probes (S13-S15). Claims about platform internals not re-tested are marked **asserted** and linked. The reproducible form is the supabase-lab `iap-lockdown` and `security-lockdown` experiments, under Reproducing.
 
 **TL;DR:**
 
@@ -64,6 +64,8 @@ The socket has a network perimeter - network restrictions and PrivateLink act on
 
 The two levers most often mistaken for gates are the two that gate nothing: **CORS** reflects an arbitrary `Origin` and a request with no `Origin` still returns data, so a non-browser client ignores it; a **custom domain** is a branding CNAME, and the origin `<ref>.supabase.co` answers identically before and after.[^sb-customdomain] The only surfaces reachable with no credential at all are a public storage object and a `verify_jwt = false` Edge Function.
 
+The table reads Auth for what leaks; the same service has levers a customer switches *on*, and they are worth naming because none of them is a tier gate either - each hardens Auth alone. A **before-user-created hook** runs your own code on the signup path before the row exists, so a domain allowlist or a fraud check can reject the account at the door.[^sb-authhooks] **CAPTCHA** - hCaptcha or Cloudflare Turnstile - gates the signup, sign-in and password-reset entry points against scripted abuse.[^sb-captcha] And the **auth rate limits** are configurable, not fixed: token refresh, OTP, email and SMS sends, verify, and anonymous sign-ins each take a lower ceiling than the shared default.[^sb-authratelimit] These tighten the Auth service; the boundary for the data underneath is still the row. security-lockdown S14 measured these on a micro project (2026-08-31): the before-user-created hook and CAPTCHA fields present and off by default (the CAPTCHA provider defaulting to hCaptcha), the seven `rate_limit_*` fields present, and one rate limit driven down and back to confirm it is settable.
+
 ## Which move fits the goal
 
 | Goal | Move | Mechanism | Cost |
@@ -79,11 +81,15 @@ The boundary is the row, so the control belongs on the row. For a table that mus
 
 RLS is the row-level version of the same move, and its write-side traps are what make "we added RLS" still fail a pen test: a view over an RLS table leaks every row without `security_invoker`, an UPDATE policy gates which rows change but not which columns, and PERMISSIVE policies OR together so an admin-intended policy bleeds onto anon.[^sb-securing]
 
+The column half of that trap is a grant, not a second policy. `REVOKE UPDATE ON <table> FROM anon, authenticated` followed by `GRANT UPDATE (<the writable columns>)` makes a write to any withheld column return `42501` (permission denied for column) through the Data API, while the row policy still decides which rows move.[^pg-grant] RLS decides the rows; the column grant decides the columns. An UPDATE policy with no matching column grant is exactly the hole a pen test writes through - a `WITH CHECK` constrains the row's new values, never which of its columns a caller may touch - and column privileges are what shut it. Measured as the pair in security-lockdown S13 (2026-08-31): a permissive UPDATE policy plus a table-level grant lets anon overwrite a `balance` column (`204`), and the same write returns `401` carrying SQLSTATE `42501` once `balance` is dropped from the grant, with the granted column still writable.
+
 Identity on the Data API is the same move with the token as the key. Register an external issuer as third-party auth (the `jwks_url` shape resolves; an inline key set never does) and key RLS on a claim only the issuer sets.[^sb-jwts] Measured: Cloudflare Access-for-SaaS registered as the issuer and its JWKS resolved on registration; the admit/deny proof - with a policy of `(auth.jwt() ->> 'iss') = '<issuer>'`, the anon key and a GoTrue user token both read zero rows while a token minted by the trusted issuer reads its rows - was run with a lab ES256 issuer (JWKS served from an Edge Function), since a real Access token needs the interactive login. That is "an IAP over the data" done at the authorisation layer, and it is plan-agnostic - the step-by-step is [Put an IAP over the Supabase Data API](/guides/supabase-iap-data-api/). Keeping RLS while dropping the Supabase HTTP layer entirely is [RLS without Supabase Auth](/reference/rls-without-supabase-auth/).
 
 <Aside type="caution" title="The IP filter that does not fire on hosted">
 PostgREST supports `pgrst.db_pre_request`: a function that reads `current_setting('request.headers')` (which carries `x-forwarded-for`) and rejects a request - a DB-layer IP filter.[^pgrst-prereq] On a managed project the role GUC persists after `ALTER ROLE authenticator SET pgrst.db_pre_request` + `NOTIFY pgrst, 'reload config'`, but no pre-request runs on the PostgREST path within 120 seconds. The mechanism is real; it is not activatable via SQL on the hosted tier. It works on your own PostgREST (move 3), where the config is yours.
 </Aside>
+
+That control, even where it fires, reaches only the REST path. `db_pre_request` is a PostgREST setting, and Storage and Realtime never traverse PostgREST - each is its own service against the same Postgres, which is why "Data API off" leaves both answering (the first row of the lever table). So an IP allowlist, or an owner-list read from request headers, gates the REST layer and nothing else: for Storage and Realtime the same intent has to live in each service's own authorization - RLS on `storage.objects`, Realtime's channel authorization - or on an edge you own. The Move 1 REVOKE does not reach the storage schema either. `storage` is owned by `supabase_admin`, not the project owner (measured), so its tables keep their own grants and Storage stays governed by RLS on `storage.objects`, not by the public-schema revoke above. Keying those policies off claims read straight from the wire has its own sharp edge - the claims GUC is unprivileged, so the connection credential becomes the boundary - worked through with a tampered-claim test in [RLS without Supabase Auth](/reference/rls-without-supabase-auth/). security-lockdown S15 measured the reach limit (2026-08-31): with the Data API wedged off (`503 PGRST002` on a table path), `/storage/v1` still served (`200`) and `/realtime/v1` still answered, so a PostgREST-path control was never in front of them.
 
 ## Move 2: lock the database socket
 
@@ -148,7 +154,7 @@ The split between the socket and the HTTP tier holds regardless of plan or regio
 
 ## Reproducing
 
-Every measured claim comes out of two disposable supabase-lab experiments. [`iap-lockdown`](https://github.com/erfianugrah/supabase-lab/tree/main/experiments/iap-lockdown) provisions one micro project and probes the full HTTP surface under each lever, the two IAP patterns (Cloudflare Access-for-SaaS as the real issuer, plus a lab ES256 issuer whose JWKS is served by an Edge Function), and the custom-domain and CORS non-gates. [`security-lockdown`](https://github.com/erfianugrah/supabase-lab/tree/main/experiments/security-lockdown) adds the platform security advisor, network restrictions applied (with a psql socket-lock probe), the self-hosted-PostgREST path with a Docker PostgREST against the project pooler and an nginx rate limiter, and the connection-role, Vault, pg_net-egress and pgaudit checks. Both provision, probe, and destroy in one run; region and plan are variables.
+Every measured claim comes out of two disposable supabase-lab experiments. [`iap-lockdown`](https://github.com/erfianugrah/supabase-lab/tree/main/experiments/iap-lockdown) provisions one micro project and probes the full HTTP surface under each lever, the two IAP patterns (Cloudflare Access-for-SaaS as the real issuer, plus a lab ES256 issuer whose JWKS is served by an Edge Function), and the custom-domain and CORS non-gates. [`security-lockdown`](https://github.com/erfianugrah/supabase-lab/tree/main/experiments/security-lockdown) adds the platform security advisor, network restrictions applied (with a psql socket-lock probe), the self-hosted-PostgREST path with a Docker PostgREST against the project pooler and an nginx rate limiter, the connection-role, Vault, pg_net-egress and pgaudit checks, and the review gap-plugging probes - column grants (S13), the Auth switch-on levers (S14), and Storage/Realtime reach with the Data API off (S15). Both provision, probe, and destroy in one run; region and plan are variables.
 
 | Claim | Status | How it was checked |
 |---|---|---|
@@ -161,6 +167,9 @@ Every measured claim comes out of two disposable supabase-lab experiments. [`iap
 | CORS / custom domain gate nothing server-side | tested | no-`Origin` request returns data; origin serves after custom domain |
 | IAP-as-issuer admits only the IAP token | tested | third-party auth + `iss`-keyed RLS; anon and GoTrue read 0 rows |
 | Own PostgREST + IP filter over the same Postgres | tested | Docker PostgREST v16.2, `db-pre-request` rejects spoofed `x-forwarded-for` |
+| A column grant closes a column an UPDATE policy leaves open | tested | `REVOKE UPDATE` + `GRANT UPDATE (col)`, write to a withheld column returns `401`/`42501` (S13); the mechanism is standard [Postgres GRANT](https://www.postgresql.org/docs/current/sql-grant.html) |
+| Auth switch-on levers (hook, CAPTCHA, configurable rate limits) present and settable | tested | before-user-created hook + CAPTCHA + seven `rate_limit_*` fields present, one rate limit PATCHed down and back (S14) |
+| Storage/Realtime answer with the Data API off - not behind PostgREST | tested | schema wedged empty (`503 PGRST002` on a table path), `/storage/v1` returns `200` and `/realtime/v1` answers (S15) |
 | PrivateLink is Team/Enterprise, socket-only | asserted | [PrivateLink docs](https://supabase.com/docs/guides/platform/privatelink); measured in [supabase-aws-privatelink](/reference/supabase-aws-privatelink/) |
 
 [^sb-netrestrict]: Supabase, "Network Restrictions," Supabase Docs. https://supabase.com/docs/guides/platform/network-restrictions
@@ -178,3 +187,11 @@ Every measured claim comes out of two disposable supabase-lab experiments. [`iap
 [^sb-ratelimit]: Supabase, "Rate Limiting Edge Functions," Supabase Docs. https://supabase.com/docs/guides/functions/examples/rate-limiting
 
 [^pgrst-prereq]: PostgREST, "Pre-Request," PostgREST Documentation. https://postgrest.org/en/stable/references/transactions.html#pre-request
+
+[^pg-grant]: PostgreSQL, "GRANT," PostgreSQL Documentation. https://www.postgresql.org/docs/current/sql-grant.html
+
+[^sb-authhooks]: Supabase, "Before User Created Hook," Supabase Docs. https://supabase.com/docs/guides/auth/auth-hooks/before-user-created-hook
+
+[^sb-captcha]: Supabase, "Enable CAPTCHA Protection," Supabase Docs. https://supabase.com/docs/guides/auth/auth-captcha
+
+[^sb-authratelimit]: Supabase, "Rate Limits," Supabase Docs. https://supabase.com/docs/guides/auth/rate-limits
