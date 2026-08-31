@@ -1,0 +1,142 @@
+---
+title: "Flint 2 VAP durability: why UCI SSIDs vanish on reboot and how to fix it"
+description: "The GL.iNet Flint 2 firmware builds WiFi from two independent provisioning layers - MediaTek's .dat-driven configurator and OpenWrt's UCI wifi stack - that do not talk to each other. VAPs added outside the GL UI silently disappear on the next reboot. This reference explains the mechanism, the failure chain that killed the IoT SSID on this rig, and the two init scripts that make every UCI VAP survive any number of restarts."
+author: Erfi Anugrah
+category: homelab
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+A GL.iNet Flint 2 running firmware 4.9.1 with an IoT SSID added via UCI. The SSID works. Someone reboots the router. The SSID is gone: the VAP interface reports `ESSID: unknown`, `Access Point: 00:00:00:00:00:00`, and every IoT device loses contact.
+
+This is not a GL.iNet bug, exactly. It is the result of two WiFi provisioning layers that run at different boot stages and read different configuration sources. Understanding the two layers is the difference between a UCI VAP that dies on the first reboot and one that survives indefinitely.
+
+**Provenance.** Everything marked measured was observed on this rig, 2026-08-31: a GL.iNet Flint 2 (GL-MT6000) running firmware 4.9.1 with the proprietary MediaTek SDK driver (`mt_wifi`), operating as a dumb L2 access point behind a separate edge router. The IoT SSID on VAP `ra2` was the subject; the diagnosis, fix, and verification all ran live over SSH. The init scripts have survived two deliberate reboots and continue to function.
+
+**TL;DR:**
+
+- The Flint 2's WiFi comes from **two independent provisioning layers**: `mtk-wifi-configurator` (START=15, reads `.dat` template files) creates the factory VAPs (ERLIS, ERLIS-5G, mesh backhaul); the standard OpenWrt `wifi` stack (START=20, reads UCI) creates everything else. They do not share state.
+- A VAP added via the GL.iNet UI or UCI (like `iot2g`/`home-iot`) is invisible to the configurator. On reboot, the configurator runs first and only creates what is in its templates. The standard `wifi` stack runs second but can only bring up VAPs that the configurator has not corrupted the radio state for.
+- The fix is **two init scripts**: one at START=14 that provides missing template files the configurator's init script expects, and one at START=20 that calls `/sbin/wifi` to bring up all UCI VAPs after the configurator has finished. Both are 6-line shell scripts enabled as rc.d symlinks; they live on the writable overlay and survive firmware updates.
+
+---
+
+## The two provisioning layers
+
+The Flint 2, on GL.iNet firmware 4.9.1, uses the proprietary MediaTek SDK driver (`mt_wifi` + `mtk_warp`/`mtkhnat` offload) rather than mainline mt76. This driver comes with its own provisioning toolchain that runs alongside - but independently of - the standard OpenWrt `wifi` stack.
+
+| Layer | Boot order | Config source | What it creates |
+|---|---|---|---|
+| `mtk-wifi-configurator` | START=15 | `.dat` template files under `/etc/wireless/mediatek/` | Factory VAPs: `ra0` (ERLIS 2.4G), `rax0` (ERLIS-5G), `ra1`/`rax1` (mesh backhaul) |
+| Standard OpenWrt `wifi` | START=20 | UCI (`/etc/config/wireless`) | Everything else: any VAP added via the GL.iNet UI, LuCI, or raw `uci set` |
+
+The configurator reads `.dat` templates - proprietary key-value files with hundreds of fields including embedded radio calibration data. It does not read UCI. The standard `wifi` stack reads UCI and does not read `.dat` templates. Neither layer knows the other exists.
+
+This worked on the initial install because both layers were run manually in sequence (`wifi reload` triggers both). It broke on the first reboot because the configurator's init script crashed, leaving the radio in a state where the standard `wifi` stack could not initialise additional VAPs.
+
+## The failure chain
+
+On 2026-08-31, the Flint 2 was rebooted. The IoT SSID vanished. The diagnosis took three passes:
+
+### 1. The configurator crashed silently
+
+The `mtk-wifi-configurator` init script (`/etc/init.d/mtk-wifi-configurator`) runs this at every boot, before anything else:
+
+```sh
+sed -i 's/VHT_BW=2/VHT_BW=1/' /etc/wireless/mediatek/mt7981.dbdc.b1.dat
+```
+
+The file `/etc/wireless/mediatek/mt7981.dbdc.b1.dat` did not exist on this Flint. The factory image ships `mt7986-ax6000.dbdc.b*.dat` - templates for the AX6000 chipset profile - but the init script references the `mt7981` chipset name. The `sed` failed silently (`ash` on OpenWrt 21.02 does not exit non-zero on a missing sed target), and the configurator started with only the factory-default VAP:
+
+- `ra0`: `ESSID: "MTK_MT7986_AP_AX6000_2.4G"`, channel 6 (auto)
+- `ra1`: `ESSID: unknown`, `Access Point: 00:00:00:00:00:00`
+- `ra2`: `ESSID: unknown`, `Access Point: 00:00:00:00:00:00`
+
+The main household SSIDs (ERLIS on `ra0`, ERLIS-5G on `rax0`) were also gone, replaced by a factory default SSID. This was measured: `iwinfo ra0 info` returned `ESSID: "MTK_MT7986_AP_AX6000_2.4G"`, and a phone scan confirmed the factory network was beaconing on channel 6.
+
+### 2. A phantom UCI section blocked the wifi stack
+
+An `iot_new` section existed in UCI - a leftover from a password rotation the previous day. It shadowed the real `iot2g` section. When the standard `wifi` stack tried to bring up `ra2` from UCI, it saw two sections competing for the same VAP slot and failed.
+
+The phantom was identified by `uci show wireless | grep iot_new` and removed with `uci delete wireless.iot_new`.
+
+### 3. The configurator owns startup ordering
+
+Even after the phantom was deleted, `ra2` stayed dead. The configurator (START=15) had already initialised the radio before the standard `wifi` stack (START=20) ran. When the configurator crashes, it leaves the radio in a partially-initialised state with `retry_setup_failed: true`. Once in this state, the standard `wifi` stack cannot bring up additional VAPs until the configurator itself is restarted - a restart that only happens on the next boot.
+
+The measured evidence: `ubus call network.wireless status` returned `"up": false, "retry_setup_failed": true` for the radio; calling `wifi` directly had no effect. Only restarting the configurator with `/etc/init.d/mtk-wifi-configurator stop && sleep 2 && /etc/init.d/mtk-wifi-configurator start`, then calling `wifi`, brought `ra2` up.
+
+## The fix
+
+Two init scripts were written and enabled on the Flint. Together they handle both the missing-template crash and the VAP bring-up gap.
+
+### Template file provision (START=14)
+
+Runs before the configurator. Copies the missing `mt7981.*` template files from the AX6000 originals so the configurator's `sed` succeeds:
+
+```sh
+#!/bin/sh /etc/rc.common
+START=14
+
+start() {
+	cd /etc/wireless/mediatek
+	cp -n mt7986-ax6000.dbdc.b0.dat mt7981.dbdc.b0.dat 2>/dev/null
+	cp -n mt7986-ax6000.dbdc.b1.dat mt7981.dbdc.b1.dat 2>/dev/null
+}
+```
+
+`cp -n` (no-clobber) preserves the files across the configurator's own rewrites - the configurator may modify `mt7981.dbdc.b*.dat` in place on subsequent boots, and the init should not overwrite those modifications.
+
+### UCI VAP bring-up (START=20)
+
+Runs after the configurator. Brings up every VAP defined in UCI:
+
+```sh
+#!/bin/sh /etc/rc.common
+START=20
+
+start() {
+	/sbin/wifi
+}
+```
+
+This is the standard OpenWrt VAP initialisation path. It runs last in the boot sequence for wireless, ensuring every UCI-defined VAP is alive regardless of what the configurator did.
+
+Both scripts are enabled via `rc.d` symlinks and live on the writable overlay (`/etc/init.d/`), so they survive GL.iNet firmware updates that preserve the overlay. Verified across two deliberate reboots: the SSID came up on `ra2` with all IoT clients reassociating within 30 seconds.
+
+## Verification
+
+After any reboot, three checks confirm the fix is in place:
+
+```bash
+# 1. All three inits are active
+for s in mt7981-template mtk-wifi-configurator wifi-uci-vaps; do
+  /etc/init.d/$s enabled && echo "$s: enabled" || echo "$s: MISSING"
+done
+
+# 2. ra2 is up with the correct SSID
+iwinfo ra2 info | grep ESSID  # expect: the IoT SSID
+
+# 3. Clients are associated
+iwinfo ra2 assoclist | grep -c dBm  # expect: client count > 0
+```
+
+## What NOT to do
+
+**Do not edit `/etc/wireless/mediatek/*.dat` templates to add VAPs.** These files contain embedded radio calibration data and hundreds of proprietary key-value pairs. A syntax error or wrong field kills the radio silently until a factory reset. The GL.iNet forum has multiple threads where users tried this path and recovered only through the reset button.[^gl-vlan-forum]
+
+**Do not delete `iot2g` from UCI and recreate it.** The GL.iNet admin UI and some firmware operations can leave phantom sections behind. Deleting the phantom (`uci delete wireless.iot_new`) and keeping the original `iot2g` is the safe path - creating a fresh section risks the same collision on the next UI edit.
+
+**Do not run `esphome` builds as root on a Pi that hosts the ESPHome dashboard.** A root-run build (`sudo esphome run`) drops root-owned files into the build tree that the sandboxed dashboard user cannot clean, producing a generic PlatformIO "unexpected error" banner and a stuck build process. The fix is `sudo chown -R esphome:esphome /var/lib/esphome/.esphome/build`.[^esphome-build]
+
+**Do not rely on `iw dev ra2 station dump` for client counts on this firmware.** The MediaTek SDK driver's `iw` interface does not populate station data. Use `iwinfo ra2 assoclist` instead.
+
+## What generalises
+
+This pattern applies to any GL.iNet router on the MediaTek SDK firmware (4.x series, Flint/Flint 2/Beryl AX class devices) where additional SSIDs are added outside the GL admin UI. The two-layer provisioning model is a GL.iNet-specific architecture, not an OpenWrt standard - mainline OpenWrt uses `wifi` alone. If the Flint eventually moves to the "open" firmware track (mainline mt76, GL's op24 builds), this entire mechanism becomes unnecessary: mt76 reads UCI directly and the configurator does not exist.[^gl-op24]
+
+The two init scripts are minimal and general: the template-fix script at START=14 only matters if the configurator's init script references files the factory image does not ship, and the UCI-VAP script at START=20 is the standard OpenWrt VAP initialisation path that would run anyway - it just needs to be explicit because the configurator's early initialisation can preempt it otherwise.
+
+[^gl-vlan-forum]: GL.iNet forum user reports of ".dat editing as a last resort" and VLAN/VAP persistence after reboot. https://forum.gl-inet.com/t/flint-2-gl-mt6000-vlan-setup/59103
+[^gl-op24]: GL.iNet open-source firmware builds (mt76-based) for the MT6000. https://dl.gl-inet.com/router/mt6000/open
+[^esphome-build]: Observed 2026-08-30 during a fleet WiFi password rotation. The root-owned build tree blocked the ESPHome dashboard's bwrap-sandboxed builds with EPERM on cleanup.
