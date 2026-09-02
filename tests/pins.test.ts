@@ -757,8 +757,13 @@ const pins: Pin[] = [
     mustContain: [
       // 4.2: the measured negative replaces the old "untested" hedge.
       "zero changes stream at any tested size",
-      // 4.2: the backfill caveat - admin API cannot carry password_hash.
-      "password_hash` is not portable via the admin API",
+      // 4.2: the backfill path. This pin used to guard "not portable via the
+      // admin API" (W09, 2026-08-15); tenant-consolidation C03 (2026-08-04)
+      // had already measured the admin API accepting a bcrypt password_hash
+      // with the original password working, and the end-to-end auth
+      // reference (2026-09-02) reconciled the two. The corrected sentence is
+      // pinned so the retracted claim cannot come back.
+      "accepts the source's bcrypt `password_hash`",
       // 4.2: the enterprise IdP escape hatch.
       "is an external IdP",
       // 4.1 Aside: standby-first DDL ordering with the resume number.
@@ -864,6 +869,56 @@ const pins: Pin[] = [
       "reference/supabase-incident-resilience",
       "reference/supabase-multi-tenant-placement",
       "reference/supabase-data-surface-lockdown",
+    ],
+  },
+  {
+    doc: "reference/supabase-auth-end-to-end",
+    mustContain: [
+      // The verifier asymmetry the self-hosted run found: PostgREST refuses an
+      // HS256 token carrying any kid, GoTrue accepts it. Reproduced on three
+      // projects; if this softens to "kid mismatch", the no-kid rule is lost.
+      "HS256 token carrying a `kid`",
+      "must leave the header without a `kid`",
+      // The role fact that makes the self-hosting compose file wrong on a
+      // managed project, with the platform's own error text.
+      "is a reserved role, only superusers can modify it",
+      "search_path=auth",
+      // Revoke timing and the collateral, measured together; the range is
+      // stated because three projects gave three values.
+      "3 s, 6 s and 4 s on three projects",
+      "the same self-hosted token was refused by the managed",
+      "legacy `anon` API key answered 401",
+      // The correction to two earlier docs: bcrypt password_hash IS portable
+      // via the admin API (consolidation C03). Pinned so the old claim cannot
+      // creep back through a merge of older prose.
+      "accepts a bcrypt `password_hash` as-is",
+      // Refresh tokens belong to the issuer - the verbatim refusal body.
+      "refresh_token_not_found",
+      // The cache-window numbers that make the rotation warning concrete.
+      "282 probes in 37 minutes",
+      "116 probes in 20 minutes",
+    ],
+    mustNotContain: [
+      // The retracted claim.
+      "is not portable via the admin API",
+    ],
+    sections: [
+      /^## Which shape do I pick$/m,
+      /^## Where the docs disagree with runtime$/m,
+      /^## Reading the numbers$/m,
+      /^## Evidence$/m,
+    ],
+    linksTo: [
+      "reference/supabase-incident-resilience",
+      "reference/rls-without-supabase-auth",
+      "reference/supabase-data-surface-lockdown",
+      "reference/pbkdf2-supabase-auth-migration",
+      "reference/supabase-multi-tenant-placement",
+      "guides/supabase-iap-data-api",
+      "guides/supabase-shared-tenancy",
+      "guides/supabase-tenant-promotion",
+      "guides/supabase-tenant-consolidation",
+      "guides/supabase-own-postgrest",
     ],
   },
 ];
