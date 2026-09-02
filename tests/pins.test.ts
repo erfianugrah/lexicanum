@@ -827,6 +827,45 @@ const pins: Pin[] = [
     ],
     linksTo: ["reference/home-iot-network", "guides/airgradient-one-esphome-local"],
   },
+  {
+    doc: "reference/supabase-edge-function-limits",
+    mustContain: [
+      // The genuine size rejection is a 413 with this body on BOTH paths. An
+      // earlier draft quoted a different error string that never appeared; if
+      // this softens to "a size error", the 413-under-parallelism caveat loses
+      // its point.
+      "413 request entity too large",
+      // Silent loss reproduced with no throttle visible. The two ratios are
+      // one run's numbers and must stay next to their denominators.
+      "10 of 24",
+      "9 of 24",
+      // The value ceiling counts characters; the docs' two figures are one
+      // number in two units. This corrected a draft that tested at exactly
+      // 48 KiB and could not tell the units apart.
+      "73,728 bytes",
+      // Platform SUPABASE_* rows do not count toward the 100 - a run that
+      // counted them read the ceiling wrong.
+      "do not count toward the 100",
+      // The restriction that did not hold. Two runs, TCP connect only.
+      "Port 587",
+      // Both runtime ceilings return one code.
+      "546 WORKER_RESOURCE_LIMIT",
+    ],
+    mustNotContain: [
+      // The error string the platform did not return.
+      "exceeds the maximum deployment size",
+    ],
+    sections: [
+      /^## Where the docs disagree with runtime$/m,
+      /^## Reading the numbers$/m,
+      /^## Evidence, by module$/m,
+    ],
+    linksTo: [
+      "reference/supabase-incident-resilience",
+      "reference/supabase-multi-tenant-placement",
+      "reference/supabase-data-surface-lockdown",
+    ],
+  },
 ];
 
 describe.each(pins.map((p) => [p.doc, p] as const))("%s", (_name, pin) => {
