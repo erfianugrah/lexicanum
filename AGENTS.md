@@ -215,6 +215,12 @@ Cite the source path when answering from docs.erfi.io in chat, too.
   Without `bgcolor="transparent"` Graphviz emits a white graph polygon and the
   diagram renders as a white card with low-contrast text in dark mode. Never set
   color/fill/fontcolor attributes on individual nodes or edges.
+- **Every `dot` decision diagram gets a text fallback** directly under it: a
+  numbered list or a table saying the same thing. Reviewers, search indexers
+  and anything fetching the page as text get the node labels run together
+  (`"deploys are breaking"1. the error string2. deploys in flight...`), which
+  turns the most useful section into noise. Learned on
+  `reference/supabase-edge-function-limits` (2026-09-02).
 
 ## Conformance
 
@@ -294,6 +300,29 @@ Run `bun run build` and confirm:
 Cite the method in prose: an evidence table with a "How it was checked" column that
 splits measured from documented-but-not-tested. That split is the contract with the
 reader, and it is maintained by hand.
+
+Four rules that three review passes on 2026-09-02 kept re-deriving, now fixed:
+
+- **Quote numbers by paste, not recall.** The lab renders a run artifact as
+  tables (`pvlab --facts run.json --only EF08`) and publishes a redacted copy
+  under `experiments/<name>/out/<date>/`. Every retyped figure that day was
+  wrong somewhere (12,022 for a recorded 12,019; a per-second rate in the wrong
+  unit; a 15 s pass band quoted as the measurement). Copy from the facts table.
+- **Name the side, the key and the project on every measured row** when the
+  doc has more than one of them (managed vs self-hosted GoTrue; PostgREST vs
+  GoTrue as verifier; ES256 vs legacy HS256 signing key vs API key; project 1
+  of 4). A reader must not reconstruct which one a number belongs to.
+- **A docs-vs-runtime table row states whether the disagreement has been
+  filed upstream**, or the table carries one line saying none has. That is what
+  tells a reader whether to expect the docs to change.
+- **Evidence links pin to a commit** (`/tree/<sha>/...`, never `/tree/main/`)
+  and point at the published `out/` artifact where one exists, so module ids in
+  the evidence table stay resolvable after the lab moves on.
+
+The `lab-writeup` skill carries the full pre-publish checklist (ambiguity
+classes, provenance, sweeps) and the reviewer brief. Three of its regex-able
+rows gate the build via `LLM_MARKERS` (`undated-earlier-run`,
+`pass-band-as-measurement`, `unsourced-reported-to`).
 
 Resist tooling it. An earlier attempt mapped published claims to ids in a private lab
 ledger, vendored a public status snapshot so CI could resolve them, and added a
