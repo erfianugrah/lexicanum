@@ -859,8 +859,11 @@ const pins: Pin[] = [
       // refusal was this code; the active wall clock cut and the truncation
       // marker are the two figures that turn "not run" rows into measured ones.
       "RATE_LIMIT_EXCEEDED",
-      "cut after 395 s",
+      "last tick at 395 s",
       "....[truncated]",
+      // The docs define the wall clock per worker; the page must keep saying
+      // the single-request run does not cover a shared warm worker.
+      "the shared-worker case not run",
     ],
     mustNotContain: [
       // The error string the platform did not return.
