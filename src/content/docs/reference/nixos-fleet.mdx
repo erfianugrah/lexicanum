@@ -1,0 +1,241 @@
+---
+title: "Three NixOS hosts, one deploy interface"
+description: A small NixOS fleet - edge router, ZFS NAS, ARM home-automation Pi - sharing profiles through a library flake rather than a monorepo, with a uniform make deploy, per-host deploy keys, and gates that assert runtime state rather than trusting a green rebuild. Includes the mixed-architecture cache trap and the conventions each incident produced.
+author: Erfi Anugrah
+category: homelab
+featured: true
+blurb: "A green switch is not proof the machine changed. Every convention here is a scar."
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Three NixOS machines with almost nothing in common: an x86 edge router that does DHCP, NAT and VLAN trunking; an x86 NAS running ZFS and a Docker media stack; an ARM Raspberry Pi running Home Assistant. They share a timezone, a shell, an SSH policy and a deploy interface, and they share those through a library flake that owns no host.
+
+This is what that shape looks like in practice, why the obvious alternative was rejected, and the conventions that came out of breaking it.
+
+<Aside type="note" title="Provenance">
+  One fleet, built and operated between July and September 2026. Every Makefile target, profile name, check name and incident date below is read from the live repositories. Configuration is NixOS 26.05 across all three hosts, each on its own nixpkgs pin. Where a rule exists because something broke, the date of the breakage is given - that is the evidence for the rule.
+</Aside>
+
+**TL;DR:**
+
+- **A library flake, not a monorepo.** Shared profiles live in one repository that declares no `nixosConfigurations`. Hosts consume it as a flake input with `inputs.nixpkgs.follows`, so each builds shared code against its own pin and upgrades when it chooses.
+- **The host's checkout is a cache, never an edit surface.** Every deploy does `git fetch && git reset --hard origin/main`, so anything edited on the machine is destroyed silently. `origin/main` is the only source of truth.
+- **A green `nixos-rebuild switch` does not prove the live state changed.** Options that are only applied when present - MTU is the canonical one - keep their old runtime value forever after you delete the declaration. Assert the runtime value, not the exit code.
+- **Mixed architecture is a build hazard, not a portability one.** A package with no aarch64 substitute gets compiled on the target, and a source build runs a test suite the cached x86 build never ran. That took a Pi's rebuild down while every eval was green.
+- **Each host carries a read-only, repo-scoped deploy key that never leaves it**, reached through a per-host SSH alias.
+
+---
+
+## The fleet
+
+| Host | Role | Arch | Checkout on host | Deploy gate |
+|---|---|---|---|---|
+| router | Edge: DHCP, nftables NAT and firewall, VLANs, syslog fan-out, resolver | x86_64 | `/etc/nixos`, as root | `eaves doctor`, 16 checks, after switch |
+| servarr | NAS: ZFS pools, Docker media stack, GPU transcoding, SMB | x86_64 | `/etc/nixos`, as root | 9-assertion acceptance eval, before push |
+| hearth | Home Assistant and ESPHome hub, NTP for the IoT VLAN | aarch64 | `~/hearth`, as a user with sudo | none yet |
+
+A fourth machine, the development workstation, is not NixOS and never builds a host: it has `nix` for evaluation only, with no daemon and no `nixos-rebuild`. Every host builds its own system natively. That constraint shapes the gates below more than anything else.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.8;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  dev [label="Dev workstation\neval only, no nixos-rebuild", style=rounded];
+  gh [label="GitHub\norigin/main per host", shape=cylinder];
+  fleet [label="nixos-fleet\nlibrary flake, owns no host", shape=cylinder];
+
+  router [label="router\nx86_64"];
+  servarr [label="servarr\nx86_64"];
+  hearth [label="hearth\naarch64"];
+
+  dev -> gh [label="make deploy: eval, then push"];
+  gh -> router [label="fetch + reset --hard"];
+  gh -> servarr [label="fetch + reset --hard"];
+  gh -> hearth [label="pull --ff-only"];
+  fleet -> router [label="flake input"];
+  fleet -> servarr [label="flake input"];
+  fleet -> hearth [label="flake input"];
+}
+```
+
+---
+
+## A library, not a monorepo
+
+The first design for this was a monorepo: all three hosts in one repository, one `flake.lock`, one place to change a shared setting. That was reversed the same day it was decided, on the observation that almost nothing in these configurations is reusable. The Pi's home-automation module is over two thousand lines of Home Assistant templates and dashboards. The router's value is its nftables, DHCP and VLAN block. The NAS's is ZFS, disko and NVIDIA. Putting those in one repository puts every host's configuration in every host's checkout and buys nothing.
+
+The shared surface turned out to be small and boring: timezone, locale, garbage-collection policy, a shell toolchain, an SSH and user policy, a tailnet DNS map, a node exporter. That is a library.
+
+There is a second reason, and it is the one that matters at 3am. A single `flake.lock` forces every host onto the same nixpkgs commit. The router pins deliberately and does not want to move because the Pi wants a newer CLI tool. As a library with `inputs.nixpkgs.follows`, shared profiles are built against **the consuming host's** pin, and each host bumps the fleet input when it chooses. Per-host version skew stops being a problem and becomes the point. The cost is that a shared change needs a bump and a deploy per host, which is the accepted trade.
+
+The library exports six profiles plus a `default` that imports all of them:
+
+| Profile | Carries |
+|---|---|
+| `base` | Timezone, locale, Nix experimental features, weekly GC with a 30-day cutoff. Deliberately does **not** set `system.stateVersion` |
+| `shell` | Binaries only: zsh, tmux, direnv, fzf, the modern CLI set. No dotfiles - those come from the existing stow flow |
+| `admin` | Key-only sshd, the admin user and groups, tailscale, an optional root-key backstop, all behind `fleet.admin.*` options |
+| `net` | The explicit-MTU doctrine and `fleet.net.defaultMtu`. Deliberately empty of interface definitions |
+| `tailnet` | Tailscale flags, a resolver default, a node map in `/etc/hosts` |
+| `observability` | Node exporter, enabled and ported with `lib.mkDefault` |
+
+Consuming it:
+
+```nix
+inputs.fleet = {
+  url = "git+ssh://git@gh-fleet/<org>/nixos-fleet";
+  inputs.nixpkgs.follows = "nixpkgs";   # build against THIS host's pin
+};
+
+outputs = { nixpkgs, fleet, ... }: {
+  nixosConfigurations.<host> = nixpkgs.lib.nixosSystem {
+    modules = [ fleet.nixosModules.default ./configuration.nix ];
+  };
+};
+```
+
+Two conventions keep the library composable. Everything a host might tighten is `lib.mkDefault`, because one host sets a stricter `PermitRootLogin` on top of the admin profile and without `mkDefault` that is a definition conflict rather than an override. And `system.stateVersion` stays per-host forever, because it encodes each machine's install vintage and means nothing shared.
+
+Adoption was incremental rather than a flag day: the Pi took the full default profile first, then the NAS took `shell` and later the default, then the router took `shell` only. The router still runs its own sshd, tailscale and networking, which predate the library by months. Partial adoption is a legitimate end state - the library is there to remove duplication, not to win completeness.
+
+---
+
+## The mixed-architecture cache trap
+
+<Aside type="caution" title="Measured, 2026-08-26">
+  A whole-host evaluation was green. Both architectures' eval checks were green. `nix flake check` was green. The Pi's `nixos-rebuild` then failed, because a package in the shared shell profile had no aarch64 substitute in the binary cache, got compiled on the Pi, and its test suite failed on ARM with 14 failures.
+</Aside>
+
+This is the failure mode that makes mixed-architecture fleets different, and evaluation cannot catch it. Evaluation proves the configuration is well-formed. It says nothing about whether the resulting store paths exist in a cache, and an uncached path on the slow ARM host is not merely slow - it runs a test suite that the cached x86 build never executed on that architecture.
+
+The check is to ask the cache directly, before deploying:
+
+```
+make cache    # evaluates systemPackages store paths for aarch64,
+              # then queries the binary cache for each narinfo
+```
+
+It reports every package with no substitute and exits non-zero on anything unexpected. Two entries are always uncacheable and filtered as benign, both host-specific trivial builds with no test suite. The fix for the offending package was to gate it to x86 in the profile rather than drop it fleet-wide:
+
+```nix
+x86Only = lib.optionals pkgs.stdenv.hostPlatform.isx86_64 (with pkgs; [ glances ]);
+```
+
+A related wrinkle: the library exposes its evaluation checks as a plain attribute rather than as flake `checks`. A flake check must be a derivation to *build*, and building a NixOS system derivation is impossible on a single-user, daemon-less, x86-only workstation - especially the aarch64 one. Naming it `checks` would have produced a `nix flake check` that cannot run where it is needed.
+
+---
+
+## The deploy interface
+
+All three hosts expose the same three targets. Always `make`, never a hand-rolled SSH command.
+
+```
+make check     # evaluate the host's toplevel derivation path, locally
+make diff      # push, then dry-build on the host
+make deploy    # gate, push, then fetch + reset + switch on the host
+```
+
+`make deploy` on the NAS expands to, in order:
+
+1. Refuse if the working tree is dirty or uncommitted.
+2. Run the acceptance evaluation and require every assertion true.
+3. `git push`.
+4. On the host: `cd /etc/nixos && git fetch origin && git reset --hard origin/main && nixos-rebuild switch --flake .#servarr`.
+
+The router is the same shape with `eaves doctor` appended after the switch instead of an acceptance gate before the push.
+
+Step 4 is the important one. The host's checkout is **force-reset to `origin/main` on every deploy**, which means anything edited on the machine is destroyed without a warning. That is deliberate: it makes `origin/main` the only source of truth and removes the failure mode that preceded it, where two manually mirrored copies of a file drifted and an edit to the wrong one no-opped silently through a green rebuild.
+
+Each host authenticates to GitHub with its own read-only, repository-scoped deploy key, reached through a per-host SSH alias, with the private key never leaving the machine. Regenerating one takes about thirty seconds, so they are not worth escrowing - unlike the sops age keys, which are. Verify with `ssh <host> 'ssh -T git@gh-<host>'` and expect "successfully authenticated". A remote left as plain `git@github.com` is a latent bug: it works by default-key probing and breaks the moment a second key appears on the box.
+
+### Divergence that remains
+
+The Pi's Makefile is not the same. It uses `git pull --ff-only` rather than fetch-and-reset, `dry-activate` rather than `dry-build`, has no clean-tree gate and no post-switch health check. That is real drift, not a design choice, and writing it down is more useful than pretending the fleet is uniform. Uniformity is the direction of travel; three hosts converged on the same three verbs first, and the internals are converging behind them.
+
+---
+
+## Gates: what actually gets asserted
+
+Three different gates for three different risk profiles, and none of them is "the rebuild exited zero".
+
+**Evaluation, on the workstation.** `make check` evaluates the host's toplevel derivation path. It catches syntax and type errors and nothing else. The rule it enforces: never let a syntax error be discovered by an activation.
+
+**Acceptance assertions, before the push.** The NAS carries a small evaluation that returns a set of booleans about the *configuration that is about to ship*: hostname correct, `hostId` non-null, ZFS in supported filesystems, Docker on, the NVIDIA toolkit on, sanoid on, tailscale on, sshd on, and the static address present on some interface. The deploy pipes it through a check that every value is true. It runs on the router rather than the workstation, because the workstation's Nix is single-user and cannot evaluate it the same way - a constraint worth designing around rather than fighting.
+
+**Runtime health, after the switch.** The router runs a 16-check doctor as the last step of every deploy, and hourly on a timer. The checks are all runtime assertions rather than configuration reads: forwarding enabled, WAN link up, nftables default policies, conntrack accept rule present, NAT masquerade present, DHCP running and its topology sane, no orphan VLANs, conntrack headroom, resolver running, Docker's NAT rules intact, the `/etc/nixos` checkout at the expected commit, trunk link state and trunk error counters. It exits non-zero on any failure and can run entirely offline against recorded fixtures, which is what makes it testable rather than merely runnable.
+
+The checkout-commit check inside the doctor is the one people skip and should not. It is what catches a deploy that pushed but did not land.
+
+---
+
+## A green switch is not proof
+
+The most expensive lesson in this fleet is that `nixos-rebuild switch` exiting zero says the *system closure* was activated. It does not say every runtime value now matches the declaration.
+
+**MTU is the canonical case.** networkd and the NixOS activation manage MTU only when the option is present. Deleting the option does not restore the default - it stops managing the value, and the last one set lives on the interface indefinitely. On 2026-08-26 a jumbo-frame revert left the router's trunk at 9014 and the NAS's NIC at 9000 through repeated green rebuilds, until both were corrected by hand. The convention that came out of it:
+
+> Declare MTU explicitly, even when it equals the default 1500.
+
+Generalise it past MTU: any option where absence means "stop managing" rather than "restore the default" needs an explicit declaration. Deleting a line is not the same as setting it back.
+
+**A second shape of the same problem:** a networkd `.link` drop-in applies at device initialisation, so it takes effect at boot and a later `switch` does not re-apply it. Tuning a NIC ring buffer that way leaves the running kernel on the old value until the next reboot, with a green deploy in between. The fix is a oneshot unit that pushes the value at switch time, which is less declarative-looking and actually converges.
+
+So the discipline is: after a deploy that changes runtime state, assert the runtime state. `ip -o link show` for link properties, the doctor for the router, `git log --oneline -1` in the host checkout to confirm the commit that landed.
+
+---
+
+## Rollback, and what it does not cover
+
+```sh
+ssh <host> 'sudo nixos-rebuild switch --rollback'
+ssh <host> 'nix-env --list-generations --profile /nix/var/nix/profiles/system'
+```
+
+For a machine that will not boot, pick the previous generation from the boot menu at the console. `git revert` plus a redeploy is the equivalent from the other end, and is preferable when the bad change is already on `origin/main`.
+
+Generations roll back *configuration*. They do not roll back state, and the distinction is where people lose data. A generation switch will not restore a ZFS dataset, a database, a Docker volume, or Home Assistant's stored entity registry. On the NAS this is explicit in the snapshot policy: the root dataset is deliberately unsnapshotted precisely because the Nix store makes it stateless, while the datasets holding live state carry their own snapshot templates and nightly dumps. Two different recovery mechanisms for two different kinds of loss - see [ZFS on NixOS](/reference/zfs-on-nixos/) for how that side is arranged.
+
+The Pi has a third mechanism that generalises to any remote machine: it boots from USB with the original SD card still in the slot, so pulling the SSD reverts the entire machine to its pre-NixOS state without a site visit. It was used twice during the migration.
+
+---
+
+## Conventions, and the incident behind each
+
+| Convention | Why |
+|---|---|
+| Declare MTU explicitly, even at the default | 2026-08-26: a jumbo revert left two hosts on stale MTUs through green rebuilds |
+| The host checkout is a cache, never an edit surface | Force-reset destroys on-box edits; the predecessor workflow drifted two mirrored copies |
+| Per-host, repo-scoped, read-only deploy key that never leaves the box | A shared or default key breaks the moment a second key appears |
+| Evaluate before activating | A syntax error should never be found by an activation |
+| sops-nix, per-host age key on the machine, escrowed offline | No plaintext in any repository; the age keys are the escrow-worthy secret, not the deploy keys |
+| A green switch is not proof - assert runtime values | The MTU and ring-buffer cases above |
+| Always deploy through the flake | A bare non-flake rebuild silently drops a module and produces a system missing it |
+| Never blanket-stow dotfiles onto a fleet host | The dotfiles tree carries `.ssh`, which would replace the host's SSH config and destroy the alias the flake input depends on |
+| Check the binary cache for the minority architecture before deploying | The 2026-08-26 ARM test-suite failure |
+| `lib.mkDefault` in shared profiles for anything a host may tighten | Otherwise a host override is a definition conflict |
+| `system.stateVersion` stays per-host | It encodes install vintage and is meaningless shared |
+
+---
+
+## Evidence
+
+| Claim | How it was checked | Status |
+|---|---|---|
+| Deploy force-resets the host checkout | The Makefile target's SSH command chain | Documented in-repo |
+| Acceptance evaluation asserts 9 booleans and gates the push | The acceptance expression and the wrapper script | Documented in-repo |
+| The router doctor is 16 runtime checks, offline-capable | The check registry in the tool's source | Documented in-repo |
+| MTU persists after the declaration is deleted | 2026-08-26, two hosts, corrected by hand after green rebuilds | Measured |
+| An uncached aarch64 package fails a rebuild that evaluates clean | 2026-08-26, 14 ARM test failures while all evals were green | Measured |
+| Shared profiles build against the consuming host's pin | `inputs.nixpkgs.follows` in each host flake; each host's lock carries a different nixpkgs revision | Documented in-repo |
+| The workstation cannot build a host system | Single-user Nix, no daemon, x86-only; the acceptance eval runs on the router instead | Measured |
+| Generation rollback does not restore data | Design statement in the storage policy; the root dataset is unsnapshotted by intent | Documented in-repo |
+
+## Related docs
+
+- [ZFS on NixOS](/reference/zfs-on-nixos/) - the NAS's storage layer, mount ownership, and why a rebuild once unmounted three datasets.
+- [Migrating a NAS without losing a byte](/guides/nas-bulk-data-migration/) - the data migration that produced the NAS host.
+- [Tailscale homelab](/reference/tailscale-homelab/) - the network these deploys travel over.
