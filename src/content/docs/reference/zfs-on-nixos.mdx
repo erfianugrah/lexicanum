@@ -1,0 +1,321 @@
+---
+title: "ZFS on NixOS: who owns the mount"
+description: How ZFS datasets actually get imported and mounted on NixOS - the three mount patterns and which to pick, why a fileSystems entry is what causes a pool to be imported at all, and the systemd reexec that unmounts non-legacy datasets and cannot put them back. Built from a three-pool 76TB NAS and the incidents it produced.
+author: Erfi Anugrah
+category: homelab
+featured: true
+blurb: "Two mount managers, one mountpoint. Which one wins decides whether a rebuild survives."
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+ZFS manages its own mountpoints. So does systemd. On NixOS both are active at once, and the question of which one owns a given dataset is answered by one option in a `fileSystems` entry. Get it wrong and the system boots fine, runs fine for weeks, and then unmounts your data during an unrelated rebuild.
+
+This is the reference for that decision: the three sanctioned patterns, what each does at boot and during a reconfiguration, and the pool and dataset design underneath. It is the sibling to [Migrating a NAS without losing a byte](/guides/nas-bulk-data-migration/), which is how the data got onto this pool, and to [Three NixOS hosts, one deploy interface](/reference/nixos-fleet/), which is how the configuration reaches the machine.
+
+<Aside type="note" title="Provenance">
+  One host: a 7-wide raidz2 HDD pool plus two NVMe pools, 64GB RAM, NixOS 26.05, OpenZFS 2.4.3, migrated off Unraid in August 2026. Every number and unit name below was read off that machine on 2026-09-02 unless marked otherwise, and the failure modes are ones it hit - each is dated. Behaviour attributed to OpenZFS or nixpkgs is cited to the man page or the module source; behaviour seen only on this host is labelled measured. The [evidence table](#evidence) splits the two.
+</Aside>
+
+**TL;DR:**
+
+- A `fileSystems` entry is not only a mount declaration. nixpkgs derives the set of pools to import **from those entries**, so a pool with no entry and no `boot.zfs.extraPools` is never imported at boot.
+- On a non-legacy dataset the mount unit needs `options = [ "zfsutil" ]`. Without it the unit silently adopts the mount ZFS already made at boot, and works - until something restarts it.
+- `nixos-rebuild switch` can trigger a systemd reexec, which restarts every loaded mount unit: unmount, then remount. The remount runs `mount(2)`, which the ZFS kernel handler refuses for a non-legacy dataset. Three datasets went down for ten minutes this way on 2026-09-02.
+- Snapshotting the dataset you declared is not the same as snapshotting the one the data is on. This host snapshotted two empty datasets for two weeks while 35GB of live databases sat on the pool root with no coverage.
+- NVMe pools created without an explicit `ashift` can land on `ashift=9`. Both of this host's NVMe pools did. It is fixed only by recreating the pool.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_boot {
+    label="Boot path"; style=rounded; fontsize=12; margin=12;
+    initrd [label="initrd\nimports root pool"];
+    impunit [label="zfs-import-POOL.service\ngenerated, one per data pool"];
+    mountunit [label="POOL-DATASET.mount\ngenerated from /etc/fstab"];
+    zfsmount [label="zfs-mount.service\nmounts canmount=on datasets"];
+  }
+
+  subgraph cluster_pools {
+    label="Pools"; style=rounded; fontsize=12; margin=12;
+    rpool [label="rpool - NVMe, single disk\nOS, docker, hot state", shape=cylinder];
+    tank  [label="tank - 7x HDD raidz2\nmedia, cold data, backups", shape=cylinder];
+    scratch [label="scratch - NVMe, single disk\ntransient working space", shape=cylinder];
+  }
+
+  initrd -> rpool [label="forceImportRoot"];
+  impunit -> tank;
+  impunit -> scratch;
+  impunit -> mountunit [label="Before="];
+  mountunit -> tank [label="mount -o zfsutil"];
+  zfsmount -> rpool [label="non-legacy datasets"];
+}
+```
+
+Three pools, split by the role the hardware suits rather than by capacity. The NVMe with DRAM and TLC holds state that is read and written constantly; the raidz2 holds bulk data; the DRAM-less QLC NVMe holds work that can be regenerated. Resilience for the non-redundant pool comes from replication to `tank`, not from mirroring - see [pool roles](#pool-roles-and-the-backup-not-redundancy-model).
+
+---
+
+## Which mount pattern do I pick
+
+| Pattern | Pool imported at boot | Mounted at boot by | Survives unit restart or reexec | Pick it when |
+|---|---|---|---|---|
+| No `fileSystems` entry, non-legacy | **No** - unless listed in `boot.zfs.extraPools` | `zfs-mount.service` | n/a, no unit exists | ZFS owns everything and you accept no systemd visibility |
+| `fileSystems` + non-legacy + `zfsutil` | Yes, generated import unit | the mount unit, `mount -t zfs -o zfsutil` | **Yes** | Default. Systemd sees the mount, ZFS keeps mountpoint semantics |
+| `fileSystems` + `mountpoint=legacy` | Yes, generated import unit | the mount unit, `mount -t zfs` | Yes | You want systemd to be the only mount manager |
+| `fileSystems` + non-legacy, **no `zfsutil`** | Yes | ZFS mounts it, the unit adopts it | **No** | Never. It looks identical to row 2 until a restart |
+
+The fourth row is not a design option. It is what you get by writing a `fileSystems` entry for a hand-created dataset without knowing about `zfsutil`. The NixOS wiki's ZFS page covers the conflict between the two mount managers and sanctions rows 1 and 3 explicitly;[^nixos-wiki-zfs] `zfsutil` is the option that makes row 2 work.
+
+---
+
+## What imports the pool
+
+The import set is derived from your `fileSystems` entries, which is the part that surprises people. In the nixpkgs ZFS module, `zfsFilesystems` is every `fileSystems` entry with `fsType = "zfs"`, and:
+
+```nix
+allPools  = unique ((map fsToPool zfsFilesystems) ++ cfgZfs.extraPools);
+rootPools = unique (map fsToPool (filter utils.fsNeededForBoot zfsFilesystems));
+dataPools = unique (filter (pool: !(elem pool rootPools)) allPools);
+```
+
+Root pools are imported in the initrd. Every data pool gets a generated `zfs-import-<pool>.service`.[^nixpkgs-zfs] The module's own documentation for `extraPools` states the relationship directly: "you should set the mountpoint property of ZFS filesystems to `legacy` and add the ZFS filesystems to NixOS's `fileSystems` option, which makes NixOS automatically import the associated pool."[^nixpkgs-zfs]
+
+On this host that produces exactly two units and no third:
+
+```
+zfs-import-scratch.service   loaded active exited   Import ZFS pool "scratch"
+zfs-import-tank.service      loaded active exited   Import ZFS pool "tank"
+zfs-import.target            loaded active active   ZFS pool import target
+```
+
+There is no `zfs-import-rpool.service` because `rpool` is the root pool and arrives via the initrd. The generated unit orders itself ahead of that pool's mount units without being asked:
+
+```
+After=systemd-modules-load.service systemd-ask-password-console.service
+Before=tank-anugrah.mount tank-backups.mount tank-data.mount tank-media.mount shutdown.target zfs-import.target
+DefaultDependencies=no
+RemainAfterExit=true
+```
+
+The consequence: **deleting a `fileSystems` entry to let ZFS handle the mount also deletes the import.** If you choose pattern 1, the pool needs `boot.zfs.extraPools = [ "tank" ]` or it will not be there at boot.
+
+### Root pool import and hostId
+
+ZFS refuses to import a pool whose on-disk hostid does not match the running system, which is the guard against two machines importing the same shared LUN. nixpkgs enforces the prerequisite with an assertion - "ZFS requires networking.hostId to be set"[^nixpkgs-zfs] - so `networking.hostId` must carry a stable 8-hex-digit value.
+
+That guard has a failure mode on single-host hardware. On 2026-08-21 an installer repair session left this host's root pool marked in use by the installer's randomly generated hostid after a failed export. With `boot.zfs.forceImportRoot = false`, the initrd refused the import and the machine would not boot - and because the root filesystem was the casualty, the recovery console was not available either. Recovery was a one-time `zfs_force=1` on the bootloader entry; a clean shutdown clears the foreign-owner marker.
+
+This host now sets it explicitly:
+
+```nix
+boot.zfs.forceImportRoot = true;
+```
+
+Upstream is moving the other way, so check the current default before copying that line. The option now defaults to `lib.versionOlder config.system.stateVersion "26.11"`, so new installs get `false`, and the module emits a warning when it is left at the legacy `true`, recommending `false` "to reduce the risk of data loss".[^nixpkgs-zfs] Setting it explicitly is also how you silence that warning.
+
+The trade is real in both directions. `true` converts a class of boot failures into a silent forced import, which is exactly the safeguard the warning is protecting. `false` converts an unclean export into a machine that needs console access to recover. Pick on two questions: can this storage ever be attached to a second machine, and do you have out-of-band console if it refuses to boot. For a CPU-direct M.2 NVMe in a homelab with no IPMI, `true` is defensible. For anything shared, it is not.
+
+---
+
+## The reexec trap
+
+<Aside type="caution" title="Measured, 2026-09-02">
+  Adding one unrelated `fileSystems` entry and running `nixos-rebuild switch` unmounted three datasets and could not remount them. Media, photos and the backup destination were offline for about ten minutes, and a photo service crash-looped on its missing library path.
+</Aside>
+
+The sequence, from the journal:
+
+```
+13:31:08  Starting [systemd-run] .../bin/switch-to-configuration switch...
+13:31:10  Unmounting /tank/anugrah...
+13:31:10  Unmounting /tank/backups...
+13:31:10  Unmounting /tank/media...
+13:31:11  Reload requested from client PID ... ('.switch-to-conf')
+13:31:12  Reexecution requested from client PID ... ('switch-to-confi')
+13:31:15  Mounting /tank/media...
+13:31:15  mount[...]: filesystem 'tank/media' cannot be mounted using 'mount'.
+13:31:15  mount[...]: Use 'zfs set mountpoint=legacy' or 'zfs mount tank/media'.
+13:31:15  tank-media.mount: Mount process exited, code=exited, status=1/FAILURE
+```
+
+Activation requested a systemd reexecution. Reexec restarts loaded mount units - unmount, then mount. The unmount succeeds. The remount goes through `mount(2)`, and the ZFS kernel mount handler rejects `mount(2)` for a dataset whose `mountpoint` is a path rather than `legacy`. The unit ends failed and the data stays offline until someone runs `zfs mount` by hand.
+
+Two details explain the two weeks of silence before it fired:
+
+- **At boot the unit never calls `mount`.** ZFS mounts the dataset during import, and the mount unit finds the target already mounted and registers it active. A unit that adopts a mount never exercises the code path that fails.
+- **The pools that carried `zfsutil` were fine.** Here the `rpool` and `scratch` entries are synthesised by disko, which emits `zfsutil` in their options, and those units restarted through the same reexec without a murmur. Only the four hand-written `tank` entries, carrying `nofail` alone, failed. The fix was one option:
+
+```nix
+fileSystems."/tank/media" = {
+  device = "tank/media";
+  fsType = "zfs";
+  options = [ "nofail" "zfsutil" ];
+};
+```
+
+A corollary for anyone auditing their own configuration: disko-generated `fileSystems` entries do not appear in a grep of your repository. They are synthesised from the disk declaration, so the only reliable inventory is `nix eval .#nixosConfigurations.<host>.config.fileSystems` or the `/etc/fstab` on the live machine.
+
+`nofail` is a separate concern. It is what stops a missing pool from dropping the boot into emergency mode, which this host also learned on 2026-08-21, when ZFS mounts without it blocked boot on `local-fs.target` while the pool was absent.
+
+### If you choose legacy instead
+
+`mountpoint=legacy` is the other valid answer, and it has a trap of its own. Changing the property unmounts the dataset immediately and leaves it unmounted,[^zfsprops] and because ZFS created the mountpoint directory during import, that directory goes with the mount. A manual remount then fails:
+
+```
+filesystem 'tank/backups' cannot be mounted at '/tank/backups' due to
+canonicalization error: No such file or directory
+```
+
+The directory has to be recreated with `mkdir -p` before the mount takes. Systemd creates it for you at boot; your hands do not.
+
+One more thing about the restart path in either pattern: if the dataset is busy, with a container holding a file open under it, `systemctl restart` fails at the unmount step, the mount stays up, and the unit stays active. That is a harmless no-op, and it is not what happens during a reexec, where PID 1 gets the unmount through regardless.
+
+---
+
+## Pool roles and the backup-not-redundancy model
+
+| Pool | Hardware | Holds | Redundancy | Recovery if the disk dies |
+|---|---|---|---|---|
+| `rpool` | 1TB NVMe, TLC + DRAM, CPU-direct | OS, docker images, all hot database and queue state | **None**, single disk | Reinstall, restore from the nightly backup on `tank` |
+| `tank` | 7x HDD raidz2, 5x 12TB + 2x 16TB | Media, cold application data, backup destination | 2-disk fault tolerance | Replace and resilver |
+| `scratch` | 2TB NVMe, QLC, DRAM-less | Downloads in flight, transcode temp | None, `sync=disabled` | Nothing to recover, it regenerates |
+
+Hot state sits on the non-redundant pool deliberately. A mirror would consume both M.2 slots, forcing the scratch role onto a SATA disk, and pairing the good NVMe with the QLC one would gate every write to the slower device. Protection for that pool is instead a nightly dump to `tank` plus snapshots: replication, not redundancy. A dead NVMe costs a reinstall and the delta since the last backup, which is a bounded and understood loss.
+
+The two 16TB drives in a pool of 12TB members contribute 12TB each. raidz2 sizes on the smallest member, so roughly 7TB of each larger disk is unavailable until every member is replaced.
+
+### Dataset boundaries
+
+Each database directory sits whole on one dataset - the SQLite file with its `-wal` and `-shm`, or the Postgres data directory including `pg_wal`. A snapshot of that dataset is then crash-consistent for that database. Splitting a write-ahead log onto a different dataset from its main file gives you two snapshots taken at two different transaction points, which is a restore that silently does not work.
+
+---
+
+## Dataset properties
+
+| Property | Value here | Where | Why |
+|---|---|---|---|
+| `compression` | `lz4` | all | Cheap; 1.52x on the mixed pool, 1.00x on media, which is already-compressed files |
+| `atime` | `off` | all | Read traffic stops generating writes[^zfsprops] |
+| `xattr` | `sa` | all | Stores extended attributes in the inode; strongly encouraged when POSIX ACLs are in use[^zfsprops] |
+| `recordsize` | `1M` | `tank/media` | Large sequential files: fewer records, less metadata |
+| `recordsize` | `16K` | the Postgres dataset | Matches the 8K page with room for the block header |
+| `sync` | `disabled` | `scratch` only | Regenerable data; trades in-flight writes on power loss for latency. Documented as dangerous for databases, which is why it is confined to this pool[^zfsprops] |
+| `acltype` | `posix` on `rpool`, `off` on `tank` and `scratch` | mixed | Unintentional. `off` is the Linux default[^zfsprops] and the hand-created pools never had it set. Samba works either way |
+
+### ashift, checked rather than assumed
+
+`ashift` is per-vdev, set at creation, and permanent. The HDD pool was created by hand with `-o ashift=12`. The two NVMe pools were created by disko, which did not specify it, so ZFS auto-detected from what the drives report - and both landed on `ashift=9`:
+
+```
+rpool:   ashift: 9
+tank:    ashift: 12
+scratch: ashift: 9
+```
+
+512-byte allocation units on flash. Blocks are allocated as a whole number of `2^ashift` sectors,[^zfsprops] so this sets allocation granularity and metadata overhead for every write those pools have ever taken. There is no property to change; the fix is recreating the pool with `-o ashift=12`, which for a root pool means a reinstall. Set it explicitly at creation even when auto-detection looks right, because you cannot inspect it afterwards without `zdb` and you cannot fix it at all.
+
+### A tuning claim that did not survive checking
+
+The Postgres dataset also carries `logbias=throughput`, added on the strength of a note that OpenZFS documents the setting as experimental and warns it causes severe fragmentation with small updates. Reading the current `zfsprops(7)`, neither statement is there. What it documents is narrower: `logbias=throughput` means ZFS will not use configured pool **log devices** and instead optimises for global pool throughput.[^zfsprops] This pool has no separate log device, so the documented mechanism does not engage, and the setting's real effect here is unmeasured. It stays flagged rather than defended. The general lesson: a tuning knob inherited with a rationale attached deserves a check that the rationale is real.
+
+---
+
+## Snapshots are not backups, and the declared layout is not the live one
+
+`sanoid` runs the snapshot policy through three templates:
+
+| Template | hourly | daily | weekly | monthly | Applied to |
+|---|---|---|---|---|---|
+| `default` | 0 | 7 | 4 | 3 | Application data, photos, backup destination |
+| `media` | 0 | 0 | 4 | 3 | The media dataset, mostly write-once, so dailies buy little |
+| `hot` | 24 | 7 | 0 | 0 | The dataset holding live databases, temporarily |
+
+Three things are deliberately unsnapshotted, each for a stated reason: `scratch` is transient by design, the docker dataset is a re-pullable image store, and the root dataset is stateless in the way that matters - on NixOS a bad configuration is rolled back by booting the previous generation, not by restoring a filesystem.
+
+The failure that generalises is the drift. This host declared `rpool/appdata` and `rpool/appdata/pg` in disko, tuned the Postgres dataset to `recordsize=16K`, and pointed sanoid at both. The application stack wrote to a directory on the **pool root dataset** instead. For two weeks the snapshot policy faithfully protected two empty datasets, the recordsize tuning applied to no data at all, and roughly 35GB of live databases had no snapshot coverage - protected only by a nightly backup, so the worst-case loss window was 24 hours rather than the intended hour. Everything was configured correctly and none of it was pointed at the data.
+
+The check is one command, and it belongs in the routine after any storage change:
+
+```sh
+zfs list -t snapshot -o name,creation -s creation | grep '^<dataset>@'
+```
+
+If the dataset holding your live data has no rows, the policy is decorative. `zfs list -o name,used,refer` alongside it shows which dataset is actually carrying the bytes.
+
+---
+
+## Gotchas and lessons learned
+
+- **A `fileSystems` entry is an import declaration.** Remove it and the pool stops being imported unless `boot.zfs.extraPools` names it.
+- **`zfsutil` on every non-legacy entry.** Adoption at boot hides its absence; a reexec exposes it.
+- **Audit disko-synthesised entries through eval, not grep.** They are real `fileSystems` entries that exist nowhere in your source tree.
+- **`nofail` on every pool not needed for boot.** Without it a missing pool drops boot to emergency mode, and if the root pool is the casualty the console is not usable.
+- **Set `ashift` explicitly at pool creation.** Auto-detection follows what the drive reports, which for some NVMe is 512B, and it is permanent.
+- **`networking.hostId` is mandatory; `forceImportRoot` is a judgement call.** The default is moving to `false`, which is right for shared storage and can strand a single-host machine after an unclean export.
+- **Verify snapshots against the dataset holding the data**, not against the configuration that says which dataset should hold it.
+- **Changing `mountpoint` to `legacy` unmounts immediately** and takes the mountpoint directory with it.
+- **`du` under-reports Postgres directories** for a non-root user: the 700-mode data directory returns EACCES and the total silently excludes it. One measurement here read 3.1GB for a 6.1GB directory. Use `zfs list`, or measure as root.
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="Does systemd need to know\nabout this mount?", shape=diamond];
+  q2 [label="Do you want ZFS mountpoint\nsemantics: zfs mount/unmount,\nmountpoint in zfs list?", shape=diamond];
+
+  p1 [label="No fileSystems entry\nboot.zfs.extraPools = [ pool ]\nZFS owns it end to end"];
+  p2 [label="fileSystems entry\noptions = [ nofail zfsutil ]\nkeep mountpoint as a path"];
+  p3 [label="fileSystems entry\nzfs set mountpoint=legacy\nsystemd owns it end to end"];
+
+  q1 -> p1 [label="no"];
+  q1 -> q2 [label="yes"];
+  q2 -> p2 [label="yes"];
+  q2 -> p3 [label="no"];
+}
+```
+
+For an ordinary NixOS host with data pools, the middle path is the default: systemd sees the mount and can order services after it, ZFS keeps the mountpoint property, and the import unit is generated for you.
+
+---
+
+## Evidence
+
+| Claim | How it was checked | Status |
+|---|---|---|
+| Reexec restarts mount units; non-legacy remount fails | `journalctl` around the 2026-09-02 activation, quoted above | Measured |
+| `zfsutil` fixes the remount | Added the option, redeployed, all four units active with non-legacy mountpoints | Measured |
+| Import units are generated per data pool, ordered before that pool's mounts | `systemctl list-units 'zfs-import*'` and `systemctl cat zfs-import-tank.service` | Measured |
+| Pool set derives from `fileSystems` plus `extraPools` | The `allPools` / `rootPools` / `dataPools` bindings and the `extraPools` option description[^nixpkgs-zfs] | Documented |
+| `forceImportRoot` default is moving to `false` with a warning | The option's `default` and the module's `warnings` list[^nixpkgs-zfs] | Documented |
+| NVMe pools are `ashift=9` | `zdb -C <pool>` read at the vdev, all three pools | Measured |
+| Live databases had zero snapshots | `zfs list -t snapshot` returned no rows for the pool-root dataset before the fix, rows after | Measured |
+| `logbias=throughput` concerns log devices only | `zfsprops(7)`[^zfsprops] | Documented |
+| Setting `mountpoint=legacy` unmounts and leaves unmounted | `zfsprops(7)`[^zfsprops], and reproduced here | Both |
+| `forceImportRoot=false` blocked boot after a foreign hostid | 2026-08-21 incident notes; recovered with `zfs_force=1` | Measured, not re-tested |
+| ARC capped at 16GiB on 64GB RAM | `/proc/spl/kstat/zfs/arcstats`: `c_max` 17179869184, no throttle events | Measured |
+
+## Related docs
+
+- [Three NixOS hosts, one deploy interface](/reference/nixos-fleet/) - how this configuration is built, gated and shipped to the machine.
+- [Migrating a NAS without losing a byte](/guides/nas-bulk-data-migration/) - how the data reached this pool, with the verification gate that ran before the source was wiped.
+- [Windows SMB credentials against NixOS Samba](/guides/windows-smb-credentials-nixos-samba/) - sharing these datasets to Windows clients.
+
+[^nixos-wiki-zfs]: NixOS, "ZFS," NixOS Wiki. https://wiki.nixos.org/wiki/ZFS
+[^zfsprops]: OpenZFS, "zfsprops.7," OpenZFS Documentation. https://openzfs.github.io/openzfs-docs/man/master/7/zfsprops.7.html
+[^nixpkgs-zfs]: NixOS, "nixos/modules/tasks/filesystems/zfs.nix," nixpkgs. https://github.com/NixOS/nixpkgs/blob/master/nixos/modules/tasks/filesystems/zfs.nix
