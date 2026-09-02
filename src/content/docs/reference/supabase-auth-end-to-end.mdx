@@ -1,0 +1,303 @@
+---
+title: "Supabase Auth end to end: tokens, trust, and what you can take in-house"
+description: One map of authentication on Supabase, measured piece by piece across a summer of throwaway projects - how a token is signed and by which key, who verifies it and with what tolerance, how sessions refresh and where refresh tokens live, how an external issuer is trusted and how long a consumer caches it, how claims reach RLS with and without PostgREST, how identities move between projects, which levers gate what, and what happens when you run GoTrue yourself against a managed project's database.
+author: Erfi Anugrah
+category: supabase
+group: architecture
+featured: true
+blurb: "Every auth finding in one place: keys and verification, refresh, third-party issuers, claims and RLS, portability, lockdown levers, and a self-hosted GoTrue on a managed project."
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Authentication on Supabase is one Postgres schema (`auth`), one issuer (GoTrue) writing to it, and several verifiers (PostgREST, GoTrue itself, Storage, Realtime, Edge Functions) reading a key set. Everything else in this reference - refresh races, third-party issuers, identity moves, lockdown levers, running your own GoTrue - is a consequence of that shape. This doc puts the measured behaviour of each piece in one place and links out to the doc that measured it.
+
+Every row marked measured was run against a real project by the [supabase-lab](https://github.com/erfianugrah/supabase-lab) harness between 2026-07-09 and 2026-09-02, each project created and destroyed for the run; the experiment and module id is named per row and the run records are public. Where two runs disagree the later one is stated and the earlier one is noted. Documented rows cite the vendor page and were not run.
+
+**TL;DR:**
+
+- **Two keys verify, one signs.** A new project holds an ES256 key `in_use` and the legacy HS256 secret `previously_used`. GoTrue signs with the ES256 key; both still verify. The HS256 secret is readable from the Management API, so anyone with a PAT can mint tokens PostgREST accepts, with zero GoTrue involvement.
+- **PostgREST is the strict verifier.** It rejects `iat` more than 30 s in the future (`401 PGRST303`), an unknown key (`401 PGRST301`), and an HS256 token that carries any `kid` at all - while the managed GoTrue accepts that same token. Two verifiers, two rules.
+- **Refresh tokens live with the issuer.** A trusting project verifies a token it did not mint but answers `400 refresh_token_not_found` to its refresh token; losing the issuer costs one access-token lifetime (3600 s) before nobody can renew.
+- **A consumer caches a third-party key set and did not re-resolve within the windows measured.** No re-resolution across 37 minutes in one run and 20 minutes in another, so a hub key rotation strands every spoke for at least that long and revocation does not revoke at a consumer.
+- **RLS reads a GUC, not a header.** `auth.uid()` reads `request.jwt.claims`; set it over the wire and per-user RLS works with no PostgREST and no GoTrue. The transaction pooler leaks a bare `SET` across clients; use `set_config(..., true)` inside a transaction.
+- **Identity is portable by SQL, not by API.** Five `auth.*` tables copied in FK order move a tenant with its existing refresh token and its MFA factor; the admin API can mint a user with a bcrypt hash but cannot carry a session.
+- **A GoTrue you run yourself works against a managed project** as the `postgres` role with `search_path=auth`, shares users and refresh tokens with the managed one, and is trusted by PostgREST as long as the legacy HS256 signing key stays `previously_used`. Revoking that signing key kills its tokens in 3-6 s (3 s, 6 s and 4 s on three projects), and the legacy anon and service_role API keys with them.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.8;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  client [label="client", style=rounded];
+  idp [label="external issuer\n(OIDC / JWKS)", style=rounded];
+
+  subgraph cluster_p {
+    label="managed project"; style=rounded; fontsize=12; margin=12;
+    gotrue [label="GoTrue (managed)\nsigns ES256, in_use"];
+    keys [label="signing keys\nES256 in_use\nHS256 previously_used", shape=note];
+    pgrst [label="PostgREST\nverifies, sets GUC"];
+    other [label="Storage / Realtime /\nEdge Functions\nverify separately"];
+    pg [label="Postgres\nauth.* schema\nRLS reads request.jwt.claims", shape=cylinder];
+  }
+  self [label="GoTrue (self-hosted)\npostgres role, search_path=auth\nsigns HS256 (legacy secret)"];
+
+  client -> gotrue [label="password / refresh"];
+  client -> self [label="password / refresh"];
+  gotrue -> pg [label="auth.users, sessions,\nrefresh_tokens"];
+  self -> pg [label="same tables,\nvia session pooler"];
+  keys -> gotrue; keys -> pgrst; keys -> other;
+  client -> pgrst [label="bearer token"];
+  pgrst -> pg [label="set role +\nrequest.jwt.claims"];
+  idp -> pgrst [label="third-party auth:\ncached JWKS", style=dashed];
+  client -> pg [label="raw wire + set_config\n(no PostgREST)", style=dashed];
+}
+```
+
+## Which shape do I pick
+
+| Goal | Shape | Where it is measured |
+|---|---|---|
+| Ordinary app, one project | Managed GoTrue, verify at the edge with cached JWKS (~0 ms) or round-trip `getUser()` (~207 ms) when revocation matters | [Cloudflare Workers + Supabase](/reference/cloudflare-supabase-architecture/) |
+| Many tenants, one project | Managed GoTrue, `tenant_id` in `app_metadata` set by the admin API, RLS keyed on it | [Running many tenants on one project](/guides/supabase-shared-tenancy/) |
+| Corporate identity in front of the Data API | Third-party auth with the IdP's issuer, RLS keyed on `iss`, signups disabled | [Put an IAP over the Data API](/guides/supabase-iap-data-api/) |
+| Keep Supabase Auth, drop PostgREST | Verify the GoTrue JWT in your backend, set `request.jwt.claims` over the wire | [RLS without Supabase Auth](/reference/rls-without-supabase-auth/) |
+| Move a tenant between projects with no re-login | Copy the five `auth.*` tables in FK order, resync the sequence, retire the source identity | [Promoting a tenant](/guides/supabase-tenant-promotion/) |
+| Bring users from a PBKDF2 system | Passwordless import plus a local verifier in an Edge Function | [Migrating PBKDF2 hashes](/reference/pbkdf2-supabase-auth-migration/) |
+| Run the auth server yourself on a managed project | Self-hosted GoTrue as `postgres` with `search_path=auth`, legacy HS256 secret, platform ES256 public key as a verify-only JWK | this doc, [Taking Auth in-house](#taking-auth-in-house-a-self-hosted-gotrue-on-a-managed-project) |
+
+## The token: keys and verifiers
+
+A fresh project bootstraps two signing keys: ES256 `in_use` and the legacy HS256 secret `previously_used`.[^sb-signing-keys] GoTrue mints with the `in_use` key and stamps its id as `kid`; the JWKS at `/auth/v1/.well-known/jwks.json` advertises the ES256 public key with `key_ops: ["verify"]`. Statuses are `standby`, `in_use`, `previously_used`, `revoked`, managed at `GET|POST|PATCH /v1/projects/{ref}/config/auth/signing-keys` on the Management API; the project's own `/auth/v1/admin/signing-keys` is a hard 404 (measured, key-rotation R01).
+
+The HS256 secret is not gone. `GET /v1/projects/{ref}/postgrest` returns `jwt_secret`, and an HS256 token minted locally with it reads the live API with 200 and no GoTrue involved (edge-resilience W07). It is the break-glass path during an Auth outage and the crown jewel a PAT holder carries; rotate it after any use, because the Management API read is auditable and the secret does not expire on its own. `PATCH /config/auth {jwt_secret}` returns 200 and changes nothing (W01).
+
+| What the verifier checks | PostgREST | Managed GoTrue | Measured |
+|---|---|---|---|
+| `iat` skew | +30 s accepted, +31 s `401 PGRST303` | not probed | W01, two runs |
+| expired token | `401 PGRST303` | `403 bad_jwt` | W01; self-hosted-auth SH05 |
+| unknown key | `401 PGRST301` | `403 bad_jwt` | W01; SH02f |
+| HS256 token carrying a `kid` | `401 PGRST301`, for an arbitrary kid and for the platform's own HS256 key id | `200` | SH04, three projects |
+| HS256 token with no `kid` | `200` | `200` | SH02d, SH04c |
+| `jwt_exp` change | n/a - `exp` is minted by the issuer | honours it about 6.5 s after the PATCH reads back | W03 |
+
+The kid row is the one nobody documents. PostgREST looks a `kid` up in its key set and the legacy HS256 secret is not addressable by one; GoTrue tries the keys of the algorithm regardless. Any signer that builds HS256 tokens from the legacy secret must leave the header without a `kid`.
+
+`PGRST301` means the key: unresolved JWKS, wrong `kid`, or a symmetric token where an asymmetric one was expected. A verified token that lacks claims fails later, as `[]` or a permission error, never as 301. `PGRST303` means the claim: `iat` or `exp`. A 303 spike while `/auth/v1/user` still answers 200 is a clock-skew alert; a 303 on its own can be an ordinary expired token, and the raw 401 count is ambiguous.[^lex-incident]
+
+<Aside type="caution" title="Edge Functions verify differently again">
+`verify_jwt = true` on an Edge Function is a token-possession check: the caller with no token gets 401 and the legacy anon API key (an HS256 JWT) passes with 200 (iap-lockdown L07). It accepts JWTs signed with either the legacy HS256 secret or the ES256 signing key, and it rejects the non-JWT `sb_publishable_` and `sb_secret_` API keys in the `Authorization` header. It is not an authorisation control.
+</Aside>
+
+## Sessions and refresh
+
+GoTrue rotates the refresh token on every use and keeps the family in `auth.refresh_tokens` and `auth.sessions`. The rules, measured on hosted and on a local GoTrue v2.195.0 with identical results (auth-refresh-race):
+
+- Reuse of the direct parent of the active token is tolerated with no time limit and returns the active token (3 s, 15 s, 45 s, 130 s after rotation).
+- Reuse of an older generation is refused `400 refresh_token_already_used` once past the reuse interval (10 s default, measured 12-15 s) and GoTrue marks the family revoked. In the same run, the token that was current at the moment of the refused reuse still refreshed successfully after that mark: the family revocation did not invalidate the live token.
+- Five concurrent refresh calls through the gotrue-dart client collapsed to a single network request and succeeded (auth-refresh-race, both client versions); two concurrent raw HTTP refreshes of one token sent straight to GoTrue both returned 200 (edge-resilience W08). Naive multi-tab concurrency does not reproduce the intermittent-401 mode.
+- `PATCH security_refresh_token_reuse_interval` to 0 was accepted and read back 0 while the running service kept the 10 s behaviour. Config acceptance is not runtime effect.
+
+The client defect that did reproduce is gotrue-dart 2.21.0 (pinned by supabase_flutter 2.14.0): a stale grandparent refresh answered `refresh_token_already_used` and the client destroyed the current, still-valid session. Fixed in gotrue-dart 2.22.0, first shipped in supabase_flutter 2.15.0, where the rejection is absorbed. Apps on supabase_flutter 2.15.0 or later (gotrue-dart 2.22.0 or later) that still sign out are hitting one of the by-design paths: expired session plus stale token, cross-isolate refresh, `signOut()` on a 401, or a custom storage resurrecting old tokens.[^lex-incident]
+
+Refresh tokens are the issuer's. A project that trusts another's tokens through third-party auth verifies them but answers `400 {"code":400,"error_code":"refresh_token_not_found","msg":"Invalid Refresh Token: Refresh Token Not Found"}` to the refresh token (cross-project-auth X03). After the issuing project was deleted, reads at the trusting project with a live token kept returning 200 until it expired; refresh at the deleted issuer's `/auth/v1/token` answered `410 Gone` (tenant-promotion Part 3). The blast radius of losing the issuer is one access-token lifetime, 3600 s by default.
+
+## External issuers: third-party auth
+
+`POST /v1/projects/{ref}/config/auth/third-party-auth` takes one of three shapes. `oidc_issuer_url` and `jwks_url` return 201 and resolve on the create response, 59-249 ms, to identical key material. `custom_jwks` returns 201, echoes the key back, and never resolves: `resolved_at` was still null past 92 s on two fresh projects and a token was refused `PGRST301` for 7 minutes 32 seconds until the shape was swapped (cross-project-auth X01). The response `type` is `custom` for all three shapes and does not tell you which one created the integration.
+
+Trust creation and removal are prompt and not synchronous. With no trust the token is refused `401 PGRST301`; about 1.1 s after the create it is accepted; about 0.6 s after the delete it is refused again, byte-identical token throughout (X02). A first-time issuer whose `kid` PostgREST has never seen took about 30 s of `PGRST301` before acceptance in the edge-resilience runs (W01, W05); a previously seen key set warms in about 300 ms. The 1.1 s acceptance figure is from X02 (2026-08-03, issuer: another Supabase project); the 30 s cold figure is from W01 and W05 (2026-08-15, issuers: a lab ES256 issuer in W01 and a Supabase project in W05). The runs do not reconcile the two; rehearse a cutover rather than assume either.
+
+The consumer's cache is the hazard. After the issuing project rotated its key, the trusting project's cached kid set never changed across 282 probes in 37 minutes (2026-08-04) and 116 probes in 20 minutes (2026-08-25), and new-key tokens were refused the whole window. A fresh integration created while the issuer's JWKS demonstrably advertised the new key still served the stale set (key-rotation R02, R03). The signing-keys docs say revocation of an asymmetric key is automatic via the discovery endpoint;[^sb-signing-keys] that holds for the issuing project and not for a consumer inside its cache window, which honoured a revoked key for 15 minutes in the 2026-08-03 run. Whether a consumer ever re-resolves, and what the cache mechanism is, remains open.
+
+A real Cloudflare Access for SaaS OIDC issuer registers with 201 and resolves immediately; a policy on `(auth.jwt() ->> 'iss')` then admits its tokens and refuses the anon key and GoTrue users (iap-lockdown L10). Third-party auth gates the Data API only; Auth, Storage, Realtime and Edge Functions keep their own endpoints, and whether Storage or Realtime accept a foreign-issuer token was not probed.
+
+## Claims and RLS
+
+PostgREST verifies the token, switches to the `role` claim's database role, and sets the claims as the `request.jwt.claims` GUC. `auth.uid()` reads `sub` from that GUC. Postgres enforces the policy for any role without `BYPASSRLS`, on any connection. That is the whole mechanism, and it is why the HTTP layer is optional: set the GUC over the wire and the same policies work with no PostgREST (rls-wire-claims C01, C02).[^lex-rls]
+
+Measured rules for doing that:
+
+- On managed Supabase `GRANT USAGE ON SCHEMA auth` to a custom role silently no-ops and `auth.uid()` errors `permission denied for schema auth`. The working shape is a SECURITY DEFINER wrapper owned by `postgres` that the policy calls.
+- The session pooler (5432) resets a bare `SET` on return. The transaction pooler (6543) leaks it to the next client. Claims belong in `set_config('request.jwt.claims', $1, true)` inside a transaction, never a bare `SET`, and never interpolated into SQL text.
+- A tampered `sub` is enforced exactly as written: the probe's made-up `sub` matched zero rows with no error, and nothing in the database noticed the substitution. The GUC is unprivileged; the connection credential is the security boundary.
+- Hyperdrive did not replay a claims-dependent query across users in the probe; the split-binding rule (a second config with caching disabled for claims-dependent queries) stays as the documented control.
+
+Tenant claims: `app_metadata` is admin-only. A user's own `PUT /auth/v1/user` with `app_metadata` answers `403 Updating app_metadata requires admin privileges` (re-measured 2026-08-03 on two fresh projects; the 2026-07-09 placement proof saw the same call silently ignored), while the same call with `data` writes `user_metadata` and the next token carries it. `POST /auth/v1/signup` with `app_metadata` in the body succeeds and drops the field. Key the policy on `app_metadata`, never `user_metadata`.[^lex-shared]
+
+Policy shapes that bit in the lab:
+
+| Shape | Result | Measured |
+|---|---|---|
+| `for all ... using (...)` with no `with check` | Postgres reuses `using` as the check; cross-tenant insert and reassignment both refused | shared-tenancy Part 3, Postgres 17.10 |
+| `with check (true)` | tenant B's row attributed to tenant A landed while every read test passed | tenant-consolidation |
+| PostgREST default `return=representation` | a permitted write is rolled back and reports `403 42501` because RETURNING is filtered by the SELECT policy; under `return=minimal` the same write is committed and reports 201 | tenant-consolidation |
+| RLS enabled, no policy | `200` and `[]` - a blank app, not an error | tenant-consolidation |
+| plain `VIEW` over an RLS table | leaks all rows to anon; `security_invoker=true` returns 0 | iap-lockdown L08 |
+| UPDATE policy | gates rows, not columns; a permissive policy plus table grant let anon overwrite a sensitive column (`204`); `REVOKE UPDATE` plus `GRANT UPDATE (safe columns)` answers `401` with SQLSTATE `42501` | security-lockdown S13 |
+| two PERMISSIVE policies | OR together, so adding a second permissive policy widened what `anon` could read | iap-lockdown L08 |
+| `REVOKE SELECT ... FROM anon` | undone for new tables by `pg_default_acl`; `ALTER DEFAULT PRIVILEGES` for the `postgres` grantor fixes it, `supabase_admin`'s default ACL cannot be altered by the owner (`42501`) | iap-lockdown L08 |
+
+The Management API query endpoint connects as `postgres` and sees every row; verifying that data landed says nothing about isolation.
+
+## Identity portability between projects
+
+Copying one `auth.users` row to a project with no third-party integration lets that user log in there with a token whose `iss` is the new project (tenant-promotion Part 3). Copying `auth.users`, `auth.identities`, `auth.sessions`, `auth.refresh_tokens` and `auth.mfa_factors` in FK order, then `setval` on `auth.refresh_tokens_id_seq`, lets the user's existing refresh token mint a session at the new project with zero password logins, and the TOTP factor arrives `verified` with the same secret producing a valid `aal2` code (P01, P02). It is unsupported, it writes into `auth`, and it is the only way to carry a session: the admin API mints a user, not the refresh token that user is holding.
+
+The sharp edges, each measured:
+
+- `auth.users.confirmed_at` and `auth.identities.email` are `GENERATED ALWAYS`; `insert ... select *` fails `428C9`. Enumerate columns with `is_generated = 'NEVER'`; there were 34 on `auth.users`.
+- `auth.refresh_tokens.user_id` is `character varying`, not `uuid`. A `uuid` predicate errors, and an INSERT of zero rows succeeds, so a copy can report success having moved nothing.
+- Do not carry the source's `auth.refresh_tokens.id`; let the target assign it. A carried id collides with `refresh_tokens_pkey` on any target with prior auth activity, on the tenant's next refresh rather than during the move.
+- `users_email_partial_key` is `UNIQUE (email) WHERE (is_sso_user = false)` over the raw column. The admin API normalises case and refuses a variant with `422 email_exists`; a SQL copy lands two rows for one person, and which row a login reaches is unstable across attempts. That is a cross-tenant exposure.
+- One duplicate in a bulk INSERT costs the whole statement.
+- `DELETE /auth/v1/admin/users/{id}` at the source refuses the password grant with `invalid_credentials` and the old refresh token with `refresh_token_not_found` while the destination carries on. The identity at the source retires; the tenant's data rows at the source stay where they are (P03).
+
+Through the admin API, `POST /auth/v1/admin/users` accepts a bcrypt `password_hash` as-is (the source's `$2a$` string) and the user logs in with the password they had, honours a supplied `id`, and sets `app_metadata` at creation (tenant-consolidation C03). GoTrue imports exactly three hash formats, bcrypt, Argon2 and Firebase scrypt, dispatched by prefix; a PBKDF2 hash answers `500 unexpected_failure` because the string is handed to `bcrypt.Cost()`. The Password Verification Hook runs after `valid` is computed and cannot plug in a verifier. The working pattern for PBKDF2 sources is a passwordless import plus a local WebCrypto verifier in an Edge Function that migrates on the first correct login.[^lex-pbkdf2] The incident-resilience reference (class 9) and the resilience runbook stated the opposite about the admin API, citing the 2026-08-15 standby run (edge-resilience W09), which posted its backfill users without a `password_hash` and recorded the limitation as an assumption rather than a measurement; the 2026-08-04 consolidation run posted the hash and measured the login, so a bcrypt hash is portable through the admin API. Both docs were corrected on 2026-09-02.
+
+Managed-to-managed logical replication does not carry `auth.*` or `storage.*` at any tested size (edge-resilience W09, W14): initial sync stalls, `received_lsn` stays null, while public and custom schemas replicate in about 4 s. A warm standby's auth posture is third-party auth for existing sessions plus a SQL backfill or forced re-login for fresh ones, and per-project auth config (SMTP, `SITE_URL`, `jwt_exp`, rate limits) does not follow a cutover (W17).
+
+## Levers, and what each one gates
+
+| Lever | Gates | Does not gate | Measured |
+|---|---|---|---|
+| `disable_signup = true` | new signups | an existing user's login | iap-lockdown L04 |
+| disable legacy API keys | the anon and service_role JWTs, in about 45 s | the new `sb_publishable_` / `sb_secret_` keys; a PAT holder can create a new API key at will (201), so this is a posture, not a lockout | L05, L11 |
+| revoke the legacy HS256 signing key | every HS256 token: self-hosted tokens in 3-6 s, and the legacy anon and service_role API keys with them | `sb_publishable_` / `sb_secret_` | self-hosted-auth SH05 |
+| Edge Function `verify_jwt = true` | the no-key caller | any valid project JWT, including the anon key | L07 |
+| `password_min_length` | signup and update below the length (`422`) | | security-lockdown S11 |
+| leaked-password protection | signup | password update: a breached password was accepted via `PUT /auth/v1/user` with HIBP on | S11 |
+| MFA `aal2` | whatever the policy checks `auth.jwt()->>'aal'` for | anything on `aal1`; there is no native remember-this-device, and a refreshed session is never re-challenged | mfa guide |
+| before-user-created hook, CAPTCHA, seven `rate_limit_*` fields | not measured (present on micro, off by default, settable) | not measured | S14 |
+| third-party auth | the Data API's accepted issuers | Auth, Storage, Realtime, Edge Function endpoints | iap-lockdown |
+| network restrictions, PrivateLink | the Postgres and pooler socket | the whole HTTP tier, Auth included | security-lockdown S02, S10 |
+| CORS, custom domain | nothing | | L13 |
+| `pgrst.db_pre_request` on hosted | nothing observed within 120 s | | L09 |
+
+`auth.audit_log_entries` is empty by default on a fresh hosted project (`audit_log_disable_postgres: true`, Dashboard-only toggle, Management API PATCH a no-op); the log stream carries every login as an `auth_event`, and an impersonation minted through `generateLink` logs the target as `actor_id` and the admin calls as `service_role`, never the human. A PAT (`sbp_`) is a control-plane credential, not an identity token, and RLS never sees it.[^lex-lockdown]
+
+## Taking Auth in-house: a self-hosted GoTrue on a managed project
+
+Measured 2026-09-02 on three throwaway Micro projects with the public `supabase/gotrue:v2.196.0` image, matching the managed version the project's health endpoint reported, pointed at the project's Postgres through the session pooler (self-hosted-auth SH01 to SH05).[^gotrue-readme][^sb-compose]
+
+**Who you connect as.** The self-hosting compose file connects Auth as `supabase_auth_admin`.[^sb-compose] On the platform that role is reserved: `ALTER ROLE ... PASSWORD` answers `42501: "supabase_auth_admin" is a reserved role, only superusers can modify it`, and granting membership answers `42501: ... role memberships are reserved, only superusers can grant them`. `postgres` is not a superuser and not a member. So a self-hosted GoTrue connects as `postgres`, which has USAGE on `auth`, INSERT on `auth.users`, `auth.refresh_tokens` and `auth.sessions`, no CREATE on the schema, and no INSERT on `auth.schema_migrations`. The schema is owned by `supabase_admin`.
+
+**The startup that fails, and why.** `postgres` defaults to `search_path = "$user", public, extensions`. GoTrue's migrator looked for `schema_migrations` in `public`, created an empty one there, concluded nothing was applied, and died on its first migration: `CREATE TABLE IF NOT EXISTS auth.users` -> `permission denied for schema auth (SQLSTATE 42501)`, because the privilege check runs before the existence check. `supabase_auth_admin` carries `search_path=auth` in its role config, which is why the managed service never meets this. Appending `?search_path=auth` to the connection URL made the same start report `GoTrue migrations applied successfully count=0`: the platform's 77 migration rows already cover all 70 files the image ships. Drop the stray `public.schema_migrations` a failed start leaves behind.
+
+**What works once it is up**, all measured pass:
+
+| Probe | Result |
+|---|---|
+| admin-create a user through the self-hosted GoTrue | 200; the managed admin list shows the user (one `auth.users`) |
+| self-hosted password grant | HS256, `iss https://<ref>.supabase.co/auth/v1` (mirrored by config), `aud authenticated`, `role authenticated`, 3600 s, no `kid` |
+| the self-hosted HS256 token against the managed tier | `/auth/v1/user` 200; PostgREST read of an authenticated-only table 200 with 1 row, anon control 0 rows |
+| managed password grant for the same user | 200 (shared hash), ES256 with the `in_use` kid, same `sub` |
+| self-hosted refresh token at the managed `/token` | 200, new access token ES256 |
+| managed refresh token at the self-hosted `/token` | 200, new access token HS256 (re-signed with what it has) |
+| managed ES256 token at the self-hosted `/user`, with the HS256 secret alone and no `GOTRUE_JWT_KEYS` | `403 bad_jwt`: the self-hosted side holds only the HS256 secret |
+| managed ES256 token at the self-hosted `/user`, with the platform's ES256 public key supplied as a verify-only JWK in `GOTRUE_JWT_KEYS` | 200 |
+
+The managed tier trusts the self-hosted tokens because the HS256 key is `previously_used`, and users and refresh tokens are shared because both services write the same tables. The managed Auth endpoint cannot be turned off (there is no lever), so both GoTrues serve the same users for as long as the project exists.
+
+**The two configuration rules.** `GOTRUE_JWT_KEYS` takes a JSON array of JWKs with exactly one `sign` key;[^gotrue-conf] supplying the HS256 secret as an `oct` sign-and-verify JWK plus the managed project's ES256 public key from its JWKS with `key_ops: ["verify"]` gives mutual trust. The `oct` key must carry no `kid`: with `GOTRUE_JWT_KEYS` set, GoTrue stamps the signing key's kid into the header, and the managed PostgREST answered `401 PGRST301` to an HS256 token carrying a kid, both an arbitrary one and the platform's own HS256 key id, while the managed GoTrue verified the same tokens. Kid-less, both verifiers answered 200. The issuer string is set to the managed one so the tokens are indistinguishable to a policy keyed on `iss`.
+
+**What the platform can take away.** `PATCH /v1/projects/{ref}/config/auth/signing-keys/{id} {"status": "revoked"}` on the HS256 signing key answered 200, and 4 s later on the project the clean SH05 run records (3 s and 6 s on the two earlier projects) the same self-hosted token was refused by the managed `/auth/v1/user` (`403 bad_jwt`) and by PostgREST (`401 PGRST301`). The collateral is the point: the legacy `anon` API key answered 401 on PostgREST and the legacy `service_role` API key answered 403 on the admin API, because both are HS256 JWTs under the same secret, while the `sb_publishable_` and `sb_secret_` API keys kept working. Revoking the HS256 signing key therefore has the same collateral as the disable-legacy-API-keys lever in the table above; whether that lever also revokes the signing key was not measured. The self-hosted GoTrue kept minting; nothing managed accepted the result. A self-hosted signer built on the legacy HS256 secret lives exactly as long as that signing key stays `previously_used`.
+
+**Not settled.** Registering the self-hosted GoTrue as a third-party issuer in its own right (so trust would rest on an ES256 key you own rather than the shared secret) needs its JWKS reachable from the platform; the container here was local. Pooler behaviour under load, an image ahead of the platform's migration set (which would try to write `auth.schema_migrations` as `postgres` and fail), SMTP, hooks and OAuth providers on the self-hosted side were not run.
+
+## Dropping the HTTP tier instead
+
+The other in-house move keeps managed Auth and removes PostgREST. Wedge the managed Data API (`PATCH /v1/projects/{ref}/postgrest {"db_schema": ""}` -> `503 PGRST002` within about 4 s; Auth, Storage, Realtime and Edge Functions unaffected) and run `postgrest/postgrest` against the session pooler as a dedicated NOSUPERUSER role that is a member of `anon` and `authenticated`, never `postgres` and never `service_role` (security-lockdown S04, S06). Point `PGRST_JWKS_URI` at the project's JWKS to keep verifying GoTrue tokens. The `db-pre-request` IP filter that never fired on hosted (L09) fires on your own PostgREST and refuses a spoofed `x-forwarded-for` with `403 PT403`. Storage and Realtime stay managed and never traverse PostgREST, so this owns the REST layer and nothing else.[^lex-own-pgrst]
+
+Dropping GoTrue as well means owning signup, OAuth, magic links, token minting, refresh and revocation; the self-hosted section above is the measured middle ground where GoTrue stays GoTrue and only its hosting changes.
+
+## Failure signatures
+
+| Signature | Meaning | Measured or reported |
+|---|---|---|
+| `401 PGRST303 "JWT issued at future"` on the Data API while `/auth/v1/user` answers 200 | clock skew between the issuer and PostgREST; every session fails at its next refresh, so within one TTL (3600 s) every active session has failed, and nothing recovers until the skew is fixed | public incidents 2026-08-14 and the week before; skew boundary measured W01 |
+| `401 PGRST301` | the key, not the claim: unresolved third-party JWKS, unknown or stale `kid`, symmetric token where asymmetric expected, HS256 token with a `kid` | W01, X02, SH04 |
+| `400 refresh_token_already_used` then a client sign-out | gotrue-dart below 2.22.0 destroying a valid session; on supabase_flutter 2.15.0 or later (gotrue-dart 2.22.0 or later), an app-side path | auth-refresh-race |
+| `400 refresh_token_not_found` at a trusting project | refresh tokens live with the issuer | X03 |
+| `403 bad_jwt` from GoTrue | key it does not hold or a revoked key | SH02f, SH05 |
+| first `POST /auth/v1/admin/users` on a fresh project answers 500 (`unexpected_failure` or `"Database error checking email"`) | `ACTIVE_HEALTHY` is not readiness; the second call about 10 s later succeeds | `unexpected_failure` on five projects; `"Database error checking email"` on two |
+| Auth 521 for about 75 s, Storage 500 for about 78 s, REST untouched, during a compute restart | the paths do not move together | platform-downtime |
+| `over_email_send_rate_limit` on scripted signups | the shared SMTP allows 2 emails per hour; use the admin create plus password grant path | W03, S11 |
+
+## Where the docs disagree with runtime
+
+| Doc claim | Runtime measured | Severity |
+|---|---|---|
+| revocation of an asymmetric key is automatic via the discovery endpoint | true at the issuer; a third-party consumer honoured a revoked key for 15 minutes and never re-resolved within 20-37 minutes | docs describe the issuer only |
+| leaked-password protection protects passwords | enforced at signup; a breached password was accepted on the update path | docs silent on the path |
+| auth audit entries are stored in two places | `auth.audit_log_entries` is empty by default on hosted; only the log stream carried the events | docs stale for hosted defaults |
+| `password_hash` import supports imported hashes | bcrypt, Argon2 and Firebase scrypt only; PBKDF2 answers `500 unexpected_failure`, not a 400 | error shape undocumented |
+| signup accepts user attributes | `app_metadata` in the signup body is dropped without error | docs state only the `user_metadata` half |
+| self-hosting compose connects Auth as `supabase_auth_admin` | that role is reserved on a managed project; a self-hosted GoTrue connects as `postgres` and needs `search_path=auth` on the URL | not a doc error, a platform difference the compose file cannot know |
+| PostgREST and GoTrue verify the same key set | PostgREST rejects an HS256 token carrying any `kid`; GoTrue accepts it | undocumented |
+| `security_refresh_token_reuse_interval` is configurable | PATCH accepted and read back; the running service kept 10 s | propagation or clamp unknown |
+
+## Reading the numbers
+
+- Dates matter here more than in most of this corpus. The platform changed under the measurements at least twice: standby-key creation was time-rate-limited on 2026-08-03/04 (`Please wait until <ISO8601>`, 127-144 s) and was not on 2026-08-25 (`422 "already has a signing key in standby"`, no time limit); the hub published a rotated key in about 7 minutes on 2026-08-04 and in 241 s on 2026-08-25. Where two runs disagree, the later figure is stated above.
+- Third-party acceptance latency has two measured values: about 1.1 s (X02, 2026-08-03, another Supabase project as issuer) and about 30 s cold (W01 and W05, 2026-08-15, a lab ES256 issuer and a Supabase project). Neither run reproduced the other's conditions.
+- All self-hosted GoTrue rows are one image version against one managed version on the same day, as `postgres` through the session pooler. The kid rule was reproduced on three projects; the revoke timing is 3 s, 6 s and 4 s across them.
+- Every "not portable" or "cannot" in this doc is stated across a complete probe set or cited to the source it comes from; a negative measured by guessing paths is not in here.
+
+## Evidence
+
+Measured claims map to module ids in the named supabase-lab experiments; every RUNLOG is public under [experiments/](https://github.com/erfianugrah/supabase-lab/tree/main/experiments).
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| ES256 `in_use` plus HS256 `previously_used` on a fresh project; `jwt_secret` readable and mints accepted tokens | measured | edge-resilience W01, W07; self-hosted-auth SH01c |
+| PostgREST skew tolerance exactly 30 s; expired and unknown-key codes | measured | edge-resilience W01, two runs |
+| PostgREST refuses an HS256 token with any `kid`; GoTrue accepts it | measured | self-hosted-auth SH04, three projects (arbitrary kid, platform kid, no kid) |
+| Refresh reuse semantics: parent tolerated, grandparent refused past the interval, family revoked, concurrent dedupe | measured | auth-refresh-race, hosted and local v2.195.0 |
+| gotrue-dart 2.21.0 defect and 2.22.0 fix boundary | measured | auth-refresh-race differential harness |
+| Refresh token refused at a trusting project | measured | cross-project-auth X03 |
+| Third-party shapes: two resolve, `custom_jwks` never; trust on and off in about 1 s | measured | cross-project-auth X01, X02 |
+| Consumer cache never re-resolved across 37 and 20 minutes; revoked key honoured 15 minutes in one run | measured | tenant-promotion Part 4; key-rotation R02, R03 |
+| Wire claims drive RLS with no PostgREST; 6543 leaks a bare `SET`; `GRANT USAGE ON SCHEMA auth` no-ops | measured | rls-wire-claims C01, C02, C03 |
+| `app_metadata` admin-only (403), `user_metadata` self-writable, signup drops `app_metadata` | measured | shared-tenancy, two fresh projects 2026-08-03 |
+| Policy and grant holes: `with check (true)`, `return=representation` masking, views, column grants, permissive OR, default ACL rot | measured | tenant-consolidation; iap-lockdown L08; security-lockdown S13 |
+| Five-table copy carries the session and the MFA factor; retire at source | measured | tenant-promotion P01, P02, P03 |
+| Admin API accepts a bcrypt `password_hash`; PBKDF2 answers 500 | measured | tenant-consolidation C03; pbkdf2 reference reproduction |
+| Email case-variant duplicate reachable from both inputs, unstable mapping | measured | tenant-consolidation C02 |
+| `auth.*` does not replicate managed-to-managed | measured | edge-resilience W09, W14 |
+| Legacy key disable in about 45 s; new keys independent | measured | iap-lockdown L05, L11 |
+| `verify_jwt` passes the anon key | measured | iap-lockdown L07 |
+| HIBP not enforced on update | measured | security-lockdown S11 |
+| `supabase_auth_admin` reserved; `postgres` privileges on `auth`; `search_path` startup failure and fix | measured | self-hosted-auth SH01, RUNLOG |
+| Shared users and refresh tokens across managed and self-hosted GoTrue; mutual trust with `GOTRUE_JWT_KEYS` carrying the platform's ES256 public key | measured | self-hosted-auth SH02, SH03, SH04 |
+| Revoking the HS256 signing key: 3-6 s to rejection on three projects; legacy API keys die, `sb_publishable_` / `sb_secret_` survive | measured | self-hosted-auth SH05 |
+| Signing-key status semantics | documented | Supabase signing-keys page |
+| Self-hosting compose connects Auth as `supabase_auth_admin` | documented | supabase/supabase docker-compose.yml |
+| `GOTRUE_JWT_KEYS` is a JSON array of JWKs with one `sign` key | documented | supabase/auth `internal/conf` |
+| 2026-08-14 JWT rejection incidents | reported | status page, as recorded in the incident-resilience reference |
+
+## Related docs
+
+- [Supabase incidents: what a client can do](/reference/supabase-incident-resilience/) - the incident classes above in full, with the client-side responses.
+- [RLS without Supabase Auth](/reference/rls-without-supabase-auth/) - the wire-claims pattern this doc summarises.
+- [Locking down Supabase](/reference/supabase-data-surface-lockdown/) - every lever, including the ones outside Auth.
+- [Migrating PBKDF2 password hashes](/reference/pbkdf2-supabase-auth-migration/) - the import formats and the lazy-migration pattern.
+- [Where should a tenant live](/reference/supabase-multi-tenant-placement/) - the isolation proofs and the placement decision.
+- [Put an IAP over the Data API](/guides/supabase-iap-data-api/), [Running many tenants on one project](/guides/supabase-shared-tenancy/), [Promoting a tenant](/guides/supabase-tenant-promotion/), [Consolidating tenants](/guides/supabase-tenant-consolidation/), [Run your own PostgREST](/guides/supabase-own-postgrest/), [Trusted-device MFA and impersonation audit](/guides/supabase-auth-mfa-trusted-device-and-impersonation-audit/) - the guides each section points at.
+
+[^sb-signing-keys]: Supabase, "JWT Signing Keys," Supabase Docs. https://supabase.com/docs/guides/auth/signing-keys
+[^gotrue-readme]: Supabase, "supabase/auth README," GitHub. https://github.com/supabase/auth/blob/master/README.md
+[^sb-compose]: Supabase, "docker/docker-compose.yml," supabase/supabase on GitHub. https://github.com/supabase/supabase/blob/master/docker/docker-compose.yml
+[^gotrue-conf]: Supabase, "internal/conf/configuration.go and jwk.go," supabase/auth on GitHub. https://github.com/supabase/auth/tree/master/internal/conf
+[^lex-incident]: Erfi Anugrah, "Supabase incidents: what a client can actually do," Erfi's Lexicanum. https://erfi.dev/reference/supabase-incident-resilience/
+[^lex-rls]: Erfi Anugrah, "RLS without Supabase Auth: JWT claims over the wire," Erfi's Lexicanum. https://erfi.dev/reference/rls-without-supabase-auth/
+[^lex-shared]: Erfi Anugrah, "Running many tenants on one Supabase project," Erfi's Lexicanum. https://erfi.dev/guides/supabase-shared-tenancy/
+[^lex-pbkdf2]: Erfi Anugrah, "Migrating PBKDF2 password hashes into Supabase Auth," Erfi's Lexicanum. https://erfi.dev/reference/pbkdf2-supabase-auth-migration/
+[^lex-lockdown]: Erfi Anugrah, "Locking down Supabase: the database is the security boundary," Erfi's Lexicanum. https://erfi.dev/reference/supabase-data-surface-lockdown/
+[^lex-own-pgrst]: Erfi Anugrah, "Run your own PostgREST against a Supabase project," Erfi's Lexicanum. https://erfi.dev/guides/supabase-own-postgrest/
