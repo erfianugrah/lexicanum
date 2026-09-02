@@ -463,6 +463,35 @@ export const LLM_MARKERS: Marker[] = [
     // RLS policy carries " -- reads" as an ordinary SQL comment.
     miss: "```sql\nselect 1 -- reads\n```",
   },
+  {
+    // Three rows from the 2026-09-02 review passes on the measured Supabase
+    // pages. Each is a shape a reviewer flagged more than once and a regex can
+    // catch; the wording rule behind each is in the lab-writeup skill.
+    name: "undated-earlier-run",
+    // "an earlier run saw it ignored" - which run? Dates and module ids, not
+    // relative time. "an earlier version of this paragraph" is legitimate
+    // (two docs use it about their own history), so `version` is excluded.
+    re: /\b(an|the) (earlier|later) (run|measurement|probe)\b/i,
+    hit: "an earlier run saw it silently ignored",
+    miss: "an earlier version of this paragraph said the opposite",
+  },
+  {
+    name: "pass-band-as-measurement",
+    // "within 15 s of the documented 400 s" quotes the test's tolerance as if
+    // it were the observation; the observation was a 5 s tick.
+    re: /\bwithin \d+ ?s of the documented\b/i,
+    hit: "that is within 15 s of the documented 400 s figure",
+    miss: "the cut fell within one 5 s tick; the module's pass band is 15 s",
+  },
+  {
+    name: "unsourced-reported-to",
+    // "is reported to corrupt" with no footnote reads as a non-public report
+    // stream. Cite the public source or say what this battery was built to
+    // look for.
+    re: /\b(is|are|was|were) reported to\b/i,
+    hit: "a path that is reported to corrupt function metadata",
+    miss: "a public issue reports 138 of 237 functions absent",
+  },
 ];
 
 /**
