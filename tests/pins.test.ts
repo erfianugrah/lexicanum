@@ -855,6 +855,12 @@ const pins: Pin[] = [
       "Port 587",
       // Both runtime ceilings return one code.
       "546 WORKER_RESOURCE_LIMIT",
+      // Second wave: the documented recursive cap did not bite, and the only
+      // refusal was this code; the active wall clock cut and the truncation
+      // marker are the two figures that turn "not run" rows into measured ones.
+      "RATE_LIMIT_EXCEEDED",
+      "cut after 395 s",
+      "....[truncated]",
     ],
     mustNotContain: [
       // The error string the platform did not return.
