@@ -882,6 +882,40 @@ const pins: Pin[] = [
     ],
   },
   {
+    doc: "reference/supabase-data-surface-lockdown",
+    mustContain: [
+      // S21 (2026-09-03): the anon-only revoke left every RPC callable; the
+      // PUBLIC grantee is the fix, and only the global default-privilege form
+      // holds for new functions. If either sentence softens, the recipe is
+      // wrong again.
+      "REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM public",
+      "ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM public",
+      // S17: FORCE binds only a non-BYPASSRLS owner, with the platform's own
+      // refusal text for the obvious workaround.
+      'is a reserved role, only superusers can modify it',
+      // S16: the hosted edge appends and passes cf-connecting-ip; the
+      // pre-request hook survived neither reload nor restart.
+      "cf-connecting-ip",
+      "by reload or by restart",
+      // S18: the trail is the logs endpoint, not the admin audit table.
+      "returned 200 with 0 entries",
+    ],
+    mustNotContain: [
+      // S19 drove HIBP at signup; the old hedge must not return.
+      "signup was not driven in the lab",
+      "was not driven in the lab",
+    ],
+  },
+  {
+    doc: "guides/supabase-own-postgrest",
+    mustContain: [
+      // S20: the through-edge behaviour is measured, with the lab config named.
+      "edge.nginx.conf",
+      "one RFC 1918 address and no client value",
+    ],
+    mustNotContain: ["the through-nginx behaviour is not measured", "reasoned, not measured"],
+  },
+  {
     doc: "reference/supabase-auth-end-to-end",
     mustContain: [
       // The verifier asymmetry the self-hosted run found: PostgREST refuses an
