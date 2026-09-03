@@ -18,8 +18,8 @@ do](/reference/supabase-incident-resilience/).
 **Prerequisites.** A Supabase Management API personal access token, a
 project on any paid plan (spend cap behavior differs on Pro), `bun` or
 Node, `wrangler` for the edge layer, `pg_dump`/`psql` for cold DR. The
-standby layer needs a second project (any region) - everything else uses
-the one you have.
+standby layer needs a second project (any region, at the compute size you
+will cut over to - see Part 4) - everything else uses the one you have.
 
 ## Constants preamble
 
@@ -94,6 +94,33 @@ curl -s -w '\n%{http_code}' \
   "https://$REF.supabase.co/rest/v1/probe_canary?select=id"
 ```
 
+The other three services need their own probes, each against a real
+operation rather than a health endpoint:
+
+- **Auth**: admin-create a probe user and take the password grant (the
+  Part 2 commands). Neither lab run probed that path: platform-downtime
+  D01 (2026-08-04, 500 ms sampling) sampled `GET /auth/v1/health` with an
+  anon key and saw `HTTP 521` for 75 s across a restart; compute-disk D09
+  (2026-08-19, 250 ms) sampled the same `/auth/v1/health` and saw 0 s of
+  contiguous outage across four resizes. Different projects, dates and
+  vantages, so the health endpoint's own behaviour is open; probing an
+  authenticated operation is a design choice, not a result.
+- **Storage**: fetch a real object. On a fresh project Storage lags
+  `ACTIVE_HEALTHY`, answering `TenantNotFound` and then `429 SlowDown` for
+  the first minutes (edge-resilience W21, 2026-08-17) - retry rather than
+  page.
+- **Pooler**: `select 1` over 6543 with a connect timeout. The error
+  string names the operation underway (rows below). The lab's 5 s probe
+  timeout coarsened the pooler's recovery resolution to about 5.5 s in
+  timeout mode; keep the timeout short if you want the window to the
+  second.
+
+Declare recovery only after sustained success (the lab required 5 s of
+passing samples), because the pooler queues before it refuses and one
+passing sample mid-outage reads as recovery; and void any probe row that
+was already failing before the operation started, or a bad credential
+becomes a platform outage (platform-downtime "Reproducing").
+
 3. Alert on the code classes, which separate incident types cleanly:
 
 | Signal | Meaning | Action |
@@ -104,6 +131,10 @@ curl -s -w '\n%{http_code}' \
 | PGRST000 / 5xx on a real table | DB or tier failure | incident response |
 | 520/521/522 from CF front | gateway path | retry with backoff; cache serves reads |
 | 402 | billing restriction (Fair Use Policy: quota, spend cap, overdue invoice) | fix billing - card, cap toggle, or usage - not the platform; details in [the DR tiers reference](/reference/supabase-dr-tiers/) |
+| pooler `Failed to connect to database: {:error, :timeout}` | project restart underway (158 s measured, platform-downtime D01) | wait; REST kept serving |
+| pooler `Failed to connect to database: {:error, :econnrefused}` | compute resize up underway (207 s measured, D03) | wait; REST kept serving |
+| pooler `terminating connection due to administrator command` | compute resize down underway (196 s measured, D04) | wait; REST kept serving |
+| pooler `(EADDRNOTALLOWED) address not in tenant allow_list` | a network restriction was just applied and excludes this client (bites in 1 s, D02) | add the client's egress address to the allow-list |
 
 **The non-engineering half of detection.** Subscribe to
 [status.supabase.com](https://status.supabase.com/) so a platform
@@ -135,9 +166,12 @@ curl -s -X PATCH -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
   -d '{"jwt_exp": 43200}'
 ```
 
-Verify the effect, not the status code - issue a token and decode
-`exp - iat`. Use the admin path, because hosted `/auth/v1/signup` hits
-email rate limits under scripted load:
+Poll the readback after the PATCH, and again after the restore: the apply
+is async, and a readback issued immediately after a restore PATCH returned
+the pre-restore value (edge-resilience W17, 2026-08-17 battery; the module
+now polls). Then verify the effect, not the status code - issue a token
+and decode `exp - iat`. Use the admin path, because hosted
+`/auth/v1/signup` hits email rate limits under scripted load:
 
 ```bash
 curl -s -X POST -H "apikey: $SECRET_KEY" -H "Authorization: Bearer $SECRET_KEY" \
@@ -221,9 +255,15 @@ delete the cache key on mutations.
 
 Deploy with wrangler (`wrangler deploy`); set `UPSTREAM` to
 `https://<ref>.supabase.co`. Scope the cache to read-only paths you mean to
-cache - do not cache auth or per-user responses without varying on the
-Authorization header (this example keys on the full request including
-headers, which handles that).
+cache - do not cache auth or per-user responses unless the cache key
+carries the caller's identity. The example passes `req.headers` into the
+key `Request`, and that is not enough on its own: the [Cache API
+documentation](https://developers.cloudflare.com/workers/runtime-apis/cache/)
+lists the response headers `put()` respects and says nothing about request
+headers as key material, so fold a hash of the Authorization header into
+the key URL yourself (or keep the Worker on anonymous paths, which is what
+the lab's W04 drill cached). Not measured in the lab: no module cached a
+per-user response.
 
 **Failover variant.** The lab worker extends this into an active-passive
 failover proxy: env vars `FAILOVER_PRIMARY` / `FAILOVER_STANDBY` /
@@ -254,6 +294,17 @@ cold-cache case, which cache-first loses anyway.
 Measured end to end: replication lag 34ms-1057ms cross-region, sessions
 portable via third-party-auth, cutover rehearsable.
 
+Run the standby at the compute size you will need at cutover, ahead of
+time. A resize during the incident adds its own window to your RTO:
+61-105 s to settle across four resizes, the Small -> Large step settling
+in 61 s with 17.0 s of contiguous REST outage (compute-disk D09,
+2026-08-19, 250 ms sampling), and
+131 s on Auth / 207 s on the pooler for a Micro -> Small step measured at
+500 ms on another rig (platform-downtime D03, 2026-08-04). If you must
+resize twice, space the PATCHes by at least 2 minutes; the second inside
+that window answered `429 We are still processing addon changes, please
+try again in 1-2 minutes` (D09).
+
 ### 4.1 Replicate
 
 On the primary (single statements - see gotchas):
@@ -261,6 +312,14 @@ On the primary (single statements - see gotchas):
 ```sql
 create publication ha_pub for table public.<your_tables>;
 ```
+
+Before the subscription, check the slot budget on both sides:
+`show max_replication_slots` returned 10 on Micro and 10 on Small
+(compute-disk D01), each subscription pins one on the publisher, and a
+dropped subscription can leave its slot on the publisher either way -
+after a plain drop (W05) and after `slot_name = none` then drop (W14) -
+so list `pg_replication_slots` on the publisher and
+`pg_drop_replication_slot` any orphan first.
 
 On the standby, same table DDL first (DDL does not replicate), then the
 subscription against the primary's direct host - never the pooler:
@@ -362,9 +421,14 @@ select pg_drop_replication_slot('ha_sub');
 ```
 
 6. Re-apply per-project auth config on the standby: GET
-   `/v1/projects/{ref}/config/auth` on both projects, diff, PATCH the
-   standby (SMTP, `SITE_URL`, redirect URLs, rate limits, `jwt_exp`).
-7. Reverse the replication direction to fail back.
+   `/v1/projects/{ref}/config/auth` on both projects, diff the entire
+   payload, PATCH the standby. SMTP, `SITE_URL`, redirect URLs, rate
+   limits and `jwt_exp` are the fields known to matter, and the list is
+   not closed: `custom_oauth_max_providers` defaulted to 32767 on one
+   project generation and 3 on another (W17 baseline diff, 2026-08-17).
+   Poll the readback after the PATCH (the apply is async - Part 2).
+7. Reverse the replication direction to fail back (not measured - no
+   module runs the reverse direction).
 
 Note the restore interaction: a PITR or daily-backup restore of the
 primary unwinds this topology - subscriptions and replication slots must
@@ -372,7 +436,16 @@ be dropped before a restore and recreated after (only the Realtime slot
 is exempted), so the standby's subscription dies with a primary restore
 and must be rebuilt with a re-sync. Mid-incident, restore-to-a-new-
 project keeps the original (and the replication) up instead of taking
-the size-dependent restore downtime. The full backup/PITR picture is in
+the size-dependent restore downtime. When restoring into a new project,
+wait for `ACTIVE_HEALTHY` and then retry the first write: 5 of 5 fresh
+projects refused the first `POST /auth/v1/admin/users` with 500 and
+accepted the next attempt one poll tick later (placement reference,
+Verified row 'Create -> healthy, and healthy is not writable', 2026-08-04,
+n=5, bash run not in the lab repo; the lab's own note is 2 of 2 fresh
+projects failing with `500 "Database error checking email"` on
+2026-08-03, supabase-lab AGENTS.md provisioning note - both summarised in
+[what a platform operation costs](/reference/supabase-platform-operation-cost/)).
+The full backup/PITR picture is in
 [the DR tiers reference](/reference/supabase-dr-tiers/).
 
 ### 4.4 Rehearse
@@ -400,6 +473,76 @@ PGPASSWORD=$DB_PASSWORD pg_dump -h aws-0-<region>.pooler.supabase.com -p 5432 \
 Measured floor: 12.4s dump / 6.4s restore for 10k rows. Schedule it; ship
 the file to object storage outside the incident blast radius.
 
+## What to do about it
+
+The practices the measured steps above add up to, grouped by part. Each
+names the module or RUNLOG line it rests on; module ids resolve in the
+[edge-resilience RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c1894cc/experiments/edge-resilience/RUNLOG.md),
+the [platform-downtime RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c1894cc/experiments/platform-downtime/RUNLOG.md)
+and the [compute-disk RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c1894cc/experiments/compute-disk/RUNLOG.md).
+A line marked "design choice" is not a result.
+
+**Detection (Part 1)**
+
+- Probe Auth through a real operation (admin-create plus password grant)
+  rather than `/auth/v1/health` alone - a design choice: both lab runs
+  sampled `/auth/v1/health`, down 75 s on a restart (platform-downtime
+  D01) and 0 s across four resizes on another rig (compute-disk D09). No
+  module measured an authenticated Auth path.
+- Probe Storage against a real object, and on a fresh project expect
+  `TenantNotFound` then `429 SlowDown` for the first minutes (W21).
+- Probe the pooler with `select 1` over 6543 under a short connect
+  timeout, and map the error string to the operation using the four rows
+  in the Part 1 table (platform-downtime pooler-mode table). With the
+  lab's 5 s probe timeout a timing-out pooler was resampled about every
+  5.5 s, which is the resolution its 158 s figure carries.
+- Declare recovery after sustained success and void rows that were failing
+  before the operation began (platform-downtime "Reproducing").
+
+**Exposure reduction (Part 2)**
+
+- Poll the readback after every `config/auth` PATCH, including the
+  restore; an immediate readback returned the pre-restore value (W17,
+  2026-08-17). The 12h value is a design choice; the ~6.5s lever is the
+  measurement (W03).
+
+**Read survival (Part 3)**
+
+- Put the caller's identity into the cache key yourself before caching any
+  per-user response; the lab cached anonymous reads only (W04), so this is
+  a design choice, not a result.
+- The origin-first posture and `max-age=86400` are design choices; the lab
+  drilled cache-first (W04).
+
+**Warm standby (Part 4)**
+
+- Run the standby at the cutover compute size ahead of time: a resize
+  costs 61-105 s to settle across four resizes, the Small -> Large step
+  settling in 61 s with 17.0 s of contiguous REST outage (compute-disk
+  D09), or 131 s Auth / 207 s pooler on the other rig
+  (platform-downtime D03). Space adjacent resize PATCHes by at least
+  2 minutes or the second answers `429 still processing addon changes`
+  (D09).
+- Check `max_replication_slots` (10 on Micro and Small, compute-disk D01)
+  and drop orphan slots before `CREATE SUBSCRIPTION` (W05, W14).
+- Never drop and recreate a table under an active Realtime subscription
+  (events for that name stop; new OID, stale channel metadata), and retry
+  joins with backoff - a join after 11 other modules had the socket closed
+  before the event (W12).
+- Diff the entire `config/auth` payload at cutover, not five named fields;
+  `custom_oauth_max_providers` read 32767 on one project generation and 3
+  on another (W17).
+- When restoring into a new project, wait for `ACTIVE_HEALTHY` and retry
+  the first write: 5 of 5 fresh projects refused it with 500 (placement
+  reference, Verified row 'Create -> healthy, and healthy is not
+  writable', 2026-08-04, n=5, bash run not in the lab repo; supabase-lab
+  AGENTS.md provisioning note, 2026-08-03, 2 of 2,
+  `500 "Database error checking email"`).
+- Not measured: failing back by reversing replication (4.3 step 7); a
+  primary-side network restriction against the standby's walreceiver; the
+  full routing-flip RTO end to end (per-step timings only: W05, W16, W17);
+  the monthly rehearsal cadence (design choice).
+
 ## Verification
 
 - Probes: kill nothing, but confirm each probe reports the right code when
@@ -423,8 +566,10 @@ the file to object storage outside the incident blast radius.
   presented as an unexplained SQL 400 until the verbatim body was read.
 - **Config APIs are not request-path truth.** TPA shows `resolved` while
   PostgREST still rejects the key (~30s cold); `jwt_exp` reads back before
-  the issuer honors it (~6.5s); a `jwt_secret` PATCH returns 200 and
-  changes nothing. Verify at the request path, always.
+  the issuer honours it (~6.5s), and a readback taken immediately after a
+  restore PATCH still showed the old value (W17, 2026-08-17); a
+  `jwt_secret` PATCH returns 200 and changes nothing. Verify at the
+  request path, always.
 - **The gateway sets `Set-Cookie` on everything.** Strip it before
   `cache.put` or the Cache API refuses silently.
 - **Cloudflare Workers wraps TCP failures to unroutable IPs as a 403
@@ -448,9 +593,11 @@ the file to object storage outside the incident blast radius.
 - **Wedged-subscription recovery is ordered**: `alter subscription <s>
   disable` -> `alter subscription <s> set (slot_name = none)` -> `drop
   subscription <s>` -> `pg_drop_replication_slot('<s>')` on the
-  publisher. Dropping without the slot detach leaves the publisher slot
-  pinning WAL; subscriptions can also vanish and reappear under platform
-  management (measured during the W09/W14 drills).
+  publisher. The publisher slot survived the drop either way - after a
+  plain drop (W05) and after `slot_name = none` then drop (W14) - so the
+  final `pg_drop_replication_slot` step is the one that frees the WAL;
+  subscriptions can also vanish and reappear under platform management
+  (measured during the W09/W14 drills).
 - **Break-glass secrets stay live until rotated.** Reading `jwt_secret`
   through the Management API is auditable, but the secret does not
   expire on its own - rotate it after any break-glass use.

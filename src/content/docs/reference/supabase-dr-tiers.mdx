@@ -19,8 +19,11 @@ page is the money-and-recovery-point axis those two deliberately skip.
 
 **Provenance** - the measured numbers on this page come from the
 edge-resilience lab experiment: logical replication from a managed
-primary (ap-southeast-2) to a managed standby (ap-southeast-1), runs of
-2026-08-15 and 2026-08-17; the standby build and cutover rehearsal are
+primary (ap-southeast-2) to a managed standby (ap-southeast-1): W05
+(replication lag) and W06 (dump and restore) on 2026-08-15, W21 (spend cap)
+on 2026-08-17, with the Storage numbers from W10 (2026-08-15) and W26
+(2026-08-17) and the resize windows from compute-disk D09 (2026-08-19) and
+platform-downtime D03 (2026-08-04); the standby build and cutover rehearsal are
 in [the runbook](/guides/supabase-resilience-runbook/). The remaining
 figures are quoted from the cited Supabase docs and the SLA page, and
 the evidence table at the end of the doc splits measured from
@@ -42,7 +45,7 @@ availability class: under the Fair Use Policy the whole org can answer
 | --- | --- | --- | --- | --- |
 | Daily backups | up to ~24h | size-dependent restore downtime, project offline | included | Pro (7d) / Team (14d) / Ent (30d) |
 | PITR add-on | ~2 minutes | size-dependent restore downtime, project offline | ~\$100 (7d) / ~\$200 (14d) / ~\$400 (28d) + Small compute | Pro + Small compute |
-| Warm standby (hand-rolled) | 34ms-1s replication lag (measured) | minutes - a rehearsed cutover | second project's compute (~\$10 Micro) + your runbook | any paid plan |
+| Warm standby (hand-rolled) | 34ms-1s replication lag (measured) | minutes - a rehearsed cutover, plus a resize window (61-105 s settle across four resizes, up to 17.0 s REST outage on the Small -> Large step, compute-disk D09) if the standby runs smaller than the primary | second project's compute at the size you will cut over to (~\$10 if that is Micro) + your runbook | any paid plan |
 | Read replicas | near-zero lag | no failover - GET-only, never promoted | same compute size as the primary, outside the \$10 credits | paid plans |
 
 RPO and RTO are different axes and the table keeps them separate on
@@ -65,7 +68,11 @@ goes to the primary - they absorb read load, not outages.
 On Pro, Team and Enterprise your project is backed up daily already:
 7, 14 and 30 days of retention respectively.[^sb-backups] Free-tier
 projects get nothing - the documented self-serve path is a scheduled
-`supabase db dump` (or `pg_dump`), kept off-site.[^sb-backups]
+`supabase db dump` (or `pg_dump`), kept off-site.[^sb-backups] Size the
+schedule off the measured floor: 12.4s to dump and 6.4s to restore 10k
+rows through the pooler session host (edge-resilience W06, 2026-08-15);
+the command and the host shape are in
+[the runbook, Part 5](/guides/supabase-resilience-runbook/).
 
 Caveats that matter when you reach for one:
 
@@ -73,7 +80,13 @@ Caveats that matter when you reach for one:
   metadata; restoring an old backup does not bring back objects deleted
   after it.[^sb-backups] Combined with the replication finding (objects
   do not follow their metadata either), Storage durability is its own
-  problem - sync objects separately.
+  problem - sync objects separately, and cost it: a standby answered
+  `400` with `NoSuchBucket` in the body for an object that existed on the
+  primary, and the download-then-upload sync of a small object took under
+  a second (edge-resilience W10, 2026-08-15); dual-writing at the client
+  lands 200/200 with 107ms skew but a partial failure (primary 200 /
+  standby 400) leaves the object on one side only, closed by a sync-after
+  in 97ms (W26, 2026-08-17).
 - **Custom role passwords are not stored.** Restore from a daily backup
   and you reset custom-role passwords afterwards.[^sb-backups]
 - **Restore is offline and size-dependent.** The project is inaccessible
@@ -103,6 +116,13 @@ The details that decide whether it fits:
   automatically.[^sb-backups] A project acting as your standby's
   publication source loses its slots in a restore - the standby's
   subscription dies with it and must be recreated (with a re-sync).
+  Inventory them first with `select * from pg_replication_slots`:
+  `max_replication_slots` is 10 on Micro and on Small (compute-disk D01),
+  and a dropped subscription can leave its slot on the publisher either
+  way - after a plain drop (edge-resilience W05) and after
+  `slot_name = none` then drop (W14) - so list `pg_replication_slots` on
+  the publisher and `pg_drop_replication_slot` any orphan first; a
+  forgotten slot is disk growth you did not schedule.
 
 ## Tier 3: the hand-rolled warm standby
 
@@ -112,10 +132,16 @@ third-party-auth registration. The build and every caveat are in
 [the runbook](/guides/supabase-resilience-runbook/) - what belongs here
 is the cost shape:
 
-- **A second project at full compute.** Micro is ~\$10/month; the \$10
-  monthly compute credits cover ONE project, so the second one is real
-  money.[^sb-compute] The full sizing table plus resize windows and quota
-  behavior are in the [compute and disk reference](/reference/supabase-compute-disk/).
+- **A second project at the compute you will cut over to.** Micro is
+  ~\$10/month; the \$10 monthly compute credits cover ONE project, so the
+  second one is real money.[^sb-compute] Pricing the standby at Micro and
+  resizing at cutover moves the resize window into your RTO: 61-105 s to
+  settle across four resizes, the Small -> Large step settling in 61 s
+  with 17.0 s of contiguous REST outage (compute-disk D09, 2026-08-19),
+  or 131 s on Auth and 207 s on the
+  pooler for Micro -> Small on another rig (platform-downtime D03,
+  2026-08-04). The full sizing table plus resize windows and quota
+  behaviour are in the [compute and disk reference](/reference/supabase-compute-disk/).
 - **Read replicas are not the cheap version of this.** A replica runs at
   the primary's compute size, its compute is not covered by the credits,
   and it is never promotable.[^sb-read-replicas] It is a read-scaling
@@ -196,6 +222,34 @@ the Management API) rather than platform HA features.
 | Region down, RTO in minutes | Warm standby | the only tier that is up somewhere else |
 | Read load, plus disk-failure cover | Read replicas | availability for reads; never a failover |
 | Zero budget, best possible | cron `pg_dump` + object sync | measured floor: 12.4s dump / 6.4s restore at 10k rows |
+
+## What to do about it
+
+The sizing rules that follow from this page's own numbers. Each row names
+the module it rests on; a row that is a design choice says so. Module ids
+resolve in the
+[edge-resilience RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c1894cc/experiments/edge-resilience/RUNLOG.md)
+and the [compute-disk RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c1894cc/experiments/compute-disk/RUNLOG.md).
+
+| Practice | Rests on |
+| --- | --- |
+| Run the standby at the compute size you will cut over to, and price that, not Micro: a resize at cutover costs 61-105 s to settle across four resizes, the Small -> Large step settling in 61 s with 17.0 s of contiguous REST outage, or 131 s Auth / 207 s pooler on the other rig. | compute-disk D09; platform-downtime D03 |
+| If you do run the standby small, add the resize window to the standby RTO and space two resize PATCHes by at least 2 minutes (`429 We are still processing addon changes`). | compute-disk D09 |
+| Add a Storage sync step to every tier and cost it: objects do not follow metadata (the standby answers `400`/`NoSuchBucket`; a small object's first sync took under a second), and dual-write is not atomic (200/400 split; sync-after 97ms). | W10, W26 |
+| Before enabling PITR on a publication source, inventory subscriptions and slots with `pg_replication_slots` and drop orphans: 10 slots on Micro and Small, and a dropped subscription left its publisher slot pinning WAL in both drills (W05 plain drop; W14 after `slot_name = none`). | compute-disk D01; W05, W14 |
+| Time a restore on a copy before you need the number: this page says "size-dependent restore downtime" because no module timed one. Restore to a new project, time it, and write that down as the RTO. | design choice; not measured |
+| Verify the 2-minute PITR recovery point with a canary insert against the WAL archive lag before quoting it into a contract; the figure here is documented, not measured. | design choice; the docs[^sb-backups] |
+| Alert on the spend-cap notification and the usage page rather than on a request error: 105 renders against a quota of 100 all returned 200, so the notification is the first detectable signal. | W21, 2026-08-17 |
+| Free tier: schedule the `db dump`, ship it off the project, and size the job off 12.4s dump / 6.4s restore per 10k rows through the pooler session host. | W06, 2026-08-15 |
+
+Not measured, so stated as such above: any PITR restore time or the
+2-minute worst-case recovery point (the lab never enabled PITR); daily
+backup restore downtime at any size; `tooManyConnections` on a restore
+(recorded in the lab's summary file with no module, date or artifact, so
+anecdotal); read replica behaviour through a disk failure; the full 402
+restriction path (W21 proved only the absence of a request-path breaker);
+the cutover RTO end to end (per-step timings exist: W05, W16, W17); the
+monthly rehearsal cadence.
 
 ## Evidence
 

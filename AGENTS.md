@@ -57,6 +57,10 @@ CLOUDFLARE_API_KEY + CLOUDFLARE_EMAIL, in env; it skips silently without them.
   frontmatter for their old URLs, and Astro emits a redirect stub page at each.
   Do not infer that a doc exists from a built directory, and do not treat an
   unmatched one as a stale artifact.
+- **MDX reads `<` in prose as JSX.** `Micro <-> Small` or a bare `<ref>`
+  outside a code span fails the build with "Unexpected character". Write the
+  words, or put the placeholder in backticks. `rg -n '<[a-z-]|<->'` on prose
+  lines before `bun run build`.
 
 ## Doc taxonomy
 
@@ -301,7 +305,7 @@ Cite the method in prose: an evidence table with a "How it was checked" column t
 splits measured from documented-but-not-tested. That split is the contract with the
 reader, and it is maintained by hand.
 
-Four rules that three review passes on 2026-09-02 kept re-deriving, now fixed:
+Five rules that review passes on 2026-09-02 and 2026-09-03 kept re-deriving, now fixed:
 
 - **Quote numbers by paste, not recall.** The lab renders a run artifact as
   tables (`pvlab --facts run.json --only EF08`) and publishes a redacted copy
@@ -318,6 +322,13 @@ Four rules that three review passes on 2026-09-02 kept re-deriving, now fixed:
 - **Evidence links pin to a commit** (`/tree/<sha>/...`, never `/tree/main/`)
   and point at the published `out/` artifact where one exists, so module ids in
   the evidence table stay resolvable after the lab moves on.
+- **Every lab-backed page ends in practices.** A "What to do about it"
+  section (or the page's older equivalent) with imperative rows and a "Rests
+  on" column naming the module id that measured the claim; `tests/pins.test.ts`
+  requires the heading on every such page. A row whose figure has no lab
+  record says so in the cell. The 2026-09-03 pass over 34 pages found that
+  most defects were attribution, not prose: a module cited for something it
+  did not measure, or a figure that exists only in this corpus.
 
 The `lab-writeup` skill carries the full pre-publish checklist (ambiguity
 classes, provenance, sweeps) and the reviewer brief. Three of its regex-able

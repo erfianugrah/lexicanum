@@ -111,6 +111,16 @@ region, and storage object bytes live in that region's S3 - so every
 subsystem's latency shifts with the move. (Edge Functions are globally
 distributed, but their *distance to the database* follows the database region.)
 
+Enumerate what you may create before you pick:
+`GET /v1/projects/available-regions?organization_slug=<slug>` answers 200 with
+`{ recommendations, all: { smartGroup[], specific[] } }` - 17 specific regions
+and 3 smart groups (americas, emea, apac) on a Team org when probed - and a
+call without the slug answers 400. The `recommendations` block is the
+platform's capacity pick for the org, which also answers the sbshift runbook's
+"re-check target-region capacity" item (platform-facts F04c,
+[supabase-lab](https://github.com/erfianugrah/supabase-lab), 2026-08-20). The
+region list hard-coded in that runbook is a snapshot; this endpoint is current.
+
 Measure before committing, from where your app actually runs:
 
 ```bash
@@ -207,7 +217,8 @@ bun start bootstrap --with-auth-data --confirm
 bun start doctor
 bun start preflight
 
-# 5. replicate; the app keeps writing to the source throughout
+# 5. replicate; the app keeps writing to the source throughout - but freeze DDL
+#    on it (a source-only ALTER stalls every table's stream; see below)
 bun start replicate
 bun start watch
 
@@ -261,6 +272,25 @@ one needs `alter table <t> replica identity full` or deletes/updates will
 not replicate. Schema, roles, extensions, and auth users must already exist
 on the target (same dump/restore as Variant A steps 2) **before** creating
 the subscription, or the initial copy fails row by row.
+
+Two more rules while the subscription is live. Freeze DDL on the source: a
+source-only `ALTER` stalled every table's stream - zero rows arrived on the
+target, including rows not using the new column - and applying the same
+`ALTER` on the target resumed it in about 6.1 s with backfill and no
+subscription recreation (edge-resilience W15, 2026-08-16); if a migration
+must ship, target first, then source. And decide the rollback before the
+write-stop: create a named restore point on the source via the Management
+API; up to the repoint, `bun start teardown` plus re-enabled source writes is
+lossless because the target has taken no application writes; after the
+repoint nothing flows target -> source, so the choices are roll forward,
+repoint back and re-apply the loss window by hand (never writes on both), or
+drain a reverse replication you set up between `reconcile` passing and the
+repoint - a second config with roles swapped, distinct slot / publication /
+subscription names and `copyData: false`
+(`bun start -c migrate.reverse.yaml replicate`), one direction at a time
+(sbshift `docs/RUNBOOK.md` sections 9 and 12, a procedure rather than a
+measurement; W05 measured managed -> managed streaming in one direction
+only).
 
 ## Part 3: repoint - the region-specific checklist
 
@@ -334,6 +364,20 @@ the only one that becomes unrecoverable, so read it before you start Part 2.
    dual-read both projects briefly (only viable for read-mostly apps), or
    accept that the installed base re-logs-in on next open.
 
+   A fourth option keeps existing access tokens working through the
+   validation window: register the source project's issuer
+   (`https://<old-ref>.supabase.co/auth/v1`) as a third-party auth provider on
+   the target before cutover. A token issued by the old project then reads
+   the new project's Data API with 200 and nothing is copied (edge-resilience
+   W05, 2026-08-15). Rehearse it: the first time PostgREST meets that issuer's
+   key it answers `401 PGRST301` for about 30 s before trusting it, and a key
+   set it has seen before warms in about 302 ms (W01, W05). Two limits: the
+   old project's Auth endpoint has to stay reachable for the window, which
+   conflicts with pausing it (Part 4) until the window closes; and it covers
+   access tokens only - refresh tokens live in the old project's
+   `auth.refresh_tokens`, and their behaviour across a cutover was not
+   measured.
+
    Passwords themselves survive: `auth.users` carries bcrypt hashes and they
    verify unchanged on the target, so nobody resets a password. Only sessions
    die.
@@ -355,8 +399,16 @@ the only one that becomes unrecoverable, so read it before you start Part 2.
    ```
 
    Then apply that value to the target project's pgsodium config before
-   restoring `vault.secrets`. Verify by selecting one secret back out through
-   `vault.decrypted_secrets` on the target and comparing it to the source.
+   restoring `vault.secrets`, and verify by selecting one secret back out
+   through `vault.decrypted_secrets` on the target and comparing it to the
+   source. The apply step is the unverified half of this item: the read
+   (`GET .../pgsodium` returning `root_key`) and the post-deletion `400` below
+   are observed, but no lab run has yet found a write surface for
+   `/projects/{ref}/pgsodium`. The vault-root-key experiment in supabase-lab
+   exists to probe PUT, PATCH and POST against it and to check that a 2xx
+   changes decrypt behaviour, and its RUNLOG records no run yet. Until it
+   does, rehearse this item on a throwaway pair before relying on it, and
+   treat a dump/restore of `vault.secrets` as lossy.
 
    The window closes permanently. Once the source project is deleted, the same
    endpoint returns `400 {"message":"Resource has been removed"}` and the key
@@ -367,7 +419,11 @@ the only one that becomes unrecoverable, so read it before you start Part 2.
 ## Part 4: validation window and decommission
 
 - Keep the **old project paused, not deleted**, for a few days as a safety
-  net. Never re-enable writes on it - that is split-brain.
+  net. Never re-enable writes on it - that is split-brain; the way back after
+  the repoint is the rollback decision from Variant B (roll forward, re-apply
+  the loss window, or drain reverse replication), never source writes. If the
+  third-party-auth bridge from Part 3 item 7 is in use, pause the source only
+  once the validation window closes.
 - Watch, against your Part 1 baseline: error rates, auth success (email and
   each social provider), Realtime connection counts, and p95 latency from
   your app host. `sbshift verify` doubles as a post-move advisor-lint health
@@ -400,6 +456,31 @@ this table is the region-move surface:
 | storage push to a bucket-less target | bucket auto-created **private**; public URL returned 400 "Bucket not found" until `public = true` was restored | executed against the sandbox pair |
 | anon keys, source vs target | different ref-scoped JWTs - old-project tokens cannot validate on the new project | documented, not executed |
 | `provision` preview | no-op when the target already matches the (default) source infra | executed against the sandbox pair |
+
+## What to do about it
+
+The practices the measurements and the sbshift runbook support. Module ids
+are supabase-lab drills (edge-resilience W, platform-facts F,
+tenant-consolidation C); "RUNBOOK" is sbshift's `docs/RUNBOOK.md`, a
+procedure rather than a measurement.
+
+| Practice | Rests on |
+|---|---|
+| Enumerate creatable regions and the capacity recommendation with `GET /v1/projects/available-regions?organization_slug=<slug>` before `projects create`; without the slug the call answers 400 | F04c (measured 2026-08-20) |
+| Freeze DDL on the source between `replicate` and `cutover`, or apply each migration on the target first: a source-only `ALTER` stalled every table's stream, and the same `ALTER` on the target resumed it in about 6.1 s with backfill | W15 (measured) |
+| Register the source issuer (`https://<old-ref>.supabase.co/auth/v1`) as third-party auth on the target before cutover so existing access tokens keep reading; expect about 30 s of `401 PGRST301` the first time and about 302 ms once seen; keep the source Auth endpoint up for the window | W05, W01 (measured); refresh-token behaviour across a cutover not measured |
+| Backfill users through `POST /auth/v1/admin/users` with the bcrypt `password_hash`, `id` and `app_metadata` rather than hand-built `auth.users` rows; duplicate and case-variant emails are refused with `422 email_exists` | C03 (measured 2026-08-04) |
+| Re-password every custom LOGIN role on the target (`ALTER ROLE <name> WITH PASSWORD '...'`) before repointing anything that uses it; it arrives with `rolpassword` NULL | measured run above; RUNBOOK sections 0 and 9 |
+| After `config-sync`, poll the config readback until it matches rather than reading once - the apply is asynchronous: in the W17 drill a readback straight after its restore PATCH returned the pre-restore value - and diff auth defaults between the two projects: `custom_oauth_max_providers` defaulted to 32767 on one project generation and 3 on another | edge-resilience battery 2026-08-17 (W17) |
+| Re-apply `ALTER ROLE ... SET` / `ALTER DATABASE ... SET` overrides by hand; they live in `pg_db_role_setting`, `config-sync` cannot see them and `doctor` only warns | RUNBOOK section 10 (procedure) |
+| If the source has network restrictions or SSL enforcement, opt into `configSync.networkRestrictions: true` / `sslEnforcement: true` or re-apply them before repointing; the target starts with no allow-list | RUNBOOK section 10 flag table (documented; not part of the 2026-07-30 apply) |
+| Create a named restore point on the source before the write-stop, and decide the rollback: before the repoint, `teardown` plus source writes is lossless; after it, roll forward, re-apply the loss window, or drain reverse replication (`copyData: false`) set up between `reconcile` and the repoint | RUNBOOK sections 9 and 12 (procedure); W05 one direction only |
+| If the app writes Storage objects during the validation window and a rollback must include them, dual-write to both projects and handle partial failure yourself: parallel writes landed 200/200 (107 ms skew in the probe run, 363 ms in the 2026-08-17 battery) with equal bytes, a 200/400 split left the object on one side only, and a sync-after (download, upload) closed the gap in 97 ms to 333 ms for a small object; a first sync took 780 ms to 1246 ms | W26, W10 (measured; probe and battery values) |
+| Treat Part 3 item 8's "apply the root key to the target" as unverified until the vault-root-key experiment reports; rehearse it on a throwaway pair first | vault-root-key RUNLOG: no run yet |
+
+The custom-domain TTL of ~60 s the day before, the validation-window length,
+the mobile key-rollout option and the byte-sync tool (`sbshift storage`
+against rclone) are design choices; no run measured them.
 
 ## Verification
 
@@ -445,6 +526,16 @@ this table is the region-move surface:
 
   The bcrypt hash itself ports fine, so once the columns are fixed the original
   password works.
+
+  The supported alternative avoids the schema entirely: post each user to
+  `POST /auth/v1/admin/users` with the source's bcrypt `password_hash`, its
+  `id` and its `app_metadata`. GoTrue accepted the `$2a$` string straight
+  from the source, honoured the supplied `id`, and the user logged in with
+  the original password; GoTrue writes the token columns itself, so the
+  empty-string trap above does not arise, and a duplicate or case-variant
+  email is refused with `422 email_exists` (tenant-consolidation C03,
+  2026-08-04). An older lab note calling the hash non-portable through the
+  admin API was an assumption, corrected 2026-09-02.
 - **Enumerate the repointing surface before the window, not during it.**
   OAuth callbacks, the region-specific pooler hostname, custom-domain DNS
   and mobile key rollouts are each a separate system with its own deploy

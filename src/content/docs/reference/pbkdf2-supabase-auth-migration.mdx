@@ -44,7 +44,7 @@ if err != nil {
 return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
 ```
 
-The same prefix check runs at **create** time in `NewUserWithPasswordHash`[^gotrue-user]: an imported hash is validated as Argon2, as Firebase scrypt, or (the fallback) as bcrypt via `bcrypt.Cost()`. A PBKDF2 string matches none of the first two and is not a bcrypt hash, so the import is rejected - and the rejection surfaces as an HTTP 500 `unexpected_failure`, not a clean validation error (measured).
+The same prefix check runs at **create** time in `NewUserWithPasswordHash`[^gotrue-user]: an imported hash is validated as Argon2, as Firebase scrypt, or (the fallback) as bcrypt via `bcrypt.Cost()`. A PBKDF2 string matches none of the first two and is not a bcrypt hash, so the import is rejected - and the rejection surfaces as an HTTP 500 `unexpected_failure`, not a clean validation error (measured). Build the importer accordingly: a 500 on a `password_hash` import is a format rejection, so do not retry it; log the user and route them to the passwordless path below. An import loop with ordinary retry-on-5xx logic treats every PBKDF2 user as a transient failure and never finishes.
 
 The accepted set:
 
@@ -60,7 +60,11 @@ hash lifted out of one project's `auth.users` is already bcrypt, so
 `password_hash` accepts it and the user keeps their password. Measured in
 [consolidating one Supabase project per customer onto a shared project](/guides/supabase-tenant-consolidation/).
 The 500 above is specific to a hash GoTrue has no verifier for, not to the
-import path itself.
+import path itself. One caveat for that route: a bcrypt hash imported at a
+non-default cost stays at that cost. The rehash-on-signin logic exists in
+`Authenticate`, but the cost change was not observed to persist on the hosted
+platform (the last row of [Reproducing](#reproducing)), so do not plan on
+GoTrue normalising imported costs for you.
 </Aside>
 
 ### The Firebase scrypt precedent
@@ -196,7 +200,7 @@ grant  execute on function public.claim_migration(uuid) to service_role;
 The service role bypasses RLS, but the Data API only serves schemas you list in `db.exposed_schemas`. Keep `private` out of that list. The `SECURITY DEFINER` wrappers (with `search_path = ''` to block search-path hijacking) are what let the function reach `private` through an `rpc` call while the table stays invisible to PostgREST.
 </Aside>
 
-The `claim_migration` delete is the concurrency lock: two racing first-logins both verify, but only one `DELETE ... RETURNING` returns a row. The winner sets the password; the loser sees no row and simply proceeds to sign in.
+The `claim_migration` delete is the concurrency lock: two racing first-logins both verify, but only one `DELETE ... RETURNING` returns a row. The winner sets the password; the loser sees no row and simply proceeds to sign in. The loser's sign-in can reach the final `signInWithPassword` (comment `4.` in the function) before the winner's `updateUserById` has landed, so retry `signInWithPassword` once after a short delay on the `migrated-concurrent` path. The race window was not measured; this is reasoned from the code path.
 
 ---
 
@@ -274,6 +278,8 @@ supabase functions deploy auth-login --project-ref <ref> --no-verify-jwt --use-a
 
 <Aside type="caution">
 The skeleton returns 200 / 400 immediately. For production, equalise response shape and timing across all three outcomes (direct, migrated, bad password) and rate-limit by IP and email, so the endpoint is not an oracle for "does this email exist" or "is this user migrated". Setting a plaintext password via `updateUserById` always produces bcrypt at the default cost via `GenerateFromPassword`[^gotrue-password], so a migrated user is a standard Supabase password user with no further action.
+
+Budget the derivation too. Each legacy login runs one PBKDF2 derivation at the source's iteration count and PRF (SHA-512 on modern .NET), on an Edge Function CPU budget that passed a 500 ms busy loop and answered `546 WORKER_RESOURCE_LIMIT` at 3 s in [the Edge Function limits reference](/reference/supabase-edge-function-limits/) (the docs place the limit at 2 s). Measure one derivation at your iteration count in a deployed function before importing users; the per-derivation cost was not measured here.
 </Aside>
 
 ---
@@ -318,7 +324,7 @@ function parseAspNetHash(b64hash: string) {
 }
 ```
 
-Import each user with `admin.createUser({ email, email_confirm: true })` (no password), then insert the parsed parameters into `private.legacy_credentials` keyed by the returned `user.id`. Setting `email_confirm: true` for already-verified accounts skips re-verification. A passwordless `createUser` leaves `encrypted_password` as an empty string (not null), and GoTrue rejects login for an empty hash[^gotrue-user] - which is exactly the pending state you want (measured).
+Import each user with `admin.createUser({ email, email_confirm: true })` (no password), then insert the parsed parameters into `private.legacy_credentials` keyed by the returned `user.id`. Setting `email_confirm: true` for already-verified accounts skips re-verification. A passwordless `createUser` leaves `encrypted_password` as an empty string (not null), and GoTrue rejects login for an empty hash[^gotrue-user] - which is exactly the pending state you want (measured). Lowercase and trim the email at import and at the gateway: `get_legacy_cred` joins on `u.email = lower(p_email)`, so a stored email with different case never matches. Whether GoTrue normalises `email` on `createUser` was not measured; the import loop is your code either way.
 
 ---
 
@@ -333,9 +339,21 @@ create view private.pending_migrations as
 
 Run the gateway through a transition window. When `remaining` plateaus, the residue is inactive users: send them a one-time reset email, then `drop schema private cascade` and delete the function. No legacy verifier material is left on the platform.
 
-Gate the legacy branch behind an environment flag (for example `DISABLE_LEGACY_FALLBACK=1`). If the legacy store is ever suspected compromised, flip it: the gateway degrades to migrated-users-only and everyone else goes through password reset.
+Gate the legacy branch behind an environment flag (for example `DISABLE_LEGACY_FALLBACK=1`). On Edge Functions that is a function secret (`supabase secrets set DISABLE_LEGACY_FALLBACK=1`), read with `Deno.env.get` at request time so the flip needs no code change; whether a secret change reaches a running function without a redeploy was not measured, so redeploy after flipping it until you have checked. If the legacy store is ever suspected compromised, flip it: the gateway degrades to migrated-users-only and everyone else goes through password reset.
 
 ---
+
+## What to do about it
+
+| Practice | Rests on |
+|---|---|
+| Treat HTTP 500 `unexpected_failure` from `admin.createUser({ password_hash })` as a format rejection: do not retry, log the user, import passwordless | Reproducing row 3: PBKDF2 import returns 500, not 400; a retry-on-5xx importer never finishes |
+| Measure one PBKDF2 derivation at the source's iteration count and PRF in a deployed Edge Function before importing users | The blob header (SHA-512 default on .NET 10, measured) against the Edge Function limits reference: a 500 ms CPU busy loop passed, 3 s answered `546 WORKER_RESOURCE_LIMIT`; the per-derivation cost was not measured here |
+| Import passwordless with `email_confirm: true` and verify a pending user cannot sign in before the cutover | Reproducing row 6: `encrypted_password` is an empty string and password sign-in is rejected |
+| Lowercase and trim the email at import and at the gateway | The credential store's own join, `u.email = lower(p_email)`; GoTrue's normalisation on `createUser` was not measured |
+| On the `migrated-concurrent` path, retry `signInWithPassword` once after a short delay | The delete-as-lock in `claim_migration`; reasoned from the code path, the race window was not measured |
+| Expect imported bcrypt hashes to keep their cost; do not plan on GoTrue rehashing them | Reproducing row 9: the rehash logic exists in `Authenticate`, the cost change was not observed to persist |
+| Keep `DISABLE_LEGACY_FALLBACK` as a function secret read at request time, and redeploy after flipping it until propagation is checked | Design choice, not a result; secret propagation without a redeploy was not measured |
 
 ## Security checklist
 

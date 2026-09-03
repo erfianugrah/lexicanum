@@ -145,12 +145,13 @@ latencies head to head is a category error.
 
 | Question | Use | Measured |
 |---|---|---|
-| Who is within N hops | Recursive CTE, indexes on both edge columns | 0.22 ms at depth 3 |
+| Who is within N hops | Recursive CTE written as a level set (`UNION`), indexes on both edge columns | 0.22 ms at depth 3 on the synthetic graph (average degree 8); 154.924 ms on the real 28778-edge graph, and 65721.220 ms if the walk is a path set (`UNION ALL`) |
 | What connects these two, how strongly | `pgr_dijkstra`, `cost` as inverse evidence weight | 1092.61 ms over 400000 edges |
 | Does the data cluster | `pgr_connectedComponents` | 1098.11 ms |
 | What is structurally critical | `pgr_articulationPoints`, `pgr_bridges` | 9883.44 ms, 254 bridges |
 | Which things are named similarly | `pg_trgm` + `fuzzystrmatch` | index-backed |
-| Which things mean something similar | `pgvector` | see [Agent memory store](/reference/agent-memory-store/) |
+| Which documents mention X | STORED `tsvector` generated column + GIN, queried with `websearch_to_tsquery` | 112.6 ms median inner query, GIN 3192 kB, on 7 rows |
+| Which things mean something similar | `pgvector` as `halfvec` with an HNSW index | 0.43 ms HNSW query against 46.13 ms IVFFlat (`lists=100`) over 30000 x 1536 synthetic vectors; recall unmeasured - see [Agent memory store](/reference/agent-memory-store/) |
 
 The CTE expands a bounded neighbourhood; `pgr_dijkstra` computes a global
 shortest path across the whole edge set.
@@ -189,7 +190,7 @@ Also present, none of them graph stores but several of them load-bearing below:
 
 | Extension | Version | Role in this design |
 |---|---|---|
-| `vector` | 0.8.2 | semantic similarity (unmeasured here) |
+| `vector` | 0.8.2 | semantic similarity; storage, build and query latency measured (G05), recall not |
 | `pg_trgm` | 1.6 | name resolution, fuzzy fallback |
 | `fuzzystrmatch` | 1.2 | name resolution, fuzzy fallback |
 | `unaccent` | 1.1 | name normalisation |
@@ -295,6 +296,12 @@ error 1102 covers CPU or memory indistinguishably from the HTTP response, and
 the analytics API reported `exceededMemory`. So it is the **128 MB per-isolate**
 limit, not CPU - the CPU ceiling was raised to the documented paid-plan
 maximum.[^cf-limits]
+
+The Edge Function has a second bound the fixtures never reached: a 150 s idle
+wall clock, after which the invoke dies with 504 `IDLE_TIMEOUT` (edge-resilience
+W13, 2026-08-15). The two 14 MB fixtures failed with the 546 at 57165 ms and
+60136 ms, well inside 150 s, so on this corpus the resource limit binds before
+the idle clock.
 
 <Aside type="caution" title="You cannot time CPU inside a Worker">
 Extraction time measured as **0 ms for every fixture**. In Workers, `Date.now()`
@@ -443,6 +450,19 @@ measure. Quote the result per document: a corpus projection stated per month of
 infrastructure cannot be compared against anything priced per document, and the
 comparison gets made in whatever units are quoted.
 
+A worked figure from the council corpus (G12, inputs measured 2026-08-14; the
+per-GB rates are Supabase list prices dated
+2026-08-10[^sb-disk-price][^sb-storage-price]): a minutes-like document ran
+about 430 KB of source PDF to about 11 KB of logical text and about 5.4 KB on
+disk after TOAST. At \$0.125/GB/mo for database disk and \$0.0213/GB/mo for the
+raw PDF in Storage, that is about a cent per thousand documents per month on
+the Supabase side, compute not priced. A 4 TB source corpus at that ratio
+projects to about 102 GB logical and about 50 GB on disk - roughly \$6/mo of
+disk plus \$85/mo of raw storage, about \$92/mo; the same 4 TB at the US
+federal corpus's 0.7633 aggregate ratio projected to about \$239/mo. Genre
+moved the projection 2.6x between two measured corpora, which is why the
+per-document figure has to come from a sample of the reader's own genres.
+
 <Aside type="caution" title="Source size is not database size">
 Corpus size in PDF bytes and Postgres footprint differ by a factor that varies
 22x by document. Quoting a terabyte of source PDFs as a database size is the
@@ -472,8 +492,11 @@ more documents, with the slugs attached.
 ### Person and organization extraction is the noisy stage
 
 The deterministic honorific and suffix patterns found 292 distinct persons and
-123 organisations across the council documents. A graded 12+12 sample shows
-what to expect of them:
+123 organisations across the council documents (the 2026-08-14 run with the
+AU patterns; the 561 / 2284 counts in the TL;DR come from the 2026-08-11
+US-pattern extractor over the earlier corpus and are recorded in this doc only,
+not in the RUNLOG). A graded 12+12 sample shows what to expect
+of them:
 
 - over-captured leading words ("Council accept the tender from Stabilicorp
   Pty Ltd")
@@ -530,6 +553,32 @@ is real is the table beside the picture, not the picture.
 
 ---
 
+## What to do about it
+
+The practices the measurements support. Module ids are `pdf-corpus-graph`
+RUNLOG sections in [supabase-lab](https://github.com/erfianugrah/supabase-lab)
+unless named otherwise.
+
+| Practice | Rests on |
+|---|---|
+| Write the recursive walk with `UNION` (level set), never `UNION ALL`, and cap the depth: a degree-917 hub took the path-set walk to about 65721 ms at depth 3 on the 28778-edge graph; the level-set walk answers in 155-159 ms warm over the pooler | the fusion run, 2026-08-14 (RUNLOG figures) |
+| Carry a surrogate integer key and name the edge columns `id`, `source`, `target`, `cost`; set `cost` to the inverse evidence weight | G07; the pgRouting contract[^pgr-dijkstra] |
+| Store embeddings as `halfvec` (0.5042 of `vector` bytes on identical columns) and index with HNSW (0.43 ms query against 46.13 ms IVFFlat at `lists=100`; build 6950 ms against 4130 ms); make no recall claim from synthetic vectors | G05 |
+| Provision disk throughput deliberately for a read-heavy corpus with vector indexes; it is a separate addon field (`baseline_disk_io_mbs=347`, `max_disk_io_mbs=2085`), not a function of disk size | G06; Cost shape |
+| Quote cost per document from measured per-genre ratios with a worked example, and label the per-GB rates as list prices with their date; genre moved the same 4 TB from about \$92/mo to about \$239/mo | G12 |
+| Set per-document fetch timeouts independent of byte size and cache fetched bytes: fetch was 9788 ms of an 11601 ms request at 2504695 bytes, and failures were not monotonic in size (6073678 bytes in 4105 ms, 3595043 bytes in 16906 ms, the 14 MB fixtures about a minute) | G02 |
+| Give keyword search its own row: a STORED `tsvector` generated column with a GIN index, queried with `websearch_to_tsquery` so raw user input does not error (GIN 3192 kB; 112.6 ms median inner query; sequential scan chosen at 7 rows) | search tier |
+| When profiling, `EXPLAIN ANALYZE` the inner query or set `pg_stat_statements.track = all`; security-definer RPC bodies do not inline and are invisible under `track = top` | search tier; sbperf audit |
+| Use the direct connection or the session pooler for ingestion and set bulk-load timeouts in-session: through the transaction pooler `show statement_timeout` returns the `2min` role default whether or not you set it, because connection-time options are dropped | method notes |
+| Treat the Edge Function as bounded by a resource limit (HTTP 546 `WORKER_RESOURCE_LIMIT`, CPU or memory not distinguished) somewhere between 2504695 and 3595043 bytes, and by a 150 s idle wall clock (504 `IDLE_TIMEOUT`); on this corpus the resource limit binds first | G02; edge-resilience W13 |
+| Route anything under about 270 characters per page to OCR outside the database | G09 |
+
+Consumer count, long-poll interval and visibility timeout in the ingestion
+section are stated as rules with no run behind them; the 400-character edge
+window and the renderer cut are editorial choices.
+
+---
+
 ## Reading the numbers
 
 - **The index ratio generalises.** Two indexes turning a 167.59 ms depth-3
@@ -543,14 +592,17 @@ is real is the table beside the picture, not the picture.
   0.3-0.7 ms, p95 at 2.9-3.6 ms, zero errors in 85 queries, on the same 2-vCPU
   medium - no knee, because the graph fits working memory. The pgrouting global
   algorithms are still single-query, uncontended numbers.
-- **The two halves of the evidence have not met.** The traversal and pgrouting
-  latencies come from a synthetic 100000/400000 graph; the extraction pipeline
-  has run over seven real documents. Nothing here measures the real pipeline at
-  even 100 documents, so "it works" and "it is fast" are two claims held
-  together by assumption. One run over roughly 100 real documents - entity
-  count, edge count, extraction wall clock, one traversal latency - fuses them,
-  and produces the per-genre extraction ratios that turn a cost projection from
-  a band into a number.
+- **The two halves of the evidence met on 2026-08-14.** Until then the traversal
+  and pgrouting latencies came from a synthetic 100000/400000 graph and the
+  extraction pipeline had run over seven real documents, so "it works" and "it
+  is fast" were two claims resting on two artifacts. The run over roughly 100
+  real documents (111: 103 council documents, the seven US fixtures and the
+  scan fixture) fused them and falsified the transfer - a degree-917 hub turned
+  the path-set walk into about 65721 ms at depth 3 on the 28778-edge graph,
+  and the level-set rewrite answers in 155-159 ms warm over the pooler (RUNLOG
+  figures) - and produced the per-genre extraction ratios (0.0011 to 0.0362
+  across the council genres) that turn the cost projection from a band into a
+  number (G12). The pgrouting latencies are still synthetic-graph only.
 - **Extension availability is region-specific until probed.** Everything here
   was measured in `ap-southeast-1`. Re-run the catalogue probe in the
   deployment-target region before quoting `pgrouting` there.
@@ -585,6 +637,9 @@ is real is the table beside the picture, not the picture.
 | Functions created by hand in a live database do not survive a rebuild | Measured - `demo.documents()` existed in no committed file, only in an older live project, and a fresh rebuild shipped a UI whose corpus table 404'd (PGRST202). It is defined in `demo/db/04-api.sql` now |
 | Browser-level end-to-end proof of the deployed demo | Measured - Playwright suite (`demo/e2e/`) over the live domain: landing, as-at bridging, entity graph + timeline + deep-link persistence, the registry-pin search flow, and the origin-down diagnostic state |
 | Recall or quality of any vector index | **Not measured.** Synthetic vectors cannot support a recall claim |
+| `halfvec` is 0.5042 of `vector` on identical columns; HNSW build 6950 ms and query 0.43 ms against IVFFlat build 4130 ms and query 46.13 ms at `lists=100` | Measured - G05, 30000 chunks x 1536 dimensions, synthetic values, 2026-08-10; storage, build time and latency are value-independent, recall is not |
+| Disk throughput is a separate addon field, not a function of disk size: `baseline_disk_io_mbs=347`, `max_disk_io_mbs=2085` | Measured - G06, `/projects/{ref}/billing/addons`, 2026-08-10 |
+| Cost per document: about 430 KB source to about 11 KB logical to about 5.4 KB on disk for council minutes; a 4 TB corpus at about \$92/mo against about \$239/mo at the US federal ratio | Measured inputs (G12, 2026-08-14) times Supabase list prices dated 2026-08-10; compute not priced |
 | Scanned / image-only PDFs | Detection measured - an image-only NARA scan extracted 0.5 chars/page against 2710-3242 for born-digital references, so ~270 chars/page routes a document to OCR. OCR itself remains unavailable in-database: `plpython3u` absent from `pg_available_extensions`, verified by query 2026-08-11 |
 | Behaviour under concurrent traversal | Measured - depth-3 CTE at concurrency 1/4/16/64 on the 100000/400000 graph: p50 0.29 ms aggregate, p95 ~3 ms, 0 errors in 85 queries, same 2-vCPU medium, 2026-08-11. pgrouting algorithms remain single-query |
 
@@ -612,3 +667,5 @@ is real is the table beside the picture, not the picture.
 [^sb-autoembed]: Supabase, automatic embeddings - the documented queue-plus-consumer architecture. https://supabase.com/docs/guides/ai/automatic-embeddings
 [^fly-autostop]: Fly.io, autostop and autostart machines. https://fly.io/docs/launch/autostop-autostart/
 [^fly-regions]: Fly.io regions. https://fly.io/docs/reference/regions/
+[^sb-disk-price]: Supabase, "Manage your usage: disk size," Supabase Docs. https://supabase.com/docs/guides/platform/manage-your-usage/disk-size
+[^sb-storage-price]: Supabase, "Storage pricing," Supabase Docs. https://supabase.com/docs/guides/storage/pricing

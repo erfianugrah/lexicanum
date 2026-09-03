@@ -117,7 +117,14 @@ connecting role the way PostgREST's role switching does.
 2. **Connect as a dedicated role** - not `postgres`, not `service_role`
    (both carry `BYPASSRLS`), not the table owner. Grant it only the
    schemas, tables, and functions the app needs. RLS then enforces for
-   every query it runs.
+   every query it runs. Policies admit by grant target: the same predicate
+   admitted 5,250 rows `TO public` and 0 `TO authenticated` (rls-policy-cost
+   E). A project's existing policies are usually `TO authenticated`, and the
+   wire role is not that role, so with RLS on and no policy naming it the
+   role reads 0 rows and the symptom looks like broken claims. Audit
+   `pg_policies.roles` and write the wire-path policies `TO claims_user`;
+   making the role a member of `authenticated` is the other route, not
+   measured.
 3. **Set claims per transaction, then query.** One measured prerequisite
    first: on managed Supabase, `GRANT USAGE ON SCHEMA auth` to a custom role
    silently no-ops, so the policy cannot call `auth.uid()` directly -
@@ -132,8 +139,27 @@ grant execute on function public.claims_uid() to claims_user;
 -- policy: using (owner = public.claims_uid())
 ```
 
+Three notes on that block. Write the policy as
+`using (owner = (select public.claims_uid()))`: the subselect hoists the
+helper to an InitPlan evaluated once per statement - measured in
+rls-policy-cost A: `auth.uid()` bare 252.9ms against 22.2ms wrapped on 100k
+unindexed rows, identical row digests, and a sequence-counted PL/pgSQL
+stand-in called 100,001 times bare against 1 wrapped; the wrapper itself was
+not timed, so the hoist is inferred from the same STABLE-function mechanism. Postgres grants EXECUTE on a new function to PUBLIC by default,
+so add `revoke execute on function public.claims_uid() from public;` before
+the grant, or every role reaches `auth.uid()` through the wrapper; the
+Management API security advisor lints exactly this shape
+(`anon_/authenticated_security_definer_function_executable`,
+`function_search_path_mutable` - security-lockdown S01; the wrapper above
+already pins `search_path`, and the revoke is standard Postgres, not measured
+here). And if you provision through the Management API query endpoint
+(`POST /v1/projects/{ref}/database/query`), it wraps a multi-statement body
+in one transaction, so a policy that references the wrapper fails when both
+are created in the same call - run the function first, the policy second.
+
 ```ts
 // Worker / server, postgres.js driver
+// (Workers: postgres.js needs the nodejs_compat compatibility flag)
 const claims = JSON.stringify({ sub: userId, role: "authenticated" });
 const rows = await sql.begin(async (tx) => {
   // set_config(name, value, is_local=true) == SET LOCAL: scoped to this
@@ -165,7 +191,11 @@ pattern above. The per-query multi-statement form works too, and has a
 useful side effect: multi-statement queries are marked uncacheable
 (`cacheStatus: multiplestatements`), which sidesteps the cache question below for that query. Measured through a
 probe Worker (C03): the transaction form and the multi-statement form both
-resolve claims, and a bare `SET` was reset on pool return.
+resolve claims, and a bare `SET` was reset on pool return. Two operational
+notes from the same run: Hyperdrive's create-time connect check races a fresh
+project's Supavisor warmup (`ENOTFOUND tenant/user`), so warm the pooler with
+a local connection and retry the create; and postgres.js in a Worker needs
+the `nodejs_compat` compatibility flag.
 </Aside>
 
 ## Sharp edge 1: the GUC is unprivileged
@@ -238,7 +268,7 @@ getting is the rest of the product surface that rides HTTP:
 | Realtime | gone | the WS layer authorizes by JWT; replicating it is its own project |
 | Edge Functions | unaffected | separate runtime, still callable |
 
-keeping Supabase Auth while dropping only PostgREST is also coherent -
+Keeping Supabase Auth while dropping only PostgREST is also coherent -
 and now measured: the lab's C02 created a real user via the Auth admin
 API, signed it in via password grant, and set the claims from the GoTrue
 JWT's `sub` over the wire; per-user RLS resolved exactly as it would have
@@ -288,6 +318,21 @@ Supavisor failures (if you route through it), and the database itself still
 take you down. You are removing one failure domain out of several - worth
 doing when you already own auth, not as a rewrite justified by a single
 outage.
+
+## What to do about it
+
+The measurements imply a short list of practices. Each row names the module
+id or run it rests on (rls-wire-claims unless prefixed); a row that is a
+design choice rather than a result says so.
+
+| Practice | Rests on |
+|---|---|
+| Write the policy as `using (owner = (select public.claims_uid()))`: the subselect hoists the helper to an InitPlan run once per statement - measured in rls-policy-cost A: `auth.uid()` bare 252.9ms against 22.2ms wrapped on 100k unindexed rows, identical row digests, and a sequence-counted PL/pgSQL stand-in called 100,001 times bare against 1 wrapped. The wrapper itself was not timed. | rls-policy-cost A |
+| Write wire-path policies `TO claims_user` and audit `pg_policies.roles`: the same predicate admitted 5,250 rows `TO public` and 0 `TO authenticated`, so an existing `TO authenticated` policy set reads as 0 rows for the wire role. Membership in `authenticated` instead is not measured. | rls-policy-cost E |
+| Add `revoke execute on function public.claims_uid() from public;` before the grant and run the Management API security advisor, which lints `anon_/authenticated_security_definer_function_executable` and `function_search_path_mutable`. The default PUBLIC grant is standard Postgres, not measured here. | security-lockdown S01 |
+| Warm the pooler with a local connection and retry before creating the Hyperdrive config on a fresh project; the create-time connect check raced Supavisor warmup with `ENOTFOUND tenant/user`. | C03 |
+| Set the `nodejs_compat` compatibility flag on a Worker using postgres.js; the probe Worker needed it. | C03 |
+| Provision the wrapper and the policy in separate calls when using `POST /v1/projects/{ref}/database/query`; the endpoint wraps a multi-statement body in one transaction and a policy referencing a function created in the same call fails. | C01-C03 fixture provisioning |
 
 ## Measured results (2026-08-20)
 

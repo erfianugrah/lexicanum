@@ -112,7 +112,8 @@ curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
   "https://api.supabase.com/v1/organizations/<slug>/entitlements" | jq
 ```
 
-Differences that affect this decision, measured on a Pro and a Team organization:
+Differences that affect this decision, measured on a Pro and a Team organization on
+2026-08-03:
 
 | Entitlement | Pro | Team |
 |---|---|---|
@@ -123,13 +124,22 @@ Differences that affect this decision, measured on a Pro and a Team organization
 | `backup.retention_days` | 7 | 14 |
 | `auth.platform.sso` | false | true |
 | `audit_log_drains` | false | true |
-| `function.max_count` | 500 | 1000 |
+| `function.max_count` | 500 on 2026-08-03; 1000 on 2026-09-02 | 1000 on 2026-08-03; 2000 on 2026-09-02 |
 | `project_pausing` | **false** | **false** |
 | `api.members.roles` | **false** | **false** |
 
+The `function.max_count` row moved between reads. On 2026-09-02 (platform-facts F01,
+against a Free, a Pro and a Team organization) it read Free 100, Pro 1000, Team 2000, and
+Supabase's docs raised the Pro and Team figures to 1000 and 2000 in a commit dated
+2026-08-18.[^sb-docs-raise] `security.member_roles` (Read-only on Team only),
+`auth.platform.sso` (Team only) and `security.audit_logs_days` (Pro 0, Team 62) read the
+same on both dates; the remaining rows were not re-read.
+
 `project_pausing` is false on both
-paid plans - a paid project cannot be paused, so an idle client project bills until
-you delete it or move it to a Free organization. And `api.members.roles` is false on
+paid plans shown - a Pro or Team project cannot be paused, so an idle client project
+bills until you delete it or move it to a Free organization. The `platform` plan is
+the exception: `project_pausing` reads `true` there and pause is enforced (`200` ->
+`INACTIVE`; sfp-platforms S06, 2026-08-24/25). And `api.members.roles` is false on
 both, meaning member and role management has no Management API surface at all; it is
 dashboard-only regardless of plan.
 
@@ -272,9 +282,12 @@ for REF in <ref-1> <ref-2> <ref-3>; do
 done
 ```
 
-The `sleep` is rate-limit courtesy. The Management API throttles aggressive polling
-and answers with a Cloudflare HTML interstitial rather than a JSON 429, so a client
-that assumes JSON throws a parse error instead of seeing something retryable.
+The `sleep` is rate-limit courtesy. On the cheap scoped read that rate-limits L01
+burst, the breach was the API's own JSON `429 ThrottlerException` with
+`retry-after: 60` at request 118 of a 120 budget (2026-08-17); the HTML page was seen
+on aggressive polling of other endpoints, where a client that assumes JSON throws a
+parse error instead of seeing something retryable. Every response carries
+`x-ratelimit-remaining`; pace by it and treat a non-JSON body as the same signal.
 
 <Aside type="caution">
 Member and role management, organization deletion, and the usage views are not on
@@ -365,8 +378,10 @@ the upgrade itself is free, per the
 > compute size. You can manually trigger the upgrade in the Compute & Disk section
 > after the transfer.
 
-The only cost of taking it is the resize downtime. Check what a project is currently
-on:
+The only cost of taking it is the resize downtime. Over the API the upgrade is
+`PATCH /v1/projects/{ref}/billing/addons` with
+`{addon_variant: "ci_micro", addon_type: "compute_instance"}` - compute is an addon
+mutation, and there is no resize endpoint. Check what a project is currently on:
 
 ```bash
 curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
@@ -376,6 +391,23 @@ curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
 
 An empty `selected_addons` means Nano. A Micro project shows a `compute_instance`
 add-on at \$0.01344/hour.
+
+## What to do about it
+
+The practices this runbook carries, collected with the module or run each
+rests on. A practice with no module id is a design choice rather than a
+result; the documented-not-tested rows in the evidence table stay that way.
+
+| Practice | Rests on |
+|---|---|
+| Replace the loop's `sleep 15` with header-paced backoff: read `x-ratelimit-remaining` on every response (limit 120 per user per scope, 1:1 decrement on a scoped read) and honour `retry-after: 60` on the JSON `429 ThrottlerException`. Treat a non-JSON body as the same signal. Do not shard across PATs: two PATs from one user drain one counter. | rate-limits L01, L01b (2026-08-17/18) |
+| Run the migration from a dedicated automation user. A separate user is a separate 120-per-minute bucket, and its PAT can be revoked after the run without touching a human's; a PAT is unscoped, so the user's membership set is the blast radius. | rate-limits L01b (2026-08-18); platform-facts F03 |
+| Read entitlements by feature key rather than dumping the body: `jq '.entitlements[] \| select(.feature.key == "project_pausing") \| .hasAccess'`. The payload is a flat list, `{entitlements: [{feature: {key, type}, hasAccess, config: {...}}]}`, 64 features on Free, Pro and Team on 2026-09-02; the plan label is on `GET /v1/organizations/{slug}` (`plan`), not in the entitlements body. | platform-facts F01 (2026-09-02) |
+| Date every numeric entitlement you plan around and re-read it before the move. `function.max_count` read Pro 500 and Team 1000 on 2026-08-03, and Free 100, Pro 1000, Team 2000 on 2026-09-02; `security.audit_logs_days` read 0 and 62 on both dates. | platform-facts F01 (2026-09-02); this doc's 2026-08-03 read |
+| If the destination is a `platform`-plan organization, plan around pausing being available: `project_pausing` reads `true` and pause is enforced (`200` -> `INACTIVE`, restore reverses it). The Pro and Team `false` rows do not apply there. | sfp-platforms S06 (2026-08-24/25) |
+| Take the free Micro upgrade over the API: `PATCH /v1/projects/{ref}/billing/addons` with `{addon_variant: "ci_micro", addon_type: "compute_instance"}`. Budget the window off the resize figures rather than the restart ones (platform-downtime, one Micro project: Auth 131 s resizing up against 75 s for a restart; pooler 207 s against 158 s - not this doc's 75.2 s paid-to-Free figure, which is a resize down to Nano), and expect an adjacent addon `PATCH` to answer `429 "still processing addon changes"`. | supabase-lab `AGENTS.md`, platform-downtime (2026-08-04); compute-disk D09 (2026-08-19); sfp-platforms S07 (2026-08-25) |
+| During a paid-to-Free move, classify edge `HTTP 521` and `525` as retryable for the 75 s window; origin-5xx retry logic does not match them, and the project reports `status: RESIZING` throughout. | this doc's 250 ms probe (2026-08-03) |
+| Before creating a destination project for a region-then-transfer path, enumerate the legal regions with `GET /v1/projects/available-regions?organization_slug=<slug>` (200 with `{recommendations, all: {smartGroup[], specific[]}}`; a bare call answers 400; `/regions` and `/projects/regions` 404). | platform-facts F04c (2026-08-20) |
 
 ## Verification
 
@@ -465,7 +497,7 @@ Measured 2026-08-03 unless marked otherwise.
 | A transferred-in Free project keeps Nano | Compared `billing/addons` against a Micro project | Measured - no compute add-on selected |
 | Nano in a paid organization bills at the Micro rate | Read the preview warning | Measured - "will increase by \$10/month" |
 | Micro is \$0.01344/hour | `GET /v1/projects/{ref}/billing/addons` | Measured |
-| Plan matrix (project-scoped roles, Read-only, pausing, API member management) | `GET /v1/organizations/{slug}/entitlements` on a Pro and a Team organization | Measured |
+| Plan matrix (project-scoped roles, Read-only, pausing, API member management) | `GET /v1/organizations/{slug}/entitlements` on a Pro and a Team organization | Measured 2026-08-03; `function.max_count`, `security.member_roles`, `auth.platform.sso` and `security.audit_logs_days` re-read 2026-09-02 (platform-facts F01) - only `function.max_count` moved |
 | A PAT is unscoped | Probed every plausible scope/permission endpoint against a working token | Measured - all 404 while normal endpoints return 200 |
 | Per-service health is a separate endpoint | `GET /v1/projects/{ref}/health?services=...` on a live project | Measured - four services reporting independently |
 | Control plane leads the data plane by ~19s | Compared aggregate project status against the data plane | Observed, method superseded - not re-measured against the per-service endpoint |
@@ -489,3 +521,5 @@ Measured 2026-08-03 unless marked otherwise.
 - [Running many tenants on one Supabase project](/guides/supabase-shared-tenancy/)
   - when one project per client is the wrong shape and you want the idle majority to
   share an instance.
+
+[^sb-docs-raise]: Supabase, "docs(functions): update Pro and Team function limits (#49173)," supabase/supabase commit 7107a22, 2026-08-18. https://github.com/supabase/supabase/commit/7107a22a6707c06546ee6d62aedb77da9c75b16a
