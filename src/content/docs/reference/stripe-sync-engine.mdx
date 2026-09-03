@@ -10,7 +10,7 @@ import { Aside } from "@astrojs/starlight/components";
 
 Two ways to get Stripe billing data into SQL - copy it into local tables, or query the API through a foreign data wrapper (FDW) - what each costs, and the version-pinning failure that only one of them has.[^sb-stripe-blog]
 
-All numbers below were measured on a **Supabase preview branch in `ap-southeast-1`**, against a **test-mode Stripe account holding 17 customers, 15 subscriptions (13 active, 2 canceled), 6 products and 6 prices**, on **2026-08-07**. That is one page of Stripe API results, which matters for the latency ratios - see [Reading the numbers](#reading-the-numbers). Claims marked documented-but-not-tested in the [evidence table](#evidence) were read from vendor docs and not reproduced here.
+All numbers below were measured on a **Supabase preview branch in `ap-southeast-1`**, against a **test-mode Stripe account holding 17 customers, 15 subscriptions (13 active, 2 canceled), 6 products and 6 prices**, on **2026-08-07**. That is one page of Stripe API results, which matters for the latency ratios - see [Reading the numbers](#reading-the-numbers). Claims marked documented-but-not-tested in the [evidence table](#evidence) were read from vendor docs and not reproduced here. These numbers are a prior observation on a pre-existing project and its same-day control branch. The lab experiment built to count how many columns are affected - a fixture matrix on a dedicated test account, probed either side of a deliberate API version change - is scaffolded and has not run; nothing on this page is a result of it.
 
 ## TL;DR
 
@@ -109,6 +109,21 @@ The working expression reads through the item:
 to_timestamp((si._raw_data->>'current_period_end')::bigint)
 ```
 
+Point dashboards at a view over that expression rather than at the typed column:
+
+```sql
+create schema if not exists billing;
+create view billing.subscriptions_with_period as
+select s.id,
+       s.status,
+       min(to_timestamp((si._raw_data->>'current_period_end')::bigint)) as current_period_end
+from stripe.subscriptions s
+join stripe.subscription_items si on si._raw_data->>'subscription' = s.id
+group by s.id, s.status;
+```
+
+Keep `billing` off the Data API's exposed schemas unless it carries its own grants. The `min()` stands in for the multi-item question - which item's period to read when a subscription has several - which the fixture matrix is built to answer and has not yet run.
+
 <Aside type="caution" title="The failure is silent">
 No error, no log line, no advisory. A dashboard query that returned dates one week returns NULL the next, because a background reconcile rewrote rows with a payload shaped differently from the schema waiting for it.
 </Aside>
@@ -137,6 +152,8 @@ The corrected diagnosis is narrower and more useful than "pinned schemas go stal
 
 The failure is not staleness. It is two version knobs that must move together and are not connected to each other. That also names the fix: pin the webhook to the spec the projection came from, or advance the projection, but do not let them drift independently.
 
+On the one-click integration neither knob is yours. The webhook is managed and records `api_version = null`; the projection ships with the install, and the install is Dashboard-only (checked 2026-08-07 against CLI 2.111.0: no `integrations` subcommand, no matching route string in the binary, none of the `supabase` Terraform provider's seven resources, and the published Management API spec's only `integration` routes are for third-party auth). Whether the Dashboard exposes a version setting was not probed. What you can do: read the relocated field through `_raw_data` behind a view (above), leave the FDW's `api_version` unset (its default matched its shipped schema on `wrappers` 0.6.2, and a forward pin reproduces the NULL column, as the table shows), and schedule query 3 from [Reproducing](#reproducing) so the next relocation is caught by a diff rather than a dashboard.
+
 ## Latency
 
 Same database, same region, same Stripe account, same logical question down both paths. `EXPLAIN ANALYZE` execution time, median of seven, first run discarded because it pays for the TLS handshake to the Stripe API.
@@ -159,7 +176,7 @@ The Supabase Model Context Protocol (MCP) server exposes this data to an LLM thr
 [{"handle":"...","renews":null},{"handle":"...","renews":null}]
 ```
 
-**You cannot leave it a hint.** `list_tables` returns only `{name, rls_enabled, rows}`. No columns, therefore no column comments, so a `comment on column` explaining the trap never reaches the model. An agent only discovers columns by running SQL against `information_schema`, where the comment is not joined in by default.
+**You cannot leave it a hint.** `list_tables` returns only `{name, rls_enabled, rows}`. No columns, therefore no column comments, so a `comment on column` explaining the trap never reaches the model. An agent only discovers columns by running SQL against `information_schema`, where the comment is not joined in by default. Put the trap where the model can see it instead: a view whose name says what it does (`billing.subscriptions_with_period`, above) appears in `list_tables` where a column comment cannot, or a line in the agent's system prompt. Whether an agent prefers the view over the typed column when both are present was not tested.
 
 The tool set at a `features=database,docs` URL is `search_docs`, `list_tables`, `list_extensions`, `list_migrations`, `apply_migration`, `execute_sql`. Note that `apply_migration` is listed even with `read_only=true`; whether it is refused at execution was not tested here.
 
@@ -171,7 +188,7 @@ Supabase's MCP server is remote HTTP. A client that only speaks stdio needs a pr
 
 Foreign tables have no RLS at all, so the wrappers documentation is explicit that they belong in a private schema and must not be exposed on the Data API.[^sb-wrappers-overview]
 
-The Sync Engine's `stripe` schema is safe by default but for a narrower reason than most people assume. Neither `anon` nor `authenticated` has `USAGE` on it and neither holds a single table grant - but **RLS is not enabled on any of the tables**. Protection is schema-level grants plus absence from PostgREST's exposed-schema list. Add `stripe` to the exposed schemas and there is no second line of defence.
+The Sync Engine's `stripe` schema is safe by default but for a narrower reason than most people assume. Neither `anon` nor `authenticated` has `USAGE` on it and neither holds a single table grant - but **RLS is not enabled on any of the tables**. Protection is schema-level grants plus absence from PostgREST's exposed-schema list. Add `stripe` to the exposed schemas and there is no second line of defence. So do not add it. If billing data must be reachable over PostgREST, expose a separate schema of views (the `billing` schema above is the shape) with its own grants, and enable RLS on anything in it that a user-facing role can read.
 
 ## Reading the numbers
 
@@ -179,7 +196,7 @@ The Sync Engine's `stripe` schema is safe by default but for a narrower reason t
 
 **Absolute latency is region-bound.** Both database and FDW client sat in `ap-southeast-1`; the Stripe API call leaves that region. Sub-millisecond local reads generalise; the FDW figures do not, and would shift with the caller's distance from Stripe.
 
-**One field is not the whole story, and this doc does not claim it is.** A sampled diff of typed columns against payload keys suggested roughly 40 columns never populated and 80 returned fields with no column. Those numbers are not published as a finding here, because on 15 subscriptions in one state "absent from every sampled payload" conflates genuine drift with expandable fields that only materialise when requested and with fields that happen to be null. Separating them needs a fixture matrix, which is a different experiment.
+**One field is not the whole story, and this doc does not claim it is.** A sampled diff of typed columns against payload keys suggested roughly 40 columns never populated and 80 returned fields with no column. Those numbers are not published as a finding here, because on 15 subscriptions in one state "absent from every sampled payload" conflates genuine drift with expandable fields that only materialise when requested and with fields that happen to be null. Separating them needs a fixture matrix, which is a different experiment - scaffolded, and not yet run.
 
 ## Decision guide
 
@@ -209,6 +226,18 @@ digraph {
 
 Whichever you pick, check the pin against your account's API version before trusting a typed column, and read `_raw_data` when it disagrees.
 
+## What to do about it
+
+| Practice | Rests on |
+|---|---|
+| Read `current_period_end` through `subscription_items._raw_data`, behind a view, and point dashboards at the view | Evidence rows 3 and 4: 0 of 13 active subscriptions populated in the typed column, 13 of 13 present in the item payload (2026-08-07) |
+| Do not treat "pin the webhook" as a step you can take on the one-click integration; the webhook is managed and the projection ships with the install | Evidence row 2: `api_version = null` in `stripe._managed_webhooks`; the Dashboard-only install, checked 2026-08-07 against CLI 2.111.0 |
+| Leave `api_version` unset on the Stripe FDW server; a forward pin reproduces the NULL column | Evidence row 6: `2025-03-31.basil` gives 0 of 13, unset gives 13 of 13, one variable, on `wrappers` 0.6.2 |
+| Validate a sync on rows the engine still re-syncs (active subscriptions), never on terminal-state rows alone | The accidental control group: two canceled rows kept their values while every active row was overwritten with NULL |
+| Never add `stripe` to the Data API's exposed schemas; if PostgREST must see billing data, expose a separate schema of views with its own grants | Evidence row 10: `anon` and `authenticated` hold no grants (`has_schema_privilege`, `role_table_grants`); the RLS-not-enabled observation is stated at "RLS is not enabled on any of the tables" above and has no evidence row of its own |
+| Give an MCP agent a self-describing view name or a system-prompt note; a column comment never reaches it | Evidence row 8: `list_tables` returns `{name, rls_enabled, rows}` from a real `tools/call`. Whether the agent picks the view is untested |
+| Schedule query 3 (pg_cron) against a stored copy of its last result and alert when the `except` set grows, but restrict the right-hand side to rows the engine still re-syncs (for example `where status = 'active'`): a canceled row keeps its original payload, so its keys mask a relocation for every other row | Reproducing: account defaults move on Stripe's schedule. The scheduling is a design choice; the query is the measured part |
+
 ## Reproducing
 
 ```sql
@@ -227,7 +256,7 @@ except
 select distinct k from stripe.subscriptions, lateral jsonb_object_keys(_raw_data) k;
 ```
 
-Query 3 generalises to any table in the schema and is the cheapest drift check available. Run it after any Stripe API version change.
+Query 3 generalises to any table in the schema and is the cheapest drift check available. Run it after any Stripe API version change. Your account's default version moves on Stripe's schedule, so you will not know when that is: schedule the query (pg_cron) against a stored copy of its last result and alert when the `except` set grows, but restrict the right-hand side to rows the engine still re-syncs (for example `where status = 'active'`): a canceled row keeps its original payload, so its keys mask a relocation for every other row. The scheduling is a design choice; the query is the measured part.
 
 ## Evidence
 
@@ -248,7 +277,7 @@ Query 3 generalises to any table in the schema and is the cheapest drift check a
 ## Gotchas and lessons learned
 
 - **A fresh install does not get a newer projection.** Reinstalling is not a fix for the pin.
-- **Terminal-state rows are never re-synced**, so they preserve whatever the schema-data agreement was on the day they were written. That makes them an accidental control group, and a misleading sample if you only look at them.
+- **Terminal-state rows are never re-synced**, so they preserve whatever the schema-data agreement was on the day they were written. That makes them an accidental control group, and a misleading sample if you only look at them. When validating a sync, look at rows the engine still re-syncs (active subscriptions); a terminal row agreeing with its column proves nothing about current drift.
 - **`n_live_tup` is an estimate.** A freshly backfilled table can report 0 rows in `pg_stat_user_tables` while `count(*)` returns 13. Do not conclude a sync failed from statistics that autovacuum has not caught up with.
 - **Foreign tables and the sync schema want different names.** The wrappers documentation suggests putting foreign tables in a schema called `stripe`, which collides with the Sync Engine's own. Use a distinct name if both are installed.
 - **Preview branches pause after inactivity.** If a branch is carrying a long-lived demo or integration, make it persistent.[^sb-branching]

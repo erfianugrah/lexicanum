@@ -100,9 +100,15 @@ create policy iap_only on public.docs for select
 
 Key on a group or email claim instead of `iss` when you want per-identity policies rather than "any identity from this IdP".
 
+Three things around that policy, measured in iap-lockdown L08 and security-lockdown S13:
+
+- New tables arrive open. `pg_default_acl` grants SELECT on every new table to `anon` and `authenticated` (iap-lockdown L08; `service_role` also reads, via its own grant and BYPASSRLS), so a table created after this step is anon-readable through the Data API with no policy at all. Run `alter default privileges in schema public revoke select on tables from anon, authenticated;` as `postgres` - new tables then answer `404 PGRST205` until you grant them - and enable RLS on every table you expose, not only `docs`.
+- Keep `iap_only` the only PERMISSIVE SELECT policy on the table. PERMISSIVE policies OR together, so a second one added later for another purpose admits anon to the same rows. A RESTRICTIVE policy only narrows what PERMISSIVE policies admit; if `iap_only` is the sole policy, making it `as restrictive` returns 0 rows to everyone. Keep `iap_only` PERMISSIVE and add later policies `as restrictive` instead. Neither RESTRICTIVE form was measured.
+- For an identity that writes, the policy decides rows and the grant decides columns. A permissive UPDATE policy plus a table-level UPDATE grant let anon overwrite a `balance` column (`204`); after `revoke update on t` and `grant update (note)` the same write returned `401` with SQLSTATE `42501` while `note` still wrote (S13). Grant UPDATE per column.
+
 ## Step 4: verify the three credential classes
 
-`$IAP_TOKEN` is the `mint.mjs` output (self-mint path), or a real token from your IdP's login. The request sends the project's anon or publishable key as `apikey` (the gateway routes on it) and the identity token as the bearer:
+`$IAP_TOKEN` is the `mint.mjs` output (self-mint path), or a real token from your IdP's login. The admit result below was measured with the self-minted ES256 issuer (L10E); a real Cloudflare Access token was never admitted in the lab, because the Access login is interactive and the L10d attempt stopped there, so treat the real-IdP case as not measured until you have run it yourself. The request sends the project's anon or publishable key as `apikey` (the gateway routes on it) and the identity token as the bearer:
 
 ```bash
 # anon key as bearer -> 200, zero rows (RLS filters)
@@ -114,7 +120,7 @@ curl -s -H "apikey: $ANON" -H "Authorization: Bearer $IAP_TOKEN" \
   "https://$REF.supabase.co/rest/v1/docs?select=id"
 ```
 
-Measured: anon and a GoTrue user token both return zero rows; a token minted by the trusted issuer returns its rows. The Data API now serves only the IAP identity.
+Measured: with the Cloudflare Access issuer registered, anon and a GoTrue user token both return zero rows (L10); with the lab ES256 issuer registered, the minted token returns its rows and anon still reads zero (L10E). The Data API now serves only the IAP identity.
 
 ## Step 5: close the other identity paths
 
@@ -127,15 +133,32 @@ The Data API is served; the project can still mint its own identities through Go
 | Third-party auth resolved | `resolved_jwks` non-null after register |
 | Anon key against the RLS table | 200, 0 rows |
 | GoTrue user token | 200, 0 rows |
-| IAP-issued token | 200, rows |
+| Token from the self-minted ES256 issuer | 200, rows (L10E) |
+| A real token from your IdP's login | 200, rows expected; not measured - L10d was attempted and needs an interactive login |
+| Management API security advisor after step 3 | no `rls_disabled_in_public` or `rls_enabled_no_policy` lint on the tables you expose; it caught every seeded exposure in security-lockdown S01 |
+
+## What to do about it
+
+The measurements behind the steps imply a short list of practices. Each row names the module id it rests on (iap-lockdown unless prefixed); a row that is a design choice rather than a result says so.
+
+| Practice | Rests on |
+|---|---|
+| Run `alter default privileges in schema public revoke select on tables from anon, authenticated;` as `postgres` and enable RLS on every exposed table: new tables otherwise arrive anon-readable through `pg_default_acl`, and afterwards answer `404 PGRST205` until granted. | L08 |
+| Create views over the gated table `with (security_invoker = true)`; a plain view returned every row to anon, the invoker-security view 0. | L08 |
+| Keep the iss policy the only PERMISSIVE SELECT policy on the table; PERMISSIVE policies OR together and a second one admits anon. A RESTRICTIVE policy only narrows what PERMISSIVE policies admit; if `iap_only` is the sole policy, making it `as restrictive` returns 0 rows to everyone. Keep `iap_only` PERMISSIVE and add later policies `as restrictive` instead. Neither RESTRICTIVE form was measured. | L08 |
+| Grant UPDATE per column for a writing identity: a permissive UPDATE policy plus a table-level grant let anon overwrite `balance` (`204`); `revoke update on t` plus `grant update (note)` turned the same write into `401` with SQLSTATE `42501`. | security-lockdown S13 |
+| Verify the IAP token inside any Edge Function you want covered; `verify_jwt = true` refused a no-key caller (401) and admitted the anon project key (200). The in-function verification is not measured. | L07 |
+| Run the Management API security advisor after step 3; it caught every seeded exposure (`rls_disabled_in_public`, `rls_enabled_no_policy`, `security_definer_view`, `anon_/authenticated_security_definer_function_executable`, `function_search_path_mutable`) in the lab. | security-lockdown S01 |
+| Run step 4 with a real token from your IdP before relying on it, and check that the token carries `role: "authenticated"` (the gotcha below): the lab admitted only the self-minted ES256 issuer's token and never a real Cloudflare Access token (the L10d attempt stopped at the interactive login), so whether your IdP sets that claim is not measured. | L10, L10E |
 
 ## Gotchas and lessons learned
 
 - `custom_jwks` is accepted and never resolves - the issuer must be a reachable URL, so an inline key set is a dead end.
 - The token needs `role: "authenticated"` for PostgREST to switch roles, and `aud: "authenticated"`. A token missing the role claim is rejected before RLS.
 - `service_role` bypasses RLS, so a backend holding the service key is not subject to this policy - keep the service key server-side and out of the IAP path.
+- A plain view over the RLS table returns every row to anon; the same view created `with (security_invoker = true)` returned 0 (L08). A view over `docs` undoes step 3 unless it is invoker-security.
 - Getting a real Cloudflare Access token means completing the interactive one-time-PIN or SSO login; there is no `client_credentials` grant on an Access SaaS OIDC app. For automated tests, the self-minted ES256 issuer (step 1) needs no browser.
-- This gates the Data API only. Auth, Storage, Realtime and Edge Functions keep their own public endpoints; a private HTTP tier is [Move 3](/guides/supabase-own-postgrest/) or self-hosting.
+- This gates the Data API only. Auth, Storage, Realtime and Edge Functions keep their own public endpoints; a private HTTP tier is [Move 3](/guides/supabase-own-postgrest/) or self-hosting. `verify_jwt = true` on an Edge Function does not extend the gate: it refused a caller with no key (401) and admitted the anon project key (200), a key-possession check (L07). Verify the IAP token inside the function against the issuer's JWKS; that in-function check was not measured here.
 
 ## File reference
 

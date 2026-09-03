@@ -159,8 +159,10 @@ it comes up with ordinary daily backups, so the copy is protected differently
 from the thing it was copied from.
 
 Turning PITR on is not free of consequence either. It is refused below Small
-compute, and the resize that gets you there took the data plane down for **61 s
-going up and 58 s coming back**. The addon endpoint rate-limits consecutive
+compute, and the Micro -> Small resize that gets you there **settled in 105 s
+with 1.0 s of contiguous REST outage; the Small -> Micro step back settled in
+73 s with none** (compute-disk D09, 2026-08-19, 250 ms sampling). The addon
+endpoint rate-limits consecutive
 changes, so the compute change and the PITR change cannot be applied back to
 back.
 
@@ -459,7 +461,11 @@ Prerequisites: Bun (sbshift runs from source, no build step), `psql` /
 ### Connectivity: direct vs pooler, and the IPv6 question
 
 Logical replication needs a **direct** connection
-(`db.<ref>.supabase.co:5432`); the pooler cannot stream WAL. Direct hosts are
+(`db.<ref>.supabase.co:5432`); the pooler cannot stream WAL - a subscription
+pointed at it fails at the tenant layer with `could not connect to the
+publisher ... FATAL: (ENOIDENTIFIER) no tenant identifier provided (external_id
+or sni_hostname required)` (edge-resilience W05,
+[supabase-lab](https://github.com/erfianugrah/supabase-lab)). Direct hosts are
 IPv6-only unless the project has the IPv4 add-on.[^sb-ipv4] Decide where
 sbshift runs before anything else:
 
@@ -569,6 +575,14 @@ path. `watch` aborts on its own if the slot bloats source WAL past the
 watchdog threshold - an unconsumed slot retains WAL until the source disk
 fills - or the slot's `wal_status` flips to `lost`.
 
+Freeze schema deploys on the source while the subscription runs. In the lab a
+source-only `ALTER TABLE` stalled every table's stream - zero rows arrived on
+the target, including rows that did not touch the new column - and applying
+the same `ALTER` on the target resumed replication in about 6.1 s with the
+missed rows backfilled and no subscription recreation (edge-resilience W15,
+2026-08-16). If a migration must ship during the window, apply the DDL on the
+target first, then on the source.
+
 ### Step 6: cutover (the only downtime)
 
 ```bash
@@ -586,6 +600,22 @@ advancing (writes not actually stopped), waits for lag to reach zero, then
 replicate, and the schema restore only carried their dump-time values, so
 rows inserted after bootstrap would otherwise collide on the next
 serial/IDENTITY insert.
+
+Decide the rollback before the write-stop, because it changes at the repoint
+(sbshift `docs/RUNBOOK.md`, sections 9 and 12 - a procedure, not a
+measurement). Create a named restore point on the source via the Management
+API before stopping writes. Up to the moment the app is repointed, rollback is
+lossless: `bun start teardown`, re-enable writes on the source, bring the app
+back unchanged - the target has taken no application writes. After the
+repoint nothing replicates target -> source, so the options are to roll
+forward on the target, to repoint back and re-apply the loss window by hand
+(never with writes enabled on both), or - if you set it up between
+`reconcile` passing and the repoint - to drain reverse replication and cut
+back. Reverse replication is a second config with the roles swapped,
+distinct slot / publication / subscription names and `copyData: false`, since
+the data already matches: `bun start -c migrate.reverse.yaml replicate`. It
+is one direction at a time, never active-active, and W05 measured
+managed -> managed streaming in one direction only.
 
 ### Step 7: copy non-data config, verify, tear down
 
@@ -717,6 +747,78 @@ throughput killer (~7x slower copy, ~11 MiB/s vs ~80 MiB/s in sbshift's
 scale rehearsal) - `watch` shows live per-table copy %, so calibrate your
 window from that, and set `maxRetainedWalMb` generous enough to hold a full
 copy's worth of WAL on the source.
+
+## What to do about it
+
+The practices the measurements and the sbshift runbook support. Module ids
+are edge-resilience drills and platform-facts probes in
+[supabase-lab](https://github.com/erfianugrah/supabase-lab); "RUNBOOK" is
+sbshift's `docs/RUNBOOK.md`, a procedure rather than a measurement.
+
+**Before the window**
+
+- Read `duration_estimate_hours` from the upgrade eligibility endpoint and
+  publish that as the budget: three aged projects eligible for
+  `17.6.1.141 -> 17.6.1.155` each reported `1`, and one project answered
+  `eligible: null` with no version fields, so treat null as "not computable"
+  rather than false (platform-facts F06, 2026-08-04).
+- Do not try to time the in-place window on a project created for the
+  purpose: it comes up at the latest version (`eligible: false`,
+  `target_upgrade_versions: []`), and `postgres_engine` / `release_channel` on
+  `POST /v1/projects` are deprecated and typed `null`, so an older version
+  cannot be requested. The clone is the only rehearsal with a real target
+  (F06).
+- Budget the PITR prerequisite as its own step: PITR is refused below Small
+  compute, the Micro -> Small resize settled in 105 s with 1.0 s of contiguous
+  REST outage and the step back in 73 s with none (compute-disk D09), and the
+  addon endpoint rate-limits consecutive changes, so the compute change and the
+  PITR change go in separate windows.
+- Create a named restore point on the source via the Management API before
+  stopping writes (RUNBOOK section 9).
+
+**While the subscription runs (Path B)**
+
+- Freeze DDL on the source, or apply each migration on the target first: a
+  source-only `ALTER` stalled every table's stream, and the same `ALTER` on
+  the target resumed it in about 6.1 s with backfill (W15).
+- Point the subscription at the direct host only; the pooler refuses with
+  `FATAL: (ENOIDENTIFIER) no tenant identifier provided (external_id or
+  sni_hostname required)` (W05).
+- When scripting the by-hand path through the Management API query endpoint,
+  send `CREATE SUBSCRIPTION` as its own single-statement request; the endpoint
+  wraps a multi-statement string in one transaction and Postgres refuses
+  `CREATE SUBSCRIPTION` inside one (W05).
+- If a table sticks in `srsubstate = 'd'` with `pid` null in
+  `pg_stat_subscription` (seen only on `auth.*` and `storage.*`, which do not
+  replicate managed -> managed; W09, W14), recover in this order: `ALTER SUBSCRIPTION ...
+  DISABLE`, `ALTER SUBSCRIPTION ... SET (slot_name = NONE)`,
+  `DROP SUBSCRIPTION`, then `pg_drop_replication_slot` on the source -
+  `slot_name = NONE` plus drop leaves the publisher slot behind, pinning WAL
+  (W09, W14).
+
+**Cutover and rollback**
+
+- Decide the rollback before the repoint: before it, `teardown` plus
+  re-enabled source writes is lossless; after it, roll forward, accept the
+  loss window, or have reverse replication (`copyData: false`, roles swapped)
+  running from between `reconcile` and the repoint (RUNBOOK section 12; W05
+  measured one direction only).
+- Re-password every custom LOGIN role on the target
+  (`ALTER ROLE <name> WITH PASSWORD '...'`) before any service that uses it is
+  repointed; the role arrives with `rolpassword` NULL (the region guide's
+  measured run; RUNBOOK sections 0 and 9).
+
+**After cutover**
+
+- After `config-sync`, poll the target's config readback until it matches
+  instead of reading once - the apply is asynchronous: in the W17 drill a
+  readback straight after its restore PATCH returned the pre-restore value
+  (edge-resilience battery 2026-08-17) - and diff auth defaults between the two projects:
+  `custom_oauth_max_providers` defaulted to 32767 on one project generation
+  and 3 on another.
+- The paused-window length ("a few days"), `watchdog.maxRetainedWalMb`,
+  whether to match compute with `provision`, and when to schedule the window
+  are design choices; no run measured them.
 
 ## Verification
 

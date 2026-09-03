@@ -96,7 +96,7 @@ Three measured disagreements, all reproducible with one curl each.
 
 **Invalid parameters.** `width=abc` returns a 400 ("must be integer"), but `width=0` and a render with no params at all are accepted and return a processed near-identity of the source. Unknown junk parameters (`&bust=xyz`) are ignored entirely - which matters for caching, below.
 
-The two limits that are enforced exactly as documented:[^sb-imgt] a source file over 25MB returns 400 "The source image file is too large to process", and a source over 50 megapixels returns 400 "The source image resolution is too large to process". Both are render-time checks - the same files upload to Storage without complaint.
+The two limits that are enforced exactly as documented:[^sb-imgt] a source file over 25MB returns 400 "The source image file is too large to process", and a source over 50 megapixels returns 400 "The source image resolution is too large to process". Both are render-time checks - the same files upload to Storage without complaint. Check size and pixel count at upload time (a client check, or an upload-path function that rejects anything over 25MB or 50 megapixels), because Storage will not do it for you and the 400 only appears when the first render is requested.
 
 ## Caching behavior
 
@@ -108,7 +108,8 @@ Renders sit behind the Smart CDN on Cloudflare's edge.[^sb-smart-cdn] Measured o
 - Each real variant (a new width/height/quality combination) is a separate cache entry and a separate cold render.
 - HEAD requests work and return the rendered variant's headers.
 - **Overwrite invalidation is unreliable.** Across five trials of overwriting an object (confirmed `x-upsert` 200) and re-rendering the same variant, one invalidated within 60s and four served the stale variant past the poll window (three full 60-second polls, one 15-second poll). The Smart CDN docs describe purge-on-update; the runtime does not reliably match within a minute. If your flow overwrites images in place, version the object path (`img-v2.jpg`) instead of relying on invalidation.
-- Render responses carry **no `Vary: Accept`** despite honoring Accept negotiation (`Accept: image/webp` yields webp on the same URL that yields png without it). Whoever warms a URL first fixes its format at the edge until TTL - a webp-capable browser and a jpeg-only client can be served each other's format.
+- Overwriting in place needs `x-upsert: true` (supabase-js `upsert: true`); a plain POST to an existing path returns 400. Check the overwrite's 200 before reading any effect from it - a failed overwrite followed by a warm hit looks exactly like a stale cache.
+- Render responses carry **no `Vary: Accept`** despite honouring Accept negotiation (`Accept: image/webp` yields webp on the same URL that yields png without it). Whoever warms a URL first fixes its format at the edge until TTL - a webp-capable browser and a jpeg-only client can be served each other's format. Do not let clients that negotiate different formats share one render URL: give each format its own variant URL and warm them separately. Whether the render endpoint's `format` transform option also fixes the format the edge stores was not measured.
 
 For the billing metric none of this matters - per-origin counting is request-independent. For egress and latency it matters a lot: a hot variant serves from the edge, and an attacker cannot force re-renders by mutating query strings.
 
@@ -117,7 +118,7 @@ For the billing metric none of this matters - per-origin counting is request-ind
 Measured properties of the render endpoint on a public bucket:
 
 - **No authentication.** A plain curl with no `Authorization` header renders any object in a public bucket.
-- **Rate limiting exists but the floor is high.** 200 parallel fresh renders all returned 200; at 500 parallel, 11 came back 429 (~2%); at 1,000 parallel, 88 (~9%). Refusals ramp rather than cut off, so a determined burst still lands most of its requests.
+- **Rate limiting exists but the floor is high.** 200 parallel fresh renders all returned 200; at 500 parallel, 11 came back 429 (~2%); at 1,000 parallel, 88 (~9%). Refusals ramp rather than cut off, so a determined burst still lands most of its requests. The same ceiling bounds your own bulk work: keep pre-warming and batch renders at or under 200 concurrent requests and retry on 429. It was measured on one project and one source, so whether the ceiling is per project, per IP or per org is open.
 - **Enumeration requires a key.** Listing a bucket without an `Authorization` header is rejected; listing with the anon key returns only what RLS allows (empty in the test). But enumeration is not the practical barrier it looks like - see below.
 
 Those three properties combine into a denial-of-wallet vector with an unusual shape: **the billing unit itself is attacker-influenceable.** Every object name visible in your site's markup - every `<img src=".../storage/v1/object/public/...">`, every URL in a CSS or JS bundle - is an origin image an attacker can activate with one unauthenticated GET to the render endpoint. One GET per name, 200 names in parallel, done in seconds.
@@ -149,6 +150,22 @@ For a bucket that must stay public, there is no configuration that prevents orig
 Two properties of a migration off transforms matter for planning. First, **usage tapers rather than stops**: if your traffic comes from installed clients (mobile apps, third-party embeds), old versions keep calling transform URLs until they are upgraded, and every distinct image they touch still counts - budget the remainder of the cycle, not a clean stop. Second, **the meter stays open after your own usage ends**: moving to upload-time renditions zeroes your clients' contribution, but on a public bucket anyone else can still hit the render endpoint and re-create billable origin images. The post-migration signal on the usage page is binary - your clients contribute nothing, so any origin-image count above zero is someone else.
 
 Two workarounds that do **not** work, despite appearing in the docs' optimisation advice:[^sb-imgt-billing] pre-generating variants *while still serving transform URLs* (the origin still counts the first time anything renders it - the rendition pipeline only works because it drops the render endpoint from the read path entirely) and CDN caching (per-origin counting is request-independent).
+
+## What to do about it
+
+The mitigations table ranks the billing posture. These are the operating practices on top of it, each with the measurement it rests on.
+
+| Practice | Rests on |
+|---|---|
+| Keep pre-warming and batch renders at or under 200 concurrent requests, and retry on 429 | I09 (500 and 1,000) and the ad-hoc probe (200), Evidence row "Rate ceiling": 0 of 200, 11 of 500 and 88 of 1,000 parallel fresh renders answered 429. Measured on one project and one source; whether the ceiling is per project, per IP or per org is open |
+| Reject sources over 25MB or 50 megapixels at upload time, in the client or an upload-path function | I04 and the ad-hoc probe, Evidence row "25MB and 50MP source limits enforced": the ad-hoc 28.8MB PNG and 56MP JPEG, and I04's generated >25MB and >50MP PNGs, uploaded without complaint and returned 400 only at render |
+| Add a test that fetches every transform URL your app builds and asserts the path contains `/render/image/` and the body is smaller than the original | I02, Evidence row "`/object/public` and `/object/sign` ignore appended params": full original bytes with a 200 and no error |
+| Give each output format its own variant URL; do not let webp and jpeg clients share one render URL | I05, Evidence row "No `Vary: Accept`": webp and png served from one URL, `vary` header absent. Whether the `format` transform option pins the edge entry was not measured |
+| Enforce your own maximum variant size in the URL builder; the server clamps and never errors | I03 and the ad-hoc probe, Evidence row "Dimension clamp at 3000 / source dims": widths 2500, 2501, 3000, 3001 and 5000 on a 4000x3000 source, none rejected |
+| Version the object path (`img-v2.jpg`) when an image changes; do not rely on overwrite invalidation | I06, Evidence row "Overwrite invalidation unreliable": 4 of 5 trials served the stale variant past the poll window (three 60s polls, one 15s poll) |
+| Send `x-upsert: true` (supabase-js `upsert: true`) when overwriting in place, and check the 200 before reading any effect | I06 harness note: a Storage POST to an existing path without it returns 400, and a failed overwrite followed by a warm hit reads as a stale cache |
+| Apply the private-bucket posture on Free-plan projects too; plan gating does not protect the render surface | Evidence row "Free-plan org renders": 200 with resized output on a Free-plan scratch project (ad-hoc probe, not yet a scripted module) |
+| Gate `/render/image/authenticated` with a bucket-scoped `storage.objects` select policy, and test the denial as well as the allow | I08, Evidence row "Authenticated render enforces storage RLS": a user JWT was denied without a select policy and rendered with one |
 
 ## What was not provable
 
