@@ -64,9 +64,19 @@ The socket has a network perimeter - network restrictions and PrivateLink act on
 
 The two levers most often mistaken for gates are the two that gate nothing: **CORS** reflects an arbitrary `Origin` and a request with no `Origin` still returns data, so a non-browser client ignores it; a **custom domain** is a branding CNAME, and the origin `<ref>.supabase.co` answers identically before and after.[^sb-customdomain] The only surfaces reachable with no credential at all are a public storage object and a `verify_jwt = false` Edge Function.
 
-The table reads Auth for what leaks; the same service has levers a customer switches *on*, and none of them is a tier gate either: each hardens Auth alone. A **before-user-created hook** runs your own code on the signup path before the row exists, so a domain allowlist or a fraud check can reject the account at the door.[^sb-authhooks] **CAPTCHA** - hCaptcha or Cloudflare Turnstile - gates the signup, sign-in and password-reset entry points against scripted abuse.[^sb-captcha] And the **auth rate limits** are configurable, not fixed: token refresh, OTP, email and SMS sends, verify, and anonymous sign-ins each take a lower ceiling than the shared default.[^sb-authratelimit] These tighten the Auth service; the boundary for the data underneath is still the row. security-lockdown S14 measured these on a micro project (2026-08-31): the before-user-created hook and CAPTCHA fields present and off by default (the CAPTCHA provider defaulting to hCaptcha), the seven `rate_limit_*` fields present, and one rate limit driven down and back to confirm it is settable. The hardening levers S03 and S11 measured sit next to them on `PATCH /v1/projects/{ref}/config/auth`: `password_min_length` (set to 12, a 4-character password on the update path was refused with 422), `password_hibp_enabled` (off by default), and MFA TOTP enroll and verify. Set `password_min_length` to 12 or more and keep MFA verify on. The value 12 is a design choice; the 422 on a 4-character password is the measurement. `password_hibp_enabled` did not fire on `PUT /auth/v1/user` (S11); at signup it did (S19, 2026-09-03: `422 weak_password: Password is known to be weak and easy to guess, please choose a different one.` for a breached password, 200 for a strong one, with `mailer_autoconfirm` on so no email was sent).
+### The Auth levers, switched on
 
-The switch-on levers were driven to their refusals in S19 on the same run. `rate_limit_anonymous_users` set to 3: 15 anonymous sign-ins returned 3 x 200 and then 12 x 429 (`over_request_rate_limit: Request rate limit reached`), the first 429 at request 4, so the configured value is the count with no burst above it in that window. CAPTCHA with Turnstile's documented always-fail test secret refused both signup and the password grant with `400 captcha_failed: captcha protection: request disallowed (no captcha_token found)`, refused the documented dummy token under that secret, and admitted the dummy token under the always-pass secret (200); the gate covers login as well as signup, and the test keys prove it without a provider account.[^cf-turnstile-test] A before-user-created hook as a Postgres function (`pg-functions://postgres/public/<fn>`) rejecting `@mailinator.com` returned the hook's own message to the client (`400`, `disposable email domains are not allowed`, `error_code` `unknown`) and 200 for another domain, active 5s after the PATCH; in the seconds before that, signups returned a 400 without the hook's message (observed while writing the probe, not recorded in the artifact), so a verifier waits for the hook's own text.
+The table reads Auth for what leaks; the same service has levers a customer switches *on*, and none of them is a tier gate either: each hardens Auth alone.
+
+| Lever | What it does | Measured |
+|---|---|---|
+| Before-user-created hook[^sb-authhooks] | runs your code on the signup path before the row exists; a domain allowlist or a fraud check rejects the account at the door | present and off by default (S14). As a Postgres function (`pg-functions://postgres/public/<fn>`) rejecting `@mailinator.com`: the client received the hook's own message (`400`, `disposable email domains are not allowed`, `error_code` `unknown`), 200 for another domain, active 5s after the PATCH (S19) |
+| CAPTCHA (hCaptcha or Cloudflare Turnstile)[^sb-captcha] | gates the signup, sign-in and password-reset entry points against scripted abuse | present and off by default, provider defaulting to hCaptcha (S14). With Turnstile's documented always-fail test secret, signup and the password grant both returned `400 captcha_failed: captcha protection: request disallowed (no captcha_token found)`; the documented dummy token was refused under that secret and admitted under the always-pass secret (200) (S19)[^cf-turnstile-test] |
+| Auth rate limits[^sb-authratelimit] | token refresh, OTP, email and SMS sends, verify, and anonymous sign-ins each take a lower ceiling than the shared default | the seven `rate_limit_*` fields present, one driven down and back (S14). `rate_limit_anonymous_users` set to 3: 15 anonymous sign-ins returned 3 x 200 and then 12 x 429 (`over_request_rate_limit: Request rate limit reached`), the first 429 at request 4 (S19) |
+| `password_min_length`, MFA TOTP | password policy and second factor | set to 12, a 4-character password on the update path refused with 422 (S03, S11). The value 12 is a design choice; the 422 is the measurement |
+| `password_hibp_enabled` | leaked-password protection | off by default; did not fire on `PUT /auth/v1/user` (S11); at signup it did, `422 weak_password: Password is known to be weak and easy to guess, please choose a different one.` for a breached password, 200 for a strong one, with `mailer_autoconfirm` on so no email was sent (S19, 2026-09-03) |
+
+S14 measured the switch-on fields on a micro project (2026-08-31) and S19 drove them to their refusals (2026-09-03). Two notes from S19: the rate-limit count is exact, with no burst above the configured value in that window; and in the seconds before the hook was active, signups returned a 400 without the hook's message (observed while writing the probe, not recorded in the artifact), so a verifier waits for the hook's own text. Set `password_min_length` to 12 or more and keep MFA verify on.
 
 ## Which move fits the goal
 
@@ -81,27 +91,130 @@ Before picking a move, read the Management API security advisor. In security-loc
 
 ## Move 1: push the control into the database
 
-The boundary is the row, so the control belongs on the row. For a table that must shut to anon without a policy migration, `REVOKE SELECT ON <table> FROM anon, authenticated` returns `42501` through the Data API while `service_role` keeps reading. It rots on the next migration - `pg_default_acl` grants `SELECT` on new tables to `anon` and `authenticated` (iap-lockdown L08; `service_role` reads regardless), so a table created after the revoke is anon-readable again. `ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE SELECT ON TABLES FROM anon, authenticated` for the `postgres` grantor closes new tables on arrival (`404 PGRST205`); the `supabase_admin` grantor keeps its own default ACL and the project owner cannot alter it (`42501`), so platform-created objects keep their default anon grants.
+The boundary is the row, so the control belongs on the row. Three levers live here - grants, RLS, and the token - and the section ends with the three places the move stops.
 
-RLS is the row-level version of the same move, and its write-side traps are what make "we added RLS" still fail a pen test: a view over an RLS table leaks every row without `security_invoker` - create it `with (security_invoker = true)`; in iap-lockdown L08 the plain view returned every row to anon and the invoker-security view 0 - an UPDATE policy gates which rows change but not which columns, and PERMISSIVE policies OR together so an admin-intended policy bleeds onto anon.[^sb-securing]
+### Grants
 
-The column half of that trap is a grant, not a second policy. `REVOKE UPDATE ON <table> FROM anon, authenticated` followed by `GRANT UPDATE (<the writable columns>)` makes a write to any withheld column return `42501` (permission denied for column) through the Data API, while the row policy still decides which rows move.[^pg-grant] RLS decides the rows; the column grant decides the columns. An UPDATE policy with no matching column grant is exactly the hole a pen test writes through - a `WITH CHECK` constrains the row's new values, never which of its columns a caller may touch - and column privileges are what shut it. Measured as the pair in security-lockdown S13 (2026-08-31): a permissive UPDATE policy plus a table-level grant lets anon overwrite a `balance` column (`204`), and the same write returns `401` carrying SQLSTATE `42501` once `balance` is dropped from the grant, with the granted column still writable.
+#### One table
 
-Identity on the Data API is the same move with the token as the key. Register an external issuer as third-party auth (the `jwks_url` shape resolves; an inline key set never does) and key RLS on a claim only the issuer sets.[^sb-jwts] Measured: Cloudflare Access-for-SaaS registered as the issuer and its JWKS resolved on registration; the admit/deny proof - with a policy of `(auth.jwt() ->> 'iss') = '<issuer>'`, the anon key and a GoTrue user token both read zero rows while a token minted by the trusted issuer reads its rows - was run with a lab ES256 issuer (JWKS served from an Edge Function), since a real Access token needs the interactive login. That is "an IAP over the data" done at the authorisation layer, and it is plan-agnostic - the step-by-step is [Put an IAP over the Supabase Data API](/guides/supabase-iap-data-api/). Keeping RLS while dropping the Supabase HTTP layer entirely is [RLS without Supabase Auth](/reference/rls-without-supabase-auth/).
+For a table that must shut to anon without a policy migration, the grant is the lever. It rots on the next migration unless the default privileges move with it (iap-lockdown L08).
 
-The shape a pen test most often finds is no RLS at all: authorisation in application code, the backend using `service_role`, and every table readable by any holder of the anon key. Grants alone close that, and the recipe has two steps that the usual guidance omits (security-lockdown S21, 2026-09-03). `REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated`, the same for sequences and functions, `REVOKE USAGE ON SCHEMA public FROM anon, authenticated`, and the matching `ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public` closed the table (anon `401`, authenticated `403`, both `42501: permission denied for table`) and left `service_role` reading its 2 rows; the same revoke left the anon RPC answering 200. Functions carry EXECUTE for PUBLIC (`proacl {=X/postgres,...}`) and `public` keeps USAGE for PUBLIC, so a revoke aimed at `anon` and `authenticated` never touches them. `REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM public` closed the RPC (`401 42501: permission denied for function`) with the `service_role` call still 200. The second step is the default privilege for new functions: the `IN SCHEMA public` form of the revoke did not stop a function created afterwards from answering anon (per-schema default privileges add to the global default and cannot remove PUBLIC's built-in EXECUTE[^pg-defprivs]); the global form, `ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM public`, did. A table created after the schema-level revoke stayed closed. Moving the API surface to a dedicated exposed schema is the same lockdown at the PostgREST layer, and it is project-wide: with `db_schema` set to `api` alone, `service_role` reading a `public` table got `404 PGRST205: Could not find the table 'api.sec21_pii' in the schema cache` 3s after the PATCH, and read the `api` view with or without an `Accept-Profile: api` header (the first exposed schema is the default). The backend's own calls move with the setting.
+| Step | Effect through the Data API | Rests on |
+|---|---|---|
+| `REVOKE SELECT ON <table> FROM anon, authenticated` | anon gets `42501`; `service_role` keeps reading | L08 |
+| The next `CREATE TABLE` | `pg_default_acl` grants SELECT on the new table to `anon` and `authenticated`, so it is anon-readable again (`service_role` reads regardless) | L08 |
+| `ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE SELECT ON TABLES FROM anon, authenticated` as the `postgres` grantor | new tables arrive closed (`404 PGRST205`) | L08 |
+| The same for the `supabase_admin` grantor | not alterable by the project owner (`42501`); platform-created objects keep their default anon grants | L08 |
 
-FORCE ROW LEVEL SECURITY is the lever that comes up next for "we want RLS applied to the roles our backend uses", and it binds less than its name says (S17). It applies RLS to the table owner, and only if the owner cannot bypass RLS: on a managed project `postgres` (the default owner, and the role the Management query endpoint runs as - S17a; the Dashboard SQL editor is documented to use the same role), `service_role` and `supabase_admin` all carry `BYPASSRLS`, while `authenticator`, `anon`, `authenticated` and `supabase_auth_admin` do not. A postgres-owned table with RLS on and no policy read its 2 rows before and after FORCE; a table owned by a lab role without `BYPASSRLS` read 2 before and 0 after. `service_role` through REST under FORCE read 200 with 2 rows. `ALTER ROLE service_role NOBYPASSRLS` as the project owner returned `42501: "service_role" is a reserved role, only superusers can modify it`. The shape that does apply RLS to a backend is role choice: a role created `NOBYPASSRLS`, granted to `authenticator`, and reached through the Data API with an HS256 JWT whose `role` claim names it (signed with the secret `GET /projects/{ref}/postgrest` returns) read 200 with 0 rows under no policy and 200 with 1 row once a `tenant = 'a'` policy existed. The backend gets RLS by connecting as a role that cannot bypass it; FORCE does not reach a `BYPASSRLS` owner.
+#### The whole schema: the no-RLS shape
 
-<Aside type="caution" title="The IP filter that does not fire on hosted">
-PostgREST supports `pgrst.db_pre_request`: a function that reads `current_setting('request.headers')` (which carries `x-forwarded-for`) and rejects a request - a DB-layer IP filter.[^pgrst-prereq] On a managed project the role GUC persists after `ALTER ROLE authenticator SET pgrst.db_pre_request` + `NOTIFY pgrst, 'reload config'`, but no pre-request runs on the PostgREST path within 120 seconds (iap-lockdown L09, 2026-08-28; 61s in security-lockdown S16, 2026-09-03). PostgREST also reads role settings at startup, so S16 then issued `POST /projects/{ref}/restart` (200): REST refused at once, the health endpoint already reported db and rest `ACTIVE_HEALTHY` on the first poll after that, REST answered again 302s after that poll (303s from the restart call), and no pre-request ran in the 182s after REST returned with the GUC still on the role. The mechanism is real; it is not activatable via SQL on the hosted tier by reload or by restart. It works on your own PostgREST (move 3), where the config is yours.
+The shape a pen test most often finds is no RLS: authorisation in application code, the backend using `service_role`, and every table readable by any holder of the anon key. Grants alone close that (security-lockdown S21, 2026-09-03), and the revoke everyone reaches for first leaves the RPC surface open.
+
+| Step | anon table | authenticated table | anon RPC | `service_role` |
+|---|---|---|---|---|
+| 1. `REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated`, the same for sequences and functions, `REVOKE USAGE ON SCHEMA public FROM anon, authenticated`, and the matching `ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public` | `401` `42501: permission denied for table` | `403` `42501: permission denied for table` | **`200` - still callable** | table `200`, 2 rows |
+| 2. `REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM public` | - | - | `401` `42501: permission denied for function` | RPC `200` |
+| A table and a function created after steps 1-2 | table `401` `42501` | - | **function `200` - callable again** | `200` |
+| 3. `ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM public` (global, no `IN SCHEMA`), then another new function | - | - | `401` `42501` | `200` |
+
+Why the first step misses functions, and why the per-schema default does not hold:
+
+- Functions carry EXECUTE for PUBLIC (`proacl {=X/postgres,...}`) and `public` keeps USAGE for PUBLIC, so a revoke aimed at `anon` and `authenticated` never touches them.
+- Per-schema default privileges add to the global default and cannot remove PUBLIC's built-in EXECUTE;[^pg-defprivs] only the global form does. The table created after the schema-level revoke stayed closed, because tables have no PUBLIC default.
+
+#### The exposed schema
+
+Moving the API surface to a dedicated exposed schema is the same lockdown at the PostgREST layer, and it is project-wide (S21). With `db_schema` set to `api` alone, `service_role` reading a `public` table got `404 PGRST205: Could not find the table 'api.sec21_pii' in the schema cache` 3s after the PATCH, and read the `api` view with or without an `Accept-Profile: api` header (the first exposed schema is the default). The backend's own calls move with the setting.
+
+### RLS
+
+#### The write-side traps
+
+RLS is the row-level version of the same move. Its write-side traps are what make "we added RLS" still fail a pen test:[^sb-securing]
+
+- **A view over an RLS table leaks every row** unless it is created `with (security_invoker = true)`. In iap-lockdown L08 the plain view returned every row to anon and the invoker-security view 0.
+- **An UPDATE policy gates which rows change, never which columns.** A `WITH CHECK` constrains the row's new values, not which of its columns a caller may touch.
+- **PERMISSIVE policies OR together**, so an admin-intended policy bleeds onto anon.
+
+#### Columns are a grant, not a second policy
+
+`REVOKE UPDATE ON <table> FROM anon, authenticated` followed by `GRANT UPDATE (<the writable columns>)` makes a write to any withheld column return `42501` (permission denied for column) while the row policy still decides which rows move.[^pg-grant] RLS decides the rows; the column grant decides the columns. Measured as the pair in security-lockdown S13 (2026-08-31):
+
+| Setup | anon write to `balance` | anon write to the granted column |
+|---|---|---|
+| Permissive UPDATE policy + table-level UPDATE grant | `204` - the hole a pen test writes through | `204` |
+| Same policy, `REVOKE UPDATE` + `GRANT UPDATE (note)` | `401` carrying SQLSTATE `42501` | `204` |
+
+#### FORCE ROW LEVEL SECURITY binds less than its name says
+
+FORCE is the lever that comes up next for "we want RLS applied to the roles our backend uses". It applies RLS to the table owner, and only if the owner cannot bypass RLS (security-lockdown S17). On a managed project the owner usually can:
+
+| Role | `BYPASSRLS` | Note |
+|---|---|---|
+| `postgres` | yes | the default owner; the role the Management query endpoint runs as (S17a; the Dashboard SQL editor is documented to use the same role) |
+| `service_role` | yes | the backend key |
+| `supabase_admin` | yes | platform |
+| `authenticator`, `anon`, `authenticated`, `supabase_auth_admin` | no | |
+
+| Reader, RLS on and no policy | Rows before FORCE | Rows after FORCE |
+|---|---|---|
+| `postgres` on a postgres-owned table | 2 | 2 |
+| a lab role without `BYPASSRLS` on a table it owns | 2 | 0 |
+| `service_role` through REST | `200`, 2 rows | `200`, 2 rows |
+
+`ALTER ROLE service_role NOBYPASSRLS` as the project owner returned `42501: "service_role" is a reserved role, only superusers can modify it`. The shape that does apply RLS to a backend is role choice, in three steps:
+
+1. Create a role `NOBYPASSRLS` and grant it to `authenticator`.
+2. Mint the backend's HS256 JWT with that role in the `role` claim, signed with the secret `GET /projects/{ref}/postgrest` returns.
+3. Call the Data API with it: `200` with 0 rows under no policy, `200` with 1 row once a `tenant = 'a'` policy existed.
+
+The backend gets RLS by connecting as a role that cannot bypass it; FORCE does not reach a `BYPASSRLS` owner.
+
+### Identity: the token as the key
+
+Register an external issuer as third-party auth (the `jwks_url` shape resolves; an inline key set never does) and key RLS on a claim only the issuer sets.[^sb-jwts] Measured with Cloudflare Access-for-SaaS registered as the issuer (its JWKS resolved on registration) and the admit/deny run with a lab ES256 issuer whose JWKS was served from an Edge Function, since a real Access token needs the interactive login:
+
+| Caller, policy `(auth.jwt() ->> 'iss') = '<issuer>'` | Rows read |
+|---|---|
+| anon key | 0 |
+| GoTrue user token | 0 |
+| token minted by the trusted issuer | its rows |
+
+That is "an IAP over the data" done at the authorisation layer, and it is plan-agnostic. The step-by-step is [Put an IAP over the Supabase Data API](/guides/supabase-iap-data-api/); keeping RLS while dropping the Supabase HTTP layer entirely is [RLS without Supabase Auth](/reference/rls-without-supabase-auth/).
+
+### Where this move stops
+
+Three limits, each measured.
+
+#### The IP filter that does not fire on hosted
+
+<Aside type="caution">
+PostgREST supports `pgrst.db_pre_request`: a function that reads `current_setting('request.headers')` (which carries `x-forwarded-for`) and rejects a request - a DB-layer IP filter.[^pgrst-prereq] On a managed project the role GUC persists after `ALTER ROLE authenticator SET pgrst.db_pre_request`, and neither reload path activates it:
+
+| Step (iap-lockdown L09, 2026-08-28; security-lockdown S16, 2026-09-03) | Result |
+|---|---|
+| `NOTIFY pgrst, 'reload config'` | no pre-request within 120 seconds (L09), none within 61s (S16) |
+| `POST /projects/{ref}/restart` | `200`; REST refused at once |
+| First health poll after that | db and rest already `ACTIVE_HEALTHY` |
+| REST answering again | 302s after that poll (303s from the restart call) |
+| After REST returned | no pre-request in 182s, GUC still on the role |
+
+The mechanism is real; it is not activatable via SQL on the hosted tier by reload or by restart. It works on your own PostgREST (move 3), where the config is yours.
 
 What the hosted edge hands SQL is measured too (S16). An RPC returning `request.headers` on the managed PostgREST saw one address in `x-forwarded-for` with no client header and two with a client-supplied `x-forwarded-for: 203.0.113.9` - the client value first, then the edge's - so the edge appends rather than replaces, and the first element is attacker-controlled. The forwarding-related keys that reach SQL are `cf-connecting-ip`, `cf-ew-via`, `cf-ipcountry`, `x-forwarded-for` and `x-forwarded-proto`; the two that carry an address are `cf-connecting-ip` and `x-forwarded-for`, and `cf-connecting-ip` is the one to read in a header-keyed check on hosted (present in S16; its value was not compared with the caller's address, that is the edge's documented behaviour[^cf-connecting-ip]).
 </Aside>
 
-That control, even where it fires, reaches only the REST path. `db_pre_request` is a PostgREST setting, and Storage and Realtime never traverse PostgREST - each is its own service against the same Postgres, which is why "Data API off" leaves both answering (the first row of the lever table). So an IP allowlist, or an owner-list read from request headers, gates the REST layer and nothing else: for Storage and Realtime the same intent has to live in each service's own authorisation - RLS on `storage.objects`, Realtime Authorization - or on an edge you own. The Move 1 REVOKE does not reach the storage schema either. `storage` is owned by `supabase_admin`, not the project owner (measured), so its tables keep their own grants and Storage stays governed by RLS on `storage.objects`, not by the public-schema revoke above. Keying those policies off claims read straight from the wire has its own sharp edge - the claims GUC is unprivileged, so the connection credential becomes the boundary - worked through with a tampered-claim test in [RLS without Supabase Auth](/reference/rls-without-supabase-auth/). security-lockdown S15 measured the reach limit (2026-08-31): with the Data API wedged off (`503 PGRST002` on a table path), `/storage/v1` still served (`200`) and `/realtime/v1` still answered, so a PostgREST-path control was never in front of them.
+#### Storage and Realtime are not on the REST path
 
-One in-database surface this move has to own is egress. `net.http_get('https://...')` returned 200 from SQL on a fresh project (security-lockdown S08): a SQL-capable caller can exfiltrate or SSRF from inside Postgres. Restrict EXECUTE on schema `net` to the roles that need it, or leave `pg_net` disabled if nothing uses it.
+Every control above sits on the PostgREST path, and two managed services never traverse it (security-lockdown S15, 2026-08-31):
+
+- **Storage and Realtime keep answering with the Data API off.** With the schema wedged empty (`503 PGRST002` on a table path), `/storage/v1` still served (`200`) and `/realtime/v1` still answered - each is its own service against the same Postgres, which is why "Data API off" leaves both up (the first row of the lever table). An IP allowlist or an owner-list read from request headers gates the REST layer and nothing else; for Storage and Realtime the same intent lives in each service's own authorisation - RLS on `storage.objects`, Realtime Authorization - or on an edge you own.
+- **The public-schema REVOKE does not reach `storage`.** The schema is owned by `supabase_admin`, not the project owner (measured), so its tables keep their own grants and Storage stays governed by RLS on `storage.objects`.
+- **Claims read straight from the wire have their own edge.** The claims GUC is unprivileged, so the connection credential becomes the boundary - worked through with a tampered-claim test in [RLS without Supabase Auth](/reference/rls-without-supabase-auth/).
+
+#### Egress from inside Postgres
+
+`net.http_get('https://...')` returned 200 from SQL on a fresh project (security-lockdown S08): a SQL-capable caller can exfiltrate or SSRF from inside Postgres. Restrict EXECUTE on schema `net` to the roles that need it, or leave `pg_net` disabled if nothing uses it.
 
 ## Move 2: lock the database socket
 
@@ -137,9 +250,32 @@ The secrets this move creates - the service key the Worker holds, the connection
 
 ## The evidence side: who accessed what, and blocking them
 
-The trail a customer credential reaches is the logs endpoint; there is no drain path in `/v1` and the Auth audit endpoint returned 0 entries (security-lockdown S18, 2026-09-03). The `/v1` OpenAPI spec has 115 paths, none mentioning a drain: Log Drains are configured in the Dashboard only.[^sb-logdrains] A marked anon request to `/rest/v1/sec18_<nonce>` (404) was found in `edge_logs` 18s later by `metadata.request.path`, with a client-address field (`cf_connecting_ip` or `x_real_ip`) populated in the request headers; a marked Storage request to `/storage/v1/bucket?sec18=<nonce>` (200) 15s later by `metadata.request.url`. A failed password grant (`400 invalid_credentials`) appears in `auth_logs` as a request line (matched on path and `error_code`; the row read back carried method, path, status, `error_code` and `remote_addr`, no email); a successful login appears as an `auth_event` line matched on `action: login` plus the email (in `actor_username` in the row read back). `GET /auth/v1/admin/audit` with the service key returned 200 with 0 entries throughout. The lab queried `/analytics/endpoints/logs.all`; the sibling `/analytics/endpoints/logs` answered `Backend error! Retry your query.` to the same SQL on that day.
+The trail a customer credential reaches is the logs endpoint; there is no drain path in `/v1` and the Auth audit endpoint returned 0 entries (security-lockdown S18, 2026-09-03). Blocking exists for the database socket only.
 
-Blocking is DB-socket scoped. The three ban paths in the spec are `network-bans/retrieve`, `network-bans/retrieve/enriched` and `DELETE network-bans`.[^sb-netbans] Ten failed psql authentications through the session pooler (`FATAL: password authentication failed`) added one address to the ban list (the lab machine's, by the fact that psql from it succeeded again only after the `DELETE`); `DELETE /network-bans` with that address returned 200, the list was empty afterwards, and a correct-password connection through the pooler succeeded. Nothing in the spec bans an address at the HTTP tier; for Data API, Auth and Storage traffic that control lives in the row, the token, or an edge you own.
+### The audit trail
+
+| Event | Where it appears | Matched on | Lag |
+|---|---|---|---|
+| anon `GET /rest/v1/sec18_<nonce>` (404) | `edge_logs`, with a client-address field (`cf_connecting_ip` or `x_real_ip`) populated in the request headers | `metadata.request.path` | 18s |
+| service-key `GET /storage/v1/bucket?sec18=<nonce>` (200) | `edge_logs`, same fields | `metadata.request.url` | 15s |
+| failed password grant (`400 invalid_credentials`) | `auth_logs`, as a request line; the row read back carried method, path, status, `error_code` and `remote_addr`, no email | path and `error_code` | 2s |
+| successful login (200) | `auth_logs`, as an `auth_event` line; the email was in `actor_username` in the row read back | `action: login` plus the email | 3s |
+| either login | `GET /auth/v1/admin/audit` with the service key | - | returned 200 with 0 entries throughout |
+
+Two facts about the plumbing: the `/v1` OpenAPI spec has 115 paths and none mentions a drain, so Log Drains are configured in the Dashboard only;[^sb-logdrains] and the lab queried `/analytics/endpoints/logs.all`, because the sibling `/analytics/endpoints/logs` answered `Backend error! Retry your query.` to the same SQL on that day.
+
+### Blocking a bad actor
+
+The three ban paths in the spec are `network-bans/retrieve`, `network-bans/retrieve/enriched` and `DELETE network-bans`, and all of them act on the database socket.[^sb-netbans]
+
+| Step | Result |
+|---|---|
+| `POST network-bans/retrieve` before | 0 banned |
+| 10 failed psql authentications through the session pooler (`FATAL: password authentication failed`) | 1 address banned (the lab machine's, by the fact that psql from it succeeded again only after the `DELETE`) |
+| `DELETE /network-bans` with that address | 200; 0 banned after |
+| correct-password psql through the pooler afterwards | succeeded |
+
+Nothing in the spec bans an address at the HTTP tier; for Data API, Auth and Storage traffic that control lives in the row, the token, or an edge you own.
 
 ## Which move to pick
 
