@@ -96,7 +96,7 @@ The absolute costs are the Singapore-to-Frankfurt figures below; the *choice* in
 | Path | median | p95 | notes |
 |---|---|---|---|
 | PostgREST over HTTPS (`supabase-js`) | 213 | 591 | the default path; fat tail from TLS/connection variance |
-| Worker **Cache API** in front of REST | 10 | 18 | first call ~258ms (cache fill), then edge-local |
+| Worker **Cache API** in front of REST | 10 | 18 | first call ~258ms (cache fill), then edge-local; the fill only happens if `Set-Cookie` is stripped before `put` (see [Storage](#storage)) |
 | **Hyperdrive** - cached read | 10 | 18 | deterministic query, default 60s TTL |
 | **Hyperdrive** - uncached read (`now()`) | 215 | 229 | bound by RTT, same floor as REST but tighter tail |
 | raw `node-postgres` -> Supavisor | - | - | **fails**: `Connection terminated unexpectedly` |
@@ -174,6 +174,8 @@ There are three ways to reach the database from a Worker.[^sb-connecting-postgre
 Disable session persistence in a Worker - the browser defaults break outside a
 browser: `createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } })`.
 </Aside>
+
+The client retries transient 5xx on its own and does not retry a claim rejection, measured on `supabase-js` 2.112.3 (edge-resilience W02, [supabase-lab](https://github.com/erfianugrah/supabase-lab)): three `503 PGRST002` answers followed by a 200 took 4 attempts and about 7.0 s; a `401 PGRST303` took exactly 1 attempt, 9 ms; a refused connection surfaced `Unable to connect` after about 7.0 s. The documented retry set is 408, 409, 503, 504 and network failures, on by default since 2.102.0.[^sb-js-retries] So do not wrap `.from()` / `.rpc()` in a second 5xx retry loop, and handle a 401 yourself - the client will not.
 
 ### B. Raw Postgres driver
 
@@ -278,6 +280,8 @@ know the token was revoked. That is the whole trade: ~0ms local verify vs a
 ~207ms revocation check. Pick per-route, do not blanket-`getUser()`.
 </Aside>
 
+Two 401 codes and one lag, measured on the request path (edge-resilience W01, W05): `401 PGRST303` is clock skew or expiry - the skew boundary sits at `iat` +30 s (200) against +31 s (401) - and `401 PGRST301` is a key PostgREST does not trust. A third-party issuer's key it has never seen takes about 30 s to become trusted after the Management API already reports `resolved_jwks`; a key set it has seen before warms in about 302 ms. After registering a third-party issuer, poll a real `/rest/v1` call until it answers 200 before routing traffic; the config API is not the request path. First-party signing-key rotation was not measured by W01 or W05.
+
 Keys: the browser gets the **anon** key (public, RLS applies). The Worker holds the **service_role** / `sb_secret_` key as a Wrangler secret and never ships it to the client. On a Hyperdrive/raw-SQL path there is no key at all - the Postgres role is the identity. RLS still applies unless that role has `BYPASSRLS`, but there is no `auth.uid()` for user-scoped policies, so you own authorization in the Worker - which the next section works through in full.
 
 That covers bearer-token auth - a Worker verifying a JWT it was handed. For a Worker or Pages Function that renders authenticated HTML server-side, the session lives in cookies instead: use `@supabase/ssr` with a `getAll` / `setAll` cookie adapter so the SSR client reads and refreshes the session from request/response cookies.[^sb-ssr] Same trust boundary (keys stay server-side), just a cookie transport rather than a bearer header.
@@ -317,7 +321,7 @@ The deployment shape this suits is `Browser -> Worker -> Supabase`: the Worker a
 
 ## Storage
 
-The full round-trip - create bucket -> upload -> signed URL -> fetch - runs against the Storage REST API with the service key. The CF-relevant pattern is to **serve Storage objects through a Worker and cache them at the edge**: the Worker mints or proxies a signed URL, fetches the object, and puts it in the Cache API.[^cf-cache-api] Objects are effectively immutable per signed URL, so the same ~10ms edge-cache behavior as the read path applies to a hot object after the first fill.
+The full round-trip - create bucket -> upload -> signed URL -> fetch - runs against the Storage REST API with the service key. The CF-relevant pattern is to **serve Storage objects through a Worker and cache them at the edge**: the Worker mints or proxies a signed URL, fetches the object, and puts it in the Cache API.[^cf-cache-api] Objects are effectively immutable per signed URL, so the same ~10ms edge-cache behaviour as the read path applies to a hot object after the first fill.
 
 ```ts
 // Worker: proxy + edge-cache a private Storage object
@@ -330,12 +334,15 @@ if (!res) {
   res = await fetch(signed);
   res = new Response(res.body, res);
   res.headers.set("cache-control", "public, max-age=60");
+  res.headers.delete("set-cookie");      // the gateway sets __cf_bm on EVERY response; put() refuses it
   ctx.waitUntil(cache.put(key, res.clone()));
 }
 return res;
 ```
 
-Order matters: authorize before `cache.match`, and scope the cache key to what the caller may see - a cache hit that skips the auth check would serve the private object to whoever requests the same URL next. And do not put the service key or a bucket-wide token in the browser - the Worker is where the privileged Storage call happens.
+Order matters: authorise before `cache.match`, and scope the cache key to what the caller may see - a cache hit that skips the auth check would serve the private object to whoever requests the same URL next. And do not put the service key or a bucket-wide token in the browser - the Worker is where the privileged Storage call happens.
+
+The `set-cookie` delete is load-bearing, and an earlier revision of this snippet lacked it. The Supabase gateway's Cloudflare front sets `Set-Cookie: __cf_bm` on every response, `caches.default.put` refuses any response carrying `Set-Cookie`,[^cf-cache-api] and the rejection lands inside `waitUntil`, where nothing surfaces it - so the copy-all-headers version never caches and every request is a MISS with no error anywhere (edge-resilience W04; the same failure was found again independently while building the [entity-graph demo's edge cache](/reference/postgres-entity-graphs/#hosting-the-read-ui)). The same W04 drill measured what a warm cache buys: with the origin repointed at an unroutable address, a warm URL still answered 200 HIT with a byte-identical body. A cold URL fails: the Workers runtime hands the worker's `fetch()` a 403 response for the unroutable origin rather than throwing, so a `catch`-only fallback never fires; the drill worker, once taught to treat 403 as origin failure, returned 503 to the client (edge-resilience W04, W24; artifact 2026-08-16). Serve the cached copy on any non-ok origin response, not only on a throw.
 
 Storage also exposes an **S3-compatible endpoint**, reachable from a Worker with a signing client like `aws4fetch`.[^sb-s3-storage] Use it for multipart uploads of large objects or to point existing S3 tooling at a bucket, where the REST API is awkward.
 
@@ -388,12 +395,13 @@ digraph {
 
 The asymmetry is the point: one upstream subscription to Supabase, N browser sockets fanned out from the DO. The push path runs `INSERT` -> trigger -> Realtime -> the one upstream -> fan-out; browsers dial the DO in the other direction to set the sockets up.
 
-Four load-bearing details, each a silent failure otherwise (all four cost real debugging time to find):
+Four load-bearing details, each a silent failure otherwise (all four cost real debugging time to find), plus a fifth from the lab:
 
 - **The DO subscribes with the anon *JWT*, not the `sb_publishable_` key.** Realtime silently ignores `sb_*` tokens as a private-channel `access_token`, so the join is unauthenticated and receives nothing. (Supabase is deprecating the legacy anon key by end of 2026; on a new-keys-only project the `access_token` must be a real signed anon/user JWT - still never the `sb_publishable_` key.)
 - **The DO's outbound socket is `fetch("https://...", { headers: { Upgrade: "websocket" } })`, not `new WebSocket("wss://...")`.** A Worker's `fetch` only upgrades an `http(s)` URL; a `wss://` URL is rejected, so the upstream never connects. (A browser `WebSocket` accepts `wss://`, so this only bites server-side.)
 - **Response middleware must skip the `101`.** A header-adding middleware that re-wraps every response with `new Response(body, init)` drops the non-standard `webSocket` property, and the browser upgrade fails with a `1002`.
 - **Rejoin with Broadcast `replay`.** On reconnect, send `broadcast.replay { since, limit }` so anything broadcast during the gap is backfilled - private channels only, DB-originated messages, up to 25 per request, at least 72h retention; dedup on the client by id (the browser socket stays up while only the DO's upstream reconnects, so a poll fallback would not cover it).
+- **Never drop and recreate a table that has a live subscription.** Dropping and recreating a table under Postgres Changes delivery kills events for that table name - the new OID does not match the channel's metadata - while a table under a fresh name delivers in about 0.5 s (edge-resilience W12). Use stable canary tables for probes and migrate with `ALTER`, not drop-and-create, on anything subscribed.
 
 The load-bearing glue - accept the browser socket, hold one upstream, fan out:
 
@@ -571,7 +579,10 @@ the 1.4s.
 <Aside type="caution">
 Edge Functions enforce a platform `verify_jwt` check *before* your handler. It
 validates both legacy HS256 JWTs and the newer asymmetric (ES256) signing keys,
-so rotating signing keys does not break it. What it rejects is a non-JWT in the
+so rotating signing keys does not break it. (Third-party JWKS registration
+takes about 30 s to become trusted by PostgREST - W01/W05 - and the same
+poll-the-request-path habit is cheap insurance after a first-party rotation,
+which those drills did not measure.) What it rejects is a non-JWT in the
 `Authorization` header - an `sb_publishable_` / `sb_secret_` key is not a JWT, so
 `verify_jwt` turns it away; send a real user JWT, or verify with `getClaims()`
 in-handler.
@@ -717,6 +728,40 @@ Supabase **PrivateLink** (AWS PrivateLink) applies to clients *inside* the same 
 
 ---
 
+## What to do about it
+
+The practices the lab measurements support, grouped by the section they belong to. Module ids are edge-resilience drills in [supabase-lab](https://github.com/erfianugrah/supabase-lab) unless named otherwise; a row that is a design choice rather than a result says so.
+
+**Caching**
+
+- Delete `set-cookie` from every Supabase response before `caches.default.put`, or the cache never fills: the gateway sets `__cf_bm` on every response, `put` refuses it, and `waitUntil` swallows the rejection (W04).
+- Serve the cached copy on any non-ok origin response, 403 included: the Workers runtime hands the worker's `fetch()` a 403 response for an unroutable origin rather than throwing, so a `>= 500` or `catch`-only fallback never trips (W04, W24). A cold URL during an outage fails - the drill worker, once taught to treat 403 as origin failure, returned 503 to the client (artifact 2026-08-16); pre-warm the URLs a landing page needs.
+- The cache TTL (`max-age=60` in the Storage snippet, Hyperdrive's 60 s default) is a design choice; no run measured staleness against hit rate.
+
+**Clients and auth**
+
+- Do not wrap `supabase-js` calls in your own 5xx retry loop, and handle `401 PGRST303` yourself: the client rode out three 503s in 4 attempts and about 7.0 s, and gave a claim rejection exactly 1 attempt in 9 ms (W02).
+- Read `401 PGRST303` as skew or expiry (`iat` +30 s accepted, +31 s refused) and `401 PGRST301` as a key PostgREST does not trust (W01).
+- After registering a third-party issuer, poll a real `/rest/v1` call until it answers 200 before flipping traffic: `resolved_jwks` on the Management API precedes PostgREST trust by about 30 s for a first-time issuer and about 302 ms for a key set seen before (W01, W05). First-party signing-key rotation was not measured; the same poll is cheap insurance after one.
+- Shorten token lifetime with `PATCH /v1/projects/{ref}/config/auth {"jwt_exp": N}` and expect the first token minted after the 200 to still carry the old lifetime; the new value applied about 6.5 s later (W03). Which value to pick is a design choice.
+- For a warm standby, register the primary's issuer (`https://<primary-ref>.supabase.co/auth/v1`) as third-party auth on the second project: a primary-issued user token then reads the second project's API with 200 and no secret is copied - `PATCH /config/auth {jwt_secret}` returns 200 and changes nothing, so copying is not on offer anyway (W05, W01).
+
+**Hyperdrive and the wire**
+
+- Set `statement_timeout` on the Hyperdrive role (`ALTER ROLE hyperdrive_user SET statement_timeout = '...'`) and handle SQLSTATE `57014` in the Worker. The signature is measured, the Hyperdrive path is not: through the Management query endpoint and a pooler session the error read `canceling statement due to statement timeout` at 3467 ms wall for a 2 s timeout, and a lock wait ended in `55P03` at 4533 ms for a 3 s `lock_timeout` (W20). Do not rely on connection-time options through the Supavisor transaction pooler: `PGOPTIONS` / `options=` are dropped and `show statement_timeout` reports the role default of `2min` whether set or not (pdf-corpus-graph method notes).
+
+**Realtime**
+
+- Never drop and recreate a table that has an active subscription: the recreated name delivers nothing, a fresh name delivers in about 0.5 s (W12). Stable canary tables only.
+- Keep a private channel's JWT lifetime short with the `jwt_exp` lever above; the right value is a design choice.
+
+**Scheduled work and provisioning**
+
+- `pg_cron` resumes across a project restart with no catch-up doubling (2 rows before, 5 after, on schedule), so job SQL needs no restart-aware guard (W23).
+- On a freshly provisioned project or preview branch, retry Storage `TenantNotFound` and `429 SlowDown` for the first minutes instead of failing the deploy: the storage tenant lags `ACTIVE_HEALTHY` (W21), and health reports per service, so poll `GET /v1/projects/{ref}/health?services=auth&services=rest&services=db` rather than project status (supabase-lab provisioning note, 2026-08-03; platform-facts F02d asserts the same and has no recorded run).
+
+---
+
 ## Decision guide
 
 ```dot
@@ -790,6 +835,7 @@ Measured from the Singapore edge to `eu-central-1` (Frankfurt), 2026-07-14. Abso
 [^cf-hyperdrive-cache]: Cloudflare, "Hyperdrive query caching," Cloudflare Docs. https://developers.cloudflare.com/hyperdrive/configuration/query-caching/
 [^cf-cache-api]: Cloudflare, "Cache API," Cloudflare Docs. https://developers.cloudflare.com/workers/runtime-apis/cache/
 [^sb-auth-jwts]: Supabase, "JSON Web Tokens (JWTs)," Supabase Docs. https://supabase.com/docs/guides/auth/jwts
+[^sb-js-retries]: Supabase, "How to do automatic retries with supabase-js," Supabase Docs. https://supabase.com/docs/guides/api/automatic-retries-in-supabase-js
 [^sb-ssr]: Supabase, "Server-side auth (@supabase/ssr)," Supabase Docs. https://supabase.com/docs/guides/auth/server-side
 [^cf-rate-limiting]: Cloudflare, "Rate limiting binding," Cloudflare Docs. https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
 [^sb-s3-storage]: Supabase, "S3 authentication (Storage)," Supabase Docs. https://supabase.com/docs/guides/storage/s3/authentication

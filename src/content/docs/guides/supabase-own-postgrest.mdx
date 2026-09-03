@@ -58,7 +58,7 @@ digraph {
 
 ## Step 1: turn the managed Data API off
 
-Empty the exposed schema so the managed PostgREST stops answering. Through the Management API (`PATCH /v1/projects/{ref}/postgrest` with `{"db_schema": ""}`), or the Dashboard's Data API toggle. Confirm it wedges:
+Empty the exposed schema so the managed PostgREST stops answering. Read the current value first with `GET /v1/projects/{ref}/postgrest` and keep it for the teardown - the body also carries the project's `jwt_secret`, so do not log the response (http-tier-lockdown run 2) - then `PATCH /v1/projects/{ref}/postgrest` with `{"db_schema": ""}`. Use the API rather than the Dashboard's Data API toggle: the toggle's off-then-on round-trip rewrites `db_schema` to the constant `public`, dropping `graphql_public` and any other exposed schema, and a client asking for a dropped schema then gets `406 PGRST106` (http-tier-lockdown run 2). Confirm it wedges:
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' \
@@ -114,6 +114,8 @@ notify pgrst, 'reload schema';
 
 For write endpoints the grant is the column control, not just the table. `grant update on public.your_table to anon` exposes *every* column; `grant update (col1, col2) on public.your_table to anon` scopes the write to those columns, and RLS still decides the rows. An UPDATE policy gates which rows change, never which columns - a table-level UPDATE grant plus a row policy leaves a caller free to overwrite any column of a row the policy admits, and a write to a withheld column then returns SQLSTATE `42501`. Measured in security-lockdown S13; the reasoning is [Locking down Supabase](/reference/supabase-data-surface-lockdown/).
 
+New tables reach your PostgREST open. `pg_default_acl` grants SELECT on every new table to `anon` and `authenticated` (iap-lockdown L08), so a table created after this step is readable through your instance with no deliberate grant. Run `alter default privileges in schema public revoke select on tables from anon, authenticated;` as `postgres`, then grant per table as above.
+
 ## Step 5: the db-pre-request IP filter
 
 This is the control the managed tier will not run. The function reads the forwarding header and raises with a `PT`-prefixed SQLSTATE, which PostgREST maps to the matching HTTP status.[^pgrst-prereq] An IP ban (block one address) keeps the filter out of the way of trusted callers:
@@ -137,7 +139,7 @@ curl -s -o /dev/null -w 'banned=%{http_code}\n' \
 curl -s -o /dev/null -w 'allowed=%{http_code}\n' 'http://localhost:3000/your_table?select=id'  # -> 200
 ```
 
-For an allowlist instead of a ban, invert the test (`raise` unless `xff` is in your set). Read the client IP from `x-forwarded-for` only if the edge in front overwrites it; if the edge appends, a client can spoof it.
+For an allowlist instead of a ban, invert the test (`raise` unless `xff` is in your set). Read the client IP from `x-forwarded-for` only if the edge in front overwrites it; if the edge appends, a client can spoof it. Pin the function's `search_path` (`alter function public.ip_filter() set search_path = '';`) so the Management API security advisor does not flag it as `function_search_path_mutable`, and run the advisor after steps 3-5: in security-lockdown S01 it caught every seeded exposure. The pinned form was not run through S04.
 
 ## Step 6: rate limit at the edge
 
@@ -160,6 +162,8 @@ docker run -d --name own-ratelimit --add-host=host.docker.internal:host-gateway 
   -p 8080:8080 -v "$PWD/ratelimit.nginx.conf:/etc/nginx/nginx.conf:ro" nginx:1.31.4-trixie
 ```
 
+Two adjustments the lab's config did not carry. Exclude any health-check path from `limit_req` (its own `location` or its own zone): in security-lockdown S12, the Worker variant of this limiter, the readiness poll spent the per-window allowance and the module had to wait a full window before the burst. And add `proxy_set_header X-Forwarded-For $remote_addr;` in the `location` block so the step 5 filter sees the peer address rather than a client-supplied header; as written, nginx passes the client's header through. S04 measured the spoof rejection against PostgREST directly; the through-nginx behaviour is not measured.
+
 A 15-request burst against `:8080` returns 2 served and 13 rejected (429).
 
 ## Verification
@@ -171,15 +175,30 @@ A 15-request burst against `:8080` returns 2 served and 13 rejected (429).
 | Spoofed `x-forwarded-for` at the filter | 403 |
 | Burst through nginx | some 429, some 200 |
 
+## What to do about it
+
+The measurements behind the steps imply a short list of practices. Each row names the module id or run it rests on (security-lockdown unless prefixed); a row that is a design choice rather than a result says so.
+
+| Practice | Rests on |
+|---|---|
+| Record `db_schema` with `GET /v1/projects/{ref}/postgrest` in step 1 and PATCH exactly that value back at teardown; the platform default is `public,graphql_public`, `public` alone drops `/graphql/v1`, and restore landed in 1-2s. | http-tier-lockdown run 1, run 2 |
+| Use `PATCH` for the off switch, never the Dashboard toggle: the toggle's off-then-on round-trip rewrites `db_schema` to `public` alone and a client asking for a dropped schema gets `406 PGRST106`. | http-tier-lockdown run 2 |
+| Keep the `GET /v1/projects/{ref}/postgrest` response out of logs; it carries the project's `jwt_secret`, the legacy HS256 key. Projects whose Auth signs ES256 need `PGRST_JWKS_URI` pointed at the project JWKS instead; which applies to yours is not measured here. | http-tier-lockdown run 2 |
+| Run `alter default privileges in schema public revoke select on tables from anon, authenticated;` as `postgres` after step 4, then grant per table; `pg_default_acl` otherwise grants SELECT on every new table to `anon` and `authenticated`. | iap-lockdown L08 |
+| Add the PostgREST host's egress IP to the network restriction list, or run the container in the VPC behind PrivateLink, before combining this guide with restrictions; an excluded address is refused with `FATAL (EADDRNOTALLOWED) address not in tenant`. | S10 |
+| Exclude the health-check path from `limit_req` (its own `location` or zone); the readiness poll spent the per-window allowance and the module waited a full window before the burst. | S12 |
+| Add `proxy_set_header X-Forwarded-For $remote_addr;` to the nginx `location` block so the step 5 filter sees the peer address; as written nginx passes a client-supplied header through. S04 measured the spoof rejection at PostgREST directly; the through-nginx behaviour is reasoned, not measured. | S04 |
+| Pin `search_path` on `ip_filter` (`alter function public.ip_filter() set search_path = '';`) and run the Management API security advisor after steps 3-5; it flags `function_search_path_mutable` and caught every seeded exposure. | S01 |
+
 ## Gotchas and lessons learned
 
 - The `db-pre-request` function must exist for the container's whole life. `PGRST_DB_PRE_REQUEST` is read at config load, and PostgREST calls the function on every request - drop it and every request errors. Create it before the container serves traffic, and do not drop it while the container runs.
 - nginx `limit_req` rejects with `503` by default. Set `limit_req_status 429` for the correct status.
 - Connect as the authenticator role from step 3, never as `postgres`. `postgres` is a superuser that bypasses RLS and every grant, so an RLS-based lockdown on your own PostgREST would be silently defeated; `service_role` bypasses RLS too, so keep it out of the connection and the request path. Authorisation is yours to enforce now - RLS on anon/authenticated, the pre-request function, or the edge - and the managed platform's role separation does not carry over automatically.
 - A fresh table is invisible until `notify pgrst, 'reload schema'`. PostgREST caches the schema; grants and new tables need the reload.
-- This wires anonymous reads. For authenticated user requests, point PostgREST's JWT verification (`PGRST_JWT_SECRET`, or `PGRST_JWKS_URI` for asymmetric keys) at your token issuer's key so it validates the bearer token and switches to `authenticated` - your own issuer, or the Supabase-issued tokens if you keep Supabase Auth.
-- Owning the REST layer does not cover Storage or Realtime. `db-pre-request`, your IP filter, and the whole PostgREST you now run sit on the REST path only; Storage (`/storage/v1`) and Realtime (`/realtime/v1`) stay the managed services against the same Postgres and never route through PostgREST - turn the Data API off and both keep answering (security-lockdown S15). An IP allowlist or owner-list for them lives in each service's own authorization - RLS on `storage.objects`, Realtime's channel authorization - or an edge you put in front of them too.
-- Put the pooler behind [PrivateLink](/reference/supabase-aws-privatelink/) to take the database connection itself off the public internet - then both the REST layer and the connection are private.
+- This wires anonymous reads. For authenticated user requests, point PostgREST's JWT verification (`PGRST_JWT_SECRET`, or `PGRST_JWKS_URI` for asymmetric keys) at your token issuer's key so it validates the bearer token and switches to `authenticated` - your own issuer, or the Supabase-issued tokens if you keep Supabase Auth. `GET /v1/projects/{ref}/postgrest` returns `jwt_secret` in the body, the legacy HS256 key (http-tier-lockdown run 2). Projects whose Auth signs ES256 need `PGRST_JWKS_URI` pointed at the project JWKS instead; which applies to yours is not measured here. Keep that response out of logs either way.
+- Owning the REST layer does not cover Storage or Realtime. `db-pre-request`, your IP filter, and the whole PostgREST you now run sit on the REST path only; Storage (`/storage/v1`) and Realtime (`/realtime/v1`) stay the managed services against the same Postgres and never route through PostgREST - turn the Data API off and both keep answering (security-lockdown S15). An IP allowlist or owner-list for them lives in each service's own authorisation - RLS on `storage.objects`, Realtime Authorization - or an edge you put in front of them too.
+- Put the pooler behind [PrivateLink](/reference/supabase-aws-privatelink/) to take the database connection itself off the public internet - then both the REST layer and the connection are private. If you apply network restrictions to the project, add the PostgREST host's egress IP to the list first, or run the container inside the VPC: an excluded address is refused at the pooler with `FATAL (EADDRNOTALLOWED) address not in tenant` (security-lockdown S10), and that is what `docker logs` will show.
 
 ## Teardown
 
@@ -187,7 +206,7 @@ A 15-request burst against `:8080` returns 2 served and 13 rejected (429).
 docker rm -f own-postgrest own-ratelimit
 ```
 
-Drop the role with `drop role pgrst_auth;`, and re-enable the managed Data API (Settings, or `PATCH .../postgrest` with `db_schema` back to `public`) if you want it back.
+Drop the role with `drop role pgrst_auth;`, and re-enable the managed Data API with `PATCH .../postgrest`, setting `db_schema` back to the value you recorded in step 1 - the platform default is `public,graphql_public`, and `public` alone drops `/graphql/v1` (http-tier-lockdown run 2). Restore landed in 1-2s (http-tier-lockdown run 1).
 
 ## File reference
 

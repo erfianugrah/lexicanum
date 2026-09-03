@@ -8,9 +8,9 @@ group: operations
 
 import { Aside } from "@astrojs/starlight/components";
 
-Build a private network path from an AWS VPC to a Supabase project: a VPC Lattice Resource endpoint serving direct Postgres (5432) and the project pooler (6543), TLS `verify-full` via a private hosted zone, Supabase CLI migrations over the endpoint, and public database access closed at the end. The measured behavior behind each step - latency, ceilings, restart windows, the tested-vs-asserted split - lives in the companion [reference](/reference/supabase-aws-privatelink/); this is the build sequence.
+Build a private network path from an AWS VPC to a Supabase project: a VPC Lattice Resource endpoint serving direct Postgres (5432) and the project pooler (6543), TLS `verify-full` via a private hosted zone, Supabase CLI migrations over the endpoint, and public database access closed at the end. The measured behaviour behind each step - latency, ceilings, restart windows, the tested-vs-asserted split - lives in the companion [reference](/reference/supabase-aws-privatelink/); this is the build sequence.
 
-**Prerequisites:** a Team or Enterprise Supabase org; an AWS account in the same region as the project; a Supabase personal access token (PAT); OpenTofu >= 1.6; the AWS CLI; a VPC with private subnets (the lab builds its own). PrivateLink is same-region only, it is beta rather than generally available, and not every region is eligible - `eu-central-2` is excluded.[^sb-privatelink] Confirm your region before building anything around it.
+**Prerequisites:** a Team or Enterprise Supabase org; an AWS account in the same region as the project; a Supabase personal access token (PAT) belonging to an Owner or Administrator of that org - a Developer-role account authenticates but gets 403 on `POST /v1/projects` and cannot change project settings, which blocks `supabase_project`, `supabase_settings` and the association alike (measured, run 2; the alternative is an Owner pre-creating the project and granting project-scoped Administrator, then `tofu import`); OpenTofu >= 1.6; the AWS CLI; a VPC with private subnets (the lab builds its own). PrivateLink is same-region only, it is beta rather than generally available, and not every region is eligible - `eu-central-2` is excluded.[^sb-privatelink] Confirm your region before building anything around it.
 
 The working repo this guide is extracted from is [supabase-lab](https://github.com/erfianugrah/supabase-lab) - every step below ran green there on 2026-07-31 before being written down, and later runs through 2026-08-02 added the Lambda path, the typed test harness, and the IPv6 answer.
 
@@ -111,7 +111,7 @@ Adding your AWS account to the project is what makes Supabase create the VPC Lat
 
 1. Project > **Settings > Integrations > AWS PrivateLink** (project-level page; nothing appears under organization settings).
 2. **Add Account**, enter your AWS account identifier and a description.
-3. Wait for status CREATING -> **READY** (~2 minutes measured).
+3. Wait for status CREATING -> **READY** (~2 minutes measured). Script the wait against the RAM invitation rather than the dashboard: `aws ram get-resource-share-invitations` shows the `sspl-<ref>-*` share once it lands (32s after the click on run 6), and the `/platform/projects/{ref}/privatelink/associations` route a poller would otherwise hit rejects PATs with 401 (run 9).
 
 A `restapi_object` for this exists in the lab behind `var.send_association = false`, kept as documentation of the endpoint shape; it cannot authenticate with a PAT.
 
@@ -244,7 +244,7 @@ tofu apply tfplan
 
 Plan to a file and apply the file, so what lands is what you read - and never commit that file (see below).
 
-Verify from outside the VPC: `psql` to `db.<ref>.supabase.co` and to `aws-<N>-<region>.pooler.supabase.com` both refuse; inside the VPC, step 6 still passes. Note the scope: this locks the database socket. The Data API (PostgREST/Auth/Storage) is HTTP and stays public by design - PrivateLink does not cover it. Switching those surfaces off has its own limits: the Data API toggle and PostgREST's `db_schema` are the same lever, and either way the service wedges into a steady `503` retry loop rather than disappearing cleanly - so script it with `PATCH .../postgrest` and never round-trip the dashboard toggle, which comes back with `db_schema` reset to `public` and every other exposed schema silently dropped. See [what the off switches do](/reference/supabase-aws-privatelink/#what-the-off-switches-do) for the measurements. And if the requirement is public ingress *removed* rather than *refused*, that remains a support-ticket action; what it does beyond socket refusal is untested here.
+Verify from outside the VPC: `psql` to `db.<ref>.supabase.co` and to `aws-<N>-<region>.pooler.supabase.com` both refuse; inside the VPC, step 6 still passes. Through the pooler the refusal is immediate and names the mechanism - `FATAL (EADDRNOTALLOWED) address not in tenant` (security-lockdown S10) - distinct from the hang to timeout a security-group drop produces (standard AWS behaviour, not measured here), so a hang points at the step 6 SG rather than at the restriction. Note the scope: this locks the database socket, and that includes Supabase-hosted compute. Under restrict-all an Edge Function's direct `pg` connect over `SUPABASE_DB_URL` fails with `CONNECT_TIMEOUT db.<ref>.supabase.co:5432` while the same function's `/rest` call with the service key still serves (iap-lockdown L22), so inventory Edge Functions that connect directly before narrowing the list; under restrict-all they move to the Data API path or break. Whether pg_cron jobs or database webhooks are affected was not measured. The Data API (PostgREST/Auth/Storage) is HTTP and stays public by design - PrivateLink does not cover it. Switching those surfaces off has its own limits: the Data API toggle and PostgREST's `db_schema` are the same lever, and either way the service wedges into a steady `503` retry loop rather than disappearing cleanly - so script it with `PATCH .../postgrest` and never round-trip the dashboard toggle, which comes back with `db_schema` reset to `public` and every other exposed schema silently dropped. Record the current `db_schema` before anyone touches it and restore exactly that value; the platform default is `public,graphql_public`, and restore landed in 1-2s (http-tier-lockdown run 1). Do not log the read-back: `GET /v1/projects/{ref}/postgrest` returns the project's `jwt_secret` in the body (http-tier-lockdown run 2). See [what the off switches do](/reference/supabase-aws-privatelink/#what-the-off-switches-do) for the measurements. And if the requirement is public ingress *removed* rather than *refused*, that remains a support-ticket action; what it does beyond socket refusal is untested here.
 
 ## Step 8: migrations over the endpoint
 
@@ -254,6 +254,8 @@ The default `supabase link` targets the public shared pooler - broken by design 
 supabase link --project-ref <ref> --skip-pooler   # then: supabase db push
 supabase db push --db-url "postgres://postgres:<pw>@db.<ref>.supabase.co:5432/postgres"
 ```
+
+Tables these migrations create get `anon` SELECT through default privileges and no RLS (run 5; dashboard-created tables get RLS), and `pg_default_acl` reopens anon read on each new table (iap-lockdown L08). Enable RLS or revoke anon SELECT on every table a migration creates, health-check tables included, or the still-public Data API serves them.
 
 ## Running it: credentials, state, and teardown
 
@@ -269,11 +271,34 @@ supabase db push --db-url "postgres://postgres:<pw>@db.<ref>.supabase.co:5432/po
 
 **Anything the orchestration creates outside tofu will survive `destroy`.** In the lab that is the S3 bucket the test suite stages its binary and artifacts through: `make destroy` reports state 0 while the bucket is still there, which is why there is a separate `make suite-clean`. Check for these before calling a teardown verified.
 
+**Destroy the endpoint before removing the AWS account.** The dashboard refuses the removal with `Cannot remove last AWS PrivateLink Association: There are still Endpoint Associations attached to the Resource Configuration` while the VPC endpoint or any Lattice service-network resource association still references the resource configuration; with both destroyed, the removal succeeded and the RAM share disappeared at once (T19, run 9). Deleting the whole project bypasses the check, which is why a lab that tears down by deleting the project never meets it.
+
+**After an out-of-band endpoint delete or a failed destroy, remove `arns.tfvars` by hand.** The file keeps `local.phase2` true while `aws_vpc_endpoint.supabase[0].network_interface_ids` is unknown, so the ENI data source's `for_each` errors at the next plan; `make destroy` only removes the file after a success, so a failed run leaves the poison in place (run 9).
+
 ## Verification
 
 The lab's `make suite` is the full verification battery, runnable against any deployment of this guide: a typed test harness that ships as one binary to the in-VPC runner and also runs orchestrator-side tests. It covers the TLS matrix (verify-full/verify-ca/host-hostaddr split/raw-IP negative), 30 cold connects and pgbench per path, a pooler ceiling probe that distinguishes queueing from `max_client_conn` refusal, a Data API probe (anon key against a real table - PostgREST's root requires service_role), Realtime over a real WebSocket client, the CLI migration paths, a Lambda probe on both ports, and destructive tests behind `--destructive` (an API-triggered restart sampled per private path at 500ms, endpoint replacement, single-ENI failure, and the HTTP-tier config flips).
 
 Two conventions in the harness carry over to any suite that measures someone else's platform. A test is one file declaring where it runs and which capabilities it needs, so it self-skips with a reason when the infrastructure is absent - which is how the Data API and Realtime tests got answered on a bare project with no VPC at all. And every fault-injection test has a baseline gate: if the control path does not work *before* the fault is injected, the test returns skip and asserts nothing. Two tests here once reported the exact opposite of the truth because their baseline had silently failed and the post-fault failure looked like a result. It renders a single markdown evidence report; see the [reference](/reference/supabase-aws-privatelink/) for the numbers and for which of them are reproducible.
+
+## What to do about it
+
+The measurements behind this guide imply a short list of practices beyond the steps. Each row names the run or module id it rests on (privatelink-aws unless prefixed); a row that is a design choice rather than a result says so.
+
+| Practice | Rests on |
+|---|---|
+| Use a PAT from an Owner or Administrator account, or have an Owner pre-create the project and grant project-scoped Administrator, then `tofu import`: a Developer-role PAT gets 403 on `POST /v1/projects` and cannot change project settings. | run 2 |
+| Poll `aws ram get-resource-share-invitations` for the `sspl-<ref>-*` share as the readiness signal after the dashboard click, which landed 32s after the click; the `/platform` associations GET answers 401 to a PAT. | run 6, run 9 |
+| Serve a second VPC from the existing endpoint with three additions - routes both ways (peering or a transit gateway attachment), an `aws_route53_zone_association` of the step 5 zone with that VPC, and an SG ingress rule for its CIDR - rather than a second endpoint; a Lambda there reached both ports over peering and over a transit gateway. `verify-full` from the second VPC is not measured (the probe had verification off). | T24 (run 9), T27 (2026-08-07, logged separately) |
+| Destroy the endpoint and any Lattice resource association before removing the AWS account; the removal is refused with `Cannot remove last AWS PrivateLink Association: There are still Endpoint Associations attached to the Resource Configuration` until both are gone. | T19 (run 9) |
+| Delete `arns.tfvars` by hand after an out-of-band endpoint delete or a failed destroy, or the next plan fails on the ENI data source's `for_each`. | run 9 |
+| Expect `FATAL (EADDRNOTALLOWED) address not in tenant` through the pooler when a caller is outside the restriction list; a hang to timeout points at an SG drop instead (standard AWS behaviour, not measured here). | security-lockdown S10 |
+| Inventory Edge Functions that open a direct database connection before narrowing restrictions: under restrict-all a function's `pg` connect over `SUPABASE_DB_URL` fails with `CONNECT_TIMEOUT db.<ref>.supabase.co:5432` while its `/rest` fallback with the service key still serves, so they move to the Data API path or break. Whether pg_cron jobs or database webhooks are affected was not measured. | iap-lockdown L22 |
+| Keep the response of `GET /v1/projects/{ref}/postgrest` out of logs; it carries the project's `jwt_secret`. | http-tier-lockdown run 2 |
+| Restore the Data API by PATCHing the `db_schema` you recorded, never the constant `public` the dashboard toggle writes; the platform default is `public,graphql_public`, and restore landed in 1-2s. | http-tier-lockdown run 1, run 2 |
+| Give a serverless client on 6543 a connect timeout of a few seconds and retry within the function's budget: the pooler path was down 60s on a restart with failure mode `timeout expired`, and a 30s Lambda timeout was spent entirely on one attempt. The timeout and retry values are a design choice, not a result. | T26 (run 9), run 6 |
+| Enable RLS or revoke anon SELECT on every table a migration creates, health-check tables included: SQL-created tables get `anon` SELECT via default privileges with no RLS, and `pg_default_acl` reopens anon read on each new table. | run 5, iap-lockdown L08 |
+| Probe a real table path with the anon key when checking the Data API, never `/rest/v1/`: the root answers anon 401 in every state - "Only the service_role API key can be used for this endpoint" on run 5, `Invalid API key` in security-lockdown S15 - and the wedged state reads as `503 PGRST002` only on a table path. | run 5, security-lockdown S15 |
 
 ## Gotchas and lessons learned
 
