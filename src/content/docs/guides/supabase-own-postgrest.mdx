@@ -26,7 +26,7 @@ The commands reference these. Run every SQL block in the **SQL Editor** (Dashboa
 
 Supabase ships three Postgres roles these steps use: `anon` (an unauthenticated caller), `authenticated` (a logged-in user), and `service_role` (bypasses RLS). PostgREST connects as an "authenticator" role and switches to `anon` or `authenticated` per request.
 
-Everything below was run on a throwaway micro project in ap-southeast-1 on 2026-08-28.
+Everything below was run on a throwaway micro project in ap-southeast-1 on 2026-08-28; the through-edge header behaviour behind step 5 was measured on the same shape on 2026-09-03 (security-lockdown S20, with the lab's `edge.nginx.conf` in front).
 
 ## Component versions
 
@@ -139,7 +139,7 @@ curl -s -o /dev/null -w 'banned=%{http_code}\n' \
 curl -s -o /dev/null -w 'allowed=%{http_code}\n' 'http://localhost:3000/your_table?select=id'  # -> 200
 ```
 
-For an allowlist instead of a ban, invert the test (`raise` unless `xff` is in your set). Read the client IP from `x-forwarded-for` only if the edge in front overwrites it; if the edge appends, a client can spoof it. Pin the function's `search_path` (`alter function public.ip_filter() set search_path = '';`) so the Management API security advisor does not flag it as `function_search_path_mutable`, and run the advisor after steps 3-5: in security-lockdown S01 it caught every seeded exposure. The pinned form was not run through S04.
+For an allowlist instead of a ban, invert the test (`raise` unless `xff` is in your set). The function judges whatever header reaches it (S20): called direct on the container with `x-forwarded-for: 198.51.100.7`, an RPC returning the header saw that value, so a client that can reach port 3000 chooses its own address; through an nginx that sets `proxy_set_header X-Forwarded-For $remote_addr` (the lab's `edge.nginx.conf`, a separate container from the step 6 rate limiter) it saw one RFC 1918 address and no client value. Keep the container reachable from the edge only, and read the header the edge sets. On the managed tier the edge appends instead, client value first, and passes `cf-connecting-ip` (S16) - a different header discipline, covered in [Locking down Supabase](/reference/supabase-data-surface-lockdown/). Pin the function's `search_path` (`alter function public.ip_filter() set search_path = '';`) so the Management API security advisor does not flag it as `function_search_path_mutable`, and run the advisor after steps 3-5: in security-lockdown S01 it caught every seeded exposure. The pinned form was not run through S04.
 
 ## Step 6: rate limit at the edge
 
@@ -162,7 +162,7 @@ docker run -d --name own-ratelimit --add-host=host.docker.internal:host-gateway 
   -p 8080:8080 -v "$PWD/ratelimit.nginx.conf:/etc/nginx/nginx.conf:ro" nginx:1.31.4-trixie
 ```
 
-Two adjustments the lab's config did not carry. Exclude any health-check path from `limit_req` (its own `location` or its own zone): in security-lockdown S12, the Worker variant of this limiter, the readiness poll spent the per-window allowance and the module had to wait a full window before the burst. And add `proxy_set_header X-Forwarded-For $remote_addr;` in the `location` block so the step 5 filter sees the peer address rather than a client-supplied header; as written, nginx passes the client's header through. S04 measured the spoof rejection against PostgREST directly; the through-nginx behaviour is not measured.
+Two adjustments the lab's config did not carry. Exclude any health-check path from `limit_req` (its own `location` or its own zone): in security-lockdown S12, the Worker variant of this limiter, the readiness poll spent the per-window allowance and the module had to wait a full window before the burst. And add `proxy_set_header X-Forwarded-For $remote_addr;` in the `location` block so the step 5 filter sees the peer address rather than a client-supplied header; as written, nginx passes the client's header through. With that line in place (the lab's `edge.nginx.conf`), the spoofed ban value returned `403 PT403` direct to PostgREST and `200` through nginx, and an RPC returning `current_setting('request.headers', true)::json ->> 'x-forwarded-for'` (S20's `sec20_xff`, not part of these steps) saw the edge's peer address instead of the client header (S20).
 
 A 15-request burst against `:8080` returns 2 served and 13 rejected (429).
 
@@ -172,7 +172,8 @@ A 15-request burst against `:8080` returns 2 served and 13 rejected (429).
 |---|---|
 | Managed REST | `503 PGRST002` |
 | Your PostgREST direct | 200 with rows |
-| Spoofed `x-forwarded-for` at the filter | 403 |
+| Spoofed `x-forwarded-for` at the filter, direct | 403 |
+| Same request through the nginx edge with `X-Forwarded-For $remote_addr` | 200 |
 | Burst through nginx | some 429, some 200 |
 
 ## What to do about it
@@ -187,7 +188,8 @@ The measurements behind the steps imply a short list of practices. Each row name
 | Run `alter default privileges in schema public revoke select on tables from anon, authenticated;` as `postgres` after step 4, then grant per table; `pg_default_acl` otherwise grants SELECT on every new table to `anon` and `authenticated`. | iap-lockdown L08 |
 | Add the PostgREST host's egress IP to the network restriction list, or run the container in the VPC behind PrivateLink, before combining this guide with restrictions; an excluded address is refused with `FATAL (EADDRNOTALLOWED) address not in tenant`. | S10 |
 | Exclude the health-check path from `limit_req` (its own `location` or zone); the readiness poll spent the per-window allowance and the module waited a full window before the burst. | S12 |
-| Add `proxy_set_header X-Forwarded-For $remote_addr;` to the nginx `location` block so the step 5 filter sees the peer address; as written nginx passes a client-supplied header through. S04 measured the spoof rejection at PostgREST directly; the through-nginx behaviour is reasoned, not measured. | S04 |
+| Add `proxy_set_header X-Forwarded-For $remote_addr;` to the nginx `location` block so the step 5 filter sees the peer address; as written nginx passes a client-supplied header through. Direct to PostgREST the client header is what SQL sees (spoofed ban value `403`); through an nginx with that line it is one RFC 1918 address and the same request returns `200`. | S20, S04 |
+| Expose port 3000 to the edge only. The filter cannot tell a client-supplied `x-forwarded-for` from an edge-set one; the allowlist property comes from the container's reachability; the function judges whatever header arrives. | S20 |
 | Pin `search_path` on `ip_filter` (`alter function public.ip_filter() set search_path = '';`) and run the Management API security advisor after steps 3-5; it flags `function_search_path_mutable` and caught every seeded exposure. | S01 |
 
 ## Gotchas and lessons learned
@@ -210,6 +212,6 @@ Drop the role with `drop role pgrst_auth;`, and re-enable the managed Data API w
 
 ## File reference
 
-The reproducible form is the supabase-lab [`security-lockdown`](https://github.com/erfianugrah/supabase-lab/tree/0998c69/experiments/security-lockdown) experiment: [`s04-self-hosted-postgrest.ts`](https://github.com/erfianugrah/supabase-lab/blob/0998c69/experiments/security-lockdown/tests/s04-self-hosted-postgrest.ts) (Data API off, container, IP filter), [`s05-rate-limit.ts`](https://github.com/erfianugrah/supabase-lab/blob/0998c69/experiments/security-lockdown/tests/s05-rate-limit.ts) (nginx burst), [`ratelimit.nginx.conf`](https://github.com/erfianugrah/supabase-lab/blob/0998c69/experiments/security-lockdown/ratelimit.nginx.conf), [`s06-postgrest-role.ts`](https://github.com/erfianugrah/supabase-lab/blob/0998c69/experiments/security-lockdown/tests/s06-postgrest-role.ts) (the connection-role check), and the `postgrest-up` / `ratelimit-up` Makefile targets.
+The reproducible form is the supabase-lab [`security-lockdown`](https://github.com/erfianugrah/supabase-lab/tree/cca1b5e/experiments/security-lockdown) experiment: [`s04-self-hosted-postgrest.ts`](https://github.com/erfianugrah/supabase-lab/blob/cca1b5e/experiments/security-lockdown/tests/s04-self-hosted-postgrest.ts) (Data API off, container, IP filter), [`s05-rate-limit.ts`](https://github.com/erfianugrah/supabase-lab/blob/cca1b5e/experiments/security-lockdown/tests/s05-rate-limit.ts) (nginx burst), [`ratelimit.nginx.conf`](https://github.com/erfianugrah/supabase-lab/blob/cca1b5e/experiments/security-lockdown/ratelimit.nginx.conf), [`s06-postgrest-role.ts`](https://github.com/erfianugrah/supabase-lab/blob/cca1b5e/experiments/security-lockdown/tests/s06-postgrest-role.ts) (the connection-role check), [`s20-xff-trust-boundary.ts`](https://github.com/erfianugrah/supabase-lab/blob/cca1b5e/experiments/security-lockdown/tests/s20-xff-trust-boundary.ts) with [`edge.nginx.conf`](https://github.com/erfianugrah/supabase-lab/blob/cca1b5e/experiments/security-lockdown/edge.nginx.conf) (the through-edge header check), and the `postgrest-up` / `ratelimit-up` / `edge-up` Makefile targets. The 2026-09-03 artifacts are under [`out/2026-09-03/`](https://github.com/erfianugrah/supabase-lab/tree/cca1b5e/experiments/security-lockdown/out/2026-09-03).
 
 [^pgrst-prereq]: PostgREST, "Pre-Request," PostgREST Documentation. https://postgrest.org/en/stable/references/transactions.html#pre-request
