@@ -1,0 +1,195 @@
+---
+title: "slskd behind WireGuard VPN with port-forward sync"
+description: How to run a P2P file sharing client (slskd) behind a Private Internet Access WireGuard tunnel with automatic port-forward synchronisation, and the dual-VPN pattern when a second tunnel is needed on the same Docker host
+author: Erfi Anugrah
+category: homelab
+---
+
+How to run a P2P file-sharing client behind a WireGuard VPN with automatic port-forward synchronisation. The pattern uses `network_mode: service:X` so the client shares the VPN container's network namespace, a port-forward sync script that PATCHes the client's runtime config whenever the VPN provider rotates the forwarded port, and a dual-tunnel setup when two services need independent port-forward leases from the same provider.
+
+The client here is slskd[^slskd], an open-source P2P daemon. The pattern works identically for any P2P client that exposes a configuration API - the VPN container and sync script are client-agnostic.
+
+**Prerequisites:** a Docker Compose host, Private Internet Access credentials, and a Caddy reverse proxy if you want the client's web UI accessible externally.
+
+## Why this pattern
+
+VPN providers that support port forwarding (PIA, ProtonVPN, AirVPN) allocate one forwarded port per tunnel session. If you already have a qbittorrentvpn container consuming your first tunnel's port, adding a second P2P client means running a second tunnel. Without a forwarded port, P2P clients operate in closed-port mode - they can connect outbound but cannot accept inbound peer connections, which degrades transfer performance and peer discovery.
+
+The second tunnel needs:
+- Its own WireGuard key pair and PIA session (separate `PIA_USER`/`PIA_PASS`)
+- A **different region** than the first tunnel - same region may hand out the same port to both sessions
+- A sync script that updates the P2P client's listen port whenever the VPN rotates it (~15-minute interval)
+
+## Component versions
+
+| Component | Image | Role |
+|---|---|---|
+| slskd | `slskd/slskd:0.25.1` | P2P client daemon with web UI and REST API |
+| wg-pia | `thrnz/docker-wireguard-pia` | WireGuard tunnel + PIA port-forward management |
+
+## Step 1: VPN container
+
+The `thrnz/docker-wireguard-pia` image handles PIA's WireGuard control plane: it authenticates against PIA's API, generates a WireGuard peer config, and manages the port-forward lease lifecycle.
+
+```yaml
+wg-pia-slskd:
+  container_name: wg-pia-slskd
+  image: thrnz/docker-wireguard-pia
+  cap_add:
+    - NET_ADMIN
+  sysctls:
+    - net.ipv4.conf.all.src_valid_mark=1
+    - net.ipv6.conf.all.disable_ipv6=1
+  environment:
+    - PIA_USER=${VPN_USER}
+    - PIA_PASS=${VPN_PASS}
+    - PIA_REGION=${PIA_REGION_SLSKD}    # different region than qbit
+    - LOCAL_NETWORK=172.19.1.0/24       # allow Docker network traffic
+    - PORT_FORWARDING=1
+    - PORT_SCRIPT=/pia/scripts/update-port.sh
+    - PORT_SCRIPT_INTERVAL=900
+  volumes:
+    - ./pia-state:/pia
+    - ./pia-shared:/pia-shared          # port number written to port.dat
+    - ./scripts:/pia/scripts:ro         # PORT_SCRIPT lives here
+  networks:
+    servarr:
+      ipv4_address: 172.19.1.16
+```
+
+`PIA_REGION` must be a region ID, not a city name. Valid values: `swiss`, `sg`, `de-frankfurt`, `ca-toronto`, etc. Source of truth: `curl -s https://serverlist.piaservers.net/vpninfo/servers/v6 | head -1 | jq '.regions[] | {id, name, port_forward}'`. A city name like `singapore` is silently rejected by the container's `wg-gen.sh` and the container crash-loops.
+
+`LOCAL_NETWORK` whitelists the Docker bridge subnet so other containers on the same network can reach the P2P client through the tunnel.
+
+## Step 2: P2P client sharing the VPN netns
+
+The P2P client uses `network_mode: "service:wg-pia-slskd"` instead of its own IP. This means the client inherits the VPN container's network namespace - it gets the tunnel's public IP, the forwarded port, and all routes go through the VPN:
+
+```yaml
+slskd:
+  container_name: slskd
+  image: slskd/slskd:0.25.1
+  network_mode: "service:wg-pia-slskd"
+  depends_on:
+    - wg-pia-slskd
+  environment:
+    - SLSKD_REMOTE_CONFIGURATION=true   # required - allows runtime PATCH
+    - SLSKD_API_KEY=${SLSKD_API_KEY}
+    # credentials for the P2P network itself
+    - SLSKD_SLSK_USERNAME=${SLSKD_SLSK_USERNAME}
+    - SLSKD_SLSK_PASSWORD=${SLSKD_SLSK_PASSWORD}
+    - SLSKD_SHARE_CACHE_STORAGE_MODE=disk
+  volumes:
+    - ./slskd-app:/app
+    - ./shared-data:/data:ro             # shared filesystem, read-only
+    - ./downloads:/downloads             # transient download staging
+    - ./incomplete:/incomplete
+```
+
+Critical: **never set `hostname:` on the client service.** `network_mode: "service:..."` makes it inherit the VPN container's hostname; setting one explicitly triggers `Error response from daemon: conflicting options: hostname and the network mode` and the container will not start.
+
+`SLSKD_REMOTE_CONFIGURATION=true` is load-bearing. With it `false`, the PATCH endpoint returns 403 and the port-forward sync path breaks permanently - the client stays on its default listen port and never gets the VPN's forwarded port.
+
+The client's HTTP API is reachable at the VPN container's IP (`172.19.1.16:5030`), NOT a hostname - `network_mode: service:X` does not give the client its own Docker DNS record.
+
+## Step 3: Port-forward sync script
+
+PIA refreshes the forwarded port every ~15 minutes. The script PATCHes the client's runtime config whenever the port changes:
+
+```bash
+#!/bin/bash
+# /pia/scripts/update-port.sh - invoked by wg-pia on port assignment + refresh
+PORT=$1
+for i in $(seq 1 240); do
+  resp=$(curl -sS -X PATCH \
+    -H "X-API-Key: $SLSKD_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"soulseek\":{\"listenPort\":$PORT}}" \
+    http://127.0.0.1:5030/api/v0/options)
+  if echo "$resp" | grep -q '"listenPort"'; then
+    echo "[update-port] Set listenPort=$PORT"
+    exit 0
+  fi
+  sleep 4
+done
+echo "[update-port] Failed to set port after 240 attempts" >&2
+```
+
+The retry loop (240 polls x 4s = ~16 minutes) exists because the client's HTTP listener may not be active yet at container start - see Step 4. The script runs inside the VPN container (mounted at `/pia/scripts:ro`), so it reaches the client at `127.0.0.1` within the shared netns.
+
+## Step 4: Share-scan startup window
+
+On first start, slskd indexes its shared directories. The log line `Listening for HTTP requests at http://:::5030/` appears near the start of the scan, but Kestrel does not actually accept TCP connections until the scan completes.[^slskd-1160]
+
+**Measured:** 14 minutes for 77,000 files on HDD storage (August 2026, servarr NAS, `tank` raidz2 pool).
+
+During the scan window:
+
+- `curl http://172.19.1.16:5030/` returns TCP RST, not timeout
+- The healthcheck times out -> container marked unhealthy (self-heals after scan)
+- The port-forward script gets `Connection refused` on every PATCH attempt -> retries up to 16 minutes
+- The reverse proxy returns 200 from its own default block, not the client's UI
+
+Diagnostic: tail the client logs for `Scanned NN% of shared directories`. When you see `Shares scanned successfully`, the HTTP listener becomes active within ~5s. **Do not restart the container mid-scan** - it resets scan progress from zero.
+
+With `SLSKD_SHARE_CACHE_STORAGE_MODE=disk`, the scan index survives restarts in SQLite. Subsequent starts load the cached index in ~3 seconds.
+
+## Dual-tunnel verification
+
+After deploying both VPN containers (one for qbittorrent, one for slskd), verify they occupy different forwarded ports and different public IPs:
+
+```bash
+# Check qbit tunnel
+docker exec qbittorrentvpn curl -s ifconfig.me
+# Check slskd tunnel
+docker exec wg-pia-slskd curl -s ifconfig.me
+```
+
+The two tunnels should show different exit IPs (different regions) and the port-forward logs should show distinct port numbers.
+
+## Caddy reverse proxy
+
+The edge Caddy proxies the client's LAN IP (on a macvlan - see [Arr stack Docker patterns](/guides/arr-stack-docker-patterns/)):
+
+```caddy
+slskd.erfi.io {
+    import waf_off
+    import tls_config_rfc2136
+    encode zstd gzip
+    reverse_proxy 10.0.71.36:5030 {
+        import proxy_headers
+    }
+    import site_log slskd
+}
+```
+
+## Verification
+
+1. `curl -sf http://172.19.1.16:5030/` returns the client's login page (after share scan completes)
+2. `docker logs wg-pia-slskd | grep 'update-port'` shows a successful port set
+3. `docker exec wg-pia-slskd curl -s ifconfig.me` returns the PIA tunnel's public IP
+4. Container health status: `docker inspect slskd --format '{{.State.Health.Status}}'` shows `healthy`
+
+## Gotchas and lessons learned
+
+- **`PIA_REGION` must be a region ID, not a city name.** `swiss`, `sg`, `de-frankfurt` are valid; `singapore` is silently rejected by `wg-gen.sh` and the container crash-loops. Source of truth: the PIA server list API.
+
+- **Two tunnels, two separate regions.** PIA allocates one forwarded port per session. Same region -> same port collision -> one tunnel's port-forward breaks silently.
+
+- **Network mode disables Docker DNS for the client.** `network_mode: service:X` means the client has no Docker DNS record. Other containers must reach it at the VPN container's static IP, not its service name.
+
+- **Never set `hostname:` on a `network_mode: service:X` service.** Docker rejects it as a conflicting option.
+
+- **Share scan blocks HTTP listener.** slskd issue [#1160](https://github.com/slskd/slskd/issues/1160): Kestrel does not accept connections until the share scan finishes. First deploy takes minutes per terabyte of shared data. The sync script's retry loop absorbs this - do not restart mid-scan.
+
+- **Long filenames can break filesystems.** P2P networks carry files with paths exceeding 250 bytes. XFS's 255-byte path-component limit means a mover-side `.partial` suffix can push a long basename over the edge (ENAMETOOLONG). Keep the download directory on a dedicated filesystem without a background mover.
+
+- **P2P peer rejections are normal noise.** The client logs `Transfer rejected: File not shared` and `ConnectionException` at ERR level with full stack traces. Counts of 50+ per hour are expected - these are peers with stale indexes or NAT issues, not bugs in your setup.
+
+## Related docs
+
+- [Docker Servarr stack security](/reference/docker-servarr-security/) - hardening the arr stack, including network segmentation and filesystem isolation
+- [Arr stack Docker patterns](/guides/arr-stack-docker-patterns/) - macvlan dual-homed containers and arr database migration across filesystems
+
+[^slskd]: slskd, "A modern client for the Soulseek file sharing network." https://github.com/slskd/slskd
+[^slskd-1160]: slskd, "The HTTP server is not active until the share scan is complete," GitHub issue #1160. https://github.com/slskd/slskd/issues/1160

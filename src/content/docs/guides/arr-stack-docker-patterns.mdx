@@ -1,0 +1,237 @@
+---
+title: "Docker networking patterns for the arr stack"
+description: "Two Docker Compose patterns for the arr media stack: dual-homed macvlan containers so edge proxies talk to LAN IPs instead of Docker bridge IPs, and migrating arr databases across filesystems when the host OS changes"
+author: Erfi Anugrah
+category: homelab
+---
+
+Two Docker Compose patterns learned the hard way while running Sonarr, Radarr, and related services on a Linux NAS. The first solves a routing problem: how to give containers first-class LAN IPs so an edge reverse proxy on a different host can reach them without hairpin NAT. The second solves a migration problem: how to move arr databases between filesystems (Unraid's FUSE to ZFS) without corrupting every stored path.
+
+Both patterns apply to any Docker Compose stack, not just the arr ecosystem.
+
+## Pattern 1: Dual-homed macvlan containers
+
+### The problem
+
+The edge Caddy reverse proxy runs on a separate host (an MS-01 router). The Docker compose stack runs on a NAS. If you proxy to Docker bridge IPs (`172.19.1.x:8989`), the router needs a route to that subnet - and the bridge subnet is not routable by default.
+
+The common fix is publishing ports on the Docker host (`ports: "8989:8989"`) and proxying to `10.0.71.2:8989`. This works but couples the proxy to the host IP and consumes host ports.
+
+### The pattern
+
+Give each container a **macvlan interface** with a first-class LAN IP, alongside its existing Docker bridge IP on the compose network. The bridge IP handles east-west traffic between containers. The LAN IP handles north-south traffic from the edge proxy.
+
+```
+                  XikeStor switch (VLAN 200)
+                           │
+           ┌───────────────┼───────────────┐
+           │               │               │
+      MS-01 router    servarr NAS    other hosts
+      (edge Caddy)    10.0.71.2
+           │               │
+           │    proxied to LAN macvlan IPs
+           ├──── 10.0.71.22  radarr
+           ├──── 10.0.71.23  sonarr
+           ├──── 10.0.71.24  bazarr
+           └──── ...
+```
+
+The macvlan parent interface is the host's physical NIC. Each container's macvlan interface gets a MAC address derived from its LAN IP octet: `02:42:0a:00:47:<octet-hex>`.
+
+### Compose block
+
+```yaml
+services:
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    networks:
+      servarr:                           # east-west: Docker bridge
+        ipv4_address: 172.19.1.3
+      lan:                               # north-south: macvlan
+        ipv4_address: 10.0.71.23
+    # ... rest of service config
+
+networks:
+  servarr:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.19.1.0/24
+  lan:
+    driver: macvlan
+    driver_opts:
+      parent: enp36s0f1                  # host's physical NIC
+      macvlan_mode: bridge
+    ipam:
+      config:
+        - subnet: 10.0.71.0/24
+          gateway: 10.0.71.1
+```
+
+Two important settings:
+
+- **`gw_priority: 100`** on the macvlan network. Without this, Docker may pick the macvlan's gateway as the default route and all outbound container traffic hairpins through the switch instead of staying on the bridge.
+
+- **Pinned MAC addresses**: predictable MACs prevent ARP table churn when containers restart. The pattern maps the LAN IP's last octet to the MAC's last octet: `02:42:0a:00:47:<hex>`. For `10.0.71.23`, the last octet is 23 (0x17), so the MAC is `02:42:0a:00:47:17`.
+
+```yaml
+sonarr:
+  mac_address: 02:42:0a:00:47:17
+```
+
+### Caddy proxy block
+
+The edge Caddy proxies directly to LAN IPs - no Docker host port publishing, no NAT:
+
+```caddy
+sonarr.erfi.io {
+    import waf_off
+    import tls_config_rfc2136
+    encode zstd gzip
+    reverse_proxy 10.0.71.23:8989 {
+        import proxy_headers
+    }
+    import site_log sonarr
+}
+```
+
+### IP allocation
+
+Reserve a contiguous block of LAN IPs for the macvlan containers. On this stack, bridge IP `172.19.1.X` maps to LAN IP `10.0.71.(X+20)`:
+
+| Service | Bridge IP | LAN IP |
+|---|---|---|
+| radarr | 172.19.1.2 | 10.0.71.22 |
+| sonarr | 172.19.1.3 | 10.0.71.23 |
+| bazarr | 172.19.1.4 | 10.0.71.24 |
+| prowlarr | 172.19.1.10 | 10.0.71.30 |
+| jellyfin | 172.19.1.15 | 10.0.71.35 |
+| sabnzbd | 172.19.1.19 | 10.0.71.39 |
+| seerr | 172.19.1.21 | 10.0.71.41 |
+
+Services behind VPN containers (qbittorrentvpn, slskd) are **not** dual-homed - they use `network_mode: service:X` and have no macvlan of their own. Expose their web UIs via host-published ports instead.
+
+### Macvlan hairpin constraint
+
+Macvlan interfaces on the same parent interface **cannot reach each other** by default. Traffic between `10.0.71.22` and `10.0.71.23` must go through the switch even though they share the same physical NIC. If containers need to talk to each other on the LAN subnet, use their bridge IPs instead - east-west traffic stays on the Docker bridge.
+
+### Verification
+
+For each dual-homed container:
+
+1. Bridge path: `docker exec sonarr curl -sf http://172.19.1.3:8989/ping`
+2. LAN path from a different host: `curl -sf http://10.0.71.23:8989/ping`
+3. Default route: `docker exec sonarr ip route | grep default` should show the bridge gateway
+4. Edge proxy: `curl -sI https://sonarr.erfi.io | head -1`
+
+## Pattern 2: Arr database migration across filesystems
+
+### The problem
+
+Arr databases (SQLite) store absolute paths for every series, movie, root folder, and import list entry. Moving from one filesystem to another invalidates every stored path.
+
+The specific migration here was Unraid (shfs/FUSE) to NixOS (ZFS), but the pattern applies to any filesystem change: ext4 to ZFS, a mount point rename, moving from one NAS to another.
+
+### Before migration: path audit
+
+Map every path that changed. On the old host, the arr stack used:
+
+| What | Old path | New path |
+|---|---|---|
+| Media library (tv, movies) | `/mnt/user/data/servarr/media` -> `/data/media/...` | `/tank/media` -> `/data/...` |
+| Configs/DBs | `/mnt/user/data/<svc>/config` | `/rpool/cache/data/<svc>/config` |
+| Usenet incomplete | `/mnt/cache/data/servarr` (slamanna pattern) | `/scratch/downloads/usenet/incomplete` |
+| Transient downloads | `/mnt/cache/slskd-dl/` | `/scratch/slskd-dl/` |
+
+The TRaSH container-path convention also changed: previously Sonarr mounted `/mnt/user/data/servarr:/data` (root folders at `/data/media/tv`); new layout mounts `/tank/media:/data` (root folders at `/data/tv`). The DB stores the container path, not the host path.
+
+### The SQLite rewrite script
+
+A script on the new host rewrites paths inside the SQLite databases before the stack starts:
+
+```bash
+#!/bin/bash
+# /root/arr-path-migrate.sh - run on the new host before compose up
+set -euo pipefail
+
+DB_DIR="/rpool/cache/data"
+
+# Sonarr: Rewrite root folders + series paths
+if [ -f "$DB_DIR/sonarr/config/sonarr.db" ]; then
+  cp "$DB_DIR/sonarr/config/sonarr.db" "$DB_DIR/sonarr/config/sonarr.db.pre-migrate"
+  sqlite3 "$DB_DIR/sonarr/config/sonarr.db" <<'SQL'
+    UPDATE RootFolders SET Path = REPLACE(Path, '/data/media/tv', '/data/tv');
+    UPDATE Series SET Path = REPLACE(Path, '/data/media/tv', '/data/tv');
+    UPDATE ImportLists SET RootFolderPath = REPLACE(RootFolderPath, '/data/media/tv', '/data/tv');
+SQL
+fi
+
+# Radarr: Rewrite root folders + movie paths + collection paths
+if [ -f "$DB_DIR/radarr/config/radarr.db" ]; then
+  cp "$DB_DIR/radarr/config/radarr.db" "$DB_DIR/radarr/config/radarr.db.pre-migrate"
+  sqlite3 "$DB_DIR/radarr/config/radarr.db" <<'SQL'
+    UPDATE RootFolders SET Path = REPLACE(Path, '/data/media/movies', '/data/movies');
+    UPDATE Movies SET Path = REPLACE(Path, '/data/media/movies', '/data/movies');
+    UPDATE Collections SET RootFolderPath = REPLACE(RootFolderPath, '/data/media/movies', '/data/movies');
+    UPDATE ImportLists SET RootFolderPath = REPLACE(RootFolderPath, '/data/media/movies', '/data/movies');
+SQL
+fi
+```
+
+Key properties:
+
+- **Self-backing-up**: copies the DB before mutating it (`*.pre-migrate`)
+- **Idempotent**: `REPLACE(Path, old, new)` is a no-op on already-migrated paths
+- **Run before stack starts**: databases must not be open when rewritten
+
+### Path-consistency rule
+
+Arr-coupled consumers that read paths from the Sonarr/Radarr API must mount the same `/data` as the arr themselves. If Sonarr reports a series at `/data/tv/Show Name` and bazarr mounts `/tank/media:/data/media`, bazarr looks for `/data/media/tv/Show Name` and finds nothing.
+
+On this migration, the rule was: **Sonarr, Radarr, Lidarr, SABnzbd all mount `/tank/media:/data`.** Arr-coupled consumers (bazarr, decluttarr) mount the same `/data`. The exception is Jellyfin, which stores library paths in its own database and kept its existing `/data/media` mount unchanged.
+
+### Three-tier storage layout (ZFS)
+
+The migration introduced a tiered storage design that generalises beyond ZFS:
+
+| Tier | Pool | What lives there |
+|---|---|---|
+| Hot | NVMe (`rpool`) | Container configs, SQLite DBs, Jellyfin metadata |
+| Bulk | HDD raidz2 (`tank`) | Media library, personal data, daily backups |
+| Scratch | NVMe (`scratch`) | Usenet incomplete/par2/unrar, download staging. `sync=disabled` for write throughput |
+
+The hot tier holds everything that needs low latency (UI responsiveness depends on SQLite read speed). The bulk tier holds large immutable files. The scratch tier holds transient, re-downloadable data - fast, non-redundant.
+
+Hardlinks only work within a single ZFS dataset. The media library and download directories live in the same `tank/media` dataset so arr importers can hardlink instead of copying.
+
+### Verification
+
+After migration and stack bring-up:
+
+1. **Sonarr**: `curl -sH "X-Api-Key: $KEY" https://sonarr.erfi.io/api/v3/series | jq '[.[] | .path] | .[0:3]'` - verify paths show `/data/tv/...`
+2. **Radarr**: same check with `/api/v3/movie`
+3. **Health**: all containers show `healthy` via `docker ps`
+4. **Queue**: queue is empty (no residual path errors from the old filesystem)
+5. **Import test**: manually trigger a download and verify import completes without path errors
+
+## Gotchas and lessons learned
+
+- **Macvlan containers cannot reach each other on the macvlan network.** Use bridge IPs for container-to-container traffic.
+
+- **Missing `gw_priority` on the macvlan network causes all outbound traffic to hairpin through the switch.** Docker may pick the macvlan's gateway as the default route. Set `gw_priority: 100` so the bridge gateway wins.
+
+- **`network_mode: service:X` containers have no macvlan interface.** They share the VPN container's netns, which may or may not have a macvlan. Publish their web UIs via host ports instead.
+
+- **Arr databases store container paths, not host paths.** The rewrite fixes paths as the container sees them (`/data/tv`, not `/tank/media/tv`). Test the script on a copy of the database before running against the live file.
+
+- **SQLite `REPLACE` is idempotent but chain the correct substring.** `REPLACE(Path, '/data/media', '/data')` would break paths that already have the new format. Match the full old prefix including the extra component.
+
+- **Run the rewrite before the stack starts.** SQLite databases will be open if any arr container is running. Stop the stack, run the script, then start.
+
+- **ZFS datasets are separate filesystems.** Hardlinks only work within one dataset. Keep media and download staging in the same dataset, or every import becomes a full copy.
+
+## Related docs
+
+- [Docker Servarr stack security](/reference/docker-servarr-security/) - hardening the arr stack, including network segmentation and filesystem isolation
+- [slskd behind WireGuard VPN with port-forward sync](/guides/slskd-wireguard-port-forward/) - dual VPN tunnel pattern for P2P clients
+- [Migrating a NAS without losing a byte](/guides/nas-bulk-data-migration/) - the bulk-data migration that moved everything onto ZFS
