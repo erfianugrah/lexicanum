@@ -64,10 +64,12 @@ and `projects/{ref}/transfer` routes all still answer `404` - the BYO-backend
 bridge is off by default regardless of plan, so the two shapes are not
 separable in practice until the bridge is enabled for the account. For a
 **time-boxed, network-restricted, role-scoped** grant instead of a full
-project handover, the JIT database access surface exists and works:
-`POST /database/jit/invite` (email + role + `expires_at` +
+project handover, the JIT database access surface exists and works on a
+`platform`-plan org: `POST /database/jit/invite` (email + role + `expires_at` +
 `allowed_networks` CIDRs) -> `200` with an `invite_id`, and
-`DELETE /database/jit/invite/{id}` -> `200` (measured 2026-08-24).
+`DELETE /database/jit/invite/{id}` -> `200` (measured 2026-08-24). The identical
+invite on a Pro org is rejected with a `500` (A/B measured 2026-08-25), so do not
+offer it there.
 
 ## 2. Provision a tenant
 
@@ -80,9 +82,13 @@ One call creates a project; the details are where the platforms get built:
   `region_selection: {type: "smartGroup", code: "apac"}` was accepted (201)
   and the platform picked `ap-northeast-2`. Defer the city choice instead of
   pinning per tenant.
-- **Healthy is not writable.** Fresh projects can refuse their first
-  `/auth/v1/admin/users` write with `500 unexpected_failure` for ~10 s.
-  Retry the first write with backoff; do not treat it as a finding.
+- **Healthy is not writable.** Fresh projects refuse their first
+  `/auth/v1/admin/users` write after reporting `ACTIVE_HEALTHY`: 5 of 5 with
+  `500 unexpected_failure`, accepting the second call one poll later
+  (2026-08-04), and 2 of 2 with `500 "Database error checking email"` for
+  ~10 s after passing the per-service health poll (2026-08-03). Poll
+  `GET /v1/projects/{ref}/health?services=auth&services=rest&services=db`,
+  then retry the first write with backoff; do not treat it as a finding.
 - Fetch keys with `GET /v1/projects/{ref}/api-keys?reveal=true` and select by
   `name` OR `type` - new projects carry both legacy JWTs and the new
   `sb_publishable_`/`sb_secret_` shapes.
@@ -219,6 +225,28 @@ operation costs in client-visible downtime is in
 | Scoped-key gateway: 200/278 families, 403 deny-by-default, ~1 s audit | Measured 2026-08-18 against a live credential-proxy deployment |
 | Refresh only at the issuing project | Measured 2026-08-18 - `400 refresh_token_not_found` verbatim |
 
+## What to do about it
+
+The practices the sections above imply, collected with the module or run each
+rests on. A practice with no module id is a design choice rather than a
+result: canary batch sizes, token-bucket parameters beyond 120 per minute per
+user, and the signal to wake a parked project on are all unmeasured.
+
+| Practice | Rests on |
+|---|---|
+| Run the provisioning service under a dedicated automation user. The rate budget is per user across all its PATs (each token's `x-ratelimit-remaining` drops on the other's calls), so a separate user is a separate 120-per-minute bucket; and a PAT is unscoped (every scope endpoint 404s while `/organizations` and `/profile` return 200), so the user's membership set is the blast radius. | rate-limits L01b (2026-08-18); platform-facts F03 |
+| Before the first write on a fresh tenant, poll `GET /v1/projects/{ref}/health?services=auth&services=rest&services=db` per service, then retry the write anyway: 2 of 2 fresh projects passed the per-service poll and still failed the first `admin/users` call (2026-08-03); 5 of 5 refused the first write and took the second (2026-08-04). | supabase-lab `AGENTS.md`, provisioning note (2026-08-03); placement reference, Verified row 'Create -> healthy, and healthy is not writable' (2026-08-04, n=5, bash run not in the lab repo) |
+| Enumerate creatable regions per org with `GET /v1/projects/available-regions?organization_slug=<slug>` before offering a tenant a region picker: 200 with `{recommendations, all: {smartGroup[], specific[]}}`, 17 specific regions and 3 smart groups on a Team org; the bare call answers 400, and `/regions` and `/projects/regions` 404. | platform-facts F04c (2026-08-20) |
+| Persist the rotated refresh token before acknowledging the refresh, and map a `404` on the refresh grant to "revoked, re-consent required": revocation answered 204 and the next refresh 404 on the first poll, 0 s lag. | byo-oauth O01c, O01e (2026-08-18) |
+| Budget a manual dashboard step per environment for OAuth app registration; there is no API for it. the project-claim route answers 404 on Pro (byo-oauth O02a) and `oauth/apps` 404 on the platform org (sfp-platforms S05, 2026-08-24), and the published spec's 169 operations hold only two org-scoped writes, organization creation and the project-claim callback. | byo-oauth RUNLOG, the manual drill; sfp-platforms S05 (2026-08-24); platform-facts F05 |
+| Do not offer JIT database access on a Pro org: `POST /database/jit/invite` answers `200` with an `invite_id` on a `platform`-plan org and the identical invite is rejected with `500` on Pro. | sfp-platforms S15 (2026-08-25, A/B) |
+| Mint tenant-facing or worker credentials with `secret_jwt_template` on `POST /v1/projects/{ref}/api-keys` and read them with `?reveal=true` (the create response redacts `api_key` otherwise); the templated `role` and custom claim reach `auth.jwt()` on Pro and platform orgs. A fresh RPC answers `PGRST202` until `notify pgrst, 'reload schema'`. | sfp-platforms S14 (2026-08-25, both org classes) |
+| Size a dedicated project at `ci_small` or above and enable PITR before promising a tenant read replicas: `POST /read-replicas/setup` answers `400 "Read replicas require a minimum size of small"` on Pro and platform orgs, then waits on a completed physical backup; the chain closed on Pro after `pitr_7` (setup `204`). PITR enable on the platform org is its own refusal, `400 "Organization is not entitled to the selected PITR duration"`. | sfp-platforms S07, S07e (2026-08-25) |
+| Grow disk to 6 GB or more in one step on a fresh gp3 volume (2 GB / 3000 IOPS / 125 MiB/s; the gp3 IOPS floor makes 2 -> 4 GB impossible). The grow is async (`201` with an empty body); 8 GB confirmed landed on a later poll. | sfp-platforms S08 (2026-08-24/25) |
+| Do not promise tenants a backup time of day: `GET /database/backups/schedule` answers a structured `402 entitlement_required` (`feature: backup.schedule`) on Pro and platform orgs; the spec text says Enterprise. | sfp-platforms S11 (2026-08-24/25) |
+| Before restoring a paused free-era project inside a paid org, decide whether it should instead be deleted or moved to a Free org: once woken it joins the always-on floor (`400 Project is not free-tier` on the next pause), and the wake exceeded a 20-minute bound. | instance-sizing I03 (2026-08-18) |
+| After `DELETE /v1/projects/{ref}`, poll `GET /v1/projects` until the ref is absent before reusing the name or counting against a quota; the delete returns in about 2 s and the project lingers in lists. | section 8 (lingers in lists); placement reference, Verified row 'Create -> healthy, and healthy is not writable' (2026-08-04, n=5, delete about 2 s, bash run not in the lab repo) |
+
 ## Verification
 
 The probes re-run on throwaway projects you create and delete; the calls are
@@ -249,13 +277,15 @@ above and reads the run logs in the repo.
 
 ## File reference
 
-| Section | Experiment in [supabase-lab](https://github.com/erfianugrah/supabase-lab) |
+| Section | Experiment in [supabase-lab](https://github.com/erfianugrah/supabase-lab), RUNLOG pinned to commit `c1894cc` |
 |---|---|
-| 1, 5 - the claim flow and the OAuth surface | [`byo-oauth`](https://github.com/erfianugrah/supabase-lab/tree/main/experiments/byo-oauth) |
-| 3, 8 - sizing floors, the legacy door, pause and restore | [`instance-sizing`](https://github.com/erfianugrah/supabase-lab/tree/main/experiments/instance-sizing) |
-| 4 - the rate budget | [`rate-limits`](https://github.com/erfianugrah/supabase-lab/tree/main/experiments/rate-limits) |
-| 6 - metering and the scoped-key gateway | [`usage-metering`](https://github.com/erfianugrah/supabase-lab/tree/main/experiments/usage-metering) |
-| 7 - cross-project trust | [`cross-project-auth`](https://github.com/erfianugrah/supabase-lab/tree/main/experiments/cross-project-auth) |
+| 1, 5 - the claim flow and the OAuth surface | [`byo-oauth`](https://github.com/erfianugrah/supabase-lab/blob/c1894cc/experiments/byo-oauth/RUNLOG.md) |
+| 1, 2, 3 - the platform-plan A/B: JIT access, templated keys, the replica and disk floors, the backup schedule | [`sfp-platforms`](https://github.com/erfianugrah/supabase-lab/blob/c1894cc/experiments/sfp-platforms/RUNLOG.md) |
+| 2, 4 - the unscoped PAT, the region catalogue, the read-only membership surface | [`platform-facts`](https://github.com/erfianugrah/supabase-lab/blob/c1894cc/experiments/platform-facts/RUNLOG.md) |
+| 3, 8 - sizing floors, the legacy door, pause and restore | [`instance-sizing`](https://github.com/erfianugrah/supabase-lab/blob/c1894cc/experiments/instance-sizing/RUNLOG.md) |
+| 4 - the rate budget | [`rate-limits`](https://github.com/erfianugrah/supabase-lab/blob/c1894cc/experiments/rate-limits/RUNLOG.md) |
+| 6 - metering and the scoped-key gateway | [`usage-metering`](https://github.com/erfianugrah/supabase-lab/blob/c1894cc/experiments/usage-metering/RUNLOG.md) |
+| 7 - cross-project trust | [`cross-project-auth`](https://github.com/erfianugrah/supabase-lab/blob/c1894cc/experiments/cross-project-auth/RUNLOG.md) |
 
 ## Related
 

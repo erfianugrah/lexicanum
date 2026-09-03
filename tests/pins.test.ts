@@ -998,3 +998,57 @@ describe.each(pins.map((p) => [p.doc, p] as const))("%s", (_name, pin) => {
     expect(missing).toEqual([]);
   });
 });
+
+// Every lab-backed Supabase page ends in practices (lab-writeup skill, "Every
+// lab-backed page ends in practices"). The audit of 2026-09-03 added the section
+// to 34 pages; a rewrite that drops it regresses the page to measurements only.
+// Two pages carry the practices under an older heading and are pinned to it.
+const PRACTICES_HEADING = /^## What to do about it$/m;
+const practicePages: Array<[doc: string, heading: RegExp]> = [
+  ["guides/mongodb-wrapper-archive-migration", PRACTICES_HEADING],
+  ["guides/postgres-corpus-entity-graph", PRACTICES_HEADING],
+  ["guides/supabase-auth-mfa-trusted-device-and-impersonation-audit", PRACTICES_HEADING],
+  ["guides/supabase-aws-privatelink-tofu", PRACTICES_HEADING],
+  ["guides/supabase-branch-detach-git-link", PRACTICES_HEADING],
+  ["guides/supabase-grafana-monitoring", PRACTICES_HEADING],
+  ["guides/supabase-iap-data-api", PRACTICES_HEADING],
+  ["guides/supabase-management-api-logs-endpoint", /^## Traps, each measured$/m],
+  ["guides/supabase-org-consolidation", PRACTICES_HEADING],
+  ["guides/supabase-own-postgrest", PRACTICES_HEADING],
+  ["guides/supabase-per-project-cost-attribution", PRACTICES_HEADING],
+  ["guides/supabase-platform-management-api", PRACTICES_HEADING],
+  ["guides/supabase-postgres-major-upgrade-e2e", PRACTICES_HEADING],
+  ["guides/supabase-preview-branch-compute", PRACTICES_HEADING],
+  ["guides/supabase-region-migration-e2e", PRACTICES_HEADING],
+  ["guides/supabase-resilience-runbook", PRACTICES_HEADING],
+  ["guides/supabase-shared-tenancy", PRACTICES_HEADING],
+  ["guides/supabase-tenant-consolidation", PRACTICES_HEADING],
+  ["guides/supabase-tenant-promotion", PRACTICES_HEADING],
+  ["reference/cloudflare-supabase-architecture", PRACTICES_HEADING],
+  ["reference/pbkdf2-supabase-auth-migration", PRACTICES_HEADING],
+  ["reference/postgres-entity-graphs", PRACTICES_HEADING],
+  ["reference/rls-without-supabase-auth", PRACTICES_HEADING],
+  ["reference/stripe-sync-engine", PRACTICES_HEADING],
+  ["reference/supabase-auth-end-to-end", PRACTICES_HEADING],
+  ["reference/supabase-aws-privatelink", PRACTICES_HEADING],
+  ["reference/supabase-compute-disk", /^## Ops playbook$/m],
+  ["reference/supabase-data-residency", PRACTICES_HEADING],
+  ["reference/supabase-data-surface-lockdown", PRACTICES_HEADING],
+  ["reference/supabase-dr-tiers", PRACTICES_HEADING],
+  ["reference/supabase-edge-function-limits", /^## What to do about each ceiling$/m],
+  ["reference/supabase-image-transformations-billing", PRACTICES_HEADING],
+  ["reference/supabase-incident-resilience", PRACTICES_HEADING],
+  ["reference/supabase-multi-tenant-placement", PRACTICES_HEADING],
+  ["reference/supabase-platform-operation-cost", PRACTICES_HEADING],
+  ["reference/supabase-rls-policy-cost", PRACTICES_HEADING],
+];
+
+describe.each(practicePages)("%s ends in practices", (doc, heading) => {
+  const src = readSource(doc);
+  test("exists in the source tree", () => {
+    expect(src).toBeDefined();
+  });
+  test.skipIf(!src)("carries a practices section", () => {
+    expect(heading.test(src!.text)).toBe(true);
+  });
+});

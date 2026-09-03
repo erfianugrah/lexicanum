@@ -55,7 +55,7 @@ settable is the auto-branching flow itself - there is no default-size knob.
 |---|---|---|
 | `supabase branches create --size <tier>` | ✅ | A branch created with `--size small` provisions `ci_small` (2 GB). |
 | `POST /v1/projects/{ref}/branches` (`desired_instance_size`) | ✅ | Enum `pico\|nano\|micro\|small\|medium` - API caps branches at **medium** at creation. |
-| `PATCH /v1/projects/{branch_ref}/billing/addons` (resize existing) | ✅ | `{addon_type:"compute_instance", addon_variant:"ci_small"}` scales an existing branch up/down - to `ci_xlarge`. **Restarts** Postgres: measured at 131 s of Auth downtime resizing up and 99 s down, with the pooler out for 207 s / 196 s, while REST and Realtime never dropped a sample - see [what a platform operation costs](/reference/supabase-platform-operation-cost/). |
+| `PATCH /v1/projects/{branch_ref}/billing/addons` (resize existing) | ✅ | `{addon_type:"compute_instance", addon_variant:"ci_small"}` scales an existing branch up/down - to `ci_xlarge`. **Restarts** Postgres. The cost was measured on project resizes, not on a branch: Micro -> Small cost 131 s of Auth downtime up and 99 s down, with the pooler out for 207 s / 196 s, while REST and Realtime never dropped a sample (platform-downtime D03/D04, 2026-08-04); a Small -> Large step on another rig produced 17.0 s of contiguous REST failure (compute-disk D09, 2026-08-19) - see [what a platform operation costs](/reference/supabase-platform-operation-cost/). |
 | `DELETE /v1/projects/{branch_ref}/billing/addons/{variant}` | ✅ | Reverts the compute add-on to the previous size. |
 | `PATCH /v1/branches/{ref}` (branch metadata) | ❌ | Body has `branch_name / git_branch / reset_on_push / persistent / status / notify_url` only - **no size field**. |
 | `supabase branches update` | ❌ | No `--size` flag. |
@@ -164,7 +164,7 @@ jobs:
           api="https://api.supabase.com/v1"
           auth=(-H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN")
           # 1. Wait until the App has FINISHED its pipeline on this PR's branch.
-          #    Resizing restarts Postgres, so we must not resize mid-migration  - 
+          #    Resizing restarts Postgres, so we must not resize mid-migration -
           #    gate on MIGRATIONS_PASSED / FUNCTIONS_DEPLOYED, not mere existence.
           branch_ref=""
           for i in $(seq 1 60); do            # ~15 min @ 15s
@@ -175,23 +175,36 @@ jobs:
             echo "branch not ready ($i)..."; sleep 15
           done
           [ -n "$branch_ref" ] || { echo "::error::branch not ready in time"; exit 1; }
-          # 2. Skip if already at target.
+          # 2. Skip if already at target. Micro is the ABSENCE of a compute
+          #    addon (the GET reports no compute_instance row), so an empty
+          #    readback means ci_micro.
           cur=$(curl -fsS "${auth[@]}" "$api/projects/$branch_ref/billing/addons" \
             | jq -r '.selected_addons[]?|select(.type=="compute_instance")|.variant.id')
+          cur=${cur:-ci_micro}
           [ "$cur" = "$TARGET" ] && { echo "already $TARGET"; exit 0; }
           # 3. Apply the compute add-on to the BRANCH project (this restarts it).
           curl -fsS -X PATCH "${auth[@]}" -H "Content-Type: application/json" \
             "$api/projects/$branch_ref/billing/addons" \
             -d "$(jq -n --arg v "$TARGET" \
                   '{addon_type:"compute_instance",addon_variant:$v}')"
-          # 4. Confirm.
+          # 4. Confirm the addon, then wait for the project to be healthy again.
+          #    The variant readback is a config value, not a health signal;
+          #    settle to ACTIVE_HEALTHY measured 61-105 s on project resizes
+          #    (compute-disk D09).
           for i in $(seq 1 20); do
             now=$(curl -fsS "${auth[@]}" "$api/projects/$branch_ref/billing/addons" \
               | jq -r '.selected_addons[]?|select(.type=="compute_instance")|.variant.id')
-            [ "$now" = "$TARGET" ] && { echo "resized to $now"; exit 0; }
+            now=${now:-ci_micro}
+            [ "$now" = "$TARGET" ] && break
             sleep 15
           done
-          echo "::warning::resize not confirmed yet"
+          [ "$now" = "$TARGET" ] || { echo "::warning::resize not confirmed yet"; exit 0; }
+          for i in $(seq 1 20); do
+            st=$(curl -fsS "${auth[@]}" "$api/projects/$branch_ref" | jq -r .status)
+            [ "$st" = "ACTIVE_HEALTHY" ] && { echo "resized to $now, healthy"; exit 0; }
+            sleep 10
+          done
+          echo "::warning::resized to $now but not ACTIVE_HEALTHY yet"
 ```
 
 :::danger[Resize only *after* the App's pipeline finishes]
@@ -612,6 +625,32 @@ own ref and keys and starts empty, while the parent still has its data:
 Neither auto-branching nor `config.toml` exposes a *default* compute size, so a
 larger tier always costs you either a resize step (B) or ownership of branch
 creation (C).
+
+## What to do about it
+
+What the measured project-lifecycle numbers add to the two workflows above.
+Every timing here comes from PROJECT resizes and fresh PROJECT provisioning;
+no branch was resized or provisioned under sampling, so treat the seconds
+as the shape to expect, not a branch figure. Module ids resolve in the
+[platform-downtime RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c1894cc/experiments/platform-downtime/RUNLOG.md),
+the [compute-disk RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c1894cc/experiments/compute-disk/RUNLOG.md)
+and the [instance-sizing RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c1894cc/experiments/instance-sizing/RUNLOG.md).
+
+| Practice | Rests on |
+| --- | --- |
+| Treat an absent compute addon as `ci_micro` when comparing against `TARGET`: returning to Micro removes the addon and the GET reports no `compute_instance` row, so a `ci_micro` target never matches `.variant.id`. The Approach B workflow defaults the empty readback to `ci_micro` for this reason. | platform-downtime D04 |
+| After the addon readback confirms, poll `GET /v1/projects/{branch_ref}` for `ACTIVE_HEALTHY` before triggering a reset or running your own steps: the variant is a config readback, and settle to healthy measured 61-105 s across four resizes and 107 s on another. | compute-disk D09, D01 |
+| Handle `429 We are still processing addon changes, please try again in 1-2 minutes` on the PATCH: a `reopened` event or a re-run inside about 2 minutes of the first PATCH fails a bare `curl -fsS`. Sleep and retry once. | compute-disk D09 |
+| Expect REST to drop during an upgrade: 1.0 s of contiguous failure on Micro -> Small, 17.0 s on Small -> Large; both measured downgrades were 0 s. The default supabase-js client took 4 attempts and ~7.0s to ride out three 503s (W02); whether it survives a 17.0 s gap was not measured. | compute-disk D09; edge-resilience W02 |
+| Budget about 200 s of pooler unavailability into any CI step that runs during the resize (seed, smoke test over the pooler; the lab sampled port 6543): the pooler was out 207 s resizing up and 196 s down while REST and Realtime kept serving. | platform-downtime D03, D04 |
+| In Approach C, wait for `ACTIVE_HEALTHY` and retry the first `db push` or first write after `branches create`: 5 of 5 fresh projects refused the first `POST /auth/v1/admin/users` with 500 one poll tick after healthy and accepted the retry. | placement reference, Verified row 'Create -> healthy, and healthy is not writable' (2026-08-04, n=5, bash run not in the lab repo); supabase-lab AGENTS.md provisioning note (2026-08-03, 2 of 2, `500 "Database error checking email"`) |
+| Treat Micro as the floor on a paid org: project creation with `desired_instance_size: "nano"` answered `400 Minimum instance size on paid plans is Micro`, the addon PATCH `400 addon_variant: Invalid input`, and `ci_nano` is absent from `available_addons`. Whether a BRANCH accepts `nano` on a paid org was not measured (the gotcha table's nano branch does not record its plan). | instance-sizing I01, 2026-08-17 |
+
+Not measured: branch resize timings (all figures are project resizes); the
+OOM threshold itself at any schema size; auto-pause timing for idle
+branches; whether the `check_run` trigger fires before the App's pipeline
+completes; WARP tunnel establishment time on a runner; the IPv4 add-on
+price is quoted undated.
 
 ## Verification
 
