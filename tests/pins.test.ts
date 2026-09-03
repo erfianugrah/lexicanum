@@ -870,6 +870,7 @@ const pins: Pin[] = [
       "exceeds the maximum deployment size",
     ],
     sections: [
+      /^## What to do about each ceiling$/m,
       /^## Where the docs disagree with runtime$/m,
       /^## Reading the numbers$/m,
       /^## Evidence, by module$/m,
@@ -913,6 +914,7 @@ const pins: Pin[] = [
     ],
     sections: [
       /^## Which shape do I pick$/m,
+      /^## What to do about it$/m,
       /^## Where the docs disagree with runtime$/m,
       /^## Reading the numbers$/m,
       /^## Evidence$/m,
