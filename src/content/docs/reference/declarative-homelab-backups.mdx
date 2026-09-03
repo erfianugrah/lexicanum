@@ -1,0 +1,254 @@
+---
+title: "Declarative backups on a ZFS homelab: nix timers, sanoid, syncoid"
+description: One NixOS module covers a ZFS homelab with three mechanisms - pg_dump timers, sanoid snapshots, syncoid replication - so coverage is derived from config instead of drifting inside a container running cron.
+author: Erfi Anugrah
+category: homelab
+featured: true
+blurb: "Three mechanisms, one matrix - and why a container running cron was the thing that silently broke."
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Backups on this NAS used to run as GitOps pipelines that exec-ed shell scripts into idle containers. They were replaced by one NixOS module that owns three mechanisms and a matrix saying which one protects which data. This is that module, and the two silent failures that made the imperative version untrustworthy.
+
+The win is not more backups. It is coverage you can derive from the configuration and that loads at `nixos-rebuild switch` instead of drifting.
+
+<Aside type="note" title="Provenance">
+  One host: a 3-pool NixOS NAS. `rpool` (Samsung 970 NVMe, non-redundant)
+  holds hot application state at `/appdata` plus Postgres at `/appdata/pg`;
+  `tank` (raidz2 HDD, redundant) holds media and `/tank/backups`. The module
+  (`backup.nix`), its templates, timers and paths were read off the
+  configuration on 2026-09-03, the day the old pipelines were retired.
+  Behaviour of sanoid, syncoid, `pg_dump` and systemd is cited to their
+  documentation; WAL point-in-time recovery is labelled as planned, not built.
+  For which tier holds what you are protecting, see the sibling
+  [appdata tiering on ZFS](/reference/appdata-tiering-zfs/).
+</Aside>
+
+**TL;DR:**
+
+- Three mechanisms, split by data shape. Postgres clusters get logical `pg_dump` timers; file state gets `sanoid` snapshots plus a `syncoid` replica. No separate tar of the files - the snapshot and the replica already carry them.
+- A snapshot on the same pool is not a backup. `syncoid` copies `rpool/appdata` to the redundant `tank`, which is the step that turns a point-in-time snapshot into an off-pool copy.
+- The imperative version broke twice in ways a declarative one cannot: a backup that read a dead path and kept reporting success, and the general class of a script that is written, tested, committed, and never installed.
+- All Postgres clusters are treated as tier-1. Baseline is an hourly snapshot plus a daily logical dump; WAL PITR is the plan for the clusters whose data is not regenerable.
+- A dump that exists is not a restore you can trust. One cluster's dump is file-verified but restore-unverified, and the gate is a test restore, not a green timer.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.8;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_rpool {
+    label="rpool (NVMe, non-redundant)"; style=rounded; fontsize=12; margin=12;
+    appdata [label="/appdata\nfile state"];
+    pg [label="/appdata/pg\n5 Postgres clusters", shape=cylinder];
+  }
+  subgraph cluster_mech {
+    label="backup.nix (NixOS module)"; style=rounded; fontsize=12; margin=12;
+    dump   [label="pg_dump timers\n02:30 + jitter"];
+    sanoid [label="sanoid\napphot template"];
+    syncoid[label="syncoid\n--no-sync-snap"];
+  }
+  subgraph cluster_tank {
+    label="tank (raidz2, redundant)"; style=rounded; fontsize=12; margin=12;
+    pgdest [label="/tank/backups/pg", shape=cylinder];
+    repl   [label="tank/backups/zfs-repl", shape=cylinder];
+  }
+  metrics [label="node-exporter\ntextfile metrics", shape=box, style=rounded];
+
+  pg      -> dump    [label="docker exec"];
+  dump    -> pgdest  [label="pg_dump -Fc"];
+  dump    -> metrics [label="last_success"];
+  appdata -> sanoid  [label="snapshot"];
+  pg      -> sanoid  [label="snapshot"];
+  sanoid  -> syncoid [label="existing snaps"];
+  syncoid -> repl    [label="replicate"];
+}
+```
+
+The same source tree feeds all three mechanisms. Read as a numbered path:
+
+1. Each Postgres cluster on `/appdata/pg` is dumped by its own timer into `/tank/backups/pg`, and the timer emits a metric on success.
+2. `sanoid` snapshots both `/appdata` and `/appdata/pg` in place on `rpool`.
+3. `syncoid` ships those existing snapshots to `tank/backups/zfs-repl` on the redundant pool.
+
+---
+
+## Which mechanism protects what
+
+| Data | Lives on | Mechanism | Form | Off-pool copy |
+|---|---|---|---|---|
+| 5 Postgres clusters (immich, atuin, joplin, tracearr timescaledb, mnemosyne) | `rpool/appdata/pg` | `pg_dump` timer, one per cluster | logical dump (`pg_dump -Fc`) | `tank/backups/pg` |
+| Arr SQLite configs, redis, qbittorrent, beets, atuin hot state | `rpool/appdata` | `sanoid` snapshot + `syncoid` replica | ZFS block state | `tank/backups/zfs-repl` |
+
+This matrix is the point of the whole exercise: given a piece of data, you can name the mechanism that protects it and the redundant pool that holds the copy, without reading a single script. File state needs no separate tar - the snapshot and the replica capture the arr SQLite files, the redis and qbittorrent state, the beets library, exactly as they sit on disk. This split is stated verbatim in `backup.nix`.
+
+---
+
+## Snapshots are not backups, and a container running cron is not one either
+
+[ZFS on NixOS](/reference/zfs-on-nixos/) makes the first half of that heading its own section: a snapshot on the pool it protects dies with the pool. That doc owns the pool and mount mechanics; this one starts where a real backup does. A backup needs two properties a snapshot alone lacks:
+
+- **Off-pool.** The copy lives on different, redundant media, so losing the source pool does not lose the copy. `syncoid` provides this by replicating to `tank`.
+- **Restore-tested.** A copy you have never restored is a hypothesis. The [untested-restore trap](#the-untested-restore-trap) below is where that bites.
+
+A container running cron fails the same test from the other direction. The retired pipelines produced files on `tank`, so they had the off-pool property. What they lacked was any guarantee that the file held the current data, or that anyone had restored it - and the imperative shape actively hid both gaps. The rest of this doc is the declarative version that closes them.
+
+---
+
+## The three mechanisms
+
+### 1. pg_dump timers - logical dumps, one per cluster
+
+A systemd timer per Postgres cluster - five of them: immich, atuin, joplin, the tracearr timescaledb, and mnemosyne. The runner does `docker exec` into each cluster and reads that container's own environment for credentials (`PGPASSWORD`, `POSTGRES_USER`, `POSTGRES_DB`), so the dump uses the same secret the database already holds and the module carries no copy of it. It runs `pg_dump -Fc --no-owner --no-acl`,[^pg-dump] writes to `/tank/backups/pg/<db>`, keeps a retention window, and emits two node-exporter textfile metrics on success: `backup_pg_last_success_timestamp` and `backup_pg_last_bytes`.[^node-textfile]
+
+The schedule is `OnCalendar=*-*-* 02:30:00` with a randomised delay, so the five timers do not all fire on the same second.[^systemd-timer] The custom format (`-Fc`) is a logical dump: it restores into any Postgres with `pg_restore`, and it survives a major-version bump, which a raw file-level copy of the data directory does not.[^pg-dump]
+
+### 2. sanoid snapshots - point-in-time on the hot tree
+
+`sanoid` runs one template, `apphot`, on `rpool/appdata` and `rpool/appdata/pg`:[^sanoid]
+
+| Cadence | Kept |
+|---|---|
+| hourly | 24 |
+| daily | 7 |
+| weekly | 4 |
+| monthly | 3 |
+
+Snapshots are point-in-time and near-free on a mostly-idle NVMe tree - a snapshot records only the blocks that later diverge, so an idle dataset costs almost nothing to keep 38 of. The template carries all four cadences because hot state needs both ends of the range at once, which the [retention](#retention-why-hot-state-needs-all-four-cadences) section works through.
+
+### 3. syncoid replication - the step that makes it a backup
+
+`syncoid` replicates `rpool/appdata` to `tank/backups/zfs-repl`, recursively, so the `pg` child dataset comes along.[^sanoid] It runs with `--no-sync-snap`, which ships the snapshots `sanoid` already cut rather than taking its own[^syncoid-nosync] - the two tools stay in one snapshot lineage instead of racing to define it.
+
+This is the step that promotes a snapshot to a backup: it copies to a different, redundant pool. Everything sanoid does stays on `rpool`; only after syncoid runs does a copy exist that survives losing that NVMe.
+
+---
+
+## Why declarative beats pipelines
+
+Two failure modes retired the imperative version, and both had actually happened.
+
+### The dead-path backup
+
+The old `appdata_backup` carrier bind-mounted `/rpool/cache/data` as its source. A storage move later relocated that state to `/appdata` and quarantined `/rpool/cache`. The carrier kept exec-ing its tar on a schedule and kept exiting zero, so it kept reporting success - while reading a path that no longer held any live data. The backup was stale and effectively empty, and nothing said so.
+
+<Aside type="caution">
+A backup job that succeeds while reading the wrong path is worse than one that
+fails: the failure is visible, the stale success is not. The declarative source
+paths are `fileSystems` and dataset names reviewed at `nixos-rebuild switch`, not
+a bind-mount string buried in a container definition that no rebuild ever reads.
+</Aside>
+
+### The written-but-never-installed class
+
+An imperative backup script can be authored, unit-tested, committed, and documented, and still never run, because installing and scheduling it is a separate manual step that nobody did. Nothing enforces that the script on disk is a job in the scheduler.
+
+A NixOS module closes that gap by construction: the timer and its service are declared in the same config that gets applied, so a timer that evaluates at switch is a timer that exists on the system. There is no second step in which the intent can be lost.
+
+---
+
+## RPO tiers: baseline vs WAL PITR
+
+The recovery-point policy sorts clusters into two tiers.
+
+| Tier | Clusters | Baseline RPO | Target RPO |
+|---|---|---|---|
+| Tier-1, cannot lose | all Postgres clusters, with vaultwarden and atuin called out (their data is not regenerable) | hourly snapshot + daily logical dump | as baseline, until WAL PITR lands |
+| Tier-1, highest value | vaultwarden, memledger, atuin | as above | seconds, via WAL PITR |
+
+Every Postgres cluster is tier-1: the decision was that none of them may lose data, so the baseline - an hourly snapshot plus a daily logical dump - applies to all of them. The worst-case loss under the baseline is roughly the snapshot interval, about an hour.
+
+On top of that, continuous WAL archiving (point-in-time recovery) is the plan for the clusters whose data cannot be regenerated at all - vaultwarden, memledger, atuin. WAL PITR ships every committed transaction to the archive as it happens, which shrinks the recovery point from about an hour to seconds.[^pg-pitr] This is design, not current state: the baseline runs today, the WAL archiving does not yet.
+
+---
+
+## Retention: why hot state needs all four cadences
+
+The `apphot` template keeps hourly, daily, weekly, and monthly snapshots because hot state has two independent recovery needs, and neither cadence covers both:
+
+- **A short loss window.** If a database corrupts a row or a service writes garbage, the useful snapshot is minutes old, not days. The 24 hourly snapshots give a recovery point within about an hour across a full day.
+- **A long tail.** Some damage is noticed late - a slow data-quality regression, a config change whose effect surfaces weeks on. The weekly and monthly snapshots hold a restore point going back roughly three months without keeping an hourly for every one of those hours.
+
+Drop the hourly cadence and a mid-day mistake costs up to a day; drop the weekly and monthly, and anything noticed after a week has no restore point. Hot state is exactly the tree that needs both, which is why the template carries the full ladder rather than the two-cadence `hot` template that [ZFS on NixOS](/reference/zfs-on-nixos/) described as a temporary measure.
+
+---
+
+## Alerting: the control that makes silence safe
+
+A backup that fails silently is not a backup, and the imperative version failed silently by default. The declarative version wires two controls so a failure surfaces:
+
+- **`OnFailure=backup-alert@%n`** on every timer's service. If any run exits non-zero, systemd starts the templated alert unit with the failed unit name as its instance, so a failure raises a notification instead of a log line nobody reads.[^systemd-onfailure]
+- **A stale-metric alert.** The `pg_dump` runner writes `backup_pg_last_success_timestamp` to the node-exporter textfile collector,[^node-textfile] which the monitoring stack scrapes. An alert on that timestamp going stale catches the case the `OnFailure` hook cannot - a timer that never fired at all, so it never failed. Where those metrics land and how the scrape reaches this host is covered in [self-hosted monitoring topology](/reference/self-hosted-monitoring-topology/).
+
+The two together cover both a run that fails and a run that silently stops happening.
+
+---
+
+## The untested-restore trap
+
+A dump that exists on disk is not a backup you can trust until a restore has been exercised against it. The `backup_pg_last_bytes` metric proves a file of non-zero size was written; it proves nothing about whether that file restores into a working database.
+
+The concrete case on this host: mnemosyne was parked mid-migration. Its data was copied to the new tier, and the file is present and non-empty, but Postgres has never opened it there - so the copy is file-verified and restore-unverified. Until a `pg_restore` into a scratch instance comes up clean, that cluster does not have a backup in the sense that matters; it has a file that is probably a backup. The gate is a test restore, not a green timer or a healthy-looking byte count.
+
+<Aside type="note">
+This is the reason the snapshots-are-not-backups section above names
+restore-tested as the second property, alongside off-pool. mnemosyne has the
+off-pool copy and lacks the restore test, which is exactly the half a byte-count
+metric cannot see.
+</Aside>
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="Is it a Postgres cluster?", shape=diamond];
+  q2 [label="Is its data regenerable?", shape=diamond];
+
+  a1 [label="sanoid snapshot + syncoid replica\nno separate tar"];
+  a2 [label="pg_dump -Fc timer\n+ hourly snapshot baseline"];
+  a3 [label="add continuous WAL archiving\n(PITR, seconds RPO)"];
+
+  q1 -> a1 [label="no (file state)"];
+  q1 -> q2 [label="yes"];
+  q2 -> a2 [label="yes"];
+  q2 -> a3 [label="no"];
+}
+```
+
+Given the data class, the mechanism follows, because the mechanism matches the data's shape and value:
+
+1. File state (arr SQLite, redis, qbittorrent, beets) -> `sanoid` snapshot plus `syncoid` replica, because block-level snapshots capture the files crash-consistently and a separate tar would duplicate what the replica already carries.
+2. A Postgres cluster whose data is regenerable -> a logical `pg_dump` timer plus the hourly snapshot baseline, because a logical dump restores across major versions and the hourly snapshot bounds the loss window to about an hour.
+3. A Postgres cluster whose data cannot be regenerated (vaultwarden, memledger, atuin) -> everything in row 2 plus continuous WAL archiving, because only per-transaction archiving shrinks the recovery point to seconds.
+
+Whichever mechanism applies, the copy is not a backup until it lands off-pool and a restore has been exercised against it.
+
+---
+
+## Related docs
+
+- [ZFS on NixOS: who owns the mount](/reference/zfs-on-nixos/) - the snapshots-are-not-backups principle in full, plus the pool and mount mechanics this doc rests on.
+- [Monitoring a self-hosted stack behind a policy-drop edge](/reference/self-hosted-monitoring-topology/) - where the `backup_pg_last_success_timestamp` metrics land and how the scrape reaches this host.
+- [Appdata tiering on ZFS](/reference/appdata-tiering-zfs/) - which tier holds what you are protecting, and why hot state sits on the non-redundant NVMe.
+
+[^pg-dump]: PostgreSQL, "pg_dump," PostgreSQL Documentation. https://www.postgresql.org/docs/current/app-pgdump.html
+[^pg-pitr]: PostgreSQL, "Continuous Archiving and Point-in-Time Recovery," PostgreSQL Documentation. https://www.postgresql.org/docs/current/continuous-archiving.html
+[^sanoid]: Jim Salter, "sanoid and syncoid," GitHub. https://github.com/jimsalterjrs/sanoid
+[^syncoid-nosync]: Jim Salter, "syncoid," sanoid README. https://github.com/jimsalterjrs/sanoid/blob/master/README.md
+[^systemd-timer]: freedesktop.org, "systemd.timer," systemd Manual. https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html
+[^systemd-onfailure]: freedesktop.org, "systemd.unit," systemd Manual. https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html
+[^node-textfile]: Prometheus, "node_exporter textfile collector," GitHub. https://github.com/prometheus/node_exporter#textfile-collector
