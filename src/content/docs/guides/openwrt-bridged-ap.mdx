@@ -1,0 +1,221 @@
+---
+title: "A bridged access point on mainline OpenWrt: flash, recover, configure as code"
+description: Taking a consumer WiFi 6 router (GL.iNet GL-MT6000 class) from vendor firmware to stock mainline OpenWrt as a pure layer-2 access point behind a separate router - the flash and the u-boot recovery that saved it, a deploy script that keeps the box equal to a git repo, the wpad-basic option that silently kills a radio, the dumb-AP settings the OpenWrt docs actually ask for, and two out-of-band paths back in when the LAN is gone.
+author: Erfi Anugrah
+category: homelab
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+The vendor firmware on a GL.iNet Flint 2 dropped its SSIDs twice in five days (the mechanism is in [Flint 2 VAP durability](/reference/flint2-vap-durability/)). This guide is the replacement: stock mainline OpenWrt 24.10 on the same box, running as a bridged access point whose only jobs are radios and a wire, with every setting in a git repo and a script that pushes it. It ends with the box reachable three ways, so a wrong bridge port is a nuisance rather than a trip to the u-boot button.
+
+Prerequisites: a laptop with an Ethernet port, SSH to the upstream router (it owns DHCP and its lease log is the liveness signal), and a household that can lose WiFi for an hour. Everything marked measured was done on the rig in the constants table on 2026-09-04; the docs cited are the OpenWrt wiki pages the settings came from.
+
+## Constants (read this first)
+
+### The rig (measured example)
+
+| Piece | Detail |
+|---|---|
+| Access point | GL.iNet Flint 2 (GL-MT6000): MediaTek MT7986A, 4x Cortex-A53, 1 GB RAM, 8 GB eMMC, 2x 2.5GbE + 4x 1GbE, USB 3 |
+| Radios | MT7976 2.4 GHz 4x4 + 5 GHz 4x4, mainline `mt76` (`kmod-mt7915e` 6.6.144 build) |
+| Firmware | OpenWrt 24.10.8 stock sysupgrade image (Linux 6.6.144, hostapd 2024.09.15, `wpad-basic-mbedtls`) |
+| Upstream router | NixOS mini PC: kea DHCP, nftables, one tagged VLAN per segment |
+| Switch | 2.5GbE managed switch; the AP's two uplinks are untagged access ports |
+| Out-of-band | A Raspberry Pi KVM on the admin segment, USB-cabled to the AP |
+
+### Segments the AP bridges
+
+| Segment | VLAN | Subnet | Who serves DHCP | AP attachment |
+|---|---|---|---|---|
+| home | 30 | 10.30.0.0/24 | router (kea) | `br-lan`: uplink port + spare LAN ports; AP management address 10.30.0.2 |
+| iot | 40 | 10.40.0.0/24 | router (kea) | `br-iot`: one LAN port; SSID `home-iot`, client isolation on |
+
+Both AP uplinks are access ports on the switch: the AP tags nothing, the switch applies the port VLAN ID on ingress and strips it on egress. The segment policy (what iot may reach) lives on the router; it is described in [Home IoT: an ESPHome fleet on a Flint-bridged VLAN](/reference/home-iot-network/).
+
+### Addresses that matter during a flash
+
+| Moment | Address | Note |
+|---|---|---|
+| Stock OpenWrt first boot | 192.168.1.1 on `br-lan`, root with no password, radios off | Serves DHCP on the LAN ports |
+| Vendor u-boot recovery page | http://192.168.1.1 | Runs no DHCP server: the laptop needs a static 192.168.1.2/24 |
+| The AP's WAN port on first boot | DHCP client | Takes a lease from the router immediately - watch that log, not ping |
+| Out-of-band USB net | 172.30.30.0/24, leased by the KVM | Independent of every LAN setting on the AP |
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  repo [label="git repo\nconfig/ + deploy.sh\n(keys in a gitignored env file)"];
+  ap [label="access point (OpenWrt)\nbr-lan 10.30.0.2 <- SSIDs home-main, home-main-5g\nbr-iot (no address) <- SSID home-iot"];
+  sw [label="switch\naccess port VLAN 30\naccess port VLAN 40"];
+  rt [label="router\nkea + nftables\n10.30.0.1 / 10.40.0.1"];
+  oob [label="OOB Pi\nUSB gadget net 172.30.30.1"];
+
+  repo -> ap [label="ssh, cat-pipe"];
+  ap -> sw [label="2x untagged"];
+  sw -> rt [label="trunk 30,40"];
+  oob -> ap [label="usb0, always"];
+}
+```
+
+Text version: the repo pushes config to the AP over SSH; the AP bridges two SSID groups onto two untagged switch ports; the switch trunks both VLANs to the router, which owns addressing and policy; a separate Pi keeps a USB network into the AP that survives any LAN mistake.
+
+## Part 1: flash from the vendor firmware
+
+GL.iNet's firmware is itself an OpenWrt fork, and the device page states that the stock OpenWrt sysupgrade image flashes from it directly, with "keep settings" off.[^owrt-mt6000] Over SSH:
+
+```sh
+# on the vendor firmware
+cat openwrt-24.10.8-mediatek-filogic-glinet_gl-mt6000-squashfs-sysupgrade.bin \
+  | ssh root@<ap> 'cat > /tmp/sysupgrade.bin'
+ssh root@<ap> 'sha256sum /tmp/sysupgrade.bin'      # compare with sha256sums from downloads.openwrt.org
+ssh root@<ap> 'sysupgrade -n /tmp/sysupgrade.bin'  # -n: do not keep the vendor config
+```
+
+Two things about the next ten minutes were learned the hard way:
+
+- **The box is alive when the router's DHCP log says so, not when ping does.** Stock OpenWrt's WAN port is a DHCP client from first boot. On the rig, kea logged the AP's WAN MAC taking a lease eleven minutes after the sysupgrade (the first boot formats the overlay), and renewed it every 150 s for half an hour while everyone stared at a dead 192.168.1.1. `journalctl -u kea-dhcp4-server -o cat | grep -i <wan-mac>` was the signal.
+- **A ping reply from 192.168.1.1 is not the AP** if the laptop has any other uplink. On the rig the laptop was on a phone hotspot; `tracert` showed 192.168.1.1 two hops away with TTL 63, on the carrier's side, while the laptop's cabled port sat on a 169.254 address. Check `arp -a` on the cabled interface before believing a ping.
+
+Measured consequence of not knowing either: forty minutes, then a reset button pressed on a box that was working. On mainline OpenWrt, holding reset on a running box for more than five seconds is a factory reset and reboot. Do not press it on a box you cannot see.
+
+## Part 2: recovery through the vendor u-boot
+
+The vendor bootloader is preserved by mainline OpenWrt and serves a plain HTML upload page.[^owrt-mt6000] It is the path that worked, measured 2026-09-04:
+
+1. Laptop cabled to any LAN port, **static** 192.168.1.2/24. There is no DHCP server in u-boot; on Windows, `netsh interface ip set address name="<adapter>" static 192.168.1.2 255.255.255.0`.
+2. Power off. Hold reset, power on, keep holding about ten seconds until the LED goes steady. Release.
+3. Open http://192.168.1.1. The page ("FIRMWARE UPDATE", U-Boot 2023.10-rc2 on this unit) takes one file upload, shows its size and MD5, then an Update button.
+4. Upload the **sysupgrade** image. The device page warns that a factory image through u-boot may brick the device.[^owrt-mt6000] Compare the MD5 the page shows with `md5sum` of the local file before clicking Update.
+5. About sixty seconds later stock OpenWrt is at 192.168.1.1 with root and an empty password. `ssh root@192.168.1.1` works with no prompt.
+
+Do not count on OpenWrt failsafe mode on this device in 24.10: an upstream issue tracks the box not entering a reachable failsafe from the button.[^owrt-failsafe] The u-boot page is the floor.
+
+## Part 3: configuration as code
+
+Six UCI files in a repo, one gitignored env file with the WPA keys, and a deploy script. The script's order is the whole design:
+
+```sh
+# deploy.sh (abridged) - target is root@192.168.1.1 on first boot, the mgmt address after
+ssh "$HOST" 'mkdir -p /etc/dropbear /root/.ssh'
+ssh "$HOST" 'cat > /etc/dropbear/authorized_keys'   < authorized_keys   # 1. keys FIRST
+ssh "$HOST" 'cat > /root/.ssh/authorized_keys'      < authorized_keys
+sed -e "s/MAIN_KEY_PLACEHOLDER/$MAIN_KEY/" -e "s/IOT_KEY_PLACEHOLDER/$IOT_KEY/" \
+    config/wireless | ssh "$HOST" 'cat > /etc/config/wireless'          # 2. keys spliced at push time
+for f in network firewall dhcp system dropbear; do
+  ssh "$HOST" "cat > /etc/config/$f" < "config/$f"                      # 3. everything else
+done
+ssh "$HOST" 'uci set wireless.radio0.disabled=0; uci set wireless.radio1.disabled=0;
+             uci commit wireless; sync; reboot'
+```
+
+- Authorised keys go in **before** the dropbear config that turns password authentication off. Reverse the order and a failed push locks you out.
+- `cat` over SSH, not `scp`: stock OpenWrt ships no SFTP server and modern `scp` defaults to the SFTP protocol (`sh: /usr/lib/sftp-server: not found`).
+- The committed `config/wireless` holds placeholders. The real keys live only in the env file. A live-versus-repo diff (`uci export wireless` on the box against the repo file, ignoring the `key` field) is the check that the box runs what git says; on the rig it is one command, `owrtctl diff`, and it exits 1 on drift.
+- A second run needs to reach the box on its new address. If the deploying machine cannot route there yet (the rig renumbered a VLAN under the AP on the same day), add a temporary alias on the router's VLAN interface and jump: `ssh -J root@<router> root@<ap>`.
+
+## Part 4: the wireless config, and the option that kills a radio
+
+The three SSIDs, in `/etc/config/wireless`:
+
+| SSID | Radio | `htmode` | `encryption` | Bridge | Extras |
+|---|---|---|---|---|---|
+| `home-main` | 2.4 GHz, channel 11 | `HE20` | `sae-mixed` | `lan` | `ieee80211k 1`, `disassoc_low_ack 0` |
+| `home-main-5g` | 5 GHz, channel 149 | `HE80` | `sae-mixed` | `lan` | same |
+| `home-iot` | 2.4 GHz, channel 11 | `HE20` | `psk2` | `iot` | `isolate 1`, `disassoc_low_ack 0` |
+
+`sae-mixed` produced `ieee80211w=1`, `sae_require_mfp=1` and `sae_pwe=2` in the generated hostapd config, which is the transition-mode set the wiki describes.[^owrt-wifi] The IoT SSID stays WPA2-PSK with no management-frame protection because that is what the ESP32 fleet was validated on; its protection is the router's segment policy, not the cipher.
+
+<Aside type="caution" title="One unknown hostapd option takes the whole radio down">
+The stock image ships `wpad-basic-mbedtls`. It does not know `bss_transition` (802.11v), and the wiki says so: the option "requires full wpad/hostapd".[^owrt-wifi] With that one line present, hostapd logged `Line 80: unknown configuration item 'bss_transition'` and `1 errors found in configuration file`, and refused to bring up the interface. The only visible symptom was `iwinfo` showing every SSID with `Tx-Power: 0 dBm` and `HT Mode: NOHT`. Measured 2026-09-04. When radios look half-up, run `logread | grep "errors found"` before anything else. Want 802.11v back: install `wpad-mbedtls` (the full build) and re-add the option.
+</Aside>
+
+Percent-style `txpower` values are a vendor-firmware habit; mainline reads dBm.[^owrt-wifi] Omit the option and the radio runs at the regulatory cap for its channel: on this rig `iw reg get` for the operator's country allowed 23 dBm on 2.4 GHz and 30 dBm on channel 149, and `iwinfo` reported exactly those. HE160 was available only in the DFS block (26 dBm, channel availability check on boot, radar moves), so the 5 GHz SSID stays at HE80 on a non-DFS channel.
+
+## Part 5: the dumb-AP settings, from the docs rather than folklore
+
+The bridged-AP guide is short and specific: static management address on the LAN bridge with the router as gateway and DNS, DHCP server ignored on every interface, IPv6 RA and DHCPv6 services disabled, and leave dnsmasq and the firewall running because disabling them saves nothing.[^owrt-bridgedap] Applied here:
+
+```
+# /etc/config/network (excerpt)
+config globals 'globals'
+	option packet_steering '1'      # no ula_prefix: this box routes nothing
+
+config interface 'lan'
+	option device 'br-lan'
+	option proto 'static'
+	option ipaddr '10.30.0.2'
+	option netmask '255.255.255.0'
+	option gateway '10.30.0.1'
+	option dns '10.10.0.5'
+
+config interface 'iot'
+	option device 'br-iot'
+	option proto 'none'             # bridge member only: no address, no routing
+
+# /etc/config/dhcp (excerpt)
+config dhcp 'lan'
+	option interface 'lan'
+	option ignore '1'
+	option ra 'disabled'
+	option dhcpv6 'disabled'
+```
+
+Two device-specific items come from the GL-MT6000 page rather than the generic guide:[^owrt-mt6000]
+
+- **Packet steering on, irqbalance installed.** The page recommends both for this four-core SoC. Bridged wifi-to-Ethernet traffic is softirq work on whichever core took the interrupt otherwise.
+- **WED (wireless Ethernet dispatch) left off.** The page says a dumb AP has CPU to spare and keeps lower WiFi latency by leaving WED disabled so AQL stays active; WED also needs the `bridger` package in bridged mode and is 5 GHz only.[^owrt-wed] Its own throughput figures are 750 Mbps without and 810 Mbps with. Not worth the trade here.
+
+`igmp_snooping` stayed off: the bridged-AP guide records Android and IPv6 breakage reports when it is enabled, and nothing on this network streams multicast.[^owrt-bridgedap] `legacy_rates` is already 0 in 24.10, so multicast goes out at 6 Mbps or better without it.
+
+## Part 6: three ways in
+
+| Path | What it survives | Setup |
+|---|---|---|
+| OpenSSH on :22 | normal operation | `opkg install openssh-server`; `PermitRootLogin prohibit-password`, `PasswordAuthentication no`, key in `/root/.ssh/authorized_keys`. Offers post-quantum key exchange (`mlkem768x25519-sha256`), which dropbear 2024.86 does not; OpenSSH clients stop warning |
+| dropbear on :2222 | sshd misconfiguration | The stock daemon, moved off :22, same key, password auth off |
+| USB gadget network from the OOB Pi | any LAN, VLAN or bridge mistake | `opkg install kmod-usb-net-cdc-ether`; a `dhcp` interface on `usb0` with `defaultroute 0`; add it to the `lan` firewall zone so SSH is accepted. The Pi's dnsmasq leases 172.30.30.x; `ssh -J root@<oob-pi> root@<lease>` |
+
+Swapping the SSH daemons in place without losing the session: bring sshd up on a spare port first, log in through it, then stop dropbear, move sshd to :22, restart, and start dropbear on the spare port. Measured 2026-09-04; the session through the spare port drops for a few seconds and comes back.
+
+The USB path was proven on the running box (lease taken, login through the Pi succeeded) but it does not cover a fresh flash: the stock image has no CDC Ethernet driver until the deploy script has run once with the uplink up.
+
+## Verification
+
+| Check | How | Expected |
+|---|---|---|
+| Radios really up | `iwinfo \| grep -E "ESSID\|Tx-Power"` | every SSID with a real dBm figure, none at 0 |
+| hostapd accepted the config | `logread \| grep -ciE "errors found\|add_iface failed"` | 0 |
+| Box equals repo | `uci export <name>` vs `config/<name>` for network, firewall, dhcp, wireless, system, dropbear | no differences outside `key` |
+| Bridge membership | `ls /sys/class/net/br-lan/brif; ls /sys/class/net/br-iot/brif` | uplink + spare ports in `br-lan`; exactly one port in `br-iot` |
+| Clients land in the right segment | a phone on `home-main-5g` gets 10.30.0.x from the router; an IoT device on `home-iot` gets 10.40.0.x | leases visible in the router's kea log |
+| IPv6 stays the router's | `ip -6 addr show br-lan` | link-local only |
+| Rescue paths | `ssh -p 2222`, and the USB jump | both log in |
+
+## Gotchas and lessons learned
+
+- **Liveness is the router's DHCP log.** The WAN port leases immediately; `ping` to a first-boot address proves nothing when another uplink exists.
+- **u-boot recovery has no DHCP.** Static 192.168.1.2 on the laptop, sysupgrade image only, check the MD5 the page prints.
+- **`wpad-basic` refuses whole interfaces on one unknown key.** `Tx-Power: 0 dBm` with SSIDs listed means a config error, not a dead radio.
+- **Keys before the dropbear config.** The deploy order is the lockout guard.
+- **Do not press reset on a running box you cannot see.**
+- **The out-of-band USB network needs the driver installed first.** A custom image with the driver baked in was tried; it went dark on first boot and the stock image plus post-flash `opkg` was the path that worked.
+- **Renumbering the segment under the AP** leaves the AP's static address on a dead subnet. A temporary alias on the router's VLAN interface plus a jump host reaches it without a reboot.
+
+## Related docs
+
+- [Flint 2 VAP durability](/reference/flint2-vap-durability/) is the vendor-firmware failure this guide replaces.
+- [Home IoT: an ESPHome fleet on a Flint-bridged VLAN](/reference/home-iot-network/) is the segment design the `iot` bridge feeds; the router-side policy is there.
+- [Moving an ESPHome fleet to a new SSID](/guides/esphome-fleet-ssid-migration/) is what the SSID rename that came with this flash forced.
+
+[^owrt-mt6000]: OpenWrt, "GL.iNet GL-MT6000," OpenWrt Wiki table of hardware. https://openwrt.org/toh/gl.inet/gl-mt6000
+[^owrt-failsafe]: OpenWrt, "filogic: GL.iNet GL-MT6000 does not enter failsafe with button press," openwrt/openwrt issue 17982. https://github.com/openwrt/openwrt/issues/17982
+[^owrt-wifi]: OpenWrt, "Wi-Fi /etc/config/wireless," OpenWrt Wiki. https://openwrt.org/docs/guide-user/network/wifi/basic
+[^owrt-bridgedap]: OpenWrt, "Wi-Fi Extender/Repeater with Bridged AP," OpenWrt Wiki. https://openwrt.org/docs/guide-user/network/wifi/wifiextenders/bridgedap
+[^owrt-wed]: OpenWrt, "Wireless Ethernet Dispatch (WED)," OpenWrt Wiki. https://openwrt.org/docs/guide-user/network/wifi/wed
