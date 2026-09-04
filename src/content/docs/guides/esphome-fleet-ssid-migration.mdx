@@ -1,0 +1,144 @@
+---
+title: Moving an ESPHome fleet to a new SSID
+description: Renaming the IoT SSID and rotating its key under thirteen ESPHome devices that were compiled for the old one - the four places the credential lives, the three hub-side caches that decide whether a device "shows up", why the fallback hotspot may not exist on your firmware even though captive_portal is configured, and the temporary bridge SSID that brought eight stranded plugs back without touching them.
+author: Erfi Anugrah
+category: homelab
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+An ESPHome device learns its WiFi credentials at compile time. Rename the SSID or rotate the key and every device is stranded until it runs new firmware, and it cannot receive new firmware until it is on a network. This guide is the cutover that resolved that loop for a fleet of twelve Athom Smart Plug V3 and one AirGradient ONE on 2026-09-04, on the segment described in [Home IoT: an ESPHome fleet on a Flint-bridged VLAN](/reference/home-iot-network/), after the access point moved to mainline OpenWrt and took a new SSID name and key with it ([A bridged access point on mainline OpenWrt](/guides/openwrt-bridged-ap/)).
+
+Prerequisites: SSH to the hub that runs the ESPHome dashboard and Home Assistant, SSH to the access point and to the DHCP server, and the previous key. Everything marked measured was done on that rig that day.
+
+## Constants (read this first)
+
+### Where the credential lives
+
+| Store | Read when | Written by |
+|---|---|---|
+| The access point's wireless config | radio start | the AP's deploy script, from a gitignored env file |
+| The repo's encrypted secrets file (sops) | never by a device; the git-tracked copy | `sops` |
+| The hub's live ESPHome `secrets.yaml` | at every compile, via `!secret wifi_ssid` / `!secret wifi_password` | by hand or by a rotation script; not by the configuration system |
+| Each device's flash | at boot | the last OTA or serial flash |
+
+All four must agree before an OTA, or the device reboots onto a network that does not exist. On the rig the first three are compared by fingerprint (`secretctl cmp`) without printing them.
+
+### What "the device shows up" depends on
+
+| Layer | Holds | Stale symptom |
+|---|---|---|
+| Device yaml `wifi.use_address` | the address the dashboard connects to | dashboard badge OFFLINE while the device answers ping |
+| Dashboard cache `.esphome/storage/<name>.yaml.json` and `.validated.yaml` | the address the dashboard **actually** uses; not the yaml | same, and it survives editing the yaml |
+| Home Assistant `.storage/core.config_entries`, `host` per ESPHome entry | where the integration connects | every entity "unavailable" |
+| DHCP reservations on the router | the address the device gets | device on a pool address nobody points at |
+
+mDNS does not cross the VLAN boundary between the hub and the fleet, so none of these can be left to discovery.
+
+### The rig
+
+| Piece | Detail |
+|---|---|
+| Fleet | 12x Athom Smart Plug V3 (ESP32-C3), 1x AirGradient ONE (ESP32-C3), ESPHome 2026.5.1 |
+| Hub | Raspberry Pi 4B, NixOS, Home Assistant + ESPHome dashboard, admin segment |
+| Access point | GL.iNet Flint 2 on OpenWrt 24.10.8, SSID `home-iot` bridged untagged to VLAN 40 |
+| Addressing | kea reservations per MAC: plugs 10.40.0.20-31, sensors from 10.40.0.40 |
+
+## Part 1: prepare the hub side so the first join is the last step
+
+Do all of this before a single device moves. Afterwards, the moment a device associates and takes its reservation, the dashboard badge turns ONLINE and the Home Assistant entities return with nothing left to click.
+
+1. **Secrets.** Put the new SSID and key in the sops file and in the hub's live `secrets.yaml`. Compare fingerprints across the AP's env file, sops and the hub; the value should never appear in a terminal. `sops` can be driven with a scripted `$EDITOR` for this.
+2. **Yaml `use_address`.** If the subnet moved (it did here, from one router-owned /24 to another), rewrite the pins in every device yaml and deploy the yamls to the hub. Reservations are keyed by MAC, so the device lands on the new pin without any change on the device.
+3. **Dashboard cache.** `sed` the old addresses to the new ones in `/var/lib/esphome/.esphome/storage/*.json` (`"address"`) and `*.validated.yaml` (`use_address`), then restart the dashboard. Measured: the dashboard connected to the cached address, not the yaml's, until this was done.
+4. **Home Assistant hosts.** Stop Home Assistant, replace the `"host"` values in `.storage/core.config_entries` for the ESPHome entries, start it. Editing that file with Home Assistant running is overwritten from memory. Thirteen entries, back in twenty seconds on the rig. The alternative is the UI: each ESPHome entry, Configure, new host.
+5. **Time.** If the fleet syncs time from the hub (chrony serving the segment), widen chrony's `allow` to the new subnet.
+
+<Aside type="note" title="A dedicated password for the fallback hotspot">
+ESPHome's fallback hotspot (`wifi.ap`) is the device's own access point for re-provisioning. Give it its own passphrase, `wifi_ap_password`, distinct from the network key. A stranded device broadcasts that hotspot to anyone in range, and a captured handshake against it should yield nothing that also joins the segment. Store `wifi_ap_password` in sops and in the hub's `secrets.yaml`; a rotation script that rewrites `secrets.yaml` must carry it over.
+</Aside>
+
+## Part 2: find out whether your devices have a fallback hotspot at all
+
+The documented re-provisioning path is the fallback hotspot plus the captive portal at `http://192.168.4.1`.[^esphome-captive] It exists only if the device yaml has an `ap:` block under `wifi:`; `captive_portal:` on its own configures nothing to serve it.[^esphome-wifi]
+
+On the rig, a commit five days earlier had removed a malformed `ap:` block from the plug yamls and left nothing in its place. Eight of twelve plugs had been flashed since, and after the SSID rename they sat silent: no hotspot, no portal, no way in over the air. The four that still ran older firmware raised their hotspots and were joined by phone. Check `grep -A2 '^  ap:' *.yaml` before planning around the portal.
+
+The yamls now carry:
+
+```yaml
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  use_address: 10.40.0.22
+  ap:
+    password: !secret wifi_ap_password
+    ap_timeout: 2min
+captive_portal:
+```
+
+`esphome config <yaml>` on the hub validates the block against the real `secrets.yaml` before anything is flashed.
+
+## Part 3: the bridge SSID for devices that cannot ask for help
+
+A device with no hotspot needs the old network to reappear. The access point can broadcast it as one more virtual AP on the same IoT bridge, with the old credentials, for the length of the migration:
+
+```
+# /etc/config/wireless, appended by the deploy script only while LEGACY_IOT_KEY is set
+config wifi-iface 'legacyiot'
+	option device 'radio0'
+	option mode 'ap'
+	option ssid 'home-iot-old'
+	option encryption 'psk2'
+	option key 'LEGACY_IOT_KEY_PLACEHOLDER'
+	option network 'iot'
+	option isolate '1'
+```
+
+Same bridge, same VLAN, same reservations: a device that joins the old name gets its usual pin and is immediately reachable by the dashboard for the OTA that carries the new name.
+
+**The key the devices know is the key they were last compiled with.** On the rig the first attempt used a constant from an old script, and hostapd logged the cause: `AP-STA-POSSIBLE-PSK-MISMATCH` for each plug as it tried, associated and dropped. The devices had been flashed after a rotation, so they carried the rotated key, which was the `wifi_password` in the sops file as of the last OTA, recoverable from git history. Swapped live with `uci set wireless.legacyiot.key`, `uci commit wireless`, `wifi reload` - no reboot, no effect on the other SSIDs - and all eight landed on their pins within fifteen seconds.
+
+Two other ways in, if a bridge SSID is not an option:
+
+- **Improv over Bluetooth LE.** Every plug yaml here has `esp32_improv:` with `authorizer: none`; a phone next to the device can set the new SSID and key with no hotspot involved.[^esphome-improv] One device at a time.
+- **Serial reflash.** The bench, last.
+
+## Part 4: the OTA sweep and the teardown
+
+With every device online at its pin, the dashboard's Update All compiles each yaml against the hub's `secrets.yaml` (new SSID, new key, the restored `ap:` block) and pushes it. The first build after a secrets change is a full compile - about twenty minutes on the Pi - and the rest reuse the cache. Each device reboots onto the new SSID at the same address, so the badge stays ONLINE through the change.
+
+Include the devices that joined through the portal. Portal-stored credentials live in flash alongside firmware compiled for the old network; until they are OTA'd their firmware still lacks the hotspot block and disagrees with the yaml.
+
+When the new SSID's association count equals the fleet and the bridge VAP is empty, remove the legacy key from the env file and delete the VAP live (`uci delete wireless.legacyiot`, commit, `wifi reload`). The old key was pasted into a terminal to get here; it dies with the bridge.
+
+## Verification
+
+| Check | How | Expected |
+|---|---|---|
+| Fleet on the new SSID | `iwinfo <iot-vap> assoclist \| grep -c dBm` on the AP | fleet size (13 here) |
+| Bridge VAP empty | same on the legacy VAP | 0, then delete it |
+| Every device on its pin | ping each reservation from the router | all answer |
+| Dashboard | `curl -s http://127.0.0.1:6052/ping` on the hub | `true` for every yaml |
+| Firmware rebuilt after the secrets change | `find .esphome/build/<name> -name '*.bin' -newer secrets.yaml` | a hit for every device whose yaml or secrets changed |
+| Home Assistant | entities out of `unavailable`; the ESPHome integration shows every device connected | |
+
+## Gotchas and lessons learned
+
+- **`captive_portal:` without `wifi.ap` is nothing.** The hotspot is the `ap:` block. Check for it before an SSID change, not after.
+- **Wrong old key looks like a dead bridge.** `logread | grep PSK-MISMATCH` on the AP names it within seconds. The devices carry the key from their last OTA, which is the sops value at that commit, not whatever a script remembers.
+- **Three caches, not one.** Yaml `use_address`, the dashboard's storage cache, and Home Assistant's config-entry hosts. The dashboard connects with its cache; Home Assistant connects with its entry. Both need the new address even when the yaml is right.
+- **Stop Home Assistant before touching `.storage`.** It rewrites the file from memory otherwise.
+- **The fallback hotspot gets its own passphrase.** With the network key reused, a stranded device's hotspot handshake is a copy of the segment credential.
+- **A bridge SSID needs the same bridge and the same reservations.** Then a device rejoining the old name is already exactly where the dashboard expects it.
+- **Time-sync scope moves with the subnet.** A hub-hosted NTP server with an `allow` for the old /24 silently stops answering the fleet.
+
+## Related docs
+
+- [Home IoT: an ESPHome fleet on a Flint-bridged VLAN](/reference/home-iot-network/) is the concept doc for the segment, the reservations and the adoption path this guide extends.
+- [A bridged access point on mainline OpenWrt](/guides/openwrt-bridged-ap/) is the access point side, including the deploy script that carries the bridge VAP.
+- [AirGradient ONE on ESPHome, fully local](/guides/airgradient-one-esphome-local/) was one of the thirteen; its yaml already had the `ap:` block.
+
+[^esphome-captive]: ESPHome, "Captive Portal," ESPHome Docs. https://esphome.io/components/captive_portal/
+[^esphome-wifi]: ESPHome, "WiFi Component," ESPHome Docs. https://esphome.io/components/wifi/
+[^esphome-improv]: ESPHome, "Improv via BLE," ESPHome Docs. https://esphome.io/components/esp32_improv/
