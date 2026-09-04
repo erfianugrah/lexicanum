@@ -233,7 +233,7 @@ lack a Verification or Gotchas section, and older prose contains em/en-dashes
 and other non-ASCII punctuation (the ASCII rule and its guard are newer).
 Do not treat the oldest docs as exemplars - the exemplars are
 `reference/cloudflare-supabase-architecture.mdx` and
-`guides/usb4-10gbe-windows-tuning.mdx`. The reverse also holds: docs written
+`guides/10gbe-link-tuning.mdx`. The reverse also holds: docs written
 since the AI-assisted era began are not a style source either - pattern-match
 the two named exemplars only, regardless of a doc's age. A corpus-wide sweep
 (2026-08-28) removed the known AI prose tells (decorative bold on labels,
