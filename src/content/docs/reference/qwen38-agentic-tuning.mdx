@@ -7,11 +7,12 @@ category: workstations
 
 How the daily-driver Qwen3.8-27B preset got its current shape: MTP speculative decoding disqualified by a decode-degradation bug, the draftless ngram-mod found to degrade the same way, and the xhigh-vs-medium reasoning-effort question settled with a sensor-gated task suite. Picks up where [the bench numbers](/reference/local-model-bench/) left off; written for anyone serving this model to an agent harness rather than a chat box.
 
-**Provenance.** The speculative-decoding and reasoning-effort numbers were measured 2026-08-18 to 2026-08-19 on an RTX 5090 (32 GB), llama.cpp b10362 then b10472, Qwen3.8-27B Q4_K_M (unsloth GGUF), 196608-token context x 2 slots, model-card sampling (temp 1.0, top_p 0.95, top_k 20, min_p 0). The template, quant and thinking-budget sections were measured 2026-09-02 on the same GPU and pin, by then on UD-Q4_K_M at 262144-token context x 1 slot. Every claim below is measured unless marked community-reported; the upstream bugs are cited to their llama.cpp issues.
+**Provenance.** The speculative-decoding and reasoning-effort numbers were measured 2026-08-18 to 2026-08-19 on an RTX 5090 (32 GB), llama.cpp b10362 then b10472, Qwen3.8-27B Q4_K_M (unsloth GGUF), 196608-token context x 2 slots, model-card sampling (temp 1.0, top_p 0.95, top_k 20, min_p 0). The template, quant and thinking-budget sections were measured 2026-09-02 on the same GPU and pin, by then on UD-Q4_K_M at 262144-token context x 1 slot. The NInfer engine section was measured 2026-09-06 to 2026-09-07 on the same GPU: NInfer at upstream commit 487f897, the Qwen3.8-27B NVFP4 `.ninfer` artifact, 262144-token context on one lane, fp8 KV, `--spec mtp --draft-tokens 3 --lm-head-draft`. Every claim below is measured unless marked community-reported; the upstream bugs are cited to their llama.cpp issues.
 
 **TL;DR**
 
-- MTP (`--spec-type draft-mtp`) gives +15% generation on short bursts, then degrades to ~0.5 tok/s within about 10 minutes of agentic task traffic. Restart restores it; the degradation returns. Not usable for loops.
+- MTP (`--spec-type draft-mtp`) gives +15% generation on short bursts, then degrades to ~0.5 tok/s within about 10 minutes of agentic task traffic. Restart restores it; the degradation returns. Not usable for loops **on llama.cpp** - the qualifier matters, see the engine section below.
+- The same model's MTP sustains on a different engine. NInfer holds 45-64% draft acceptance across a whole multi-milestone build-out with decode flat from 30K to 100K of context, which places the failure in llama.cpp's speculation path rather than in the model's recurrent state.
 - `ngram-mod` (draftless, a ~16 MB hash pool over the server's own history) measured +93-100% generation on a cold pool - and then degraded identically to MTP under real task-suite churn. The only stable config for agentic loops on this model is no speculation at all.
 - `reasoning_effort = "medium"` is quality-neutral on the task suite (the ceiling tasks fail identically at both efforts) and removes the thinking-binge lottery: xhigh once spent 1308.5 s on a task that also completed in 19.7 s.
 - Bump your llama.cpp pin: b10472 fixes an abandoned-stream slot-parking bug that freezes slots under harnesses that timeout-kill their clients.
@@ -25,6 +26,7 @@ How the daily-driver Qwen3.8-27B preset got its current shape: MTP speculative d
 | Agentic loops, benches, unattended runs | none | medium | both speculators degrade under churn; medium kills binges |
 | Interactive coding/chat, babysat | `draft-mtp` or `ngram-mod` | xhigh | +15% gen (MTP) or +93% cold (ngram) while the server is fresh; watch for drift |
 | Anything long-lived on b10362 | none | - | slot parking on abandoned streams; upgrade |
+| Agentic loops, if you can run NInfer | `mtp` (draft 3) | medium | speculation holds under churn on that engine; Qwen-only, sm_120a-only |
 
 ## The MTP degradation
 
@@ -59,6 +61,65 @@ Two honest caveats on the warm-pool number. The perf harness reuses canned promp
 
 The shared-mechanism hypothesis for both speculators: every rejected draft forces a rollback of the hybrid Gated DeltaNet recurrent state, and the rollback cost grows with context; at agentic-loop context sizes (24k+ tokens, growing) the rollback dominates until decode crawls, while prompt processing - a different path - stays fast. No-spec never rolls back, which fits the control. Upstream also tracks a separate ngram-mod stuck-loop on failed verification[^pr-25819]. If a future pin fixes the state-rollback cost, the perf numbers above justify re-testing; until then this stack runs no speculation on the daily-driver preset.
 
+That hypothesis is now partly falsified, and the next section is why: it predicts the failure for any engine running this architecture, and one engine does not show it.
+
+## The same speculator, a different engine
+
+Both speculator findings above were measured on llama.cpp, and the rollback
+hypothesis makes a prediction that reaches past it: if rejected drafts force a
+recurrent-state rollback whose cost grows with context, any engine running
+this architecture under agentic churn should crawl the same way. NInfer, a
+from-scratch C++/CUDA engine for explicitly registered Qwen checkpoints[^ninfer],
+does not.
+
+Measured over 336 requests of real agentic coding traffic - the engine driving
+a four-milestone Rust and TypeScript build-out to all-sensors-green, prompt
+contexts to 88,985 tokens:
+
+| ctx bucket | requests | decode p50 |
+|---|---|---|
+| 0-10K | 18 | 180.0 tok/s |
+| 30-50K | 38 | 141.1 tok/s |
+| 50-70K | 42 | 142.3 tok/s |
+| 70-100K | 37 | 136.5 tok/s |
+
+Decode drifts 141 to 136 tok/s across 30K to 100K of context. MTP draft
+acceptance held at a 64% median (45.5-94.4% range) for the whole run, with
+zero engine errors and no restarts. On llama.cpp the same speculator on the
+same model decays to ~0.5 tok/s within ten minutes, and a community
+measurement thread reports its no-spec decode falling 122 to 69 tok/s as
+context fills[^megathread].
+
+So the degradation is a property of an implementation, not of Gated DeltaNet
+rollback. That does not repair llama.cpp - it narrows where to look, and it
+retires "speculation cannot work on this model under churn" as a conclusion.
+
+The catch is coverage, and it is severe. NInfer serves five explicitly
+registered Qwen artifact identities and rejects every other checkpoint, its
+build targets `sm_120a` only, and each artifact is a single file carrying its
+own tokenizer and chat template[^ninfer]. Of the eight presets on this box, two
+map to it and the Gemma and LFM ones never can. It is a second engine for one
+model family, not a replacement.
+
+Two configuration traps cost most of a day before any of the above measured
+cleanly, and both are invisible in the harness report:
+
+- **Thinking effort is a per-request field on this engine, not a serve flag,
+  and the artifact's template exposes `low|medium|xhigh`.** The OpenAI
+  protocol's `high` is parsed and then rejected with
+  `reasoning_effort_not_supported`, because the engine validates against the
+  template embedded in the artifact rather than translating vocabularies[^ninfer-serving].
+  A client sending the protocol default gets HTTP 400 on every request.
+- **A missing output cap truncates mid-thought.** With no explicit
+  `maxTokens` the harness applied a 16,384 default; at xhigh one tool call
+  produced 35,747 output tokens, so responses were cut before emitting a tool
+  call or any text. The agent exited 0 having changed nothing, twice, which
+  reads as model incapability rather than a ceiling.
+
+Neither is fixable in the preset, because the template ships inside the
+artifact. They belong in the proxy, which is the one place that fixes them for
+every client at once.
+
 ## Reasoning effort: xhigh vs medium
 
 The A/B ran the sensor-gated task suite with both arms speculation-free, isolating the effort lever.
@@ -78,7 +139,9 @@ The xhigh t2 row is the argument: the same one-iteration task measured 19.7 s in
 
 The community read on this is genuinely split: one set of reports runs xhigh unattended overnight with zero failures and sees no reason to drop; another reports endless re-thinking even at medium; a measurement thread puts medium at roughly the previous generation's default quality[^overbring]. The task-suite answer for this stack: identical failure outcomes on the hard tasks, no binges on the easy ones. xhigh stays one preset away for babysat work where the extra thinking is worth supervising.
 
-Mechanics, for llama.cpp: the level goes in as a chat-template kwarg, `--chat-template-kwargs '{"reasoning_effort":"medium"}'` (compact JSON; the flag word-splits). xhigh is the server default and injects "think carefully" language; community reports put it at 15k-40k thinking tokens per one-shot prompt[^qwen-card].
+A second argument for medium arrived from operations rather than the task suite. Running an unattended loop on the NInfer engine at inherited xhigh, one tool call produced 35,747 output tokens - inside the 15k-40k band the community reports[^qwen-card], and enough to blow a 16,384-token response cap mid-thought. Two iterations exited cleanly having written nothing. The task-suite case for medium is that it costs nothing in quality; the operational case is that xhigh's tail interacts badly with every output ceiling downstream of it.
+
+Mechanics, for llama.cpp: the level goes in as a chat-template kwarg, `--chat-template-kwargs '{"reasoning_effort":"medium"}'` (compact JSON; the flag word-splits). xhigh is the server default and injects "think carefully" language; community reports put it at 15k-40k thinking tokens per one-shot prompt[^qwen-card]. On NInfer it is a per-request field instead, and `high` is rejected outright - see the engine section.
 
 ## The thinking budget, and why nothing sets it
 
@@ -119,6 +182,8 @@ Deployed here 2026-08-23 at v22.3. Smoke-tested across 13 cases: basic chat, mul
 
 The repo ships new versions faster than a stack notices. v22.4 landed the day after v22.3 was deployed here and went unnoticed for ten days: it adds multi-tool token alignment (dropping a stray newline before `<tool_call>`) and handling for an assistant `message.reasoning` field. Measured on the four fast fixture tasks, two runs each, same GGUF, container respawned so the new template actually loaded: both versions passed 8 of 8, but loop iterations fell from 12 to 8 - every v22.4 run converged on its first attempt, where v22.3 needed two or three on three of them - and total wall time fell from 543.4 s to 452.0 s. Small sample, and wall time on this suite is noisy, but the iteration count is the signal and it points where the release notes claim: a malformed tool call is exactly what costs an iteration. Check the template repo on a schedule; a template bug reads as a model failure.
 
+None of this transfers to NInfer. Its artifacts embed their own chat template, resolved at startup from the file rather than supplied by a flag, so there is no `--chat-template-file` to point at the community fix and no way to apply it short of rebuilding the artifact. Whether those template bugs are present there is unmeasured; the effort vocabulary differs, which is evidence the template is a different one.
+
 ## The quant your config names can stop existing
 
 A preset here carries a HuggingFace repo plus filename, which the container uses as a download fallback when the file is absent locally. Nothing re-validated that pair after the first download.
@@ -140,7 +205,7 @@ Two readings had to be retracted along the way, both from impatience. A first tw
 
 ## The verdict
 
-The boring config wins. The daily-driver preset is now: model-card sampling (temp 1.0, top_p 0.95, top_k 20, min_p 0), `reasoning_effort = "medium"`, no thinking budget, no speculation, the community-fixed chat template, unsloth's `UD-Q4_K_M`, and the full 262144-token context on one slot. Every release-week optimisation that looked good in a short benchmark - MTP, ngram stacking, KV quant stretches, "recommended" sampling - either degraded under the actual workload or was never the author's to recommend. xhigh + MTP stays one preset away for babysat interactive sessions where the +15% matters and a restart is cheap; if upstream fixes the recurrent-state rollback cost, the ngram-mod numbers above justify a re-test.
+The boring config wins. The daily-driver preset is now: model-card sampling (temp 1.0, top_p 0.95, top_k 20, min_p 0), `reasoning_effort = "medium"`, no thinking budget, no speculation, the community-fixed chat template, unsloth's `UD-Q4_K_M`, and the full 262144-token context on one slot. Every release-week optimisation that looked good in a short benchmark - MTP, ngram stacking, KV quant stretches, "recommended" sampling - either degraded under the actual workload or was never the author's to recommend. xhigh + MTP stays one preset away for babysat interactive sessions where the +15% matters and a restart is cheap; if upstream fixes the recurrent-state rollback cost, the ngram-mod numbers above justify a re-test. The boring config is boring about llama.cpp specifically: on NInfer the same model runs MTP under churn without degrading, so a second preset now carries speculation deliberately rather than as a short-burst curiosity.
 
 ## Reading the numbers
 
@@ -156,6 +221,9 @@ The boring config wins. The daily-driver preset is now: model-card sampling (tem
 
 The bench harness is the `llmc bench` module of the llm-compose stack: `llmc bench perf --presets a,b` for the synthetic suite, `llmc bench tasks --presets a,b --tasks t3,t6 --runs 1` for the sensor-gated suite. Preset A/B variants need distinct GGUF filenames because presets deduplicate by model id (derived from the filename stem) - a hardlink costs zero disk. The p5 bench script embeds a `/slots` watchdog that respawns the server when a slot stops making progress, which is what made the long suite runs survivable while the degradation was live.
 
+[^ninfer]: Neroued, "NInfer," GitHub. https://github.com/Neroued/ninfer
+[^ninfer-serving]: Neroued, "HTTP serving," NInfer docs. https://github.com/Neroued/ninfer/blob/master/docs/serving.md
+[^megathread]: r/LocalLLaMA, long-context decode-decay measurements for llama.cpp against vLLM and NInfer, August 2026.
 [^llamacpp-spec]: ggml-org, "Speculative decoding," llama.cpp docs. https://raw.githubusercontent.com/ggml-org/llama.cpp/master/docs/speculative.md
 [^issue-27151]: ggml-org, "MTP draft acceptance collapses over server lifetime," llama.cpp issue #27151. https://github.com/ggml-org/llama.cpp/issues/27151
 [^issue-27296]: ggml-org, "MTP breaks long/short inference (Qwen3.8-27B)," llama.cpp issue #27296. https://github.com/ggml-org/llama.cpp/issues/27296
