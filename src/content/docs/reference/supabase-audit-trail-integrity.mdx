@@ -1,0 +1,319 @@
+---
+title: "Auditing Supabase: where each copy of an event lives, and who can erase it"
+description: A managed project's tenant holds its most privileged database credential, so every "is the audit trail tamper-proof" question resolves to which side of the tenant boundary each copy of an event sits on. Five surfaces, measured on two fresh projects - who can delete or forge each one, what erasing leaves behind, how long each copy is kept per plan, and the one credential class that cannot reach the auth schema at all.
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+An auth event on Supabase is recorded in more than one place, and the places differ in who can write to them. One is a table in the tenant's own Postgres, owned by `supabase_auth_admin` - and the tenant's database password holds the same five write privileges on it that the owner does (A01b). The others belong to the platform. This reference maps the copies, measures who can delete or forge each one, what erasing leaves behind, and how long each is kept.
+
+<Aside type="note">
+Rows marked **measured** were run on 2026-09-08 by the [supabase-lab](https://github.com/erfianugrah/supabase-lab) `audit-integrity` experiment against two FRESH Micro projects in `ap-southeast-1` on Postgres 17.6 - one on a Pro-plan organization, one on a Team-plan organization - each created for the run and destroyed after it. A fresh project is the point: a privilege or logging default read off a months-old project is a fact about that project, and the same reading on a project minutes old is a fact about the platform. Every module id is named per row; the redacted artifacts are published under `experiments/audit-integrity/out/2026-09-08/`. Rows marked **documented** cite the vendor page and were not run.
+</Aside>
+
+**TL;DR:**
+
+- **The in-database copy is off by default.** `audit_log_disable_postgres` reads `true` on a fresh project, so `auth.audit_log_entries` stays empty through real logins. The switch is Dashboard-only: a Management API PATCH asking for the opposite value answers `200` and leaves it unchanged (A06a, A06b, A06c).
+- **Four database roles can write to that table, and none of them is an API role.** `postgres`, `dashboard_user`, `supabase_admin` and `supabase_auth_admin` hold delete and truncate; `service_role`, `anon` and `authenticated` hold nothing at all, not even select (A01b, A02a).
+- **As `postgres`, forging and rewriting work as well as deleting.** An inserted entry with a chosen actor and source IP and a `created_at` three days in the past, and an in-place `UPDATE` of an existing row's IP and action, were both accepted. The table has a primary key and nothing else - no foreign key to `auth.users`, no trigger, no `updated_at` (A01a, A02b, A02c).
+- **Erasing it leaves no statement in the logs.** Defaults are `log_statement=ddl`, `log_min_duration_statement=-1`, `log_connections=off`, no pgaudit. A DDL control statement carrying a nonce was first seen in `postgres_logs` 32 s after it was fired, while a bare `DELETE` and a bare `TRUNCATE` with their own nonces were still absent at the end of a 192 s search (A01d, A03a, A03b, A03c).
+- **pgaudit session mode catches the delete and the truncate at 32 s each, with no restart. Object mode catches the delete at 33 s and misses the truncate entirely**, even with truncate granted to the auditor role (A04b, A04c). `log_statement` is not settable through the Management API: the PUT answers `400 Unrecognized key` (A04a).
+- **The platform audit log records control-plane calls; SQL execution is absent from it**, and it has no API surface at all - 0 of 115 `/v1` paths mention audit (A07b, plus a Dashboard read).
+- **Retention is an entitlement, so the compliance answer names a plan.** The `security.audit_logs_days` entitlement reads no-access, 0 days on Free and Pro and 62 days on Team; `log.retention_days` reads 1 day on Free, 7 on Pro and 28 on Team (A07a).
+- **With the copy switched on, erasing it is measurable by comparison.** Six events wrote 6 rows to the table and 6 to the stream; a `DELETE` took the table to 0 and left the stream at 6 (A05e).
+- **A minted CLI login role cannot reach the auth schema in either variant.** `read_only` and read-write both answer `permission denied for schema auth` on `auth.audit_log_entries`, which makes them strictly weaker than the project database password against the audit trail (A12b, A12c).
+
+## The copies of one auth event
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  login [label="a login"];
+  gotrue [label="Auth server (GoTrue)"];
+
+  subgraph cluster_tenant {
+    label="inside the tenant boundary";
+    table [label="auth.audit_log_entries\n(off by default)"];
+  }
+
+  subgraph cluster_platform {
+    label="platform side (one log stream, several sources)";
+    stream [label="auth_audit_logs\n(log source)"];
+    pglogs [label="postgres_logs\n(platform store,\ntenant-controlled collection)"];
+    orgaudit [label="organization audit log\n(Dashboard only)"];
+    backups [label="backups and PITR"];
+  }
+
+  login -> gotrue;
+  gotrue -> table [label="only when the switch is on"];
+  gotrue -> stream [label="first seen 2 s / 33 s"];
+  table -> backups [label="physical copy"];
+  orgaudit -> orgaudit [label="control-plane calls only"];
+}
+```
+
+Reading the diagram as text:
+
+1. A login reaches the Auth server, which writes the event to the platform log stream. First visible 2 s after the writes on the Pro-plan project and 33 s on the Team-plan one, one run each at a 30 s poll interval (A05c).
+2. The same event reaches `auth.audit_log_entries` inside the tenant's database only when the Dashboard switch is on. It is off on a fresh project (A06c).
+3. `postgres_logs` is a platform-side store and a source of the same log stream, but what gets written into it is decided by tenant-controlled settings, so a tenant can stop the collection without reaching the store.
+4. The organization audit log records control-plane API and Dashboard calls against the project. It does not record SQL execution.
+5. Backups and PITR hold a physical copy of the table, and the restore paths sit under the same project scope as the credential that can delete from it (A10b, path enumeration only).
+
+## Where each copy lives
+
+| Copy | Written by | Tenant can delete | Tenant can forge | Default state | Retention |
+|---|---|---|---|---|---|
+| `auth.audit_log_entries` | the Auth server, into the tenant's Postgres | yes, as 4 roles (A01b) | yes, as `postgres` (A02b) | **off** (A06c) | tenant's own |
+| `auth_audit_logs` stream | the platform | no write path found or tried | no write path measured; a forged table row does not reach it (A05d) | on | 1 (Free) / 7 (Pro) / 28 (Team) days, from `log.retention_days` (A07a) |
+| `postgres_logs` | the platform | no, but collection is tenant-controlled (A04) | not probed | `log_statement=ddl`, no pgaudit (A01d) | 1 (Free) / 7 (Pro) / 28 (Team) days, from `log.retention_days` (A07a) |
+| Organization audit log | the platform | no API path exists (A07b) | not probed | on where entitled | 0 (Free) / 0 (Pro) / 62 (Team) days, from `security.audit_logs_days` (A07a) |
+| Backups and PITR | the platform | no delete path; a restore that overwrites sits under the same PAT scope (A10b) | not probed | `pitr_enabled=false` on a new project (A10a) | 0 (Free) / 7 (Pro) / 14 (Team) days, from `backup.retention_days` (A07a) |
+
+Retention figures throughout are Free / Pro / Team entitlement values read from the API, not expiries anyone watched happen - see the caveat under the entitlement table.
+
+## The one table inside the tenant boundary
+
+`auth.audit_log_entries` is owned by `supabase_auth_admin`, and its ACL on both projects read (A01a, measured):
+
+```
+{supabase_auth_admin=arwdDxtm/supabase_auth_admin,
+ dashboard_user=arwdDxtm/supabase_auth_admin,
+ postgres=ar*wdDxtm/supabase_auth_admin}
+```
+
+Of 10 roles probed, 4 hold delete and truncate - `postgres`, `dashboard_user`, `supabase_admin`, `supabase_auth_admin` - and 5 hold select, the fifth being `supabase_read_only_user`, which holds select alone. `service_role`, `anon`, `authenticated`, `authenticator` and `pgbouncer` hold nothing at all in the grant read (A01b, measured). Three of those five were also exercised rather than read - `service_role`, `anon` and `authenticated` - and each answers `permission denied for table audit_log_entries` to all five operations (A02a, measured).
+
+Two of those roles cannot be exercised from a `postgres` session. `set local role dashboard_user` and `set local role supabase_read_only_user` both answer `permission denied to set role`, because `postgres` is not a member of either, so the Dashboard connects as those roles rather than switching to them from a `postgres` session (A02a, measured). Their privileges in the table above come from the grant read in A01b rather than from an exercised statement.
+
+The columns are `instance_id uuid, id uuid, payload json, created_at timestamptz, ip_address varchar`, with `audit_log_entries_pkey` and no other constraint: 0 foreign keys, 0 user triggers (A01a, measured). Nothing reconciles a row against a user, and there is no serial to detect a gap in.
+
+As `postgres` (A02b, A02c, measured):
+
+- an insert of a `login` entry naming an actor who never logged in, from a chosen source IP, with `created_at` three days in the past - accepted, and read back;
+- an `UPDATE` rewriting an existing row's `ip_address` and its `payload->>'action'` - accepted.
+
+An audit row here is a plain heap row. There is no version column and no `updated_at`, so an edit leaves the row looking like the original.
+
+## What erasing it leaves behind
+
+The platform defaults on both fresh projects were `log_statement=ddl`, `log_min_duration_statement=-1`, `log_connections=off`, `log_disconnections=off`, and pgaudit available at 17.1 but not installed (A01d, measured).
+
+Under those defaults, three statements were fired with unique nonces and then searched for in `postgres_logs` in one query per poll (A03, measured):
+
+| Statement | Found in `postgres_logs` | Search window |
+|---|---|---|
+| `create table` / `drop table` (control) | yes, first seen **32 s** after the fire | 192 s at a 30 s poll interval |
+| `delete from auth.audit_log_entries where ...` | no | the full 192 s |
+| `truncate table auth.audit_log_entries` | no | the full 192 s |
+
+Earlier passes reported 189 s and 191 s for the control. Those were the loop's exit time, not the control's arrival: the search runs to its timeout whenever any marker is missing, and the delete and truncate nonces never arrive. Recording per-marker first-seen times put the control at 32 s and left the two misses bounded by the window, which is the shape the claim needs.
+
+The control proves the query matched and ingestion was live in that window, so the misses are misses and not lag. `log_statement=ddl` does not cover DML, and `log_statement` groups `TRUNCATE` with the data-modifying statements under `mod` rather than with DDL,[^pg-log-statement] which is why `TRUNCATE` - one statement that empties the table - is unlogged too.
+
+The control line that did get logged carries the attribution the platform does provide (A03d, measured):
+
+```
+statement: create table public.a03ddl<nonce>(a int); drop table public.a03ddl<nonce>
+-- source: POST /v1/projects/:ref/database/query
+-- user: pat:<id>
+-- date: 2026-09-08T05:40:26.577Z
+```
+
+`role=postgres`, `application_name=mgmt-api`, plus an appended comment naming the calling route and the acting credential. Every tenant path arrives as the same database role and differs only in the application name: a Dashboard SQL Editor session reports `current_user=postgres, session_user=postgres, application_name=supabase/dashboard-query-editor` on both plans, and `postgres_logs` for the same hour grouped as `postgres/mgmt-api x14` and `postgres/supabase/dashboard-query-editor x1` (A11a, A11b, measured). Attribution is therefore by path, never by person; the person is named in the organization audit log instead.
+
+## The levers that make it visible
+
+`log_statement` is not on the Management API's Postgres configuration surface. `PUT /v1/projects/{ref}/config/database/postgres {"log_statement":"mod"}` answers `400 {"message":": Unrecognized key: \"log_statement\""}`. `log_connections` is accepted and the write takes: the PUT answers `200`, the GET echoes `log_connections=true`, and a session opened afterwards reports `pg_settings.log_connections = on`. No `connection authorized` line was searched up within 97 s, so the setting is confirmed and its output was not (A04d, measured). The GET answered with 0 keys on both fresh projects and 1 key - `log_connections` - on a later pass of the same project after a PUT had set it, so it reports the overrides that have been set instead of the effective configuration (A04a, measured across passes).
+
+pgaudit is the lever that exists, and both of its useful shapes work (A04b, A04c, measured):
+
+| Mode | How it was set | Caught the delete | Caught the truncate | Restart needed |
+|---|---|---|---|---|
+| Session | `create extension pgaudit` then `alter role postgres set pgaudit.log to 'write'` | yes, first seen 32 s | yes, first seen 32 s | no |
+| Object | an auditor role granted select, insert, update, delete AND truncate on the table, set as `pgaudit.role`, with `pgaudit.log` back to `none` | yes, first seen 33 s | **no line across a 193 s window** | no |
+
+The two session-mode figures come from one query covering both nonces, with per-marker first-seen times, so they are two arrivals that happened to fall in the same poll. The object-mode gap is the finding to act on: the auditor role held `TRUNCATE` on the table and the truncate still produced no line, so the mechanism behind object auditing does not cover it. Nothing here establishes why; the measurement is the absence.
+
+The object-mode line is scoped to the one table:
+
+```
+AUDIT: OBJECT,1,1,WRITE,DELETE,TABLE,auth.audit_log_entries,"delete from auth.audit_log_en...
+```
+
+Role-level settings applied to sessions opened after the `ALTER ROLE`, so the reboot the vendor page prescribes for a permanent configuration was not needed for the setting to take effect on new connections.[^sb-pgaudit] Object mode logs only statements touching the granted table, so it adds no lines for the rest of the database traffic.
+
+## The copy a tenant cannot write to
+
+Three admin-created users and three password logins were run twice, once per configuration of the in-database copy (A05, measured):
+
+| In-database copy | Rows in `auth.audit_log_entries` | Rows in `auth_audit_logs` | Stream first visible |
+|---|---|---|---|
+| off (the default) | 0 | 6 | 2 s |
+| on | 6 - `login` x3, `user_signedup` x3 | 6 | 33 s |
+
+With the copy off, the stream is the only record of the login. Before those events the source had produced no rows at all, so it appears when auth audit events do and does not sit there empty; with the copy on, the project's log stream carried 9 sources including `auth_audit_logs` (A05a, measured).
+
+With the copy on, the erasure is measurable as a divergence. A `DELETE` matching the run's six events took the table from 6 rows to 0 and left the stream at 6 (A05e, measured). The comparison needs no cooperation from the tenant's own logging, because the second count comes from a store the tenant has no write path to.
+
+The forged row goes the other way. A05d's own fabricated entry - a separate insert from A02b's, which that module removes - was present in the table and absent from `auth_audit_logs` across a 127 s search on the Pro-plan project and a 126 s search on the Team-plan one, because the stream is fed by the Auth server and not by the table (A05d, measured). A row in one store with no counterpart in the other is the signature, in both directions.
+
+## The admin endpoint reads the table
+
+`GET /auth/v1/admin/audit` is the read a backend holding the service key can make without touching Postgres. It reads `auth.audit_log_entries`, which both configurations demonstrate (A08a, A08b, measured):
+
+- with the copy off, it answered `200` with **0 entries** for its own freshly created user and login, while A05c's six events on the same project were in the stream;
+- with the copy on, it returned 5 entries - the table's whole contents at that moment, the other 3 written by earlier modules on the same project - of which 2 carried this run's tag, visible immediately after the write; after a `DELETE` removed those 2 rows from the table, the endpoint's tagged entries went from 2 to 0.
+
+So erasing the table blinds the admin API in the same statement. `DELETE` and `POST` on that path both answer `405`, so a service-key holder can read the trail over the API but has no route to change or erase it (A08c, measured).
+
+## The platform audit log
+
+The organization audit log is the only store no tenant credential can rewrite, and it has no programmatic reader: 0 of 115 paths in the `/v1` specification mention audit, so no path reads, exports or deletes it.[^sb-platform-audit] The vendor page says the same in prose - no export from the Dashboard, no log drain, retention by plan.
+
+Read in the Dashboard, it records the actor (a named user and their organization role), the method, a description, the HTTP status, the target project and reference, and a timestamp. Reads are included: `GET Get project api keys` and `GET Gets project's settings` appear alongside the mutations.
+
+What it does not record is SQL execution. Across one 20-minute window the page held the experiment's control-plane calls - `PUT Updates project's Postgres co...` at 13:44:48 and 13:44:50, `PATCH Updates a project's auth co...` at 13:44:51 and 13:46:58, `POST [Beta] Create a login role` twice at 13:47:02, `DELETE [Beta] Delete existing login...` at 13:47:03 - while the dozens of `POST /v1/projects/{ref}/database/query` calls the same battery made in the same minutes, including the deletes and truncates against `auth.audit_log_entries`, produced no entry. The window's total was 30 entries against more query calls than that.
+
+<Aside type="caution">
+A first attempt at this comparison used a `GET /v1/projects/{ref}/functions` call as the positive control, and that control did not appear either - listing functions is evidently not an audited action, so the pair proved nothing. The comparison above rests on the experiment's own mutations serving as the control instead: same credential, same project, same minutes, recorded, while the SQL calls were not.
+</Aside>
+
+So the statement that erases the audit trail is absent from both stores that could hold it: `postgres_logs` under the defaults, and the organization audit log, which records no SQL on the Team-plan organization where it exists and does not exist at all on Free or Pro (A07a). The detection that does exist is pgaudit, inside the database the tenant controls, off by default.
+
+## Retention and export are entitlements
+
+`GET /v1/organizations/{slug}/entitlements` returns 64 entitlements per organization, and the audit-relevant ones differ by plan (A07a, measured):
+
+| Entitlement | Free | Pro | Team |
+|---|---|---|---|
+| `security.audit_logs_days` | no access, 0 days | no access, 0 days | 62 days |
+| `log.retention_days` | 1 day | 7 days | 28 days |
+| `backup.retention_days` | no access, 0 days | 7 days | 14 days |
+| `audit_log_drains` | false | false | true |
+| `log_drains` | false | true | true |
+| `pitr.available_variants` | none | `pitr_7`, `pitr_14`, `pitr_28` | `pitr_7`, `pitr_14`, `pitr_28` |
+| `security.private_link` | false | false | true |
+| `security.soc2_report` | false | false | true |
+
+The Pro organization's `security.audit_logs_days` entitlement reads no-access, 0 days, so a Pro project has no platform audit log to read (A07a; no Pro Dashboard page was read). With the in-database copy off by default its backups hold an empty table, which leaves a 7-day platform-side stream as the whole auth audit trail and a project log drain as the only preservation lever.
+
+Read those numbers as entitlement values rather than as observed expiries. The run queried the entitlement endpoint and got the figures above; nothing in the run waited for a log line or an audit entry to age out, so the mapping from a key name to a particular store - `log.retention_days` to the `auth_audit_logs` and `postgres_logs` sources, `security.audit_logs_days` to the organization audit log, `backup.retention_days` to the physical copies - follows the key names and the vendor pages,[^sb-platform-audit] not a measured expiry. Entitlements are also per-organization and move with a plan change or a negotiated term: re-read the endpoint rather than trusting this table.
+
+## Credentials that cannot reach the audit trail
+
+`POST /v1/projects/{ref}/cli/login-role` is a Beta endpoint that mints a temporary database login role and returns the role name, a password and a TTL.[^sb-temp-access] Both variants were minted and exercised through the session pooler as `<role>.<ref>` (A12b, A12c, measured):
+
+| Request | Role | TTL | `select` on the audit table | `delete` on it |
+|---|---|---|---|---|
+| `{"read_only": true}` | `cli_login_supabase_read_only_user` | 300 s | denied, `permission denied for schema auth` | denied, same error |
+| `{"read_only": false}` | `cli_login_postgres` | 300 s | denied, `permission denied for schema auth` | denied, same error |
+
+The read-write variant is refused as firmly as the read-only one, and the refusal is at the schema and not the table. Revocation was checked with the credential itself: the same role and password answered `select 1` immediately before `DELETE /v1/projects/{ref}/cli/login-role`, that call answered `200`, and reconnecting afterwards with the **same correct password** got `FATAL: (EAUTHQUERY) user not found in the database` (A12d, measured). So a 300-second minted credential is strictly weaker against the audit trail than the project database password, which is the one most teams hand out, and revoking it takes effect.
+
+None of the three organizations read had a Read-Only member to exercise (A12a, measured), so the Dashboard half of that role stays documented and unmeasured: the access-control page states that a Read-Only member's SQL runs as `supabase_read_only_user`,[^sb-access-control] which A01b measures as select-only on this table.
+
+## A hash-chained mirror, and the two things it does not catch
+
+The pattern teams reach for once they learn the table is writable: mirror every entry into an append-only table where each row carries a hash over its own contents plus the previous row's hash, fed by a trigger on `auth.audit_log_entries`. It installs, and it works: the ACL grants `postgres` the TRIGGER privilege on a table owned by `supabase_auth_admin`, and a `SECURITY DEFINER` capture function records the rows the Auth server writes as `supabase_auth_admin`. Two users and two logins produced a 4-row mirror that verified end to end, captured immediately (A09a, A09b, measured).
+
+Three removals against that chain (A09e, A09c, A09d, measured, in this order):
+
+| What was removed | What the verifier reported |
+|---|---|
+| the tail, `seq 4` of 4 | **no break**, over the 3 remaining rows |
+| an interior row, `seq 2` of the 3 remaining | first break at `seq 3`, over 2 rows |
+| nothing - every remaining row rehashed after the interior cut | no break over 2 rows; the head hash moved from `5d462b0c189312fb` to `2eb685578caa86b3` |
+
+Each row links to the one before it, so removing the newest rows leaves a chain that still recomputes from end to end. A chain detects an interior removal, and by construction an edit to a row's hashed contents, which A09 did not probe separately; it does not detect truncation, and truncating the most recent entries is the shape someone hiding a recent event would reach for. An interior deletion does break the chain, and the verifier names the first broken link.
+
+The identity that can delete a mirror row can also rehash the entire table, and afterwards the verifier is quiet; the head hash is the only thing that changed. A chain is evidence only if its head left the database before the tampering, so the control is an off-box anchor - a periodic export of the head hash, or the count comparison against the platform stream in "The copy a tenant cannot write to" (A05e) - rather than the chain itself.
+
+<Aside type="note">
+The 2026-09-08 06:10 UTC pass (artifact `run-2026-09-08T06-10-20-608Z`) reported "no break" for what its own output called an interior deletion. The mirror held 2 rows at the time, so "the second row" was the tail, and the module was measuring truncation while claiming to measure an interior cut. It now creates two users so a genuinely interior row exists, and reports the tail and interior cases as separate rows. The numbers above are from the 06:15 UTC pass (`run-2026-09-08T06-15-19-378Z`).
+</Aside>
+
+## Reading the numbers
+
+- **Separate the arrival from the window.** The control arrived at 32 s; the 192 s figure is how long the search ran, which is what bounds the two misses. The earlier 189 s and 191 s readings were the loop's exit time reported as an arrival, and that is the shape to distrust in any polled measurement here.
+- **The pgaudit figures are statement-to-visible-in `postgres_logs`**, a different source of the same unified log stream from the `auth_audit_logs` that the reconciliation check uses. They are poll-derived at a 30 s interval, so the interval is their granularity and 32 s and 33 s are the same poll; they are not a platform SLA.
+- **The stream's visibility figures are 2 s and 33 s on two projects.** Both are poll-derived and neither is a platform guarantee; reconcile on a window wide enough to absorb the slower one.
+- **The privilege and default readings reproduced across both plans**, which is why they are stated as platform behaviour and not as per-project readings. The retention and export numbers did not reproduce across plans, which is the point of that table.
+- **What does not generalise**: the entitlement values, for the reasons under that table, and the two projects' region. Everything measured here ran in `ap-southeast-1`.
+
+## What to do about it
+
+| Do this | Why | Rests on |
+|---|---|---|
+| Decide deliberately whether `auth.audit_log_entries` is on, and record the decision | It is off by default, so a compliance answer that assumes a queryable audit table is wrong until someone flips it in the Dashboard | A06a, A06c |
+| Do not build the toggle into automation | The Management API PATCH answers `200` and changes nothing, so a pipeline that "enforces" it will report success and do nothing | A06b |
+| Turn on pgaudit session-mode `write` for the role that runs SQL if you need `TRUNCATE` covered | It is the only setting measured to record both a delete and a truncate on the audit table, both first seen at 32 s | A04b |
+| Add pgaudit object mode on top if the session-mode volume is too high, knowing it misses `TRUNCATE` | Object mode caught the delete at 33 s and produced no line for the truncate across 193 s, with truncate granted to the auditor role - so on its own it leaves the fastest erasure path unlogged | A04c |
+| Set `log_connections` through the Management API | It separates a tenant path from a direct psql session and is off by default; the PUT is confirmed to take, though no connection line was observed in the 97 s after it | A04d |
+| Reconcile the two stores on a schedule: count events per window in `auth.audit_log_entries` against `source = 'auth_audit_logs'` | The stream copy is outside the tenant's write reach; a measured `DELETE` moved the table 6 -> 0 and left the stream at 6 | A05c, A05d, A05e |
+| Treat a table row with no stream counterpart as a forgery signal | The stream is fed by the Auth server, so it never sees a row written directly to the table and lag cannot explain the gap | A05d |
+| Hand out `POST /cli/login-role` credentials instead of the database password | Both variants are refused on the auth schema, so the credential cannot erase the trail it is being used near | A12b, A12c |
+| Send project logs to a drain if the retention you need exceeds the plan's | `log.retention_days` is 1, 7 and 28 by plan, and `log_drains` is available from Pro | A07a |
+| Do not plan to export the organization audit log | There is no API path and no drain for it; on Free and Pro there are 0 days of it | A07a, A07b |
+| Anchor a hash chain outside the database if you build one | The role that can break the chain can rehash the whole table, after which the verifier is quiet and only the head hash has moved | A09d |
+| Do not rely on a hash chain to catch truncation | Deleting the tail of a 4-row chain left it verifying; only an interior deletion broke it | A09e, A09c |
+| Expect PITR to be absent on a new project until you enable it | `pitr_enabled=false` and no physical window on a fresh project; the variants are entitled but not on | A10a |
+| Scope the PAT that can restore separately from the one that runs SQL | Six restore paths sit under the same project scope as the PAT that can delete the rows, so no separate credential boundary exists; no restore was called | A10b |
+
+## Reproducing
+
+The experiment is `experiments/audit-integrity` in [supabase-lab](https://github.com/erfianugrah/supabase-lab). `make up` provisions one Micro on the Pro-plan organization and one on the Team-plan organization - the Free-plan organization is read for entitlements and members only and gets no project - `make probe` runs the battery against the Pro-plan project and `make probe ORG=team` against the Team-plan one, and `make down` destroys both. Module ids in the tables above match the `tests/a*.ts` files, and `PLAN.md` states each module's question and what it deliberately does not settle.
+
+Six modules cannot be driven from a credential alone: A05e, A08b, A09b, A09c, A09d and A09e need the in-database copy switched on, which is Dashboard-only, and A11 needs a human to run one statement in the SQL Editor so there is a non-`mgmt-api` session to find.
+
+## Evidence
+
+| Claim | How it was checked |
+|---|---|
+| ACL, owner, columns, constraints of `auth.audit_log_entries` | Measured, A01a, both projects, `pg_class.relacl` and `information_schema.columns` via the Management query endpoint |
+| 4 of 10 roles hold delete; API roles hold nothing | Measured, A01b (`has_table_privilege`) and A02a (the statements themselves, one subtransaction per cell) |
+| `postgres` cannot `set role dashboard_user` / `supabase_read_only_user` | Measured, A02a, `permission denied to set role` |
+| Forged and rewritten entries accepted | Measured, A02b, A02c |
+| `DELETE` and `TRUNCATE` unlogged under defaults, with a positive control | Measured, A03a (control first seen 32 s into a 192 s search at a 30 s poll interval), A03b, A03c (both absent across the full window). Earlier passes published 189 s / 191 s for the control; those were the search loop's exit time, corrected by recording per-marker first-seen times |
+| Provenance comment and `application_name` on a platform-run statement | Measured, A03d; the Dashboard side confirmed by running `current_user` / `application_name` in the SQL Editor (A11b) |
+| `log_statement` not settable; the `log_connections` write takes | Measured, A04a (`400 Unrecognized key`; GET returns set overrides only - 0 keys fresh, 1 after a PUT), A04d (`200`, GET echoes `true`, a later session reports `on`; no connection line seen in 97 s) |
+| pgaudit session mode catches delete and truncate; object mode catches delete and misses truncate | Measured, A04b (both first seen 32 s), A04c (delete 33 s; no truncate line across 193 s with truncate granted to the auditor role), neither needing a restart |
+| 6 events in `auth_audit_logs` with the copy off (0 in the table, stream at 2 s), and 6 in both with it on (stream at 33 s) | Measured, A05a, A05b, A05c, one run per configuration |
+| A `DELETE` moved the table 6 -> 0 while the stream stayed at 6 | Measured, A05e, with the in-database copy switched on in the Dashboard |
+| The admin audit endpoint's entries follow the table (2 -> 0 after the delete) | Measured, A08a, A08b |
+| Forged row absent from the stream across 127 s | Measured, A05d |
+| `audit_log_disable_postgres=true` by default; PATCH is a no-op | Measured, A06a, A06b, A06c, on two fresh projects in two organizations |
+| `/auth/v1/admin/audit` returns 0 entries with the copy off; `DELETE`/`POST` are 405 | Measured, A08a, A08c |
+| A trigger on `auth.audit_log_entries` fires for the Auth server's own insert | Measured, A09b, SECURITY DEFINER capture function, entry mirrored immediately |
+| A chain misses a tail deletion and catches an interior one | Measured, A09e (no break after removing `seq 4` of 4) and A09c (first break at `seq 3` after removing an interior row); the 06:10 UTC pass conflated the two cases on a 2-row mirror and was corrected in the 06:15 UTC pass |
+| A rehash by the same role silences the verifier | Measured, A09d, head hash moved `5d462b0c1893` -> `2eb685578caa` |
+| 0 of 115 `/v1` paths mention audit | Measured, A07b, against the published OpenAPI document |
+| The organization audit log records control-plane calls and not SQL | Measured by Dashboard read on the Team-plan organization, with the experiment's own mutations as the control after the first control choice proved invalid; there is no API to assert this from |
+| Entitlement values per plan | Measured, A07a, `GET /v1/organizations/{slug}/entitlements`, three organizations |
+| CLI login roles refused on the auth schema, both variants | Measured, A12b, A12c, connected through the session pooler. One `read_only` connect probe failed with `password authentication failed` seconds after minting while the two probes after it authenticated, so treat a credential as usable only after a successful connect |
+| Revoking a minted login role takes effect | Measured, A12d: the same role and password answered before `DELETE /cli/login-role` and got `FATAL: (EAUTHQUERY) user not found in the database` after |
+| No Read-Only member exists in any organization read, so that role could not be exercised | Measured, A12a |
+| `pitr_enabled=false`, 1 logical backup, no physical window on a fresh project | Measured, A10a |
+| 6 restore paths reachable with the same PAT | Measured, A10b, path enumeration; no restore was performed |
+| A Read-Only Dashboard member's SQL runs as `supabase_read_only_user` | Documented, not tested - no Read-Only member existed to exercise[^sb-access-control] |
+| A restore-and-diff recovers deleted audit rows | Not run. The levers were enumerated and the physical window read as absent on a fresh project (A10a, A10b); the recovery itself costs a project restore |
+
+## Related docs
+
+- [Locking down Supabase: the database is the security boundary](/reference/supabase-data-surface-lockdown/) - the grant and RLS boundary this doc's privilege readings sit inside.
+- [Supabase Auth end to end](/reference/supabase-auth-end-to-end/) - the `auth` schema and the issuer that writes these events.
+- [Trusted-device MFA and impersonation audit trails on Supabase Auth](/guides/supabase-auth-mfa-trusted-device-and-impersonation-audit/) - actor attribution for an impersonated session, and the first measurement of the empty-by-default audit table.
+- [Query Supabase project logs through the Management API](/guides/supabase-management-api-logs-endpoint/) - how to pull the stream copy programmatically.
+
+[^sb-pgaudit]: Supabase, "PGAudit: Postgres Auditing," Supabase Docs. https://supabase.com/docs/guides/database/extensions/pgaudit
+[^pg-log-statement]: PostgreSQL, "Error Reporting and Logging - log_statement," PostgreSQL Documentation. https://www.postgresql.org/docs/current/runtime-config-logging.html#GUC-LOG-STATEMENT
+[^sb-platform-audit]: Supabase, "Platform Audit Logs," Supabase Docs. https://supabase.com/docs/guides/security/platform-audit-logs
+[^sb-access-control]: Supabase, "Access Control," Supabase Docs. https://supabase.com/docs/guides/platform/access-control
+[^sb-temp-access]: Supabase, "Temporary access," Supabase Docs. https://supabase.com/docs/guides/platform/temporary-access
