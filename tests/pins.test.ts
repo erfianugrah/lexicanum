@@ -882,6 +882,40 @@ const pins: Pin[] = [
     ],
   },
   {
+    doc: "reference/supabase-audit-trail-integrity",
+    mustContain: [
+      // A06 (2026-09-08, two fresh projects in two organizations): the
+      // in-database copy is OFF by default and the API PATCH is a no-op. Both
+      // halves are load-bearing - a reader who takes only the first half
+      // automates a switch that silently does nothing.
+      "audit_log_disable_postgres",
+      "answers `200` and leaves it unchanged",
+      // A01b/A02a: the API roles hold nothing at all, and postgres cannot
+      // assume the two Dashboard roles, so the matrix covers 4 of 6.
+      "not even select",
+      "permission denied to set role",
+      // A03: the positive control is what licenses the two misses. If the
+      // control sentence goes, the claim becomes an unsupported absence. The
+      // second string also holds the line that stops the window bound being
+      // read as an ingestion latency, which is how it was first published.
+      "189 s",
+      "so the misses are misses and not lag",
+      // A04a: statement-level DML logging is not a platform toggle.
+      'Unrecognized key',
+      // A05e: the divergence that makes reconciliation a real check.
+      "6 rows to 0 and left the stream at 6",
+      // A07b plus the Dashboard read: the platform audit log records
+      // control-plane calls and no SQL execution.
+      "SQL execution is absent from it",
+      // A09e: a chain does not catch truncation. This is the one most likely
+      // to be softened into "a chain detects tampering".
+      "it does not detect truncation",
+      // A12b/A12c: both variants are refused at the schema.
+      "permission denied for schema auth",
+    ],
+    sections: [/^## What to do about it$/m, /^## Evidence$/m, /^## Reading the numbers$/m, /^## Reproducing$/m],
+  },
+  {
     doc: "reference/supabase-data-surface-lockdown",
     mustContain: [
       // S21 (2026-09-03): the anon-only revoke left every RPC callable; the
