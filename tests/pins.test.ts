@@ -672,7 +672,6 @@ const pins: Pin[] = [
       /^## Extraction, and where it can run$/m,
       /^## Reading the numbers$/m,
       /^## Evidence$/m,
-      /^## Sources$/m,
     ],
   },
   {
@@ -787,7 +786,7 @@ const pins: Pin[] = [
       // prose, so pin the constants-table phrasing instead).
       "never `>=500` alone",
       // File reference links out to the public repo.
-      "github.com/erfianugrah/supabase-lab/blob/0998c69/experiments/edge-resilience/worker/worker.ts",
+      "github.com/erfianugrah/supabase-lab/blob/0769afb/experiments/edge-resilience/worker/worker.ts",
     ],
     linksTo: ["reference/supabase-incident-resilience"],
   },

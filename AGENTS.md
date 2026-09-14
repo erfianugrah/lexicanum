@@ -101,6 +101,7 @@ Body sections (concept-ordered; tables over prose; Asides for gotchas)
 Reading-the-numbers / what-generalises - if measured
 Decision guide (closing diagram)
 Reproducing / Evidence table (tested vs design-only) - if measured
+Modules - if lab-backed (see Modules section)
 References  (auto-rendered from footnotes; see Citations)
 ```
 
@@ -118,6 +119,7 @@ Part 1..N / Step 1..N (sequential, each independently verifiable)
 Verification
 Gotchas and Lessons Learned
 File Reference / File Structure
+Modules - if lab-backed (see Modules section)
 References - only if the guide makes attributable factual claims (usually optional)
 ```
 
@@ -156,6 +158,30 @@ claim, and a References list renders at the bottom. Mechanism:
 **Guides**: keep links inline in the step where they're used (flow beats
 attribution in a how-to). Add a References footnote list only if the guide is
 reference-heavy and makes standalone factual claims (e.g. `magic-wan-interop`).
+
+**Modules** (lab-backed pages, added 2026-09-14). A page that cites supabase-lab
+module ids ends with a `## Modules` table - `Module | Experiment | Test |
+Artifact` - listing every id the page cites, with the test file that produced it
+and the published `out/<date>/` artifact, or `none published` where the
+experiment has none. It exists because module ids collide across experiments
+(`S01` is both `security-lockdown` and `sfp-platforms`; `D01` is both
+`compute-disk` and `platform-downtime`; `L01` is both `iap-lockdown` and
+`rate-limits`), so a bare id in prose is not resolvable without the page saying
+which experiment it means. Rules:
+
+- The `Experiment` column is the disambiguator. When a page cites one id in two
+  senses, it gets **two rows**, one per experiment. Three pages do
+  (`supabase-compute-disk`, `supabase-incident-resilience`,
+  `supabase-resilience-runbook`).
+- Evidence-column ids stay inline-linked as above; the table is for the ids a
+  page cites only in prose, which is why it does not replace inline links.
+- An id recorded only in an experiment's RUNLOG rather than as a module (a
+  manual drill, a finding without a test) links to that RUNLOG and says so.
+  `W14`, `T11` and `G12` are the known cases.
+- The section goes before `## Related docs` / `## See also`, which stay last,
+  and before the footnote definitions.
+- Do not add one for a single borrowed module - link it inline in the prose that
+  already attributes it (`reference/caching` is the case that established this).
 
 Cite the source path when answering from docs.erfi.io in chat, too.
 
