@@ -163,21 +163,18 @@ reference-heavy and makes standalone factual claims (e.g. `magic-wan-interop`).
 module ids ends with a `## Modules` table - `Module | Experiment | Test |
 Artifact` - listing every id the page cites, with the test file that produced it
 and the published `out/<date>/` artifact, or `none published` where the
-experiment has none. It exists because module ids collide across experiments
-(`S01` is both `security-lockdown` and `sfp-platforms`; `D01` is both
-`compute-disk` and `platform-downtime`; `L01` is both `iap-lockdown` and
-`rate-limits`), so a bare id in prose is not resolvable without the page saying
-which experiment it means. Rules:
+experiment has none. It exists because module ids collide across experiments:
+`S01` is both `security-lockdown` and `sfp-platforms`, `D01` is both
+`compute-disk` and `platform-downtime`, `L01` is both `iap-lockdown` and
+`rate-limits`.
 
-- The `Experiment` column is the disambiguator. When a page cites one id in two
-  senses, it gets **two rows**, one per experiment. Three pages do
-  (`supabase-compute-disk`, `supabase-incident-resilience`,
-  `supabase-resilience-runbook`).
+- When a page cites one id in two senses, it gets two rows, one per experiment
+  (e.g. `supabase-compute-disk`).
 - Evidence-column ids stay inline-linked as above; the table is for the ids a
-  page cites only in prose, which is why it does not replace inline links.
+  page cites only in prose.
 - An id recorded only in an experiment's RUNLOG rather than as a module (a
-  manual drill, a finding without a test) links to that RUNLOG and says so.
-  `W14`, `T11` and `G12` are the known cases.
+  manual drill, a finding without a test) links to that RUNLOG and says so -
+  `W14`, `T11` and `G12` are of that kind.
 - The section goes before `## Related docs` / `## See also`, which stay last,
   and before the footnote definitions.
 - Do not add one for a single borrowed module - link it inline in the prose that
@@ -349,10 +346,15 @@ Five rules that review passes on 2026-09-02 and 2026-09-03 kept re-deriving, now
   and point at the published `out/` artifact where one exists, so module ids in
   the evidence table stay resolvable after the lab moves on.
 - **Every lab-backed page ends in practices.** A "What to do about it"
-  section (or the page's older equivalent) with imperative rows and a "Rests
-  on" column naming the module id that measured the claim; `tests/pins.test.ts`
-  requires the heading on every such page. A row whose figure has no lab
-  record says so in the cell. The 2026-09-03 pass over 34 pages found that
+  section (or the page's older equivalent), as a `Practice | Evidence | Module`
+  table; `tests/pins.test.ts` requires the heading on every such page. The
+  Practice cell is the imperative alone, under 90 characters. Do not drop an
+  API path or an identifier to hit that. Everything that justifies it (figures,
+  error codes, reasoning) goes in Evidence; Module names the module id that
+  measured the claim. A page with a leading axis column keeps it, and the table
+  is four columns, as `supabase-edge-function-limits` does with "Ceiling or
+  failure". A row whose figure has no lab record says so in the cell.
+  The 2026-09-03 pass over 34 pages found that
   most defects were attribution, not prose: a module cited for something it
   did not measure, or a figure that exists only in this corpus.
 
