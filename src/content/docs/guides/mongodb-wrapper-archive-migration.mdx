@@ -1,6 +1,6 @@
 ---
 title: Migrating a static MongoDB archive into Postgres with the Supabase MongoDB wrapper
-description: The MongoDB wrapper is a live foreign-data-wrapper connector, not a migration tool - so for a static archive the right move is a one-off copy through it, then decommission Mongo. Covers why the wrapper is native (platform-only), a batched _id-keyset copy that is idempotent and resumable, and the empty-string keyset gotcha that silently copies zero rows through the wrapper but not against a plain-text stub.
+description: The MongoDB wrapper is a live foreign-data-wrapper connector; for a static archive, copy through it once, then decommission Mongo. Covers why the wrapper is native (platform-only), a batched _id-keyset copy that is idempotent and resumable, and the empty-string keyset gotcha that silently copies zero rows through the wrapper but not against a plain-text stub.
 author: "Erfi Anugrah"
 category: supabase
 group: migrations
@@ -17,17 +17,15 @@ unappealing. The [Supabase MongoDB wrapper](https://supabase.com/docs/guides/dat
 gets floated as a way to just *keep the data in Mongo and query it from Postgres*,
 with no migration at all.
 
-That framing is wrong. The wrapper is a **live foreign-data-wrapper (FDW)
-connector, not a migration shortcut**. Data stays in Mongo and Postgres queries
-it over the network on every scan. As a bridge while you migrate the rest it is
+The wrapper is a live foreign-data-wrapper (FDW) connector: data stays in
+Mongo and Postgres queries it over the network on every scan. As a bridge while you migrate the rest it is
 fine; as a way to *avoid* migrating that data forever it means you keep running
 and paying for two databases, and you keep an inbound network path open between
 Supabase and your Mongo box indefinitely.
 
-For a **static archive** the calculus is simple: an extra system running
-forever for data that never changes is more overhead than a one-time copy. So
-use the wrapper as a **one-off copy tool**, verify row counts, then drop the
-connection and decommission Mongo.
+For a static archive, a one-time copy costs less than a second database
+running indefinitely for data that never changes, so use the wrapper once to
+copy, verify row counts, then drop the connection and decommission Mongo.
 
 This guide is the whole path, verified end-to-end against a real hosted Supabase
 project (`wrappers 0.6.2`) reading a seeded MongoDB Atlas cluster.
@@ -59,8 +57,7 @@ create foreign table mongo.events (
 ```
 
 It supports `where` / `order by` / `limit` pushdown, and `INSERT` / `UPDATE` /
-`DELETE` when `rowid_column` is set. What it does **not** do is the part people
-assume away:
+`DELETE` when `rowid_column` is set. It does not do the following:
 
 | Limitation | Consequence for a "leave it in Mongo" plan |
 |---|---|
@@ -70,19 +67,19 @@ assume away:
 | No `import foreign schema` | Every foreign table is declared by hand |
 | Dynamic Supabase egress IPs | The remote must allow a broad IP range (see below) - a standing exposure |
 
-None of that matters for a **one-off drain**; all of it matters if you keep the
-connector live in production.
+These limits do not affect a one-off copy; they apply to every query if the
+connector stays live in production.
 
 ## It is a native wrapper, so it only exists on hosted projects
 
-The MongoDB wrapper is a [**native** FDW, not a Wasm one](https://supabase.com/docs/guides/database/extensions/wrappers/overview). Native wrappers are
+The MongoDB wrapper is a [native FDW, not a Wasm one](https://supabase.com/docs/guides/database/extensions/wrappers/overview). Native wrappers are
 compiled into the Supabase platform Postgres image, so `create foreign data
 wrapper mongodb_wrapper` works on a hosted project but not on a plain local
 Postgres - `supabase start`'s local image does not ship `mongodb_fdw_handler`,
 and there is no `fdw_package_url` install path the way there is for Wasm wrappers
 (Snowflake, Stripe, and the like).
 
-The practical consequence: you cannot dry-run the full migration on a local
+You cannot dry-run the full migration on a local
 stack. If you want to exercise the copy SQL before pointing it at a hosted
 project, run it against an ordinary Postgres table with the same two columns
 (`_id text, _doc jsonb`) loaded from a `mongosh` dump. The SQL is identical;
@@ -131,24 +128,23 @@ select _id, _doc->>'type', _doc->'payload'->>'name'
 from mongo.events limit 3;
 ```
 
-## The caveat that bites on first connect: dynamic egress IPs
+## Dynamic egress IPs
 
-The first live read will very likely **fail** - not with a timeout, but a TLS
-reject on every shard:
+The first live read will likely fail with a TLS reject on every shard:
 
 ```
 ERROR: HV000: Kind: Server selection timeout: No available servers.
   ... Error: Kind: I/O error: received fatal alert: InternalError ...
 ```
 
-This is the IP allowlist. **Supabase's outbound egress IPs are dynamic** - there
+This is the IP allowlist. Supabase's outbound egress IPs are dynamic, so there
 is no fixed range to safelist. On MongoDB Atlas you must add `0.0.0.0/0` to
 Network Access (or front Mongo with a fixed-IP proxy and safelist only that). It
 is easy to miss because *your own* box (whose IP you allowlisted to seed the
 data) connects fine, while Supabase - a different, shifting source IP - does not.
 
 :::caution[The self-hosted case is worse]
-For a **self-hosted** Mongo box, `0.0.0.0/0` means opening your firewall to
+For a self-hosted Mongo box, `0.0.0.0/0` means opening your firewall to
 Supabase's dynamic egress. That standing inbound exposure, for data that never
 changes, is the case for draining and decommissioning rather than running the
 connector live.
@@ -156,7 +152,7 @@ connector live.
 
 ## The copy: batched `_id`-keyset, not a single create-table-as-select (CTAS)
 
-The obvious one-liner is wrong at scale:
+Do not copy with a single statement at scale:
 
 ```sql
 -- do not do this at scale
@@ -171,7 +167,7 @@ large collection produces an equally large volume of WAL and backup churn, held
 in one long transaction that will trip `statement_timeout` long before it
 finishes.
 
-Instead, page by **`_id` keyset**. ObjectId's leading 4 bytes are a creation
+Instead, page by `_id` keyset. ObjectId's leading 4 bytes are a creation
 timestamp, and the wrapper returns `_id` as a 24-char lowercase hex string, so
 lexicographic `_id` order tracks insertion order and keyset pagination pushes
 down cleanly (`where _id > <last>` becomes a Mongo `$gt`, with the hex coerced
@@ -202,26 +198,24 @@ while :; do
 done
 ```
 
-`on conflict (_id) do nothing` makes it **idempotent and resumable**: interrupt
-it, run it again, and it tops up to exact parity without duplicating. That is the
-property a multi-hour drain of an interruptible archive needs. A single CTAS has
-neither.
+`on conflict (_id) do nothing` makes it idempotent and resumable: interrupt
+it, run it again, and it tops up to exact parity without duplicating.
 
-## The gotcha only the real wrapper exposes
+## Seed the keyset with the zero ObjectId
 
-Notice the keyset seeds with `000000000000000000000000`, the all-zeros ObjectId,
-**not** an empty string. This matters, and it is invisible until you run against
-the real wrapper:
+The keyset seeds with `000000000000000000000000`, the all-zeros ObjectId,
+rather than an empty string. The two behave the same against a stub and
+differently through the real wrapper:
 
-- Against a **plain-text stub** (`_id` is a Postgres `text` column), `_id > ''`
-  matches every row - the migration works, tests pass, everything is green.
-- Through the **real wrapper**, `''` is not a valid 24-char hex, so it cannot
-  coerce to an ObjectId. The pushed-down `$gt` filter matches **nothing**, and
-  the migration silently copies **zero rows** with no error.
+- Against a plain-text stub (`_id` is a Postgres `text` column), `_id > ''`
+  matches every row, so the copy works and tests pass.
+- Through the real wrapper, `''` is not a valid 24-char hex, so it cannot
+  coerce to an ObjectId. The pushed-down `$gt` filter matches nothing, and
+  the migration silently copies zero rows with no error.
 
 The all-zeros ObjectId is a valid 24-char hex that sorts below every real `_id`,
-so it works both locally and through the wrapper. It is a green-but-wrong bug: a
-local test does not catch it because the stub does not share the wrapper's
+so it works both locally and through the wrapper. A local test does not catch
+the empty-string bug because the stub does not share the wrapper's
 type-coercion semantics. Test the copy against the real
 wrapper at least once before you trust it, even if a shaped stub is green.
 
@@ -248,48 +242,41 @@ select
 
 You want `mongo_src = pg_target = distinct_id`, `top_level_nulls = 0`, and
 `nested_ok = pg_target` (proving both top-level and nested jsonb survived, for
-whatever fields your documents actually carry). Then cut the cord:
+whatever fields your documents carry). Then drop the connection:
 
 ```sql
 drop server mongo_server cascade;   -- drops the foreign table too
 -- and delete the Vault secret holding the Mongo credentials
 ```
 
-Now the data lives in Postgres as queryable `jsonb`, Mongo is gone, and there is
-no standing network path to maintain.
-
 ## The jsonb table is not a normalised schema
 
-The `select _id, _doc` copy lands a **raw jsonb** table. It is queryable
-(`_doc -> ... ->> ...`, plus a GIN index for containment), but it is **not** the
-same relational shape as a set of typed, normalised tables. If you need the data
+The `select _id, _doc` copy lands a raw `jsonb` table. It is queryable
+(`_doc -> ... ->> ...`, plus a GIN index for containment), but it does not have
+the relational shape of a set of typed, normalised tables. If you need the data
 in a normalised shape, the jsonb landing table is a *staging* step and you still
 need a transform pass - a bounded, one-time job against a local Postgres table,
-not an ongoing ETL against a live Mongo connector. Decide which you actually
-need before you start; it is the difference between an afternoon and a project.
+not an ongoing ETL against a live Mongo connector. Decide which you need
+before you start.
 
 ## Storage cost
 
-"One-time copy versus a system running forever" is the right frame, but do not
-gloss the storage cost. On Supabase's Pro/Team plans, database disk (gp3) runs
+On Supabase's Pro/Team plans, database disk (gp3) runs
 [\$0.125/GB/month](https://supabase.com/docs/guides/platform/manage-your-usage/disk-size)
 while [Storage](https://supabase.com/docs/guides/storage/pricing) runs
 \$0.0213/GB/month - roughly 6x cheaper per GB, before you compress the dump or
 count the GIN index a *queryable* hot table needs. So if the archive is queried
 *rarely*, a compressed dump in Storage loaded on demand is the cheaper home; if
-it is queried *regularly*, the Postgres jsonb table earns its disk. Size the
-decision to query frequency, not migration convenience.
+it is queried *regularly*, the Postgres jsonb table is worth its disk.
 
-Those two figures are Supabase's published Pro/Team list prices (linked above,
-re-checked against the docs), not a benchmark. The Storage round-trip below was
-exercised end-to-end against a real project - dump, compress, upload, download,
-reload, query - so the *procedure* is verified even though the per-GB rates are
-cited list prices rather than something measured here.
+The two rates are Supabase's published Pro/Team list prices (re-checked
+against the docs), not a benchmark. The Storage round trip below (dump, compress, upload, download,
+reload, query) was run end-to-end against a real project.
 
 ### Setting up the storage-archive path
 
-If you land on the *queried-rarely* side, here is the whole loop. It starts from
-the `public.events` landing table the copy above produced.
+For an archive that is queried rarely, the loop starts from the
+`public.events` landing table the copy above produced.
 
 **1. Dump the table to a compressed file.** A portable `jsonl` line dump piped
 through `zstd` keeps it readable and re-loadable anywhere:
@@ -300,9 +287,9 @@ psql "$DB_URL" -c "\copy public.events to stdout" | zstd -19 > events.jsonl.zst
 
 How much you save depends entirely on the data - jsonb with repetitive keys and
 string values compresses hard (10-70x on synthetic data), varied binary-ish
-payloads far less. Measure your own dump before assuming the win.
+payloads far less. Measure your own dump before assuming a ratio.
 
-**2. Create the destination bucket first.** `supabase storage cp` does **not**
+**2. Create the destination bucket first.** `supabase storage cp` does not
 create buckets - it fails with `Bucket not found` if the target does not exist,
 and the CLI has no `create-bucket` subcommand. Make it once in the Dashboard
 (Storage -> New bucket, keep it private), or over the Storage API:
@@ -324,8 +311,8 @@ supabase storage cp events.jsonl.zst ss:///archive/events.jsonl.zst --experiment
 The object now lives at the ~6x-cheaper Storage rate, independent of any
 provisioned disk.
 
-**4. Free the disk - and understand what "free" means here.** Drop the table
-(and with it the GIN index) so the space is released *inside* the disk:
+**4. Drop the table to free space inside the disk.** Dropping the table also
+drops the GIN index:
 
 ```sql
 drop table public.events;   -- releases the space + GIN index within the disk
@@ -333,8 +320,8 @@ drop table public.events;   -- releases the space + GIN index within the disk
 
 Testing confirmed that `drop` reclaims space *inside* the volume
 (database size visibly shrinks - after a vacuum, since dead tuples are not
-reclaimed immediately) but Supabase's gp3 disk **auto-grows and never
-auto-shrinks**. Your *provisioned* (billed) disk stays at its high-water mark:
+reclaimed immediately) but Supabase's gp3 disk auto-grows and never
+auto-shrinks. Your *provisioned* (billed) disk stays at its high-water mark:
 there is no manual shrink. It [right-sizes to 1.2x the database size (minimum
 8 GB) only during a project upgrade](https://supabase.com/docs/guides/platform/database-size#reducing-disk-size)
 - and if the project is already on the latest Postgres, the fallback is
@@ -347,7 +334,7 @@ already at the current version reports `eligible: false` with
 high-water mark stays until you migrate to a new project (platform-facts F06,
 [supabase-lab](https://github.com/erfianugrah/supabase-lab), 2026-08-04).
 
-**5. Load on demand to query, then let it evaporate.** Pull the dump back,
+**5. Load on demand into a temporary table.** Pull the dump back,
 decompress, and `\copy` into a *temporary* table so the disk footprint lasts
 only for the session:
 
@@ -361,14 +348,14 @@ create temp table events (_id text, _doc jsonb);
 SQL
 ```
 
-The temp table is dropped when the session ends: cheap at rest, a
-download-and-load tax per query. If that tax starts
-hurting, that is the signal to keep the data resident in the jsonb table instead.
+The temp table is dropped when the session ends. Storage cost is low at rest,
+and each query pays a download and load; if that per-query cost is too high,
+keep the data resident in the jsonb table instead.
 
 ## What to do about it
 
-What the guide's own observations and two borrowed lab measurements support.
-A row without a run behind it says so.
+The practices below rest on this guide's own observations and two borrowed
+lab measurements; a row without a run behind it says so.
 
 | Practice | Evidence | Module |
 |---|---|---|
@@ -387,9 +374,9 @@ ranges; the exact Vault deletion call is left out because it was not verified.
 ## Gotchas
 
 - **The wrapper is native, so it is hosted-only.** `create foreign data wrapper mongodb_wrapper` works on a Supabase project but not on a plain local Postgres, and there is no `fdw_package_url` install path. Confirm it exists before you design around it.
-- **The remote must allow Supabase's egress, and that egress is dynamic.** There is no fixed IP range to safelist - allow `0.0.0.0/0` on the Mongo side, or front it with a fixed-IP proxy and safelist only that. The first connection fails with a TLS reject if you skip this, and it is easy to misdiagnose because your own machine (already allowlisted) connects fine.
+- **The remote must allow Supabase's egress, and that egress is dynamic.** Allow `0.0.0.0/0` on the Mongo side, or front it with a fixed-IP proxy and safelist only that; skip this and the first connection fails with a TLS reject while your own allowlisted machine connects fine.
 - **Seed keyset pagination with the all-zeros ObjectId** (`000000000000000000000000`), not an empty string. `''` cannot coerce to an ObjectId, so the pushed-down filter matches nothing and the copy silently moves zero rows.
-- **Do not use a single `CREATE TABLE AS` at scale.** One unbounded statement is one giant WAL-logged transaction that trips `statement_timeout`. Page by `_id` keyset in bounded batches instead.
+- **Do not use a single `CREATE TABLE AS` at scale.** It runs as one WAL-logged transaction that trips `statement_timeout`; page by `_id` keyset in bounded batches.
 - **No aggregate pushdown.** `count`/`sum`/`avg`/`min`/`max` fetch every row and compute in Postgres - do not run them against the live foreign table on a large collection.
 - **Nested fields only through `_doc`.** Dotted column names do not traverse; use `_doc -> ... ->> ...` with a GIN index for containment queries.
 - **No `import foreign schema`, no multi-document transactions.** Declare each foreign table by hand, and do not treat the connector as a transactional store.

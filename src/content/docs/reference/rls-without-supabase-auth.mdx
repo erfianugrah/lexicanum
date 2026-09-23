@@ -1,26 +1,26 @@
 ---
 title: "RLS without Supabase Auth: JWT claims over the wire"
-description: Row-level security without PostgREST or GoTrue - RLS reads session GUCs, not HTTP headers, so any client that can run SQL can set request.jwt.claims itself and keep per-user policies working over a raw Postgres connection. The pattern (with its measured SECURITY DEFINER prerequisite), the two sharp edges (unprivileged GUCs, SQL-text-keyed caches), what leaving the Supabase HTTP layer actually costs, and which incident classes it removes.
+description: Row-level security without PostgREST or GoTrue - RLS reads session GUCs, not HTTP headers, so any client that can run SQL can set request.jwt.claims itself and keep per-user policies working over a raw Postgres connection. The pattern (with its measured SECURITY DEFINER prerequisite), the two sharp edges (unprivileged GUCs, SQL-text-keyed caches), what leaving the Supabase HTTP layer costs, and which incident classes it removes.
 author: Erfi Anugrah
 category: supabase
 group: architecture
 featured: true
-blurb: "RLS is a Postgres feature, not a PostgREST one - set request.jwt.claims yourself over the wire and per-user policies keep working with your own auth."
+blurb: "RLS is a Postgres feature - set request.jwt.claims yourself over the wire and per-user policies keep working with your own auth."
 ---
 
 import { Aside } from "@astrojs/starlight/components";
 
 A recurring question after any PostgREST-layer incident: can you keep
 row-level security while dropping both Supabase Auth and the Data API,
-talking to the database over the wire protocol instead? Yes - because RLS
-never belonged to the HTTP layer in the first place. The price is that the
-client becomes the claims authority, and that is a real security
-reassignment, not a config tweak. It is the deep version of Move 1 in [Locking down Supabase: the database is the boundary](/reference/supabase-data-surface-lockdown/): the control belongs on the row.
+talking to the database over the wire protocol instead? Yes: Postgres
+enforces RLS, and the HTTP layer only supplies the claims. The cost is that
+your backend becomes the claims authority, which moves a security
+responsibility onto code you own. This extends Move 1 in [Locking down Supabase: the database is the boundary](/reference/supabase-data-surface-lockdown/), which puts the control on the row.
 
-**Provenance.** Measured end to end against throwaway Supabase projects
-and a probe Worker on 2026-08-20 (supabase-lab `experiments/rls-wire-claims`,
-modules C01-C03). The doc's design was run green live; three of its claims
-needed correction from the measurements, marked below.
+Measured end to end against throwaway Supabase projects and a probe Worker
+on 2026-08-20 (supabase-lab `experiments/rls-wire-claims`, modules C01-C03).
+The design ran green live, and the measurements corrected three of its
+claims, marked below.
 
 **TL;DR:**
 
@@ -37,12 +37,12 @@ needed correction from the measurements, marked below.
   connecting as a dedicated non-superuser role. Per-user RLS policies work
   unchanged - measured end to end (supabase-lab `rls-wire-claims`,
   2026-08-20) on both Supavisor modes and through Hyperdrive.
-- Two sharp edges: the GUC is **unprivileged** (anyone with SQL access can
+- Two sharp edges: the GUC is unprivileged (anyone with SQL access can
   set any claims, so the connection credential is now the security
   boundary), and any SQL-text-keyed query cache cannot see claims -
   Hyperdrive's cache did not replay across claims in the measured probe,
   but the split-binding (cache-disabled for claims-scoped queries) stays
-  the documented control because that behavior is not contractual.[^cf-hd-cache]
+  the documented control because that behaviour is not contractual.[^cf-hd-cache]
 - This works from any runtime with a Postgres driver, not just Cloudflare
   Workers, and against any Postgres with RLS - the Supabase-specific part
   is only the GUC name and the `auth.*` helper functions.
@@ -52,7 +52,7 @@ needed correction from the measurements, marked below.
 
 ---
 
-## The mechanism: RLS reads GUCs, not HTTP
+## RLS reads session GUCs
 
 Postgres row-level security is a property of the table and the connecting
 role.[^pg-rls] A policy like `owner = auth.uid()` is just SQL evaluated per
@@ -93,12 +93,13 @@ digraph {
 }
 ```
 
-PostgREST is a claims *setter*, not the enforcer. Any client that can run
-SQL can set the same GUC - which is both the opportunity and the hazard.
+PostgREST sets the claims and Postgres enforces the policy. Any client that
+can run SQL can set the same GUC, which is what makes this pattern possible
+and what makes it hazardous.
 
-The claims form that `auth.uid()` resolves is the JSON GUC, measured in
-this site's lab (as `postgres`, which owns schema `auth`; a custom role
-cannot call it directly - the grant caveat is in the pattern section):
+The claims form that `auth.uid()` resolves is the JSON GUC. This was measured
+in the lab as `postgres`, which owns schema `auth`; a custom role cannot call
+it directly, for the grant reason in [The pattern](#the-pattern):
 
 ```sql
 set "request.jwt.claims" = '{"sub":"<user-uuid>","role":"authenticated"}';
@@ -141,18 +142,22 @@ grant execute on function public.claims_uid() to claims_user;
 
 Three notes on that block. Write the policy as
 `using (owner = (select public.claims_uid()))`: the subselect hoists the
-helper to an InitPlan evaluated once per statement - measured in
-rls-policy-cost A: `auth.uid()` bare 252.9ms against 22.2ms wrapped on 100k
-unindexed rows, identical row digests, and a sequence-counted PL/pgSQL
-stand-in called 100,001 times bare against 1 wrapped; the wrapper itself was
-not timed, so the hoist is inferred from the same STABLE-function mechanism. Postgres grants EXECUTE on a new function to PUBLIC by default,
-so add `revoke execute on function public.claims_uid() from public;` before
-the grant, or every role reaches `auth.uid()` through the wrapper; the
-Management API security advisor lints exactly this shape
-(`anon_/authenticated_security_definer_function_executable`,
-`function_search_path_mutable` - security-lockdown S01; the wrapper above
-already pins `search_path`, and the revoke is standard Postgres, not measured
-here). And if you provision through the Management API query endpoint
+helper to an InitPlan evaluated once per statement. In rls-policy-cost A,
+bare `auth.uid()` took 252.9ms against 22.2ms wrapped on 100k unindexed rows
+with identical row digests, and a sequence-counted PL/pgSQL stand-in was
+called 100,001 times bare against 1 wrapped. The wrapper itself was not
+timed, so its hoist is inferred from the same STABLE-function mechanism.
+
+Postgres grants EXECUTE on a new function to PUBLIC by default, so add
+`revoke execute on function public.claims_uid() from public;` before the
+grant, or every role reaches `auth.uid()` through the wrapper. The Management
+API security advisor lints exactly this shape as
+`anon_/authenticated_security_definer_function_executable` and
+`function_search_path_mutable` (security-lockdown S01). The wrapper above
+already pins `search_path`; the revoke is standard Postgres and was not
+measured here.
+
+And if you provision through the Management API query endpoint
 (`POST /v1/projects/{ref}/database/query`), it wraps a multi-statement body
 in one transaction, so a policy that references the wrapper fails when both
 are created in the same call - run the function first, the policy second.
@@ -172,12 +177,10 @@ const rows = await sql.begin(async (tx) => {
 ```
 
 `SET LOCAL` semantics: the setting holds until transaction end, then
-reverts.[^pg-set-local] Never use bare `SET` outside a transaction - and
-this is now measured, not just principled: on the session pooler (5432) a
-bare `SET` was reset on return (no leak across 5 subsequent invocations),
-but on the transaction pooler (6543) a bare `SET` **leaked across
-invocations** - the next psql session saw the first's rows. Claims belong in
-a transaction, never a bare `SET`.
+reverts.[^pg-set-local] Never use bare `SET` outside a transaction. On the
+session pooler (5432) a bare `SET` was reset on return (no leak across 5
+subsequent invocations), but on the transaction pooler (6543) a bare `SET`
+leaked across invocations: the next psql session saw the first's rows.
 
 <Aside type="caution" title="Hyperdrive: per-query or per-transaction, never per-session">
 Hyperdrive's pooler runs in transaction mode and supports `SET` for the
@@ -189,13 +192,12 @@ connection cannot be reused while you hold it. Structure claims as
 `set_config(..., true)` at the top of each transaction, exactly like the
 pattern above. The per-query multi-statement form works too, and has a
 useful side effect: multi-statement queries are marked uncacheable
-(`cacheStatus: multiplestatements`), which sidesteps the cache question below for that query. Measured through a
-probe Worker (C03): the transaction form and the multi-statement form both
-resolve claims, and a bare `SET` was reset on pool return. Two operational
-notes from the same run: Hyperdrive's create-time connect check races a fresh
-project's Supavisor warmup (`ENOTFOUND tenant/user`), so warm the pooler with
-a local connection and retry the create; and postgres.js in a Worker needs
-the `nodejs_compat` compatibility flag.
+(`cacheStatus: multiplestatements`), which sidesteps the cache question below
+for that query. In the C03 probe Worker the transaction form and the
+multi-statement form both resolved claims, and a bare `SET` was reset on pool
+return. The same run found that Hyperdrive's create-time connect check races
+a fresh project's Supavisor warmup (`ENOTFOUND tenant/user`), so warm the
+pooler with a local connection and retry the create.
 </Aside>
 
 ## Sharp edge 1: the GUC is unprivileged
@@ -210,8 +212,7 @@ Two consequences:
   only, rotatable, never in a client bundle. Nothing in the database layer
   validates the claims themselves (C02, below) - the JWT you verified in app
   code is the only check on who the caller is.
-- **Defense in depth moves into the DB schema where you can still have
-  it.** Prefer policies that combine the claims GUC with data invariants
+- **Defence in depth moves into the schema.** Prefer policies that combine the claims GUC with data invariants
   (tenant columns, membership tables) so a claims mistake degrades to a
   smaller blast radius than "any user as anyone".
 
@@ -220,29 +221,29 @@ anon key can only do what RLS allows *and* the JWT is validated by
 infrastructure you do not control. It is strictly better than the
 alternative raw-SQL shape - a `BYPASSRLS` role with authorization purely
 in app code, where a SQL-injection bug in one query has no policy layer
-behind it at all. Measured concretely (C02): a claims GUC carrying a
-`tampered` sub (a valid uuid belonging to no user) is enforced exactly as
-written - zero rows, no error, no validation anywhere in the database. The
+behind it at all. In C02, a claims GUC carrying a `tampered` sub (a valid
+uuid belonging to no user) was enforced exactly as written: zero rows, no
+error, no validation anywhere in the database. The
 [Cloudflare + Supabase architecture reference](/reference/cloudflare-supabase-architecture/)
-covers that `BYPASSRLS`-by-role variant and its measured behavior; this doc
-is the third option between the two.
+covers that `BYPASSRLS`-by-role variant and its measured behaviour; this
+pattern sits between the two.
 
 ## Sharp edge 2: RLS-blind query caches
 
 Any query cache keyed on SQL text + parameters cannot see session GUCs.
 Hyperdrive's cache is exactly that, and it does not invalidate on
-writes.[^cf-hd-cache] The doc's original warning was that two users running
-the same deterministic `SELECT * FROM pastes` with different claims would
-share one cache entry.
+writes.[^cf-hd-cache] The risk is that two users running the same
+deterministic `SELECT * FROM pastes` with different claims could share one cache
+entry.
 
-Measured on 2026-08-20 (supabase-lab C03): Hyperdrive did **not** replay
-across claims in the probe. An identical parameterized query under user A's
+In the 2026-08-20 probe (supabase-lab C03), Hyperdrive did not replay across
+claims. An identical parameterized query under user A's
 claims warmed the cache; the same SQL text and parameter under user B's
 claims returned B's filtered result (0 rows), not A's cached row. Either the
 cache key includes claims-relevant session state or claims-carrying
-transactions are excluded from caching. **Do not rely on this** - the
-split-binding control below stays the documented pattern, because the
-behavior is not contractual and could change.
+transactions are excluded from caching. Do not rely on this: the behaviour
+is not contractual and could change, so the split-binding control below
+stays the documented pattern.
 
 The documented fix is the split-binding pattern: one Hyperdrive
 configuration with caching for queries that are claims-independent
@@ -254,7 +255,7 @@ When in doubt, a query is claims-dependent. The per-query `SET; SELECT`
 multi-statement form is never cached, but do not rely on that as the
 policy - the cache-disabled binding is the explicit control.
 
-## What leaving the HTTP layer actually costs
+## What leaving the HTTP layer costs
 
 The connection string is the same one Supabase documents for every external
 client; nothing here needs platform changes.[^sb-connect] What you stop
@@ -268,8 +269,8 @@ getting is the rest of the product surface that rides HTTP:
 | Realtime | gone | the WS layer authorizes by JWT; replicating it is its own project |
 | Edge Functions | unaffected | separate runtime, still callable |
 
-Keeping Supabase Auth while dropping only PostgREST is also coherent -
-and now measured: the lab's C02 created a real user via the Auth admin
+Keeping Supabase Auth while dropping only PostgREST also works. The lab's
+C02 created a real user via the Auth admin
 API, signed it in via password grant, and set the claims from the GoTrue
 JWT's `sub` over the wire; per-user RLS resolved exactly as it would have
 through PostgREST. Verify the GoTrue-issued JWT in your backend (JWKS,
@@ -291,14 +292,12 @@ Nothing in the pattern is Workers-specific:
   convention - `SET LOCAL app.user_id = ...` read via
   `current_setting('app.user_id', true)` in policies. The mechanism,
   hazards, and pooler rules are identical; only the GUC name changes.
-- **Pooler compatibility** is the one thing to check per platform, and the
-  two Supabase pooler modes are now measured to differ on GUC hygiene:
-  session mode (5432) reset a bare `SET` on return (no leak), transaction
-  mode (6543) let a bare `SET` leak to the next invocation. The pattern
-  needs transaction-scoped claims everywhere, but the failure mode for
-  getting it wrong is worse on 6543.
+- **Pooler compatibility** is the one thing to check per platform. The two
+  Supabase pooler modes differ on bare-`SET` hygiene (measured above), so the
+  pattern needs transaction-scoped claims everywhere, and getting it wrong
+  costs more on 6543.
 
-## What this buys during incidents
+## What this changes during incidents
 
 Two of the recurring classes in the
 [incident resilience reference](/reference/supabase-incident-resilience/)
@@ -315,14 +314,13 @@ live entirely in the layer this pattern removes:
 
 Everything below the HTTP layer is unchanged: compute lifecycle events,
 Supavisor failures (if you route through it), and the database itself still
-take you down. You are removing one failure domain out of several - worth
-doing when you already own auth, not as a rewrite justified by a single
-outage.
+take you down. This removes one failure domain of several, which is worth
+doing when you already own auth; a single outage does not justify the
+rewrite.
 
 ## What to do about it
 
-The measurements imply a short list of practices. Each row names the module
-id or run it rests on (rls-wire-claims unless prefixed); a row that is a
+Each row names the module id or run it rests on (rls-wire-claims unless prefixed); a row that is a
 design choice rather than a result says so.
 
 | Practice | Evidence | Module |
@@ -343,12 +341,12 @@ deleted after):
 | Claim | Result |
 |---|---|
 | Claims GUC drives per-user RLS as a custom role | pass - A sees A's row, B sees B's, no claims sees 0 (5432, 6543, Hyperdrive tx + multi) |
-| `GRANT USAGE ON SCHEMA auth` to a custom role | **silently no-ops**; `auth.uid()` then errors `permission denied for schema auth`. SECURITY DEFINER wrapper is the working shape |
+| `GRANT USAGE ON SCHEMA auth` to a custom role | silently no-ops; `auth.uid()` then errors `permission denied for schema auth`. SECURITY DEFINER wrapper is the working shape |
 | GoTrue-issued `sub` over the wire | pass - per-user RLS resolves with no PostgREST anywhere |
-| Tampered sub enforced as-is | pass - the GUC-is-unprivileged hazard, concrete |
+| Tampered sub enforced as-is | pass - the unprivileged-GUC hazard in practice |
 | Session pooler (5432) bare-`SET` leak | no leak across 5 invocations (resets on return) |
-| Transaction pooler (6543) bare-`SET` leak | **leaks** - next invocation saw the first's rows |
-| Hyperdrive cache replays across claims | **not observed** - B's claims got B's (empty) result, not A's cached row |
+| Transaction pooler (6543) bare-`SET` leak | leaks - next invocation saw the first's rows |
+| Hyperdrive cache replays across claims | not observed - B's claims got B's (empty) result, not A's cached row |
 | Hyperdrive bare `SET` | reset on pool return (0 rows on the next query) |
 | Prepared statements over 6543 | pass (parity with the lab's T11 finding, recorded in the [privatelink-aws RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/privatelink-aws/RUNLOG.md) rather than as a module) |
 
@@ -356,7 +354,7 @@ deleted after):
 
 | Your situation | Pick |
 |---|---|
-| Standard app, Supabase Auth, SDK ergonomics matter | `supabase-js` over PostgREST - the default, nothing here beats it |
+| Standard app, Supabase Auth, SDK ergonomics matter | `supabase-js` over PostgREST - the default |
 | Own auth already, want per-user RLS kept, edge/serverless runtime | claims over the wire (this doc), cache-disabled binding for user-scoped reads |
 | Own auth, RLS is coarse (role-level, not per-user) | `BYPASSRLS` role + app authz, per the architecture reference - simpler, fewer GUC mechanics |
 | Only the PostgREST layer is the problem, Auth is fine | GoTrue JWTs + claims over the wire - keeps user management, drops the Data API |

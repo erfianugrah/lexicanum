@@ -9,7 +9,7 @@ blurb: "Non-redundant NVMe or redundant HDD - the per-service call, and why 'app
 
 import { Aside } from "@astrojs/starlight/components";
 
-A homelab with a fast single NVMe pool and a slow redundant HDD array has to answer one question per service: does this state go on the fast disk or the safe disk. This is the reference for that decision. It sits beside [ZFS on NixOS](/reference/zfs-on-nixos/), which owns the pool and mount mechanics (import, `zfsutil`, the reexec trap, why snapshots are not backups); this doc owns where the bytes land and why.
+A homelab with a fast single NVMe pool and a slow redundant HDD array has to answer one question per service: does this state go on the fast disk or the safe disk. [ZFS on NixOS](/reference/zfs-on-nixos/) covers the pool and mount mechanics (import, `zfsutil`, the reexec trap, why snapshots are not backups); this doc covers where the bytes land and why.
 
 <Aside type="note" title="Provenance">
   One host: an ASRock X570D4U-2L2T, Ryzen 7 5800X, 64 GB RAM, RTX 3080 Ti, NixOS, three ZFS pools. Every allocation figure below was read off that machine on 2026-09-03 with `zfs list` and `zpool list`. The placement rules are design decisions from that host's layout, labelled as reasoning where they are; the pool sizes and the ~40G consolidated on 2026-09-03 are measured. ARC is capped at 16 GiB.
@@ -19,8 +19,8 @@ A homelab with a fast single NVMe pool and a slow redundant HDD array has to ans
 
 - Three pools by hardware role: `rpool` (single 1TB NVMe, non-redundant, hot state) mounts `/appdata` and `/appdata/pg`; `tank` (6-wide raidz2 HDD, redundant) mounts `/tank/media` and `/tank/appdata`; `scratch` (single 2TB QLC NVMe, `sync=disabled`) holds transient downloads and transcode temp.
 - Placement is decided on three axes: latency need, redundancy need, re-derivability. fsync-heavy random-IO state (SQLite, Postgres, redis) earns NVMe; large re-pullable or regenerable data (model weights, object caches, the metrics database) tolerates bulk HDD.
-- The NVMe tier is a single disk with no pool redundancy. Irreplaceable data still lives there for speed - its protection is ZFS snapshots plus off-pool replication, not a mirror. Irreplaceable does not mean redundant pool; it means snapshotted and replicated.
-- Placement follows the data's IO shape, not the service's label. The Jellyfin media files are bulk on `/tank/media`, but the Jellyfin library is SQLite hot state on `/appdata`.
+- The NVMe tier is a single disk with no pool redundancy. Irreplaceable data still lives there for speed, protected by ZFS snapshots plus off-pool replication instead of a mirror.
+- Placement follows the data's IO shape. The Jellyfin media files are bulk on `/tank/media`, but the Jellyfin library is SQLite hot state on `/appdata`.
 - One service's hot state lives in exactly one path. A prior split scattered state across a `/tank/data/appdata` cold copy and a `/rpool/cache` hot copy; it was consolidated on 2026-09-03 into `/appdata` (hot) and `/tank/appdata` (bulk), ~40G moved.
 
 ---
@@ -51,7 +51,7 @@ digraph {
 }
 ```
 
-Three pools, split by the role the hardware suits. The mechanics - which pool gets imported at boot, who owns each mount, why the non-redundant pool is safe to run without a mirror - are in [ZFS on NixOS](/reference/zfs-on-nixos/). What this doc adds is the rule for deciding which service's state goes where.
+Three pools, split by the role the hardware suits. Which pool gets imported at boot, who owns each mount, and why the non-redundant pool is safe to run without a mirror are in [ZFS on NixOS](/reference/zfs-on-nixos/).
 
 | Pool | Hardware | Redundancy | Mounts | Allocated |
 |---|---|---|---|---|
@@ -73,40 +73,36 @@ Every piece of state is scored on three axes, and the axis that dominates picks 
 | Postgres clusters (immich, atuin, joplin, tracearr timescaledb, mnemosyne, memledger, vaultwarden) | `/appdata/pg` NVMe | latency: random-page fsync |
 | redis / valkey (redis_immich, tracearr-redis, bonkled valkey) | `/appdata` NVMe | latency: append-only fsync |
 | qbittorrent state, beets, atuin | `/appdata` NVMe | latency: frequent small writes |
-| Jellyfin library (SQLite) | `/appdata` NVMe | latency: IO shape, not the service label |
+| Jellyfin library (SQLite) | `/appdata` NVMe | latency: SQLite fsync, whatever the service |
 | media files | `/tank/media` HDD | bulk, write-once (see the [migration guide](/guides/nas-bulk-data-migration/)) |
 | MinIO object store | `/tank/appdata` HDD | re-derivability + redundancy over speed |
 | Prometheus TSDB | `/tank/appdata` HDD | re-derivability: a lost window is cheap |
 | LLM model weights (open-webui, gumshoe) | `/tank/appdata` HDD | re-derivability: re-downloadable |
 | research datasets, geo data, searxng config | `/tank/appdata` HDD | re-derivability + redundancy |
 
-The three sections below take the axes one at a time.
-
 ---
 
 ## What earns the NVMe tier
 
-The hot tier is for state whose access pattern is small, random, and synchronous. A relational or embedded database commits by writing to a log and calling `fsync`, and it does this on every transaction; the cost of that `fsync` is a function of how long the underlying disk takes to make a durable write at a random offset. On an HDD that is a seek plus a rotation - single-digit to low-tens of milliseconds each - and a database doing hundreds of small commits a second stalls on the mechanics of the platter. On NVMe the same durable write is tens of microseconds. The gap is three orders of magnitude, and it lands entirely on the workloads that commit constantly.
-
-That is why the hot tier holds:
+The hot tier is for state whose access pattern is small, random, and synchronous. A relational or embedded database commits by writing to a log and calling `fsync`, and it does this on every transaction; the cost of that `fsync` is a function of how long the underlying disk takes to make a durable write at a random offset. On an HDD that is a seek plus a rotation - single-digit to low-tens of milliseconds each - and a database doing hundreds of small commits a second stalls on the mechanics of the platter. On NVMe the same durable write is tens of microseconds, three orders of magnitude less, and the difference falls on the workloads that commit constantly. The hot tier holds:
 
 - Every arr service config, which is SQLite with its `-wal` and `-shm` sidecars. SQLite in WAL mode still `fsync`s at each checkpoint, and its write path is the random-small-durable shape HDDs are worst at.[^sqlite-wal]
 - All Postgres clusters, under `/appdata/pg`. Postgres writes 8 KB pages and flushes its write-ahead log on commit;[^pg-page-size] the same seek-bound penalty applies, multiplied across every service that keeps a Postgres database.
 - redis / valkey with append-only persistence, which `fsync`s its AOF on the configured interval.
 
-Media files are the opposite shape - large, sequential, written once and read streaming - so they sit on the HDD array without penalty. The distinction is not database against files; it is random-synchronous against sequential-streaming. The tier follows the IO shape.
+Media files are the opposite shape - large, sequential, written once and read streaming - so they sit on the HDD array without penalty. The line runs between random-synchronous and sequential-streaming writes, whether the bytes belong to a database or to files.
 
 ---
 
-## Where redundancy actually comes from
+## Where redundancy comes from
 
-The NVMe tier is a single disk. It has no pool redundancy at all - a dead `rpool` device loses every byte on it at once. Yet it holds data that is genuinely irreplaceable: the Postgres clusters behind vaultwarden, immich, and the personal tooling. That pairing looks wrong until you separate two things that "redundancy" usually bundles together.
+The NVMe tier is a single disk with no pool redundancy: a dead `rpool` device loses every byte on it at once. It still holds irreplaceable data, the Postgres clusters behind vaultwarden, immich, and the personal tooling. That looks wrong until you separate the two protections "redundancy" usually bundles.
 
-Pool redundancy (a mirror or raidz) protects against one class of failure: a disk dying. It does nothing for the failures that actually destroy homelab data - a bad `DELETE`, a botched migration, ransomware, an `rm -rf` on the wrong path. A mirror faithfully replicates the mistake to both disks in real time.
+Pool redundancy (a mirror or raidz) protects against a disk dying. It does nothing for the failures that more often destroy homelab data - a bad `DELETE`, a botched migration, ransomware, an `rm -rf` on the wrong path - since a mirror writes the mistake to both disks in real time.
 
-What protects against those is a point-in-time copy you can roll back to, and a copy on different hardware. On this host both come from ZFS: snapshots give the rollback point, and replication of those snapshots to `tank` (and off-box) gives the second copy. A dead NVMe then costs a reinstall plus the delta since the last replication - a bounded, understood loss - not the data itself.
+Those need a point-in-time copy you can roll back to and a copy on different hardware. On this host both come from ZFS: snapshots give the rollback point, and replication of those snapshots to `tank` (and off-box) gives the second copy. A dead NVMe then costs a reinstall plus the delta since the last replication, and the data itself survives.
 
-So irreplaceable data goes on the fast non-redundant tier deliberately. Its safety is snapshots plus replication, and putting it on a mirror instead would buy protection against the least likely failure while costing the second M.2 slot and gating writes. How each tier is snapshotted and replicated is the subject of [declarative homelab backups](/reference/declarative-homelab-backups/); the point here is only that irreplaceable data routes on latency, and protection is a separate mechanism layered on top.
+Irreplaceable data therefore goes on the fast non-redundant tier by choice: it routes on latency, and protection is a separate mechanism on top. A mirror would protect against the least likely of those failures while costing the second M.2 slot and gating writes. How each tier is snapshotted and replicated is in [declarative homelab backups](/reference/declarative-homelab-backups/).
 
 <Aside type="caution">
 A snapshot policy pointed at the wrong dataset protects nothing. This host once
@@ -127,17 +123,17 @@ The bulk tier is for data where losing speed costs nothing you notice and losing
 - Regenerable or losable-window. The Prometheus TSDB is append-heavy but tolerant: losing the most recent scrape window is a gap in a graph, not a corrupted system, and the data rebuilds as new scrapes land. It reads back rarely and sequentially.
 - Large object stores and caches. MinIO holds objects that are either re-creatable or already backed elsewhere; the searxng and geo config are small and re-deployable.
 
-For all of these the HDD array's redundancy is the feature that matters and its latency is the cost that does not. raidz2 rides out a two-disk failure and resilvers; a slow read on a metrics query or a model load is invisible against the workload. The axis that dominates here is re-derivability - cheap to lose or re-derive, so it does not earn the fast tier - with redundancy as the tie-breaker that makes the redundant bulk tier the right home for it.
+Re-derivability decides these: the data is cheap to lose or re-derive, so it does not earn the fast tier. Redundancy is the tie-breaker that makes the redundant bulk tier its home: raidz2 rides out a two-disk failure and resilvers. The HDD latency goes unnoticed, since a slow read on a metrics query or a model load is small against the workload.
 
 ---
 
 ## The Jellyfin library edge case
 
-Jellyfin is the case that shows why the tier follows the data and not the service. Jellyfin is "media", and its media files are exactly what the bulk tier is for: large, write-once, streamed. They live on `/tank/media`.
+Jellyfin's media files are what the bulk tier is for: large, write-once, streamed. They live on `/tank/media`.
 
-Its library is a different animal. The Jellyfin library is a SQLite database - metadata, watch state, image references - with the same random-synchronous write pattern as any other SQLite config. Placed on the HDD array it would inherit the seek-bound `fsync` penalty on every scan and playback update. So the library lives on `/appdata`, the hot tier, next to the arr configs, while the files it indexes stay on bulk.
+The Jellyfin library is a SQLite database - metadata, watch state, image references - with the same random-synchronous write pattern as any other SQLite config. Placed on the HDD array it would inherit the seek-bound `fsync` penalty on every scan and playback update, so the library lives on `/appdata`, the hot tier, next to the arr configs, while the files it indexes stay on bulk.
 
-One service, two placements, because it carries two kinds of state. A rule that placed data by service label ("Jellyfin is media, put it on the media pool") would put the database on the wrong tier. The rule that works is: score the state, not the service.
+A rule that placed data by service label ("Jellyfin is media, put it on the media pool") would put the database on the wrong tier. Scoring each kind of state separately gives the one service two placements.
 
 ---
 
@@ -145,7 +141,7 @@ One service, two placements, because it carries two kinds of state. A rule that 
 
 Each database keeps its files whole on one dataset, so a snapshot of that dataset is crash-consistent for that database - the reason [ZFS on NixOS](/reference/zfs-on-nixos/#dataset-boundaries) gives for not splitting a write-ahead log onto a separate dataset from its main file.
 
-The Postgres dataset `/appdata/pg` carries `recordsize=16K`. Postgres reads and writes in 8 KB pages;[^pg-page-size] a 16K ZFS record covers two pages, which is a common default for Postgres on ZFS. The reasoning is a balance rather than a measurement here: a `recordsize` at or near the page size keeps a single-page write from forcing a read-modify-write of a much larger record (write amplification), while staying large enough that lz4 still finds something to compress. The `16K` value is what the dataset is set to; the balance argument is the rationale for it, not a benchmark run on this host.
+The Postgres dataset `/appdata/pg` carries `recordsize=16K`. Postgres reads and writes in 8 KB pages;[^pg-page-size] a 16K ZFS record covers two pages, which is a common default for Postgres on ZFS. The `16K` value is what the dataset is set to; the rationale below is an argument, with no benchmark run on this host. A `recordsize` at or near the page size keeps a single-page write from forcing a read-modify-write of a much larger record (write amplification), while staying large enough that lz4 still finds something to compress.
 
 The `/appdata` datasets otherwise take the pool defaults (lz4, `atime=off`), matching the property table in [ZFS on NixOS](/reference/zfs-on-nixos/#dataset-properties).
 
@@ -155,7 +151,7 @@ The `/appdata` datasets otherwise take the pool defaults (lz4, `atime=off`), mat
 
 Before the 2026-09-03 consolidation, app state was split by accident: some services wrote a hot copy to `/rpool/cache` while a cold copy of the same state sat under `/tank/data/appdata`. Two locations for one service's state means two things to back up, two things to reason about when restoring, and a standing question of which copy is authoritative.
 
-The consolidation collapsed that into exactly two canonical locations, `/appdata` for hot and `/tank/appdata` for bulk, moving ~40G. The move itself ran through migctl - cross-dataset copy, checksum re-verify, coverage diff, and a gate that does not clear until the copy is provably complete - covered in [Migrating a NAS without losing a byte](/guides/nas-bulk-data-migration/). The rule it enforces: one service's hot state lives in exactly one path. appdata is appdata. A service is either hot or bulk, and its state is in the one directory that says so - which is also what makes the snapshot policy checkable, because there is a single dataset per tier to verify coverage against.
+The consolidation collapsed that into exactly two canonical locations, `/appdata` for hot and `/tank/appdata` for bulk, moving ~40G. The move ran through migctl (cross-dataset copy, checksum re-verify, coverage diff, and a gate that does not clear until the copy is provably complete), covered in [Migrating a NAS without losing a byte](/guides/nas-bulk-data-migration/). Since then one service's hot state lives in exactly one path: a service is either hot or bulk, and its state is in the one directory that says so. That also makes the snapshot policy checkable, with a single dataset per tier to verify coverage against.
 
 ---
 
@@ -184,18 +180,18 @@ digraph {
 
 Reading the guide as a list:
 
-1. If the state is small, random, and synchronous - any SQLite, Postgres, or redis workload, including a media server's library - it goes on the hot NVMe tier `/appdata`. Its safety comes from snapshots and replication, not from a redundant pool.
+1. If the state is small, random, and synchronous - any SQLite, Postgres, or redis workload, including a media server's library - it goes on the hot NVMe tier `/appdata`. Its safety comes from snapshots and replication.
 2. Otherwise, if it is cheap to lose or re-derive - re-downloadable weights, regenerable metrics, re-creatable object caches - it goes on the bulk HDD tier `/tank/appdata`, where redundancy matters and latency does not.
 3. Otherwise, if it is large, sequential, and written once - the media files themselves - it goes on `/tank/media`.
 
-Score the state, not the service, and give each service exactly one hot path and one bulk path.
+Score the state rather than the service, and give each service exactly one hot path and one bulk path.
 
 ---
 
 ## Related docs
 
-- [ZFS on NixOS](/reference/zfs-on-nixos/) - who owns the mount, how the pools import, the reexec trap, and why the non-redundant pool is safe to run. The mechanics under this doc's placement decisions.
-- [Migrating a NAS without losing a byte](/guides/nas-bulk-data-migration/) - how the consolidation move was executed and verified, with a gate that does not clear until the copy is provably complete.
+- [ZFS on NixOS](/reference/zfs-on-nixos/) - who owns the mount, how the pools import, the reexec trap, and why the non-redundant pool is safe to run.
+- [Migrating a NAS without losing a byte](/guides/nas-bulk-data-migration/) - how the consolidation move was executed and verified.
 - [Declarative homelab backups](/reference/declarative-homelab-backups/) - how each tier is protected: the snapshot policy and off-pool replication that stand in for the NVMe tier's missing redundancy.
 
 [^raidz-expansion]: OpenZFS, "zpool-attach.8," OpenZFS Documentation. https://openzfs.github.io/openzfs-docs/man/master/8/zpool-attach.8.html

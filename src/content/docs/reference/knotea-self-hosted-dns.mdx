@@ -11,7 +11,7 @@ import { Aside } from "@astrojs/starlight/components";
 
 `knotea` is a single Go binary that is at once an authoritative nameserver and a recursive, ad-blocking resolver - the Cloudflare model of auth and resolver behind one query path. A query for a name in a served zone is answered authoritatively; anything else is filtered (policy, then ad-block, then cache) and recursed. It owns public `:53` UDP/TCP, `:853` for DNS-over-TLS, and `:8080` for an HTTP dashboard plus DNS-over-HTTPS, and it supervises two specialists as child processes: `unbound` for recursion with DNSSEC, and `knotd` for the authoritative zones. RFC 2136 UPDATE and zone transfers are relayed inward to knotd.
 
-**TL;DR:** One merged binary replaced two projects (glory-hole the resolver, knot-fly the authority) so the authoritative zones live in the same process as the resolver - a query for your own zone never leaves the box, which sidesteps an entire class of hairpin failures. Live record edits go through `knotctl`, a TSIG-signed RFC 2136[^rfc2136] CLI. It runs on Fly.io anycast as the production nameserver for the zones it serves.
+**TL;DR:** One merged binary replaced two projects (glory-hole the resolver, knot-fly the authority) so the authoritative zones live in the same process as the resolver - a query for your own zone never leaves the box, which sidesteps the Fly anycast UDP hairpin and failures like it. Live record edits go through `knotctl`, a TSIG-signed RFC 2136[^rfc2136] CLI. It runs on Fly.io anycast as the production nameserver for the zones it serves.
 
 This is the big sibling of two smaller DNS setups documented elsewhere here: the [Gloryhole DoT / VyOS interop](/guides/vyos-dot/) guide, which exposes this same resolver over DNS-over-TLS through the edge router, and [Unbound + AdGuard Home on a travel router](/guides/unbound-agh-mt3000/), a standalone recursive resolver for a single device class. knotea is what the resolver grew into once it also took over authoritative duty.
 
@@ -23,7 +23,7 @@ This is the big sibling of two smaller DNS setups documented elsewhere here: the
 
 ## Why merge the two
 
-They started as separate projects - `glory-hole` (the resolver) and `knot-fly` (the authority) - and were merged so the authoritative data sits in the same process as the resolver. When this box is asked for one of its own zones, the query is answered locally instead of recursing out to a public resolver and back. On Fly.io that matters twice over, because Fly blocks inbound UDP to customer-anycast IPs from inside Fly[^fly-anycast] - so a resolver running on Fly that has to recurse *to itself* for a Fly-hosted zone returns SERVFAIL. Running knotd in-process on loopback removes that dependency entirely.
+They started as separate projects - `glory-hole` (the resolver) and `knot-fly` (the authority) - and were merged so the authoritative data sits in the same process as the resolver. When this box is asked for one of its own zones, the query is answered locally instead of recursing out to a public resolver and back. On Fly.io it is required, because Fly blocks inbound UDP to customer-anycast IPs from inside Fly[^fly-anycast] - so a resolver running on Fly that has to recurse *to itself* for a Fly-hosted zone returns SERVFAIL. Running knotd in-process on loopback removes that dependency entirely.
 
 Both subprojects keep their full git history under their subdirectories; each still builds standalone. A root `go.work` links the two modules.
 
@@ -63,7 +63,7 @@ Measured (from the repo's perf harness): a full-handler profile of 166 ns/op at 
 
 knotd (Knot DNS)[^knot-dns] serves the two zones, both DNSSEC-signed and validating - ECDSAP256SHA256 with KSK and ZSK, online signing, DS records published at the parent. Zone data is operator state held in knotd's confdb and journal, added at runtime; the declarative source of truth is a set of YAML zonefiles reconciled onto the server.
 
-**TSIG keys are scoped by role**, so no consumer holds more power than it needs:
+TSIG keys are scoped by role, so no consumer holds more power than it needs:
 
 | Key | May update |
 |---|---|
@@ -83,9 +83,9 @@ knotctl set example.com TXT "v=spf1 -all"
 knotctl apply zones/example.com.yml --prune
 ```
 
-Subcommands: `add`, `rm`, `set`, `ls`, `apply`, `export`, `keys`. The ones with care behind them:
+Subcommands: `add`, `rm`, `set`, `ls`, `apply`, `export`, `keys`. Three of them do more than their name says:
 
-- **`add` polls** until the record is actually queryable and exits non-zero on timeout - so a script that chains on it does not race the zone.
+- **`add` polls** until the record is queryable and exits non-zero on timeout - so a script that chains on it does not race the zone.
 - **`set` bundles** the delete-rrset and the new records into one UPDATE message, so there is no empty or partial window.
 - **`apply` reconciles** declarative YAML - additive by default, `--prune` removes drift, and it never touches apex NS, SOA, or DNSSEC records. Idempotent; multi-value rrsets are atomic.
 
@@ -97,7 +97,7 @@ Runs as a single Fly.io app (region `sin`) on anycast.[^fly-anycast] The port ma
 
 ## The Cloudflare -> Knot migration, briefly
 
-The zones were moved off Cloudflare by mirroring over AXFR (CF Enterprise can do outgoing transfers to a TSIG peer), then promoting Knot to primary and swapping the registry NS records. The full runbook is in the authority subproject's docs. The load-bearing lessons:
+The zones were moved off Cloudflare by mirroring over AXFR (CF Enterprise can do outgoing transfers to a TSIG peer), then promoting Knot to primary and swapping the registry NS records. The full runbook is in the authority subproject's docs. What the migration turned up:
 
 - **Cloudflare's documented NOTIFY source IPs are wrong.** NOTIFYs arrive from CF's full anycast ranges plus Fly-internal ranges. Allowlist the runtime-fetched CF list, or Knot logs `ACL, denied, action notify` and your IXFR silently falls behind.
 - **The first CF AXFR returns BADKEY for about 30 seconds.** Wait it out; do not roll back.
@@ -108,22 +108,22 @@ The zones were moved off Cloudflare by mirroring over AXFR (CF Enterprise can do
 
 - **TSIG rotation is confdb-first.** knotd's confdb is the source of truth; rotate there before consumer stores, verify the old key gets BADSIG, and only then clean up. A past incident baked live TSIG secrets into config comment lines for ~29h via a `sed` that matched placeholders in comments - the entrypoint now fails closed if a secret appears in a comment.
 - **`knotc conf-set` is runtime-only** in file mode; run knotd with `-C <confdb-dir>`[^knot-dns] or your changes vanish on restart.
-- **The ACME ACL shape is easy to get wrong.** `update-owner-match: sub-or-equal` does not match `_acme-challenge.<host>` - use a pattern covering `_acme-challenge` and its wildcard forms.
+- **`sub-or-equal` does not match ACME owners.** `update-owner-match: sub-or-equal` does not match `_acme-challenge.<host>` - use a pattern covering `_acme-challenge` and its wildcard forms.
 - **Single region is a SPOF.** A second Knot machine pulling over Fly's internal network is the recorded plan, not yet built.
 
 ## Reading the numbers
 
-The latency figures above are same-region (client and server both in `sin`), so they are the floor: a resolver on anycast is only that fast for a client near a PoP, and cross-region recursion is distance-dominated the same way any round trip is. The 166 ns/op handler profile is a single-core microbenchmark; it tells you the Go code is never the bottleneck, not that the box sustains that rate - the UDP socket and the harness saturate first. Treat both as "the software is not the limit" evidence, and size for the network instead.
+The latency figures above are same-region (client and server both in `sin`), so they are the floor: a resolver on anycast is only that fast for a client near a PoP, and cross-region recursion is distance-dominated the same way any round trip is. The 166 ns/op handler profile is a single-core microbenchmark; it shows the Go code is not the bottleneck, and it does not show the box sustains that rate, because the UDP socket and the harness saturate first. Size for the network.
 
 ## Decision guide
 
-Run knotea (or this auth+resolver-in-one pattern) when you want your own zones and your recursive/filtering DNS under one roof with one deploy, and you are comfortable operating DNSSEC and TSIG yourself. Do not take on the authoritative half just to get ad-blocking - if all you want is filtered recursive DNS for clients, the [Unbound + AdGuard Home travel-router setup](/guides/unbound-agh-mt3000/) is far less to run, and if you only need to expose the resolver over DoT through an edge router, [the VyOS interop guide](/guides/vyos-dot/) covers that without touching authoritative DNS. The merge earns its complexity only when the same box genuinely serves both.
+Run knotea (or this auth+resolver-in-one pattern) when you want your own zones and your recursive/filtering DNS under one roof with one deploy, and you are comfortable operating DNSSEC and TSIG yourself. Do not take on the authoritative half just to get ad-blocking - if all you want is filtered recursive DNS for clients, the [Unbound + AdGuard Home travel-router setup](/guides/unbound-agh-mt3000/) is far less to run, and if you only need to expose the resolver over DoT through an edge router, [the VyOS interop guide](/guides/vyos-dot/) covers that without touching authoritative DNS.
 
 ## Related docs
 
 - [Gloryhole DoT DNS service interop with Magic WAN and VyOS](/guides/vyos-dot/) - exposing this resolver's DoT listener through the edge router.
 - [Unbound + AdGuard Home on the GL-MT3000](/guides/unbound-agh-mt3000/) - the standalone recursive-resolver counterpart.
-- [Self-hosted Forgejo on the router](/reference/self-hosted-forgejo-router/) - the sibling NixOS-edge service; same anycast-and-self-host instinct.
+- [Self-hosted Forgejo on the router](/reference/self-hosted-forgejo-router/) - the sibling NixOS-edge service.
 
 [^rfc2136]: P. Vixie et al., "Dynamic Updates in the Domain Name System (DNS UPDATE)," RFC 2136, IETF. https://www.rfc-editor.org/rfc/rfc2136
 [^knot-dns]: CZ.NIC, "Knot DNS 3.5 Documentation - Configuration (confdb, TSIG keys, dynamic updates)." https://www.knot-dns.cz/docs/3.5/singlehtml/index.html
