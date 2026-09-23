@@ -8,17 +8,17 @@ group: operations
 
 import { Aside } from "@astrojs/starlight/components";
 
-Two gaps in Supabase Auth have no setting to find: skipping the MFA prompt on a trusted device for N days, and seeing who impersonated whom from the log stream. This guide measured both gaps live and builds the custom pieces that close them - for each, the native behavior, where it stops, and the workaround.
+Supabase Auth has no setting for skipping the MFA prompt on a trusted device for N days, and its log stream does not show who impersonated whom. Both gaps were measured on a live project. Each part below gives the native behaviour, where it stops, and the custom piece that closes the gap.
 
 <Aside type="note">
-Behaviors below were validated live against hosted Supabase Auth (GoTrue) in `ap-southeast-2` on 2026-07-24, then the scratch project was deleted. Runtime behaviors (aal survival across refresh, the fresh-login aal1, the empty-by-default Postgres audit table, the log-stream shape, the `generateLink` session) are measured. Platform defaults change between versions. Both `audit_log_disable_postgres` readings were re-verified on 2026-09-08 by the [audit-integrity](/reference/supabase-audit-trail-integrity/) experiment on two fresh projects in `ap-southeast-1`, one Pro-plan and one Team-plan (modules A06a, A06b, A06c): still `true` by default, and the PATCH still a no-op when asked for the opposite value.
+The runtime behaviour here (aal survival across refresh, the fresh-login aal1, the empty-by-default Postgres audit table, the log-stream shape, the `generateLink` session) was measured against hosted Supabase Auth (GoTrue) in `ap-southeast-2` on 2026-07-24, on a scratch project deleted afterwards. Platform defaults change between versions. The [audit-integrity](/reference/supabase-audit-trail-integrity/) experiment re-read both `audit_log_disable_postgres` findings on 2026-09-08 on two fresh projects in `ap-southeast-1`, one Pro-plan and one Team-plan (modules A06a, A06b, A06c): the default is still `true`, and the PATCH is still a no-op when asked for the opposite value.
 </Aside>
 
-**Prerequisites:** a Supabase Pro (or higher) project with MFA enabled, a backend that validates Supabase JWTs locally against the project JSON Web Key Set (JWKS, the `/.well-known/jwks.json` endpoint) - the bring-your-own (BYO) backend pattern, and - for the impersonation half - an imported asymmetric signing key so your backend can mint its own Supabase-shaped tokens.
+Prerequisites: a Supabase Pro (or higher) project with MFA enabled, and a backend that validates Supabase JWTs locally against the project JSON Web Key Set (JWKS, the `/.well-known/jwks.json` endpoint), which is the bring-your-own (BYO) backend pattern. The impersonation half also needs an imported asymmetric signing key, so your backend can mint its own Supabase-shaped tokens.
 
 ## The assurance model you build on
 
-MFA in Supabase is expressed through the **Authenticator Assurance Level** (`aal`) claim on the JWT. A conventional login is `aal1`; verifying a second factor (TOTP or phone) upgrades the session to `aal2`. You gate sensitive actions on `aal2`, either in the database with an RLS predicate (`auth.jwt()->>'aal' = 'aal2'`) or with a backend check. Everything in this guide sits on top of that single claim - you are not replacing MFA, you are shaping when it is demanded. One consequence for the trusted-device pattern in Part 1: a skipped challenge leaves the session at `aal1`, and only GoTrue's own verify step raises it to `aal2`, so a database-side `aal2` predicate cannot be satisfied by that path. Gate in the database for the actions that must always challenge, and in the backend, where the trusted-device cookie is visible, for the ones a trusted device may skip.
+MFA in Supabase is expressed through the **Authenticator Assurance Level** (`aal`) claim on the JWT. A conventional login is `aal1`; verifying a second factor (TOTP or phone) upgrades the session to `aal2`. You gate sensitive actions on `aal2`, either in the database with an RLS predicate (`auth.jwt()->>'aal' = 'aal2'`) or with a backend check. The workarounds in this guide change when that claim is demanded; MFA itself stays as it is. In the trusted-device pattern in Part 1, a skipped challenge leaves the session at `aal1`, and only GoTrue's own verify step raises it to `aal2`, so a database-side `aal2` predicate cannot be satisfied by that path. Gate in the database for the actions that must always challenge, and in the backend, where the trusted-device cookie is visible, for the ones a trusted device may skip.
 
 ```dot
 digraph {
@@ -47,53 +47,49 @@ digraph {
 
 ### What is native
 
-Two measured facts settle the "how often do we re-prompt" question:
-
-| Behavior | Result (live) |
+| Behaviour | Result (live) |
 |---|---|
 | `aal2` after TOTP verify, then `refreshSession()` x2 | stays `aal2` |
 | Fresh `signInWithPassword` on a new client (a new device) | `aal1`, `nextLevel=aal2`, factor still `verified` |
 
-So there are two regimes:
-
-- **Same device, session kept alive -> no re-prompt.** A refreshed session is never re-challenged; `aal2` rides along for the whole session lifetime. The knob that controls "how long before we ask again on this device" is therefore the **session TTL**, set in Auth settings: [Time-box user sessions](https://supabase.com/docs/guides/auth/sessions) (a hard cap) and Inactivity timeout. Want "don't ask again for a day on this device"? Give the session a roughly one-day inactivity timeout and do not force logout.
-- **Every new device or fresh login re-prompts.** A brand-new session starts at `aal1` and must challenge again.
+- On the same device, with the session kept alive, the user is not prompted again: a refreshed session is never re-challenged and keeps `aal2` for its whole lifetime. The re-prompt interval on one device is therefore the session TTL, set in Auth settings as [Time-box user sessions](https://supabase.com/docs/guides/auth/sessions) (a hard cap) and Inactivity timeout. To stop asking for a day on one device, give the session a roughly one-day inactivity timeout and do not force logout.
+- A new device or a fresh login starts a new session at `aal1`, which must challenge again.
 
 ### What is not native
 
-The Google-style "trust this device, don't ask for 30 days even after logout or on a new session." Supabase Auth keeps no device-trust registry, and the [MFA Verification Hook](https://supabase.com/docs/guides/auth/auth-hooks/mfa-verification-hook) only runs *after* a code is submitted - it can rate-limit or reject a challenge, but it cannot skip one. There is no native "remember this device" flag.
+Supabase Auth has no Google-style "trust this device, don't ask for 30 days even after logout or on a new session". It keeps no device-trust registry, and the [MFA Verification Hook](https://supabase.com/docs/guides/auth/auth-hooks/mfa-verification-hook) runs only *after* a code is submitted: it can rate-limit or reject a challenge but cannot skip one.
 
 ### The workaround (a few dozen lines)
 
 Build device trust in your app layer on top of the native `aal`:
 
 1. After a successful `aal2`, compute a device token (random, or a fingerprint bound to the user), store `{user_id, device_hash, trusted_until}` server-side, and set a signed, `HttpOnly`, `Secure`, `SameSite=Strict` cookie.
-2. On a subsequent fresh login, before presenting the TOTP challenge, check the cookie plus the server row. If present and `trusted_until > now()`, **skip the challenge step** for that login. The session stays `aal1` (measured: a fresh login is `aal1` even with a verified factor, and only GoTrue's verify raises it), so satisfy your own gate in the backend where the cookie is visible; any RLS policy that gates on `auth.jwt()->>'aal' = 'aal2'` is unreachable on this path: the query is denied, and your app still has to run the TOTP challenge before that action succeeds.
+2. On a subsequent fresh login, before presenting the TOTP challenge, check the cookie plus the server row. If present and `trusted_until > now()`, skip the challenge step for that login. The session stays `aal1` (measured: a fresh login is `aal1` even with a verified factor), so satisfy your own gate in the backend, where the cookie is visible. A query under an RLS policy that gates on `auth.jwt()->>'aal' = 'aal2'` is denied on this path, and the app has to run the TOTP challenge before that action succeeds.
 3. Expire and rotate on the server; offer "forget this device"; and never trust a device for a genuine step-up action (address or payment change) - force `aal2` there regardless of any trusted-device cookie.
 
-This is a deliberate, documented weakening of MFA - the same trade-off every IdP makes with a "remember this device" checkbox. Keep it off high-value actions.
+This is a deliberate, documented weakening of MFA, the same trade-off every IdP makes with a "remember this device" checkbox.
 
 <Aside type="tip">
-Adaptive / impossible-travel MFA belongs at the perimeter (a Zero Trust access layer or WAF), not Supabase Auth; device-posture scoring (CrowdStrike, Tanium) is a separate layer again. Do not try to push either into Supabase Auth.
+Adaptive / impossible-travel MFA belongs at the perimeter (a Zero Trust access layer or WAF), and device-posture scoring (CrowdStrike, Tanium) is a separate layer again. Neither belongs in Supabase Auth.
 </Aside>
 
 ## Part 2: Impersonation audit trail
 
-In a BYO-backend Supabase setup, impersonation is your backend minting a short-lived JWT **as** the target user, signed with an imported signing key, carrying an `act` (RFC 8693 actor) claim set to the admin id. The backend validates it via JWKS like any other token.
+In a BYO-backend Supabase setup, impersonation is your backend minting a short-lived JWT as the target user, signed with an imported signing key, carrying an `act` (RFC 8693 actor) claim set to the admin id. The backend validates it via JWKS like any other token.
 
 ### What is native (and the empty-by-default audit table)
 
-- A **self-minted signing-key JWT never touches Supabase Auth** - it is local crypto. So it produces **no audit event anywhere**, and it is **not a session**: `getUser`, refresh, and signout all return `session_not_found` (verified). It is a pure bearer for your own JWKS validation.
-- The native **auth audit log** records login/logout/token/MFA events - but a live default bites here. On a fresh hosted project **`audit_log_disable_postgres: true`**, so the SQL-queryable `auth.audit_log_entries` table is **empty by default** (validated: `select count(*) -> 0` after real logins). This **differs from the [audit-logs docs](https://supabase.com/docs/guides/auth/audit-logs)**, which say entries are stored in two places. The toggle is Dashboard-only (Authentication -> Configuration -> Audit Logs); it is **not writable via the Management API** (the PATCH is a no-op). Re-verified 2026-09-08 on two fresh projects, and the Dashboard labels the switch in the positive form, "Write audit logs to the database", where these docs describe the negative one - see [the audit-trail integrity reference](/reference/supabase-audit-trail-integrity/).
-- Regardless of that toggle, **the log stream (the logs backend / Log Drains source) captures every login as an `auth_event`** with `action`, `actor_id`, `actor_username`, `provider`, `remote_addr`, `status`, and `time`. This is the stream an external SIEM (for example Datadog via Log Drains) consumes, and it is where seeing who impersonated whom from the log stream is actually possible. The query shape on the replacement logs endpoint (`WHERE source = 'auth_logs'`, fields read from the `log_attributes` map) is in [the logs-endpoint guide](/guides/supabase-management-api-logs-endpoint/); that endpoint is the one the 2026-08-22 re-check used.
+- A self-minted signing-key JWT never touches Supabase Auth. Signing it is local crypto, so it produces no audit event anywhere and is not a session: `getUser`, refresh, and signout all return `session_not_found` (measured). It is a bearer for your own JWKS validation and nothing else.
+- The native auth audit log records login/logout/token/MFA events, but a fresh hosted project has `audit_log_disable_postgres: true`, so the SQL-queryable `auth.audit_log_entries` table is empty by default (measured: `select count(*) -> 0` after real logins). This contradicts the [audit-logs docs](https://supabase.com/docs/guides/auth/audit-logs), which say entries are stored in two places. The toggle is Dashboard-only (Authentication -> Configuration -> Audit Logs), and the Management API PATCH is a no-op. The 2026-09-08 re-check on two fresh projects confirmed the `true` default and the no-op PATCH. The Dashboard labels the switch in the positive form, "Write audit logs to the database", where these docs describe the negative one; the detail is in [the audit-trail integrity reference](/reference/supabase-audit-trail-integrity/).
+- Regardless of that toggle, the log stream (the logs backend / Log Drains source) captures every login as an `auth_event` with `action`, `actor_id`, `actor_username`, `provider`, `remote_addr`, `status`, and `time`. This is the stream an external SIEM (for example Datadog via Log Drains) consumes. The query shape on the replacement logs endpoint (`WHERE source = 'auth_logs'`, fields read from the `log_attributes` map) is in [the logs-endpoint guide](/guides/supabase-management-api-logs-endpoint/); that endpoint is the one the 2026-08-22 re-check used.
 
 ### Workaround A: custom act audit table
 
-Recommended for real admin impersonation. Keep the self-minted-JWT approach and, in the same request and before minting, write your own `impersonation_audit(actor, target, reason, issued_at, expires_at)` row - a failed insert is a failed impersonation, since nothing else will record it - and carry `act.sub = adminId` in the token so every downstream request is attributable via JWKS. This is the only path that records **which admin** acted - the native log only ever shows the target's own login, never the actor behind an impersonation. Short-lived tokens (10 minutes) bound the window.
+For admin impersonation, keep the self-minted-JWT approach and, in the same request and before minting, write your own `impersonation_audit(actor, target, reason, issued_at, expires_at)` row. Treat a failed insert as a failed impersonation, since nothing else will record it. Carry `act.sub = adminId` in the token so every downstream request is attributable via JWKS. This row is the only record of which admin acted; the native log shows the target's own login and nothing about the actor. Short-lived tokens (10 minutes) bound the window.
 
 ### Workaround B: generateLink to a real, auditable session
 
-Use this only when the impersonated session must work against the Supabase Data API, Storage, or Realtime and be refreshable - cases where a self-minted bearer is the wrong tool.
+Use this only when the impersonated session must work against the Supabase Data API, Storage, or Realtime and be refreshable, which a self-minted bearer cannot do.
 
 ```ts
 // admin (service_role), server-side only - no email is sent:
@@ -104,15 +100,15 @@ const { data: s } = await anon.auth.verifyOtp({ token_hash: tokenHash, type: 'ma
 // s.session is a genuine, refreshable, sign-out-able session (validated).
 ```
 
-Validated: this yields a real session (`getUser`, refresh, and signout all work; `amr:[otp]`; carries a `session_id`), and the whole sequence **is** captured in the log stream as `auth_event`s - the impersonation `login` (`/verify`, `log_type:account`), the `generateLink` call (`user_recovery_requested`, `/admin/generate_link`), and the `createUser` (`user_signedup`, `actor_username:service_role`).
+Validated live: the exchange yields a real session (`getUser`, refresh, and signout all work; `amr:[otp]`; carries a `session_id`), and the log stream captures the whole sequence as `auth_event`s: the impersonation `login` (`/verify`, `log_type:account`), the `generateLink` call (`user_recovery_requested`, `/admin/generate_link`), and the `createUser` (`user_signedup`, `actor_username:service_role`).
 
-The trade-off (proven): the `login` event's `actor_id` is the **target**, and the admin calls log as `service_role` - the stream never names the *human* admin behind the impersonation. So pair this with a one-row insert into your own audit table (as in workaround A) for actor attribution. And protect the endpoint hard: anyone who can call it can mint a session as any user.
+Measured: the `login` event's `actor_id` is the target, and the admin calls log as `service_role`, so the stream never names the human admin behind the impersonation. Pair this with a one-row insert into your own audit table (as in workaround A) for actor attribution, and restrict who can call the endpoint: anyone who can call it can mint a session as any user.
 
 ### Recommended combination
 
-- Turn **on** the Postgres audit table (Dashboard) *or* wire **Log Drains to a SIEM** so `auth_event`s are retained and queryable. Do not assume `auth.audit_log_entries` is populated. After turning the toggle on, confirm with `select count(*) from auth.audit_log_entries` after one login before relying on it: the default-off state was measured (`0` after real logins), the on state was not.
-- Use **workaround A** (self-minted JWT + `act` + custom audit row) for admin impersonation of a BYO-backend - it is the only source of admin-actor attribution and needs no session.
-- Use **workaround B** only when the impersonated identity must drive Supabase-native services and be refreshable; add the custom audit row on top for the actor.
+- Turn on the Postgres audit table (Dashboard) or wire Log Drains to a SIEM so `auth_event`s are retained and queryable. Do not assume `auth.audit_log_entries` is populated. After turning the toggle on, confirm with `select count(*) from auth.audit_log_entries` after one login before relying on it: the default-off state was measured (`0` after real logins), the on state was not.
+- Use workaround A (self-minted JWT + `act` + custom audit row) for admin impersonation of a BYO-backend; it is the only source of admin-actor attribution and needs no session.
+- Use workaround B only when the impersonated identity must drive Supabase-native services and be refreshable; add the custom audit row on top for the actor.
 
 ## Evidence
 
@@ -121,7 +117,7 @@ The trade-off (proven): the `login` event's `actor_id` is the **target**, and th
 | `aal2` survives refresh; a fresh login is `aal1` even with a verified factor | measured | `refreshSession()` x2 after TOTP verify, and a fresh `signInWithPassword` on a new client, live in `ap-southeast-2` on 2026-07-24 |
 | A self-minted signing-key JWT produces no audit event and is not a session | measured | `getUser`, refresh, and signout all returned `session_not_found` on the live project |
 | `auth.audit_log_entries` is empty by default (`audit_log_disable_postgres: true`) | measured | `select count(*) -> 0` after real logins, via Management API SQL. Re-verified 2026-09-08 on two fresh projects in `ap-southeast-1` (audit-integrity A06c: 3 users and 3 password logins, table 0 -> 0) |
-| The Postgres-audit toggle is Dashboard-only, not Management-API-writable | measured | the PATCH was a no-op on a live project. Re-verified 2026-09-08 by asking for the OPPOSITE of the held value: HTTP 200, value unchanged (audit-integrity A06b) |
+| The Postgres-audit toggle is Dashboard-only, not Management-API-writable | measured | the PATCH was a no-op on a live project. Re-verified 2026-09-08 by asking for the opposite of the held value: HTTP 200, value unchanged (audit-integrity A06b) |
 | The log stream captures every login as an `auth_event` | measured | `analytics/endpoints/logs.all` on the live project (2026-07-24); that endpoint is scheduled for removal on 2026-09-23, and the same check was re-verified on the replacement `analytics/endpoints/logs` with `WHERE source = 'auth_logs'` (2026-08-22) |
 | Audit entries are stored in two places | documented | [audit-logs docs](https://supabase.com/docs/guides/auth/audit-logs) - contradicted by the live check above |
 
@@ -129,7 +125,7 @@ The trade-off (proven): the `login` event's `actor_id` is the **target**, and th
 
 | Practice | Evidence |
 |---|---|
-| Put the trusted-device gate in the backend, not in an RLS predicate on `auth.jwt()->>'aal' = 'aal2'` | The backend can see the cookie; a skipped challenge does not satisfy the predicate. Evidence row 1: a fresh login is `aal1` even with a verified factor, and only GoTrue's verify raises it |
+| Put the trusted-device gate in the backend instead of an RLS predicate on `auth.jwt()->>'aal' = 'aal2'` | The backend can see the cookie; a skipped challenge does not satisfy the predicate. Evidence row 1: a fresh login is `aal1` even with a verified factor, and only GoTrue's verify raises it |
 | Set the re-prompt interval with the session TTL (time-box and inactivity timeout); a live session is never re-challenged | Evidence row 1: `aal2` survives `refreshSession()` x2 |
 | Never trust a device for a step-up action; force `aal2` there regardless of the cookie | Design choice, not a result: the same trade-off every IdP makes with "remember this device" |
 | Write the `impersonation_audit` row before minting the token, in the same request, and treat a failed insert as a failed impersonation | Evidence row 2: a self-minted JWT produces no audit event anywhere; Gotcha 8: native logs never name the admin actor |
@@ -138,7 +134,7 @@ The trade-off (proven): the `login` event's `actor_id` is the **target**, and th
 
 ## Verification
 
-Every check in this guide is reproducible against any throwaway Pro project using the Auth client calls in the Part 1 table plus the Management API, config, and log-stream calls below - the two behavior suites ran as throwaway probe scripts, not retained files:
+Every check here reproduces on a throwaway Pro project with the Auth client calls in the Part 1 table plus the Management API, config, and log-stream calls below:
 
 ```bash
 # provision a throwaway Pro project, then:
@@ -154,17 +150,17 @@ export SB_URL=https://<ref>.supabase.co SB_ANON=<anon> SB_SERVICE=<service_role>
 
 ## File reference
 
-No project files ship with this guide. The two suites above ran as throwaway probe scripts against the scratch project and were not retained; every check reduces to the Auth client calls in the Part 1 table plus the Management API, config, and log-stream calls listed in Verification.
+No project files ship with this guide. The two behaviour suites ran as throwaway probe scripts against the scratch project and were not retained; every check reduces to the calls listed in Verification.
 
 ## Gotchas and lessons learned
 
 | # | Finding |
 |---|---|
-| 1 | `aal2` **survives token refresh** - a live session is never re-challenged; session TTL is the native "re-prompt interval". |
-| 2 | A **fresh login is `aal1`** (`nextLevel=aal2`) even with a verified factor - every new device re-prompts. No native trusted-device skip. |
-| 3 | Trusted-device "remember for N days" is a **custom cookie plus server row** around native `aal`; the MFA Verification Hook cannot skip a challenge. |
-| 4 | A **self-minted signing-key JWT is not a session and is never audited** (`session_not_found`; no log event) - it is a JWKS bearer only. |
-| 5 | `auth.audit_log_entries` is **empty by default** (`audit_log_disable_postgres: true`); the toggle is **Dashboard-only**, not Management-API-writable. The docs say otherwise. |
-| 6 | The **log stream always carries `auth_event`s** (login/logout/token/generate_link/signup, with actor_id, log_type, path, remote_addr) - the way to see impersonation from the log stream (Log Drains to a SIEM). |
-| 7 | `generateLink({magiclink})` + `verifyOtp(token_hash)` mints a **real, refreshable session** for a target and the `/verify` login **is** logged - but `actor_id` is the target (admin calls log as `service_role`), so no human-admin attribution without a custom row. |
-| 8 | Native logs never record the **admin actor** behind an impersonation; a custom `act`-claim plus audit row is the only source of that. |
+| 1 | `aal2` survives token refresh, so session TTL is the native re-prompt interval. |
+| 2 | A fresh login is `aal1` (`nextLevel=aal2`) even with a verified factor, so every new device re-prompts. |
+| 3 | Trusted-device "remember for N days" is a custom cookie plus server row around native `aal`; the MFA Verification Hook cannot skip a challenge. |
+| 4 | A self-minted signing-key JWT is not a session and is never audited (`session_not_found`; no log event). |
+| 5 | `auth.audit_log_entries` is empty by default (`audit_log_disable_postgres: true`), and the toggle is Dashboard-only; the docs say otherwise. |
+| 6 | The log stream always carries `auth_event`s (login/logout/token/generate_link/signup, with actor_id, log_type, path, remote_addr); Log Drains to a SIEM is how you see impersonation in it. |
+| 7 | `generateLink({magiclink})` + `verifyOtp(token_hash)` mints a real, refreshable session for a target and the `/verify` login is logged, but `actor_id` is the target (admin calls log as `service_role`), so the human admin is not attributed without a custom row. |
+| 8 | Native logs never record the admin actor behind an impersonation; a custom `act`-claim plus audit row is the only source of that. |

@@ -1,6 +1,6 @@
 ---
 title: "RLS policy cost, measured"
-description: "Which RLS policy shape to pick, and what each shape actually costs - measured InitPlan hoisting, index interaction, nested EXISTS policies, and grant targets on a disposable Supabase project."
+description: "Which RLS policy shape to pick, and what each shape costs - measured InitPlan hoisting, index interaction, nested EXISTS policies, and grant targets on a disposable Supabase project."
 author: Erfi Anugrah
 category: supabase
 group: architecture
@@ -10,12 +10,11 @@ blurb: "Policy shape decides plan shape. Measured: the (select auth.uid()) wrap,
 
 Row Level Security policy text is a query plan input. The shape you pick decides
 whether your lookup helper runs once per statement or once per row, and whether
-the optimizer can even see an index. This doc measures the three
-shapes: the `(select auth.uid())` wrap, the
-`SECURITY DEFINER` helper, and the joined-table `EXISTS` - plus the grant-target
-and client-filter shapes people treat as synonyms and are not.
+the optimizer can see an index. Measured here: the `(select auth.uid())`
+wrap, the `SECURITY DEFINER` helper, the joined-table `EXISTS`, grant targets,
+and client filters.
 
-**Provenance.** Fixtures and runs come from the `supabase-lab` OpenTofu repo
+Fixtures and runs come from the `supabase-lab` OpenTofu repo
 (disposable `supabase_project`, micro, ap-southeast-1; Postgres 17.6; SQL
 issued over the session-mode pooler at port 5432). Fixture sizes: 100k-row
 `items`, 2k-row `threads`, 300-row `posts`; two fake user UUIDs. Timings are
@@ -29,13 +28,13 @@ directional. The full SQL and output are linked below.
   Measured on 100k rows, unindexed: 100,001 helper calls -> 1 call, and the
   row digests (count + sum) are identical in both directions.
 - With an index on the policy column, the bare form already evaluates O(1)
-  per query (2 calls vs 1 here). The wrap still wins, but the remaining gap
-  is noise; deferring the rewrite on already-indexed columns is defensible.
+  per query (2 calls vs 1 here). The remaining gap is within noise, so the
+  rewrite can wait on already-indexed columns.
 - A table joined inside a policy's `EXISTS` enforces its own RLS recursively.
   Postgres may decorrelate the `EXISTS` into a hashed subplan (`loops=1`), in
   which case the wrap inside the `EXISTS` hoists too. At other sizes the same
   statement can come back as a correlated `SubPlan` evaluated per outer row.
-- Predicate shape does not decide grant visibility; the grant target does.
+- The grant target decides grant visibility.
   `TO public` on a SELECT policy exposes it to `anon`. `TO authenticated`
   does not.
 - Client-side filters combine with the policy by conjunction. A client filter
@@ -63,19 +62,17 @@ with an unindexed `owner` column:
 - wrapped: `Filter: (owner = (InitPlan 1).col1)` - 1 call, 22.2ms
 
 Row digests are identical in both forms (count 90,000; sum 4,500,010,000). The
-wrap is access-control-neutral by construction. A caveat: if the wrapped
-subquery references a row column, it becomes a correlated `SubPlan` and the
-win disappears - the hoist only applies where the helper is genuinely row-
-independent, which `auth.uid()` is.
+wrap is access-control-neutral by construction. If the wrapped subquery
+references a row column it becomes a correlated `SubPlan` and runs per row
+again; the hoist needs a row-independent helper, which `auth.uid()` is.
 
 ## What an index does to the win
 
 Once `items(owner)` has an index, the bare form's stable helper becomes an
 index condition evaluated O(1) times per scan rather than per tuple: 2 calls
 here against 1 for the wrapped form. Timing converged (24.1ms / 24.2ms on this
-run). Read that two ways: the wrap is still strictly better, and deferring the
-rewrite on a column you just indexed buys real time. Index the columns your
-policies filter on first, then wrap the helpers. Run `VACUUM ANALYZE` on a
+run). The wrap still makes fewer calls, and on a column you just indexed the rewrite
+can wait. Index the columns your policies filter on first, then wrap the helpers. Run `VACUUM ANALYZE` on a
 fixture after loading and again after `CREATE INDEX` before comparing plans:
 the post-index plan here was a Bitmap Heap Scan with no Index Only Scan
 because the fresh table had never been vacuumed (RUNLOG result B); whether a
@@ -97,30 +94,27 @@ hashed subplan at 300x2000 fixture scale (`loops=1`), and the wrap inside the
 calls versus 1 wrapped. Index the joined column; the hashed build narrows to
 the caller's rows (`Index Cond` off the join policy's own wrapping).
 
-The plan form is a choice, not a guarantee. A correlated `SubPlan` at larger
-scale or different statistics evaluates the subquery per outer row, and there
-the bare form's helper cost is per row of the outer table - the rewrite case
-is strongest exactly there. If a policy looks like this shape and the table is
-growing, wrap the helper before you need to. Read the plan for which form you
+The planner picks the plan form and can pick differently. A correlated
+`SubPlan` at larger scale or different statistics evaluates the subquery per
+outer row, and the bare form's helper then runs per row of the outer table. If
+a policy looks like this shape and the table is growing, wrap the helper before you need to. Read the plan for which form you
 got: a `SubPlan` whose `loops` equals the outer row count is per-row
 evaluation; an `InitPlan` is hoisted; a hashed subplan with `loops=1` is
 decorrelated, and the helper's hoist then shows as an `InitPlan` inside it
 (RUNLOG result C: `InitPlan 3`).
 
-## Grant target, not predicate
+## Grant targets
 
 `TO public` admits the `anon` role; `TO authenticated` does not. Measured on
 the same predicate both ways: `anon` read 5,250 rows through `TO public`, 0
-through `TO authenticated`. Audit by grant target, not by reading predicates.
-To do that: `select tablename, policyname, roles from pg_policies where
-'public' = any(roles) or 'anon' = any(roles);` lists the policies whose
+through `TO authenticated`. Audit the grant targets:
+`select tablename, policyname, roles from pg_policies where 'public' = any(roles) or 'anon' = any(roles);` lists the policies whose
 target admits anon (a standard catalogue query, not part of the matrix). The
 security advisor does not lint grant targets; its `rls_enabled_no_policy` and
 `rls_disabled_in_public` lints cover the missing-policy case
 (security-lockdown S01).
 
-The write side is the same lesson with grants. A permissive UPDATE policy plus
-a table-level UPDATE grant let anon overwrite a `balance` column (`204`);
+A permissive UPDATE policy plus a table-level UPDATE grant let anon overwrite a `balance` column (`204`);
 after `revoke update on t` and `grant update (note)` the same write returned
 `401` with SQLSTATE `42501` while `note` still wrote (security-lockdown S13).
 Policies decide rows, grants decide columns; a `WITH CHECK` never constrains
@@ -133,9 +127,9 @@ a table with 100 subscribers performs 100 authorization checks, so throughput
 scales with subscriber count, not write rate[^sb-pg-changes]. Every read-path
 cost above therefore also prices the delivery path. A policy that is cheap to
 read is cheap to authorize; a policy that seq-scans a joined table per event
-does it per subscriber. The grant-target coupling cuts the other way too: a
-`TO authenticated` read path delivers nothing to anonymous subscribers while
-the REST path keeps working through a function.
+does it per subscriber. A `TO authenticated` read policy also delivers
+nothing to anonymous Realtime subscribers, while the REST path keeps working
+through a function.
 
 ## Client filters compose safely
 
@@ -143,21 +137,20 @@ Supabase composes a client query's own `WHERE` with the policy predicate by
 conjunction. Measured with policy `owner = auth.uid()` OR `tag = 'public'`
 and an other-user filter: 90,250 visible unfiltered; owner-drifted filter
 returns the other user's 250 public rows - never more; `private`-drifted
-filter returns 0. Bad client-side duplication only ever narrows.
+filter returns 0.
 
 ## What to do about it
 
-The measurements imply a short list of practices. Each row names the RUNLOG
-result or module id it rests on (rls-policy-cost unless prefixed); a row that
+Each row names the RUNLOG result or module id it rests on (rls-policy-cost unless prefixed); a row that
 is a design choice rather than a result says so.
 
 | Practice | Evidence | Module |
 |---|---|---|
-| Declare the helper `security definer set search_path = ''` and grant EXECUTE narrowly. | `revoke execute ... from public`, then grant to the intended role only; the security advisor lints this shape as `function_search_path_mutable` and `anon_/authenticated_security_definer_function_executable`. | security-lockdown [S01](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/security-lockdown/tests/s01-security-advisors.ts) |
-| Audit policy grant targets for `public` and `anon` yourself. | `select tablename, policyname, roles from pg_policies where 'public' = any(roles) or 'anon' = any(roles);` lists the policies whose target admits anon; the security advisor does not lint grant targets, and its `rls_enabled_no_policy` and `rls_disabled_in_public` lints cover the missing-policy case. The same predicate admitted 5,250 rows `TO public` and 0 `TO authenticated`. | result E, security-lockdown [S01](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/security-lockdown/tests/s01-security-advisors.ts) |
-| `VACUUM ANALYZE` fixtures after loading and after `CREATE INDEX`, before comparing plans. | The post-index plan here was a Bitmap Heap Scan with no Index Only Scan because the fresh table had never been vacuumed; whether a vacuumed table gives an Index Only Scan was not measured. | result B |
+| Declare the helper `security definer set search_path = ''` and grant EXECUTE narrowly. | `revoke execute ... from public`, then grant to the intended role only; the advisor flags this shape as `function_search_path_mutable` and `anon_/authenticated_security_definer_function_executable`. | security-lockdown [S01](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/security-lockdown/tests/s01-security-advisors.ts) |
+| Audit policy grant targets for `public` and `anon` yourself. | The `pg_policies` query above lists them; the advisor does not lint grant targets. The same predicate admitted 5,250 rows `TO public` and 0 `TO authenticated`. | result E, security-lockdown [S01](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/security-lockdown/tests/s01-security-advisors.ts) |
+| `VACUUM ANALYZE` fixtures after loading and after `CREATE INDEX`, before comparing plans. | Unvacuumed, the post-index plan was a Bitmap Heap Scan with no Index Only Scan; the vacuumed case was not measured. | result B |
 | Grant UPDATE per column on tables with UPDATE policies. | A permissive UPDATE policy plus a table-level grant let anon overwrite `balance` (`204`); `revoke update on t` plus `grant update (note)` turned the same write into `401` with SQLSTATE `42501` while `note` still wrote. | security-lockdown [S13](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/security-lockdown/tests/s13-column-grants.ts) |
-| Read EXPLAIN ANALYZE for the form you got. | A `SubPlan` whose `loops` equals the outer row count is per-row evaluation; an `InitPlan` is hoisted; a hashed subplan with `loops=1` is decorrelated, and the helper's hoist then shows as an `InitPlan` inside it (`InitPlan 3` in result C). | result C |
+| Read EXPLAIN ANALYZE for the form you got. | `SubPlan` with `loops` = outer rows is per-row; `InitPlan` is hoisted; a hashed subplan with `loops=1` is decorrelated (`InitPlan 3` inside it in result C). | result C |
 
 ## Reading the numbers
 
@@ -210,11 +203,10 @@ digraph {
 The full SQL matrix and run output live in the
 [supabase-lab repo](https://github.com/erfianugrah/supabase-lab/tree/0769afb/experiments/rls-policy-cost)
 (`make up`, then `make destroy`; the project is gone). The method: log in as
-`postgres` over the session-mode pooler (port 5432; transaction mode drops
-session GUCs *between transactions* - and, measured in the sibling
-rls-wire-claims experiment, lets a bare `SET` leak to the next invocation,
-so 6543 is unusable for claims fixtures either way), then `SET ROLE authenticated` and
-`set "request.jwt.claims" = '{"sub":"<fixture-uuid>"}'`. Call counts use a
+`postgres` over the session-mode pooler (port 5432), then `SET ROLE authenticated` and `set "request.jwt.claims" = '{"sub":"<fixture-uuid>"}'`.
+Transaction mode (6543) drops session GUCs between transactions and, measured
+in the sibling rls-wire-claims experiment, leaks a bare `SET` to the next
+invocation, so it cannot run claims fixtures. Call counts use a
 PL/pgSQL helper that increments a sequence alongside `auth.uid()`, which
 survives the pooler because the sequence is ordinary DDL. RLS tests run as
 `postgres` prove nothing - that role carries `BYPASSRLS` on Supabase.
