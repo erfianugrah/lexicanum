@@ -1098,6 +1098,7 @@ const practicePages: Array<[doc: string, heading: RegExp]> = [
   ["reference/stripe-sync-engine", PRACTICES_HEADING],
   ["reference/supabase-auth-end-to-end", PRACTICES_HEADING],
   ["reference/supabase-aws-privatelink", PRACTICES_HEADING],
+  ["reference/supabase-branching-two-projects-one-repo", PRACTICES_HEADING],
   ["reference/supabase-compute-disk", /^## Ops playbook$/m],
   ["reference/supabase-data-residency", PRACTICES_HEADING],
   ["reference/supabase-data-surface-lockdown", PRACTICES_HEADING],
