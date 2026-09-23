@@ -10,11 +10,11 @@ blurb: "One Postgres for every agent client's session history, and the lessons f
 Every coding agent keeps its own session log in its own format on the machine
 where it ran, prunes it on its own schedule, and searches it with its own
 built-in tool. Three clients on two machines is three histories, three search
-tools, and a retention window that quietly deletes the thing you wanted last
-month. This is the architecture of the store that consolidates them, and what
-seeding 640k messages into it taught.
+tools, and a retention window that deletes last month's sessions. This is the
+architecture of the store that consolidates them, and what seeding 640k
+messages into it showed.
 
-**Provenance.** Measured 2026-08-09 and 2026-08-10 on a self-hosted deployment:
+Measured 2026-08-09 and 2026-08-10 on a self-hosted deployment:
 Postgres 18 with pgvector, PostgREST, and a CPU embedding worker, all in one
 Compose stack on a 2-core/2GB container allocation, ingesting from one
 workstation. Corpus at time of writing: 642,496 messages across three agent
@@ -22,12 +22,12 @@ clients plus a work-ledger and an agent memory file.
 
 ## TL;DR
 
-- Session logs are append-only files, so ingest is a byte-offset or line-count
-  checkpoint per file, not a diff. Re-reading a 30MB log every five minutes to
-  find four new lines is the thing to avoid.
+- Session logs are append-only files, so ingest keeps a byte-offset or
+  line-count checkpoint per file and reads only what was appended, instead of
+  re-reading a 30MB log every five minutes to find four new lines.
 - One Postgres does both retrieval modes. Full-text search answers "where did I
   write this exact string", vector search answers "where did I discuss this
-  idea", and they are different questions with different failure modes.
+  idea", and the two fail in different ways.
 - Filtering a vector search needs its own design. The index applies the filter
   after it collects candidates, so a selective filter returns short, and the
   workaround for that scans the table when the filter is broad: 9,625 ms
@@ -35,22 +35,21 @@ clients plus a work-ledger and an agent memory file.
 - Measure recall against exact search before trusting an approximate index, and
   pin the query vectors when you do. An unpinned `OFFSET` sample here reported
   100% recall for something that measures around 92%.
-- Embedding 640k rows on CPU is a throughput problem with one lever that works
-  (parallel workers on disjoint row batches) and one that inverts (more
-  intra-op threads per call).
+- Embedding 640k rows on CPU scaled with parallel workers on disjoint row
+  batches, and got slower with more intra-op threads per call.
 - A background worker started from a framework lifecycle hook that the framework
   silently skipped ran for weeks doing nothing while its health endpoint
-  reported healthy. Heartbeat-or-it-did-not-happen.
+  reported healthy. The fix is a heartbeat that the health endpoint reads.
 - A session searching the store for its own prior context matched only its own
   synthesis of that context - the query vocabulary echoes back, and AND
   semantics at message granularity select for the echo. Retrieval tools need
-to know which session is asking.
+  to know which session is asking.
 - The same worker later held one uncommitted transaction open across its idle
   sleeps, which blocked every DDL statement and then every query behind it. A
   loop that touches a database has to commit on the path where it finds nothing
   to do.
 - Expose retrieval as ordinary HTTP. Any client that can make a request can use
-  it - protocol adapters are a thin layer on top, not the architecture.
+  it, and protocol adapters such as MCP sit on top of the same endpoints.
 
 ## Topology
 
@@ -100,13 +99,13 @@ digraph {
 | Agent memories | one json file | whole-file | Small, changes rarely, cheap to re-read |
 
 The unifying key is `session_key = <source>:<host>:<external_id>`, and messages
-are keyed `(session_key, ordinal)` where ordinal is the line index. That choice
-is what makes incremental ingest idempotent: re-reading a file from an earlier
+are keyed `(session_key, ordinal)` where ordinal is the line index. That key
+makes incremental ingest idempotent: re-reading a file from an earlier
 offset re-derives the same keys, and the upsert merges rather than duplicating.
 
 ## Incremental ingest
 
-The ingester is a CLI on a five-minute timer, not a daemon. Per source file it
+The ingester is a CLI on a five-minute timer rather than a daemon. Per source file it
 stores `(size, mtime, offset, line count)` in an `ingest_state` table, reads
 from the stored offset, and writes back the new one. A file whose size and mtime
 match the checkpoint is skipped without opening it.
@@ -120,34 +119,33 @@ of adopting the pattern:
   only sets optional columns when non-null will produce exactly that batch. Pad
   the missing keys with null in the client before posting.
 - **Order matters across tables.** Messages carry a foreign key to sessions, so
-  the session rows have to land first. Discovered the way these things are
-  usually discovered: a foreign-key violation on the very first run of a new
-  source.
+  the session rows have to land first. This showed up as a foreign-key
+  violation on the very first run of a new source.
 
 Because the timer reads the live log file, a session's messages are searchable
-minutes after they are written - closing the client is not what triggers ingest,
+minutes after they are written. Ingest does not wait for the client to close,
 and nothing is lost if the machine is off for a day.
 
 ## Two retrieval modes, one database
 
 Full-text search runs in Postgres against a generated `tsvector` column with a
 GIN index, exposed as a function through PostgREST. Vector search runs against
-a pgvector column with an HNSW index.[^pgvector] They answer different questions:
+a pgvector column with an HNSW index.[^pgvector]
 
 | Mode | Good at | Bad at | Cost |
 |---|---|---|---|
 | Full-text | Exact identifiers, error strings, file paths, flag names | Paraphrase, concepts, "the thing about locking" | Index maintained inline on write |
 | Vector | Concepts, paraphrase, "what was that idea about X" | Exact tokens, rare identifiers, anything the embedding model never saw | Backfill cost + index maintenance per row |
 
-Keep the query syntax honest per mode. Postgres `websearch_to_tsquery` accepts
+Query syntax differs per mode. Postgres `websearch_to_tsquery` accepts
 quoted phrases, `OR`, and `-negation`, but not the FTS5-style `AND`/`NOT` an
 agent might have learned from a different tool; multi-word queries are joined
 with `OR` before they reach it so a two-word search does not silently require
 both.[^pg-fts]
 
 Vector search needs the query embedded with the same model as the corpus, so it
-belongs behind a small service rather than in each client. That service is also
-where the embedding model lives, which keeps the model out of every consumer.
+belongs behind a small service rather than in each client. That service also
+hosts the embedding model, so no consumer has to load it.
 
 ## Filtering a vector search
 
@@ -173,25 +171,23 @@ The resolution probes the index and falls back to the exact subset only when the
 probe returns fewer rows than were asked for, which is the signature of the
 post-filter discard. End to end that endpoint went from 8.4s to 0.21s.
 
-Measuring the recall this costs needs care, and the first attempt here got it
-wrong in a way worth copying the fix for. Drawing a query vector with `OFFSET n
-LIMIT 1` and no `ORDER BY` returns a different row per run, so two runs of the
-same "offset 5000" probe disagreed - 10 of 10 against exact one time, 6 of 10 the
-next - and a single such draw had already been written up as "identical to exact".
-Pinning the sample by primary key and widening it to 20 vectors gives a figure
-that holds still, top-10 against exact search:
+Measuring the recall this costs needs a pinned sample. Drawing a query vector
+with `OFFSET n LIMIT 1` and no `ORDER BY` returns a different row per run, so
+two runs of the same "offset 5000" probe disagreed - 10 of 10 against exact one time, 6 of 10 the
+next. Pinning the sample by primary key and widening it to 20 vectors gives a
+stable figure, top-10 against exact search:
 
 | Index | Recall | Worst single vector |
 |---|---|---|
 | Full precision | 183/200 (91.5%) | 0/10 |
 | Half precision | 185/200 (92.5%) | 0/10 |
 
-Approximate means approximate: the index was never returning exact results, and
-the honest number for both is around 92%, not 100%. Both share the same worst
-vector, consistent with duplicate embeddings and tied distances rather than a
-graph failure.
+Neither index returns exact results: both recall around 92% of the exact
+top-10, against the 100% the unpinned sample suggested. Both share the same
+worst vector, consistent with duplicate embeddings and tied distances rather
+than a graph failure.
 
-Two adjacent behaviours, a day between them:
+Two related behaviours showed up a day apart:
 
 - A similarity threshold belongs after the query rather than in the `WHERE`
   clause. With the threshold in SQL, a query that legitimately has few results
@@ -212,20 +208,20 @@ Two adjacent behaviours, a day between them:
 | Full-text GIN index | 387 MB |
 | Stored message content | 1,133 MB |
 
-Vectors dominate: the column and its index together are 1,986 MB against
-1,133 MB of message content. The index earns that. A top-10 search takes 2.8 ms
+The vector column and its index together are 1,986 MB against 1,133 MB of
+message content. In exchange, a top-10 search takes 2.8 ms
 warm and 26 ms cold, and with index scans disabled the same query took
 2,535 ms - then 3,005 ms on a second run, because table plus TOAST is 2,814 MB
 against a 2GB container allocation, so the exact scan re-reads roughly 1.6GB
 from disk every time and never warms.
 
-The index is also the half of that pair worth shrinking, because it is what gets
-traversed on every search. pgvector can index the cast rather than the column -
+The index is the half of that pair to shrink, because every search traverses
+it. pgvector can index the cast rather than the column -
 `hnsw ((embedding::halfvec(384)) halfvec_cosine_ops)` - which leaves the stored
 vectors at full precision and the write path untouched. Here that took the
 messages index from 1,043 MB to 597 MB and the database from 4,415 MB to
-3,946 MB, at the recall shown above: 185/200 against 183/200, so no quality was
-traded for the 43%. Three things to know before copying it:
+3,946 MB, at the recall shown above: 185/200 against 183/200, so the 43% cost
+no recall. Three things to know before copying it:
 
 - An expression index is only used when the query repeats the cast verbatim.
   `embedding <=> $1::vector` against a `halfvec` index silently becomes a
@@ -238,13 +234,13 @@ traded for the 43%. Three things to know before copying it:
   `max_parallel_maintenance_workers = 0` works around it (9m29s for 644k rows,
   spilling past a 256 MB `maintenance_work_mem` after 180,983 tuples); raising
   `shm_size` to 1 GB fixed it properly and the same build then took 5m35s with two
-  workers. Note `shm_size` is a ceiling rather than a reservation, and the pages
+  workers. `shm_size` is a ceiling rather than a reservation, and the pages
   used are charged to the container's memory limit: writing 300 MB into
   `/dev/shm` moved this container from 86 MiB to 402.6 MiB, and back to 100 MiB
   when the file was deleted.
-- A freshly built index is cold, and cold is seconds: the first `limit=50` search
-  after the swap took 5.37s before settling to 0.047-0.18s. The warm numbers in
-  this doc are not a claim about the first query after a deploy.
+- A freshly built index is cold: the first `limit=50` search after the swap
+  took 5.37s before settling to 0.047-0.18s. The warm numbers on this page do
+  not describe the first query after a deploy.
 
 ## Embedding throughput on CPU
 
@@ -260,19 +256,19 @@ measured scaling matrix, one configuration change at a time:
 | 8 CPU, 6 workers x batch 8, 2 intra-op threads | 589 |
 
 Intra-op thread scaling inverted past four: the 8-CPU single-worker row is
-slower than the 4-CPU one. What scaled was worker threads on **disjoint** row
+slower than the 4-CPU one. What scaled was worker threads on disjoint row
 batches - each worker claims its own rows with `SELECT ... FOR UPDATE SKIP
 LOCKED`, so six workers never fight over the same batch.[^pg-select] The
 inference runtime releases the interpreter lock during the forward pass, so the
-threads genuinely overlap.
+threads overlap.
 
 Two things to know before copying the numbers. The rate is content-dependent -
 the same configuration ran at 938 rows/min through a stretch of short tool
 results and 589 through prose - so measure your own corpus rather than
 extrapolating from a row above. And at six workers neither side was saturated
-(the worker container at roughly 3 of 8 cores, Postgres at about 1 of 2), which
-means the ceiling was coordination, not capacity: adding workers past that point
-buys progressively less.
+(the worker container at roughly 3 of 8 cores, Postgres at about 1 of 2), so
+the ceiling was coordination rather than capacity, and adding workers past six
+would likely add progressively less.
 
 The backfill query itself becomes the bottleneck as the queue drains. `WHERE
 embedding IS NULL ORDER BY ts DESC LIMIT n` has no index that matches it, and
@@ -285,14 +281,14 @@ does.
 
 The backfill worker was started from a framework startup hook. When an MCP
 surface was added later, the app set a custom lifespan context - and a custom
-lifespan makes the framework skip the startup hooks entirely. No error, no log
-line, no failed health check: the process was serving search requests while the
-thread that was supposed to be embedding had never been created. It sat at 2.6%
+lifespan makes the framework skip the startup hooks entirely. Nothing errored
+or logged, and the health check passed: the process was serving search requests
+while the thread that was supposed to be embedding had never been created. It sat at 2.6%
 embedded for weeks.
 
-What found it was `py-spy dump` from a sidecar container sharing the PID
-namespace, which listed two Python threads where there should have been three.
-What prevents the next one is a heartbeat the health endpoint reads:
+`py-spy dump` from a sidecar container sharing the PID namespace found it,
+listing two Python threads where there should have been three. The prevention
+is a heartbeat that the health endpoint reads:
 
 ```python
 WORKER_STATE = {"last_loop": 0.0, "rows_embedded": 0, "errors": 0}
@@ -309,14 +305,13 @@ def health(response: Response):
 
 A container healthcheck against that endpoint turns "the worker is wedged" into
 `unhealthy` in `docker ps`, and the same counters go out as Prometheus metrics.
-The rule generalises past this stack: any background loop inside a serving
-process needs a liveness signal that the serving half exposes, because "the port
-answers" is not evidence that the loop runs.
+Any background loop inside a serving process needs a liveness signal that the
+serving half exposes, because an answering port says nothing about whether the
+loop runs.
 
 ### The loop that held a lock forever
 
-The same worker had a second defect, and it took the database down rather than
-quietly doing nothing. Each pass claimed a batch per table with `SELECT ... FOR
+The same worker had a second defect, and this one took the database down. Each pass claimed a batch per table with `SELECT ... FOR
 UPDATE SKIP LOCKED`, which opens a transaction and takes a row-share lock on the
 table. The early-exit path for "nothing to embed" returned without committing:
 
@@ -350,7 +345,7 @@ change while the worker returns to active every sleep interval - the transaction
 is long, the idle spells are not.
 `transaction_timeout` would catch it and is the wrong instrument at server
 scope: `pg_dump` holds a long transaction by design, so the nightly backup
-becomes the casualty. Fix the loop, not the server.
+becomes the casualty. The fix belongs in the worker loop.
 
 ## Access model
 
@@ -366,14 +361,13 @@ before native tools replaced it.
 ## Client integration: HTTP first, protocol second
 
 The store speaks plain HTTP, which every client can already do. A protocol
-adapter such as MCP is worth adding for clients that expect it,[^mcp] but it is
-a layer on the same endpoints, not a prerequisite - and it carries real cost:
-process spawn per session, a handshake before the first tool call, and one more
-place for a credential to live.
+adapter such as MCP suits clients that expect it,[^mcp] and it sits on the same
+endpoints. It costs a process spawn per session, a handshake before the first
+tool call, and one more place for a credential to live.
 
 For a client with a native extension mechanism, wiring the same REST calls
 directly is fewer moving parts and a faster session start. The tool surface is
-small enough to be worth doing twice:
+small enough to wire twice:
 
 | Tool | Backed by |
 |---|---|
@@ -386,13 +380,13 @@ small enough to be worth doing twice:
 ## The store echoes the question back
 
 The first real consumer of this store was an agent session looking for its own
-prior context, and the failure it hit is worth designing for. A seven-term query
+prior context. A seven-term query
 about a hard-drive purchase returned hits from exactly one session: the session
 that had just spent an hour synthesising that same purchase. The sessions that
-actually held the facts - the pricing research, the cable selection - did not
+held the facts - the pricing research, the cable selection - did not
 match at all. Everything was ingested and indexed; the query could not see it.
 
-Two mechanisms compound here, and either one alone is survivable:
+Two mechanisms compound:
 
 - **Self-reference ranks first.** The querying session's own messages repeat
   the full query vocabulary, because it is the session that assembled those
@@ -403,7 +397,7 @@ Two mechanisms compound here, and either one alone is survivable:
   message containing all seven stems. A pricing page quote has three of them;
   the synthesis paragraph has all seven. The query selects for its own echo.
 
-The fix is client-side and unglamorous: the calling tool knows its own session
+The fix is client-side. The calling tool knows its own session
 key (`source:hostname:uuid`), so results drop rows from that session; when the
 exact query then matches nothing, it retries the same query at a deeper limit,
 then retries OR-broadened. The result text states which strategy fired, because
@@ -411,23 +405,22 @@ then retries OR-broadened. The result text states which strategy fired, because
 different answers. Interfaces that cannot know their own identity - raw curl,
 the web UI - keep both behaviours off and need short queries instead.
 
-The diagnostic lesson outlives the fix. "The search only returns the current
-session's messages" looks exactly like an ingest gap and, in the one incident
-investigated, was query shape instead. Count the rows server-side before
-suspecting the pipeline; the failure that looks like missing data is usually
-the retrieval layer describing itself.
+"The search only returns the current session's messages" looks exactly like an
+ingest gap and, in the one incident investigated, was query shape instead.
+Count the rows server-side before suspecting the pipeline.
 
 ## Reading the numbers
 
 The corpus is 642k messages and roughly 2.3GB in the messages table. That is
 small for Postgres and large for a laptop-class container. Once the embeddings
 landed the same table measured 4,395 MB of a 4,412 MB database, and 1,986 MB of
-that is the vector column plus its index - a vector store's footprint tracks its
-index and dimensionality, not the text it was derived from. The constraining
-cost is the embedding backfill: one pass proportional to corpus size, then a
-trickle of a few hundred rows per sync. Sizing the compute for the steady state and temporarily scaling it up for
-the initial seed is the right shape - this deployment ran 6 workers on 8 cores
-for the seed and scales back to 1 worker on 2 cores afterwards.
+that is the vector column plus its index; a vector store's footprint tracks its
+index and dimensionality rather than the text it was derived from. The
+constraining cost is the embedding backfill: one pass proportional to corpus
+size, then a trickle of a few hundred rows per sync. Size the compute for the
+steady state and scale it up temporarily for the initial seed. This deployment
+ran 6 workers on 8 cores for the seed and scales back to 1 worker on 2 cores
+afterwards.
 
 ## Decision guide
 
