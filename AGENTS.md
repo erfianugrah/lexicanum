@@ -10,6 +10,13 @@ HTML), and without the purge some PoPs serve the previous deploy for tens of
 minutes (observed 2026-08-17). The purge needs CLOUDFLARE_API_TOKEN, or
 CLOUDFLARE_API_KEY + CLOUDFLARE_EMAIL, in env; it skips silently without them.
 
+PUSHING TO MAIN ALSO DEPLOYS: `.github/workflows/deploy.yml` runs on every
+push to main - build + test gate, then `wrangler-action` deploy and a
+cache-purge job (`if: refs/heads/main`). A docs commit is live within ~2 min
+of `git push`; there is no separate release step. `bun run deploy` is the
+manual path for when CI is bypassed or broken, not the normal one. PRs get
+the build/test gate only, no deploy.
+
 ## Pipeline facts (load-bearing)
 
 - `gfm: true` in `astro.config.mjs` -> GFM footnotes render. The citation system
