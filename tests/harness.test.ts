@@ -21,12 +21,16 @@ const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")) as {
 };
 
 describe("every check has a trigger", () => {
-  const WORKFLOWS = join(ROOT, ".github/workflows");
-  const workflows = existsSync(WORKFLOWS)
-    ? readdirSync(WORKFLOWS)
+  // CI moved to Forgejo Actions (.forgejo/workflows); keep reading
+  // .github/workflows too so either location counts as a trigger.
+  const workflows = [".forgejo/workflows", ".github/workflows"]
+    .map((d) => join(ROOT, d))
+    .filter((dir) => existsSync(dir))
+    .flatMap((dir) =>
+      readdirSync(dir)
         .filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"))
-        .map((f) => readFileSync(join(WORKFLOWS, f), "utf8"))
-    : [];
+        .map((f) => readFileSync(join(dir, f), "utf8")),
+    );
 
   const checks = Object.keys(pkg.scripts).filter((n) => /^(verify|check)(:|$)/.test(n));
 
