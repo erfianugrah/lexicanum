@@ -27,6 +27,9 @@ a tenant is worth promoting at all, and what the dedicated project then costs.
   session.
 - Optionally, a copy of the tenant's identity itself, so the dedicated project can
   issue its own tokens instead of only verifying the hub's.
+- The same identity copy applied to every user of an app, moving the whole app from
+  a source project to a target project, and what each piece of a live session does
+  on the way (Part 5).
 
 Prerequisites: a Personal Access Token in `SUPABASE_ACCESS_TOKEN`, the `service_role`
 key for the shared and dedicated projects, `jq`, and the shared tier from the guide
@@ -51,6 +54,13 @@ throwaway projects, a 20-minute window;
 [published artifacts](https://github.com/erfianugrah/supabase-lab/tree/d386347/experiments/key-rotation/out/2026-08-25)).
 That run reproduced the consumer-cache result, refuted the standby rate limit,
 and did not re-confirm the revoked-key result. Part 4 carries both dated runs.
+
+Two session-carry runs on 2026-09-25 moved existing sessions between two projects.
+The 02:55 UTC run covered S00-S04 and the 02:56 UTC run repeated S01, both on two
+Micro projects in `ap-southeast-1` in one organization. S01x also used a free-plan
+project in a second organization under the same account
+([published artifacts](https://github.com/erfianugrah/supabase-lab/tree/31b9102/experiments/session-carry/out/2026-09-25)).
+They add the `aal2` result to Part 3 and are the whole of Part 5.
 
 ## Constants
 
@@ -260,7 +270,11 @@ Copying four tables also carries the session. Add
 against the new project. No re-login anywhere.
 
 ```sql
--- On the target, per table, in FK order: users, identities, sessions, refresh_tokens.
+-- On the target, per table, in FK order: users, identities, sessions, refresh_tokens,
+-- then mfa_factors and mfa_amr_claims (mfa_amr_claims references auth.sessions).
+-- One user's rows at the source: users by id, refresh_tokens by user_id::text,
+-- mfa_amr_claims by session_id in (select id from auth.sessions where user_id = '<uid>'),
+-- the rest by user_id.
 -- `select *` does NOT work - see Gotchas and lessons learned.
 do $mig$
 declare cols text;
@@ -287,6 +301,17 @@ copied alongside the other four tables, and the same secret produces a code that
 verifies there for an `aal2` session. Without this, the zero-re-login result would
 have excluded every account that had enrolled a factor, and those are the accounts
 most likely to notice being logged out.
+
+The factor travelling does not carry a session's assurance level with it. In
+session-carry S04a on 2026-09-25, only users, identities, sessions, refresh_tokens
+and mfa_factors were copied. A session that was already `aal2` at the source came
+back `aal1` on its first refresh at the target, with no `amr` methods (`amr_after`
+none). The source held 2 `auth.mfa_amr_claims` rows for each user, and that table is keyed by
+session, so the five-table copy leaves them behind. Copying `auth.mfa_amr_claims`
+after `auth.sessions` kept `aal2`, with `amr` password+totp (S04b). The control,
+S04a's refresh token presented at the source after it had been spent at the target, stayed `aal2` (S04c).
+An app whose RLS or routes require `aal2` would then shut those users out of
+MFA-gated paths until they verify a factor again (inferred, not probed).
 
 Retiring the source identity is one call, and it closes both issuing paths. After
 `DELETE /auth/v1/admin/users/{id}` on the hub, the hub refuses a password grant with
@@ -356,6 +381,111 @@ keep working; here the fresh credential is the broken one.
 Plan a hub rotation as a scheduled window with sessions drained, or avoid the hub
 pattern where key rotation has to be fast. Nothing measured here makes it quick.
 
+## Part 5: moving a whole app between two projects
+
+Promotion moves one tenant. The same copy moves every user of an app from a source
+project to a target project, and then nobody stays on the source: every session a
+browser holds at cutover has to survive on the target or end in a sign-in. The plan
+has three parts: import one signing key into both projects, copy each user's auth
+rows, and pin the client's `storageKey`. Each part moves a different piece of the
+session. Session-carry ran the first two; the third needs a browser (see
+[What was not run](#what-was-not-run)).
+
+### One signing key cannot serve both projects
+
+Only ES256 signing keys were probed, imported through
+`POST /v1/projects/{ref}/config/auth/signing-keys` with a `private_jwk`; sharing the
+legacy HS256 JWT secret between projects was not tried.
+
+| Probe (2026-09-25, 02:56 UTC run) | Result |
+|---|---|
+| Import a private ES256 JWK into the source and promote it to `in_use` (S01a) | import 201, kid preserved, promote 200 |
+| The same JWK, same kid, into the target in the same organization (S01b) | `409` `Signing key with kid "..." already exists` |
+| Different key material under the same kid, into a project in a second organization under the same account (S01x) | `409`, same message |
+| The same private material under a fresh kid into the target, promoted (S01c) | import 201, promote 200 |
+| Target JWKS lists its kid for that material (S01e) | 450882 ms after polling began (10 s step; polling began after S01d, not at the S01c promotion) |
+| Source access token at the target's PostgREST, after S01e (S01f) | `401 PGRST301` |
+| The same token at the target's managed Auth `/user` (S01g) | `403 bad_jwt` "unrecognized JWT kid ... for algorithm ES256" |
+
+A kid is unique beyond one project, at least while one project holds it `in_use`;
+other key states were not run. S01x used different key material, so the check is on
+the kid alone. Both organizations belong to one account, so whether the check spans
+accounts is not measured. Identical material under a fresh kid does not make the
+target accept the source's tokens either. Managed Auth's error names the cause: it
+looks the key up by kid. PostgREST refused after the target's JWKS was already
+listing the target's kid; that it also looks up by kid is inferred, since `PGRST301`
+is equally consistent with a verifier cache that had not picked the new key up yet.
+
+Parts 1-4 run on third-party-auth trust, which is separate from signing-key import:
+cross-project-auth X02 measured a spoke's PostgREST accepting a hub token once the
+hub was registered via `oidc_issuer_url`. Session-carry did not probe it, and managed Auth `/user`
+acceptance under it was not measured. Part 4 covers what that trust costs at
+rotation.
+
+A project holds at most 3 `previously_used` signing keys. On the 02:55 UTC run an
+import on the source (S01a) was refused `422` "There already are 3 previously used
+signing keys. To proceed first revoke at least 1."; the harness now revokes the
+oldest key before importing. Revoke the oldest asymmetric key, never the HS256
+legacy secret, which signs the legacy `anon` and `service_role` API keys.
+Separately, one ad-hoc signing-key create outside the harness answered `429`; a create on the
+same project about a minute later was 201. One occurrence; cause and window not
+measured.
+
+### What a live session carries across
+
+S02 ran against what a hosted move produces: a session created at the source, the
+five tables copied (users, identities, sessions, refresh_tokens, mfa_factors), the
+sequence resynced, and the two projects signing with different ES256 kids.
+
+| Probe (2026-09-25, 02:55 UTC run) | Result |
+|---|---|
+| Held source access token at the target's managed Auth `/user` (S02a) | `403 bad_jwt` "unrecognized JWT kid" |
+| The same token at the target's PostgREST (S02b) | `401 PGRST301` |
+| Held refresh token at the target, after the copy (S02c) | 200 |
+| `iss` before / after that refresh (S02d) | source / target |
+| The refreshed access token at the target's managed Auth `/user` (S02e) | 200, same user id |
+
+The access token a browser holds at cutover fails at the target until the client
+refreshes; the refresh token is the piece of the session that crosses, through the
+row copy. A client that refreshes only on its own schedule
+would carry a refused access token for up to one access-token lifetime, 3600 s on
+defaults as read on the hub in Part 3; session-carry did not read the source's.
+Forcing a refresh at cutover, or lowering the source's JWT expiry beforehand, would
+shorten that window. Both are inferred, not measured. An `aal2` session also needs
+`auth.mfa_amr_claims` in the copy, or that first refresh drops it to `aal1`
+([Part 3](#migrating-the-identity-so-the-dedicated-project-issues-its-own-tokens), S04).
+
+### A refresh at the source after the copy forks the session
+
+Login at the source gives R1; the rows are copied, so the target holds R1
+unrevoked; a refresh at the source then turns R1 into R2.
+
+| Probe (2026-09-25, 02:55 UTC run) | Result |
+|---|---|
+| R2 at the target (S03a) | `400 refresh_token_not_found` |
+| R1 at the target (S03b) | 200 |
+| R2 at the source (S03c) | 200, gives R3 |
+| R1 re-presented at the source, 12 s after S03c (S03d) | `400 refresh_token_already_used` |
+| R3 at the source, after S03d (S03e) | 200 |
+| The target lineage from S03b, after S03d (S03f) | 200 |
+
+A client that refreshed at the source after the copy holds a token the target never
+saw, and is signed out at cutover with `refresh_token_not_found`. A client still on
+the pre-copy token refreshes at the target though the source already revoked it,
+while the source lineage also continues: from then on one session has two live
+lineages, one per project. The reuse at the source in S03d did not revoke the
+session's other tokens, since R3 still refreshed afterwards; that is one trial, and
+the conditions under which GoTrue's reuse detection revokes a whole session were not
+explored. Stop writes at the source, sign-ins and refreshes included, and make the
+copy the last step before cutover.
+
+### What was not run
+
+`storageKey` pinning is a client-side setting and session-carry had no browser, so
+it was not run. Only password users were copied; OAuth and OIDC identities were not.
+The other auth tables (`one_time_tokens`, `flow_state`, `mfa_challenges`, the SSO and
+SAML tables, `audit_log_entries`) were neither copied nor probed.
+
 ## What to do about it
 
 A practice with no module id is a design choice rather than a result;
@@ -371,6 +501,11 @@ measures.
 | Budget the issuer's publication at minutes and the consumer's cache at the whole window, and hold new sign-ins through the window. | The hub published the new kid in 241 s on 2026-08-25 and in about 7 minutes on 2026-08-04, while the trusting project's cached set did not change across 116 probes in 20 minutes or 282 probes in 37 minutes; new sessions break first. | key-rotation [R02](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/key-rotation/tests/r02-no-reresolve.ts) (2026-08-04 bash; 2026-08-25 live) |
 | Do not `DELETE` and re-`POST` the integration to clear the cache. | Even after the hub's JWKS shows the new kid: a fresh integration created while the hub demonstrably advertised the new key still served the original kid set. | key-rotation 2026-08-25 ([R03](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/key-rotation/tests/r03-revoked-key.ts) side-finding) |
 | Randomise or namespace test emails when rehearsing against the same project pair. | `adminCreate` answers 422 on a duplicate address, so a rehearsal with constant addresses passes exactly once. | tenant-promotion RUNLOG, "Emails are randomised per run" |
+| Copy `auth.mfa_amr_claims` after `auth.sessions`, selected through `auth.sessions`. | Without it an `aal2` session came back `aal1` with no `amr` methods on its first target refresh; with it, `aal2` and password+totp. The same token refreshed at the source stayed `aal2`. | session-carry [S04](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/tests/s04-aal2-carry.ts) (S04a, S04b, S04c; 2026-09-25) |
+| Do not plan a whole-app move on one signing-key kid shared by source and target. | The same kid on a second project answered `409` in the same organization and in another one; the same ES256 material under a fresh kid imported, but the target still refused source tokens (PostgREST `401 PGRST301`, managed Auth `403 bad_jwt`). | session-carry [S01](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/tests/s01-shared-key.ts) (S01b, S01x, S01c, S01f, S01g; 2026-09-25) |
+| Plan the cutover around one access-token lifetime, or force a client refresh at cutover. | Held source access tokens failed at the target (`403 bad_jwt`, `401 PGRST301`); the held refresh token refreshed there (200) and `iss` moved to the target. The window length and the forced refresh are inference, not measured. | session-carry [S02](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/tests/s02-rows-keys-differ.ts) (S02a-S02e; 2026-09-25) |
+| Stop writes at the source, refreshes included, and make the copy the last step. | A refresh at the source after the copy left a token the target never saw (`400 refresh_token_not_found`); the pre-copy token R1 still refreshed at the target (200) while R2 refreshed at the source (200): two live lineages. | session-carry [S03](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/tests/s03-refresh-after-copy.ts) (S03a, S03b, S03c; 2026-09-25) |
+| Before importing, revoke the oldest asymmetric `previously_used` key if 3 exist. | The next import answered `422` "There already are 3 previously used signing keys. To proceed first revoke at least 1." Never revoke the HS256 legacy secret: it signs the legacy API keys. | session-carry [S01](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/tests/s01-shared-key.ts) (S01a, 02:55 UTC run, 2026-09-25) |
 
 ## Verification
 
@@ -442,6 +577,10 @@ than a proxy (Part 2).
 - **The unexercised parts of the identity migration.** MFA factors and retiring the
   source user were measured on 2026-08-04. OAuth and SAML identities were not, and
   need a real external provider.
+- **The untested parts of a whole-app move.** `storageKey` pinning, OAuth and OIDC
+  identities, whether kid uniqueness spans accounts, the auth tables session-carry
+  did not copy, and whether lowering the source's JWT expiry before cutover shrinks the
+  window in which held access tokens fail (Part 5).
 - **The rotation anomaly.** In one of two runs the old token started failing before
   its key was revoked, while that key was still the only one the trusting project had
   cached. A third run on 2026-08-04, capturing the JWKS body, the PostgREST error code
@@ -464,6 +603,11 @@ than a proxy (Part 2).
 | A discovery endpoint carries a promotion without a gateway | Client re-read its `{ref, key}` from a registry after the flip and continued with the refresh token it already held | Measured - zero password logins, rows read at the dedicated project, the other tenant unaffected, only the two project hosts contacted |
 | Ref-hiding needs no proxy | `check-availability` then `activate` on the dedicated project | Measured - both 201, hostname carries no ref. Wants a bare label; the docs say CLI-only, the API accepts it |
 | MFA survives promotion | Enrolled and verified a real TOTP factor, copied `auth.mfa_factors`, verified the same secret at the target | Measured - factor arrives `verified`, target session reaches `aal2`. Three runs |
+| An already-`aal2` session stays `aal2` through a target refresh | Stepped two users up to `aal2` with TOTP at the source, one per variant: copied the five tables for the first ([S04a](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/tests/s04-aal2-carry.ts)) and the five plus `auth.mfa_amr_claims` for the second (S04b), refreshed each at the target; control S04c presented the S04a refresh token at the source | Measured, 2026-09-25 - S04a `aal1` with no `amr` methods (`amr_after` none); S04b `aal2`, `amr` password+totp; S04c `aal2` |
+| One imported ES256 signing key can serve two projects | Imported one private JWK into the source, then the same kid into the target (same organization) and into a project in a second organization; then the same material under a fresh kid, and presented a source token to the target ([S01](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/tests/s01-shared-key.ts)) | Measured, 2026-09-25 - no. `409` for the shared kid (S01b, S01x); fresh kid imported 201, then target PostgREST `401 PGRST301` (S01f) and managed Auth `403 bad_jwt` (S01g) after the target JWKS listed it (S01e, 450882 ms of polling) |
+| A held access token works at the target after a whole-app copy | Copied five tables with the projects on different ES256 kids, presented the held access token, then the held refresh token, to the target ([S02](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/tests/s02-rows-keys-differ.ts)) | Measured, 2026-09-25 - no. Managed Auth `403 bad_jwt`, PostgREST `401 PGRST301`; the refresh token refreshed (200), `iss` moved source -> target, the new token 200 at `/user` |
+| A refresh at the source after the copy is harmless | Refreshed at the source after the copy, then presented both the new and the pre-copy refresh token to both projects ([S03](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/tests/s03-refresh-after-copy.ts)) | Measured, 2026-09-25 - no. New token `400 refresh_token_not_found` at the target; the pre-copy token 200 at the target while the source lineage also refreshed (200). Reuse at the source 12 s later `400 refresh_token_already_used`, the token from S03c (R3) still 200 (one trial) |
+| A project holds any number of old signing keys | Imported a key into a source already holding 3 `previously_used` keys (S01a, 02:55 UTC run) | Measured, 2026-09-25 - no. `422` "There already are 3 previously used signing keys" |
 | Retiring the source identity closes both issuing paths | `DELETE /auth/v1/admin/users/{id}` on the hub, then password grant and old refresh token there, and a login at the target | Measured - `invalid_credentials` and `refresh_token_not_found` at the hub, target unaffected, the tenant's rows still on the hub |
 | The rotation window is the consumer's cache, not the issuer's | Re-read the hub's JWKS and the trusting project's cached set at every probe for 37 minutes | Measured - hub published the new `kid` in about 7 minutes; the consumer never re-resolved, 282 probes (2026-08-04); 241 s and 116 probes over 20 minutes on 2026-08-25 |
 | A standby key is rate limited on creation | `POST /v1/projects/{ref}/config/auth/signing-keys` twice on a fresh hub, 2026-08-25 | Refuted - a create with a standby already present answered `422 "already has a signing key in standby"` (R01b) and a create with none present answered 201 at once (R03c); the 2026-08-04 `Please wait until <ISO8601>` refusals (144 s, 127 s, 131 s) did not recur |
@@ -488,6 +632,9 @@ The harness for these runs lives in the [supabase-lab repo](https://github.com/e
 | `lib/promote.ts` | the `auth` table copy and the `setval` resync |
 | [`RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/d386347/experiments/tenant-promotion/RUNLOG.md) | the per-test narrative and what the first live run changed, pinned to the lab commit; the raw probes are not published because they carry project refs |
 | [`key-rotation/out/2026-08-25/`](https://github.com/erfianugrah/supabase-lab/tree/d386347/experiments/key-rotation/out/2026-08-25) | the redacted artifacts of the 2026-08-25 rotation run Part 4 quotes (R01-R03) |
+| [`session-carry/RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/RUNLOG.md) | the 2026-09-25 whole-app move (S00-S04) that Part 5 and the `aal2` paragraph in Part 3 quote |
+| [`session-carry/out/2026-09-25/`](https://github.com/erfianugrah/supabase-lab/tree/31b9102/experiments/session-carry/out/2026-09-25) | the redacted artifacts of both 2026-09-25 session-carry runs |
+| [`session-carry/lib/carry.ts`](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/lib/carry.ts) | `copyUser`: the per-table where-clauses, `mfa_amr_claims` keyed through `auth.sessions` |
 
 ## Modules
 
@@ -502,8 +649,14 @@ The harness for these runs lives in the [supabase-lab repo](https://github.com/e
 | R02 | key-rotation | [`r02-no-reresolve.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/key-rotation/tests/r02-no-reresolve.ts) | [`out/2026-08-25`](https://github.com/erfianugrah/supabase-lab/tree/713c28f/experiments/key-rotation/out/2026-08-25) |
 | R03 | key-rotation | [`r03-revoked-key.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/key-rotation/tests/r03-revoked-key.ts) | [`out/2026-08-25`](https://github.com/erfianugrah/supabase-lab/tree/713c28f/experiments/key-rotation/out/2026-08-25) |
 | R03c | key-rotation | [`r03-revoked-key.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/key-rotation/tests/r03-revoked-key.ts) | [`out/2026-08-25`](https://github.com/erfianugrah/supabase-lab/tree/713c28f/experiments/key-rotation/out/2026-08-25) |
+| S00 | session-carry | [`s00-no-shared-key.ts`](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/tests/s00-no-shared-key.ts) | [`out/2026-09-25`](https://github.com/erfianugrah/supabase-lab/tree/31b9102/experiments/session-carry/out/2026-09-25) |
+| S01 | session-carry | [`s01-shared-key.ts`](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/tests/s01-shared-key.ts) | [`out/2026-09-25`](https://github.com/erfianugrah/supabase-lab/tree/31b9102/experiments/session-carry/out/2026-09-25) |
+| S02 | session-carry | [`s02-rows-keys-differ.ts`](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/tests/s02-rows-keys-differ.ts) | [`out/2026-09-25`](https://github.com/erfianugrah/supabase-lab/tree/31b9102/experiments/session-carry/out/2026-09-25) |
+| S03 | session-carry | [`s03-refresh-after-copy.ts`](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/tests/s03-refresh-after-copy.ts) | [`out/2026-09-25`](https://github.com/erfianugrah/supabase-lab/tree/31b9102/experiments/session-carry/out/2026-09-25) |
+| S04 | session-carry | [`s04-aal2-carry.ts`](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/tests/s04-aal2-carry.ts) | [`out/2026-09-25`](https://github.com/erfianugrah/supabase-lab/tree/31b9102/experiments/session-carry/out/2026-09-25) |
 | V02 | vault-root-key | [`v02-copy-without-key.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/vault-root-key/tests/v02-copy-without-key.ts) | none published |
 | V04 | vault-root-key | [`v04-deleted-source.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/vault-root-key/tests/v04-deleted-source.ts) | none published |
+| X02 | cross-project-auth | [`x02-token-portability.ts`](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/cross-project-auth/tests/x02-token-portability.ts) | none published |
 | X03 | cross-project-auth | [`x03-refresh-to-issuer.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/cross-project-auth/tests/x03-refresh-to-issuer.ts) | none published |
 
 ## Related
