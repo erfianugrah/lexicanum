@@ -20,6 +20,7 @@ Everything that follows is a consequence of these fixed facts.
 | The VHDX is dynamic | Grows on guest writes, never shrinks on guest deletes. The guest sees a default maximum of 1 TB (512 GB before WSL 0.58.0, 256 GB before that) regardless of physical disk size.[^ms-wsl-disk] |
 | ext4 delete only updates guest metadata | The host cannot tell a deleted block from a live one until the guest issues a discard. |
 | `fstrim` issues that discard | After trim, the host-side compaction tools can see which blocks are reclaimable. Trim before compact is non-negotiable; without it, compaction "succeeds" and the file size does not change. |
+| Compaction stops at what the guest uses | A compact only returns blocks the guest has freed and trimmed. A vhdx cannot shrink below the used space inside it, so a nearly full guest gains little - on the rig in September 2026, a 931 GB vhdx holding 881 GB compacted to 901.7 GB. Check `df -h /` in the guest before expecting a large reclaim. |
 | `Optimize-VHD` and `compact vdisk` refuse compressed, encrypted, or NTFS-sparse files | Check with `compact /q` and `fsutil sparse queryflag` before blaming the tool. The compression flag is sticky even at a 1.0:1 ratio. The exact error text is in Microsoft's own troubleshooting page.[^ms-wsl-troubleshoot] |
 | WSL sparse mode (`sparseVhd=true` / `--set-sparse true`) auto-shrinks on shutdown | Unreliable in practice, with corruption reports - Part 6. Manual compaction is the dependable path. |
 
@@ -81,6 +82,7 @@ Reclaim frees the space in the guest filesystem (right) first, then makes it vis
 | Want a separate "archive" disk inside WSL | 8, with its brittleness warnings |
 | Docker disk should live on another drive | 9 (GUI-managed, low risk) |
 | Distro reports out of space but the host has room | 10 (grow the vhdx maximum) |
+| Compacted, but the vhdx barely shrank | compare the file to `df -h /` in the guest: if they are close, free space inside the guest (1) or grow the disk (10) |
 | Distro boots read-only after a power event | 11 (e2fsck repair) |
 
 ## Part 1: clean inside the distro
@@ -215,7 +217,19 @@ Each compaction takes 5-15 minutes depending on size. Repeat for every vhdx from
 
 The whole loop - trim every distro, shut down, compact each vhdx, log the before/after - is scripted as `vhdctl compact` in my dotfiles, with `vhdctl report` covering the Part 4 listing plus orphan-swap accounting and `vhdctl clean` deleting the locked-and-aged swap orphans. diskpart needs elevation and swallows its own output when run non-elevated through WSL interop, so the script relaunches itself elevated on the Windows side before touching anything.
 
-5. Verify with the Part 4 size listing. Expect 50-80% reduction on a freshly cleaned, trimmed disk. The rig's distro vhdx went 860 GB to 150 GB holding ~148 GB of files.
+The script runs from WSL or directly from Windows PowerShell (`powershell -ExecutionPolicy Bypass -File vhdctl.ps1 help` lists the flags). What it does beyond the manual steps:
+
+| Behaviour | Why |
+|---|---|
+| Targets default to the registered distro disks plus Docker Desktop's disks; `-Paths`, `-Exclude` and `-AllVhdx` change that | `%TEMP%` swap files and the images under Program Files are never compact targets, and explicit paths are validated against both |
+| `-WhatIf` prints the plan; the real run opens a visible elevated window and waits for a typed `YES` | the run shuts WSL down, so the caller in WSL dies; the window outlives it and the script copies itself off `\\wsl.localhost` first |
+| waits up to 90 s per disk for the file to unlock after `wsl --shutdown`, else skips it | a vhdx still open (WSL restarted by another app, Docker Desktop relaunching) makes the attach fail; skipping is cleaner than a half-run |
+| a second diskpart run with `detach vdisk noerr` after every compact, and 15 s between diskpart runs | diskpart aborts a script at the first error, so a failed `compact vdisk` skips the `detach` after it and leaves the disk attached; Microsoft also asks for 15 s between consecutive `diskpart /s` runs ([diskpart scripts](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/diskpart-scripts-and-examples)) |
+| `vhdctl report` prints guest used/available per distro and the most a compact can free (file size minus guest used) | predicts the Compaction-stops-at-guest-usage limit before you pay for the downtime |
+
+Second measured run, September 2026 on WSL 2.7.14.0 through `vhdctl compact`: `docker_data.vhdx` 228.71 GB -> 178.03 GB (50.68 GB, about 1.5 minutes) and the distro vhdx 931.18 GB -> 901.66 GB (29.52 GB, about 10 minutes), 80.19 GB in total. The distro result is the compaction floor at work: the guest held 881 GB of files at 93% of its 1007 GB filesystem, so there was little freed space to return.
+
+5. Verify with the Part 4 size listing. Expect 50-80% reduction on a freshly cleaned, trimmed disk. The rig's distro vhdx went 860 GB to 150 GB holding ~148 GB of files. The reduction is bounded by the guest's used space: a disk that is mostly live data (the September run above) shrinks by a few percent.
 
 ## Part 6: sparse mode is not the answer
 
@@ -337,6 +351,8 @@ wsl --shutdown
 wsl --manage archlinux --resize 2TB
 ```
 
+`vhdctl resize -Distro archlinux -Size 1500GB` wraps this with the same `-WhatIf` plan, elevated window and typed confirmation as compact, and refuses any size at or below the current filesystem size. Judge fullness by the `Use%` column of `df -h /`: it is used / (used + available), so ext4's reserved blocks count as full. On the rig, 881 GB used of 1007 GB was 87% of the filesystem size but 93% in `df`.
+
 Size strings are integer-only (`B/M/MB/G/GB/T/TB`; `2.5TB` is rejected). On older WSL, the manual path is `diskpart` -> `select vdisk` -> `expand vdisk maximum=<sizeInMegaBytes>`, then inside the distro `sudo resize2fs /dev/sdX <size>M` against the device `mount | grep ext4` reports.[^ms-wsl-disk] Growing is the safe direction; shrinking a vhdx maximum is the complicated one, so overshoot deliberately.
 
 ## Part 11: repair a read-only distro disk
@@ -387,6 +403,10 @@ The end state, all reproduced on the rig:
 ## Gotchas and lessons learned
 
 - **`compact` succeeded but the file is the same size** means the guest never issued discards. Boot, `sudo fstrim -av`, shut down, compact again.
+- **`compact` succeeded and the file shrank by only a few percent** usually means the guest is full, not that trim failed. Compare the vhdx size with `df -h /` in the guest; the difference is the most a compact can return.
+- **`fstrim -av` reporting a large number is not the reclaim.** On the September run it printed `112.9 GiB (121274744832 bytes) trimmed` with about 126 GB free in the filesystem - close to the whole free area, most of which was never allocated in the vhdx - and the compact then returned 29.52 GB. The before/after file size is the real figure.
+- **`execvpe(fstrim) failed: No such file or directory` for `docker-desktop`**: Docker Desktop's own distro has no `fstrim`, and `docker_data.vhdx` is not mounted there unless Docker Desktop is running. Skip it; prune inside Docker instead.
+- **A distro that will not start after a scripted compact** can be a disk diskpart left attached: a failed `compact vdisk` aborts the script before its `detach vdisk`. Run a separate diskpart script with `select vdisk file="..."` and `detach vdisk noerr`; it reports `The virtual disk is already detached` when nothing was wrong.
 - **`Optimize-VHD: ... virtual disk system limitation ... must be uncompressed and unencrypted and must not be sparse`** is the NTFS compression flag almost every time.[^ms-wsl-troubleshoot] `compact /q` to confirm, `compact /u` to clear. A 1.0:1 ratio still blocks - the flag is sticky independent of actual compression.
 - **`Optimize-VHD: Failed to attach the virtual disk`** means something holds it open. `wsl --shutdown`; for the Docker disk, quit Docker Desktop and check `Get-Process *docker*`.
 - **Default user becomes root** after `--import` / `--import-in-place` (and occasionally after `--move`). Fix in `/etc/wsl.conf` with a `[user]` block, `wsl --terminate <distro>`, relaunch.
@@ -408,6 +428,7 @@ The end state, all reproduced on the rig:
 | `fsutil sparse queryflag <file>` | Check NTFS sparse flag |
 | `Optimize-VHD -Path <file> -Mode Full` | Compact (Hyper-V module) |
 | `diskpart` -> `attach vdisk readonly` -> `compact vdisk` | Compact without Hyper-V |
+| `vhdctl report` / `clean` / `compact` / `resize` | The scripted versions of Parts 2, 4, 5 and 10 |
 | `wsl --manage <distro> --resize <size>` | Grow the vhdx maximum (WSL 2.5+)[^ms-wsl-disk] |
 | `wsl --manage <distro> --move <dest>` | Relocate the distro (WSL 2.3.11+)[^wsl-2311] |
 | `wsl --manage <distro> --set-sparse true` | Auto-shrink (Part 6 caveats) |
