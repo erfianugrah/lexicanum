@@ -63,6 +63,16 @@ export const TAXONOMY = [
     blurb: "The services that run on the home network, and the network they run on.",
   },
   {
+    id: "forge",
+    label: "Forge and CI",
+    blurb: "The self-hosted Forgejo forge: repositories, Actions runners, releases, and the deploys they trigger.",
+  },
+  {
+    id: "secrets",
+    label: "Secrets",
+    blurb: "Where credentials live, how they are encrypted, rotated, and kept out of agent transcripts.",
+  },
+  {
     id: "workstations",
     label: "Workstations and tooling",
     blurb: "Hardware tuning and the tooling around the machines.",

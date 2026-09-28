@@ -53,6 +53,10 @@ const MONGUIDE = "guides/monitor-compose-postgres-prometheus";
 const WEATHER = "guides/singapore-weather-ha-grafana";
 const MEMSTORE = "reference/agent-memory-store";
 const SBRESIDENCY = "reference/supabase-data-residency";
+const FORGEJO = "reference/self-hosted-forgejo-router";
+const AGENTGUARD = "reference/agent-secret-guard";
+const PORTING_FORGEJO = "guides/porting-github-actions-to-forgejo";
+const GH_ACTIONS_CF = "guides/gh-actions-cloudflare";
 
 const pins: Pin[] = [
   // The two PrivateLink docs went unpinned through the corrections that made
@@ -998,6 +1002,143 @@ const pins: Pin[] = [
       "guides/supabase-tenant-consolidation",
       "guides/supabase-own-postgrest",
     ],
+  },
+  {
+    // Rewritten 2026-09-29 from an August cutover page that had drifted hard:
+    // it still described a fresh GitHub-pull-mirror install with no backups,
+    // when the fleet had since flipped to Forgejo-primary with GitHub as a
+    // push-mirror backup. These pins guard the corrected facts and keep the
+    // retired numbers (old versions, old mirror count, old runner capacity,
+    // the bridge's internal subnet) from creeping back in a future edit.
+    doc: FORGEJO,
+    mustContain: [
+      "269 repositories",
+      "206 push mirrors",
+      "16.0.5",
+      "PostgreSQL | `postgres:18-alpine`",
+      "capacity 4",
+      "Silo",
+      "effectively root on the router",
+      "recorded in the migration plan",
+    ],
+    mustNotContain: [
+      // The old description's mirror count and mirror-enrolment framing -
+      // superseded by push mirrors once Forgejo became primary.
+      "248 repos",
+      "248 GitHub pull mirrors",
+      // The pre-upgrade database version.
+      "PostgreSQL 17",
+      // The pre-upgrade Forgejo image tag.
+      "16.0.3",
+      // The runner's old concurrency before the capacity 1 -> 4 change.
+      "capacity: 2",
+      "Capacity 2 means",
+      // Internal bridge subnet and the Unraid box's LAN IP - replaced with
+      // roles per the public-safety pass.
+      "172.20.",
+      "10.0.0.56",
+    ],
+    sections: [/^## Topology$/m, /^## Decision guide$/m],
+    linksTo: [
+      "reference/nixos-fleet",
+      "reference/declarative-homelab-backups",
+      "reference/knotea-self-hosted-dns",
+      "reference/appdata-tiering-zfs",
+    ],
+  },
+  {
+    // 2026-09-29 update: the digest cache gained a systemd-timer writer, and
+    // that timer silently failed open for six days because the user service
+    // manager's PATH did not include the binary's directory. These pins
+    // guard the corrected facts (the PATH fix, the fail-open behaviour, the
+    // three-writer/two-lock-file reality replacing a "single writer"
+    // design claim, the vault-store cost note) and block a regression that
+    // would describe `uci:` as a registered store when it is only a
+    // supported, unregistered scheme on this fleet.
+    doc: AGENTGUARD,
+    mustContain: [
+      // The PATH/fail-open finding and its fix.
+      "`secretctl: command not found`",
+      "31 runs in the journal's 8-day window logged",
+      "Wherever no cache existed, the known-value",
+      "`Environment=PATH=`",
+      "fails the unit on empty output",
+      // The liveness-signal proposal is explicitly not implemented.
+      "does not exist yet",
+      // The three-writer lock history and the single protocol that replaced
+      // it on 2026-09-29.
+      "**Three writers, three lock schemes.**",
+      "`flock -w 40`: waits for an in-flight pass",
+      // The 2026-09-29 registry-scale row.
+      "402, unresolved 0",
+      // Vault stores: name-glob expansion and the opt-in cost note.
+      "registering the whole vault is opt-in",
+      "`rbw:` is read-only to `secretctl set`",
+    ],
+    mustNotContain: [
+      // `uci:` is a supported scheme, not a registered store on this fleet -
+      // a future edit must not claim otherwise.
+      "uci store is registered",
+      "registered uci store",
+      "uci: store is registered on this fleet",
+      // Fixed 2026-09-29; must not read as still open.
+      "it is not done",
+      "a fix is planned but does not exist",
+    ],
+    sections: [
+      /^## Known issues$/m,
+      /^### Vault items as stores$/m,
+      /^### The digest cache and its writers$/m,
+    ],
+  },
+  {
+    // New guide (2026-09-29): the Forgejo port of this site's own GitHub
+    // Actions deploy. Its fact pack held two claims the drafting pass is
+    // prone to overstate - Forgejo documents artifact support for its own
+    // v3 / patched-v4 forks, it does not lack artifacts outright; and its
+    // enable-openid-connect key exists and is documented, it was just never
+    // exercised on this runner, which is not "no OIDC". Review also caught
+    // and removed a gitleaks release version (8.18.4) the draft invented
+    // with no source in the fact pack.
+    doc: PORTING_FORGEJO,
+    mustContain: [
+      "v3 or patched v4",
+      "enable-openid-connect",
+      "effectively root on the host",
+      // The unresolved weekly-link-check failure (H05): the ported
+      // issue-filing step was never confirmed to actually file.
+      "unverified until a run confirms it files",
+    ],
+    mustNotContain: [
+      "Forgejo has no artifact API",
+      "there is no artifact API",
+      "no OIDC",
+      "OIDC is not supported",
+      "Forgejo does not support artifacts",
+      // The fabricated gitleaks version; replaced with a GITLEAKS_VERSION
+      // placeholder the reader pins themselves.
+      "8.18.4",
+    ],
+    sections: [/^## Verification$/m, /^## Gotchas and lessons learned$/m],
+    linksTo: [FORGEJO, GH_ACTIONS_CF],
+  },
+  {
+    // The GitHub-hosted sibling, corrected 2026-09-29: this site moved its
+    // own deploy to a self-hosted Forgejo runner on 2026-09-24, so every
+    // "(this site)" / "like this one" / "this very website" framing that
+    // implied GitHub Actions still runs it was false. Also drops the dead
+    // erfi-dev-docs deploy.yml link (301 to a 404).
+    doc: GH_ACTIONS_CF,
+    mustContain: [
+      "GitHub-hosted variant",
+    ],
+    mustNotContain: [
+      "(this site)",
+      "like this one",
+      "this very website",
+      "erfianugrah/erfi-dev-docs/blob/main/.github/workflows/deploy.yml",
+    ],
+    linksTo: [PORTING_FORGEJO],
   },
 ];
 
