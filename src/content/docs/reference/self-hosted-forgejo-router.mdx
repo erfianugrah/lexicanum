@@ -1,157 +1,383 @@
 ---
-title: "Self-hosted Forgejo on the NixOS edge router"
-description: "Migrating from Gitea on Unraid to Forgejo 16 on a NixOS router with PostgreSQL 17, a self-hosted Actions runner, 248 GitHub pull mirrors, and a systemd timer for mirror enrolment."
-author: "Erfi Anugrah"
-category: homelab
+title: "Forgejo as the primary forge on the NixOS edge router"
+description: "How a single-user Forgejo instance on the NixOS edge router became the primary git host and CI for about 270 repos, with GitHub demoted to a push-mirror backup - topology, the router-disk vs object-store storage split, edge TLS and SSH, hardening, backups and the restore drill, and when GitHub-primary is still the better pick."
+author: Erfi Anugrah
+category: forge
 ---
 
-import { LinkCard } from "@astrojs/starlight/components";
+import { Aside } from "@astrojs/starlight/components";
 
-## Why Forgejo
+git.erfi.io is the git and CI primary for the whole personal fleet. A
+single-user Forgejo instance on the NixOS edge router serves every
+repository and runs every workflow; GitHub holds a push-mirror backup of
+the git data with Actions switched off. This page covers the topology,
+the split between router disk and object store, edge TLS and SSH,
+hardening, backups and the restore drill, and when GitHub-primary is
+still the better pick.
 
-Forgejo is a self-hosted Git forge - a community-governed hard fork of Gitea
-maintained by Codeberg e.V. It runs git.erfi.io, serving as a disaster-recovery
-mirror of GitHub (248 repos) and a self-hosted CI/CD platform (Forgejo Runner)
-on hardware that is already paid for.
+Measured rows come from a read-only probe run on 2026-09-29 around
+06:20 +08 against the router (docker inspect, `select count(*)` in
+Postgres, greps of named keys, `systemctl show`) and GET requests to the
+public API and the Composer API. Configuration rows come from the
+stack's compose files, the router's NixOS config, and Forgejo's
+`app.ini`.
 
-## The cutover
+## TL;DR
 
-Gitea ran on the Unraid server (`servarr`, 10.0.0.56) with PostgreSQL 17, a
-macvlan LAN IP, and host-volume data under `/mnt/user/gitea/`. In August 2026,
-the Unraid box began a migration to a new NixOS server. With the server's Docker
-daemon down, git.erfi.io went 502.
+- The Forgejo-primary migration ran 2026-09-23 to 2026-09-27. Live
+  inventory on 2026-09-29: 269 repositories, 0 of them pull mirrors, 0
+  public; 206 push mirrors to GitHub, one per mirrored repo, all
+  syncing on commit and on an 8h interval.
+- Git repositories and Postgres live on router Docker volumes.
+  Everything in Forgejo's `[storage]` section lives in one bucket on
+  Silo, an S3-compatible fork of MinIO on the storage host, reachable
+  through exactly one nftables forward rule.
+- Hardening: rootless image, `cap_drop: ALL`, `no-new-privileges`,
+  memory limits of 2048M (Forgejo), 1024M (Postgres), 2048M (runner),
+  CPU limit 4 each.
+- `DEFAULT_ACTIONS_URL` is set to `github`; Forgejo's own default is
+  `https://data.forgejo.org`.[^fj-cheat]
+- A systemd timer at 02:30 dumps Postgres with `pg_dump -Fc` and rsyncs
+  the bare-repo tree to the storage host's ZFS backup dataset. The
+  restore drill passed 2026-09-23 (recorded in the migration plan, not
+  re-run for this page).
 
-The forge moved to the MS-01 NixOS edge router, the same machine that
-runs the edge Caddy reverse proxy, the kea DHCP server, and the nftables
-firewall. The router has 20 cores and 32 GB of RAM; the forge stack's memory
-limits total 4 GB.
+## Topology
 
-The old compose file (`docker-compose.yml`) is untouched and serves as a
-rollback path when the new server is ready. The live stack is
-`docker-compose.router.yml`.
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
 
-## Architecture
+  user [label="git client / browser"];
 
+  subgraph cluster_router {
+    label="edge router (NixOS)"; style=rounded; fontsize=12; margin=12;
+    caddy [label="edge Caddy (host network)\nTLS via RFC 2136 DNS-01\nL4 SSH proxy"];
+    subgraph cluster_bridge {
+      label="forge bridge network (pinned bridge)"; style=rounded; fontsize=12; margin=12;
+      forgejo [label="Forgejo 16.0.5 (rootless)\nHTTP 3000, SSH 2222"];
+      pg [label="PostgreSQL 18", shape=cylinder];
+      runner [label="Forgejo Runner 13.2.0\ncapacity 4"];
+    }
+    vols [label="router volumes\ngit repositories, Postgres data,\nrunner cache"];
+    composer [label="Composer (GitOps deploys)"];
+    timers [label="systemd timers\nbackup 02:30, cache prune 02:55,\nrunner restart 03:00"];
+  }
+
+  store [label="storage host\nSilo (S3-compatible, MinIO fork)\n(bucket: release assets, logs,\nartifacts, packages, LFS, avatars)"];
+  tank [label="storage host backup dataset\n(ZFS, sanoid snapshots)"];
+  github [label="GitHub\n(push-mirror backup, Actions off)"];
+
+  user -> caddy [label="HTTPS 443"];
+  user -> caddy [label="SSH 2223"];
+  caddy -> forgejo [label="HTTP 3000"];
+  caddy -> forgejo [label="L4 -> 2222"];
+  forgejo -> pg;
+  forgejo -> vols [label="git repos"];
+  pg -> vols;
+  runner -> forgejo [label="poll tasks"];
+  forgejo -> store [label="single forward rule\n(S3 port)"];
+  forgejo -> github [label="push mirror\n8h + on commit"];
+  github -> composer [label="webhook (forgejo stack)"];
+  forgejo -> composer [label="webhook (other stacks)"];
+  timers -> tank [label="pg_dump + rsync"];
+}
 ```
-forgejo0 bridge (172.20.6.0/24)
-  .2  Forgejo 16.0.3-rootless   :3000 HTTP, :2222 SSH
-  .3  PostgreSQL 17             :5432
-  .10 Forgejo Runner v13        docker.sock, labels ubuntu-latest/ubuntu-22.04
 
-Edge Caddy (host network, same machine)
-  git.erfi.io:443            -> 172.20.6.2:3000
-  :2223 (L4 TCP proxy, SSH)  -> 172.20.6.2:2222
-```
+The same thing in list form:
 
-### Why a pinned bridge
+1. Git clients and the browser reach the edge Caddy on 443 (HTTPS) and
+   2223 (SSH).
+2. Caddy proxies to Forgejo on the pinned bridge; SSH is an L4 proxy to
+   Forgejo's built-in SSH server.
+3. Forgejo keeps the git repositories and Postgres on router volumes.
+4. Everything in Forgejo's `[storage]` section goes to Silo, the
+   S3-compatible object store on the storage host, over one
+   forward-chain rule.
+5. Every mirrored repo push-mirrors to GitHub.
+6. A nightly timer dumps Postgres and rsyncs the repositories to the
+   storage host's ZFS backup dataset.
+7. Composer redeploys stacks on webhook.
 
-The router's nftables forward chain is policy-drop. Every Docker bridge must be
-listed in `dockerBridges` in `configuration.nix` to let traffic pass. The bridge
-name `forgejo0` is pinned via Docker `driver_opts` so it survives container
-restarts and compose down/up cycles.
+## Which do I pick
 
-### Why no macvlan
+The migration is a decision about where CI runs and which copy is
+canonical, with a backup direction to match.
 
-Gitea needed a first-class LAN IP (`10.0.0.56`) because the edge Caddy ran on a
-different machine (servarr). The edge Caddy now runs on the router,
-`network_mode: host`, so it can reach the bridge IP directly, no macvlan or
-VyOS NAT needed.
-
-### Why Forgejo over Gitea
-
-Codeberg e.V., which maintains Forgejo, is a non-profit. At the time of
-migration:
-
-| Attribute | Forgejo 16 | Gitea |
+| Question | Forgejo primary + GitHub push mirror (this setup) | GitHub primary + Forgejo pull mirror (the pre-2026-09-23 setup) |
 |---|---|---|
-| Governance | Community non-profit (Codeberg e.V.) | For-profit |
-| Federation | Under development | None planned |
+| Where CI runs | Self-hosted runner on your own hardware | GitHub Actions; Forgejo pull-mirror repos never get an Actions unit, so a self-hosted runner cannot run their workflows |
+| What GitHub holds | The git data (branches, tags, commits), pushed on every commit and every 8h[^fj-mirror] | The canonical copy, including issues, PRs, releases |
+| Issues, PRs, release metadata | Start empty on Forgejo; nothing is copied from GitHub | Stay on GitHub |
+| Outage of your box | Git and CI stop; the GitHub backup keeps a git copy | Development continues on GitHub |
+| Deploy tooling bootstrap | The forge's own stack must not be sourced from the forge | No circularity |
+| Credential to rotate | One GitHub token stored in every push-mirror row | Tokens in the pull-mirror remotes |
+| Backups you own | Postgres dump + repo mirror + Silo snapshots | GitHub is the backup of record |
 
-The instance was a fresh install: all repos are GitHub pull mirrors with no
-issues, PRs, or metadata, so there was no data to migrate.
+## Component versions
 
-## Forgejo Runner
+| Component | Version | Notes |
+|---|---|---|
+| Forgejo | `codeberg.org/forgejo/forgejo:16.0.5-rootless`; public API reports `16.0.5+gitea-1.22.0` | Single user; self-registration disabled |
+| PostgreSQL | `postgres:18-alpine`; live server reports 18.6 | Upgraded from 17 to 18 on 2026-08-29 onto a new volume; the old pg17 volume is still declared for rollback |
+| Forgejo Runner | `data.forgejo.org/forgejo/runner:13.2.0` | Capacity 4; labels `ubuntu-latest` and `ubuntu-22.04`, both mapped to `ghcr.io/catthehacker/ubuntu:act-22.04` |
 
-```yaml
-runner:
-  image: data.forgejo.org/forgejo/runner:13.0.0
-  group_add: ["131"]  # docker gid on the NixOS router
-  volumes:
-    - /var/run/docker.sock:/var/run/docker.sock
-  labels:
-    - ubuntu-latest:docker://ghcr.io/catthehacker/ubuntu:act-22.04
-    - ubuntu-22.04:docker://ghcr.io/catthehacker/ubuntu:act-22.04
-  capacity: 2
+## Why the router
+
+Gitea 1.27.2-rootless ran on the old Unraid NAS. On 2026-08-23 the forge
+moved to Forgejo on the NixOS edge router, the same host as the edge
+Caddy proxy, in the first router compose commit of that day. The Gitea
+compose file is kept unchanged as a rollback variant.
+
+On 2026-09-18 the router became the permanent home; the earlier
+"until the new server is built" framing was dropped. The stated reason:
+the router's CPU is the strongest in the lab, which suits a CI runner.
+The router runs a 13th Gen Intel Core i9-13900H, 20 logical CPUs,
+~31 GiB RAM; the root disk is 937G with 97G used (11%).
+
+## Storage split
+
+Since 2026-09-25 the stack splits storage by location:
+
+- **Router Docker volumes** - the git repositories (6.3G on
+  2026-09-29) and Postgres data.
+- **Silo, an S3-compatible fork of MinIO, on the storage host** -
+  everything in Forgejo's `[storage]` section: release assets, Actions
+  logs and artifacts, packages, LFS, avatars, attachments, one bucket,
+  each subsystem in its own directory.[^fj-storage] With
+  `STORAGE_TYPE = minio`, the `[storage]` section sets the default for
+  all subsystems to the S3-compatible server.[^fj-storage]
+
+Reachability is one nftables forward-chain rule: from the forge bridge
+to the storage host's S3 port on the servers segment. The forward chain
+is policy-drop, so without the rule the traffic is dropped. Silo's
+data is covered by daily sanoid snapshots of the storage host's
+appdata dataset, same pool as the live data with no off-pool copy,
+which is accepted. Pre-switch local copies of attachments, logs and
+packages remain on the router volume as frozen leftovers; Forgejo
+reads from Silo.
+
+Where these datasets sit on the storage host is covered in [Hot vs
+bulk: placing app state on a two-tier ZFS homelab](/reference/appdata-tiering-zfs/).
+
+## Edge: TLS, WAF, SSH
+
+- **TLS** - Caddy's ACME issuer uses DNS-01 over RFC 2136
+  (TSIG-signed updates) against the self-hosted Knot authority; the
+  authority itself is covered in [knotea: one binary that is both your
+  recursive resolver and your authoritative DNS](/reference/knotea-self-hosted-dns/).
+- **WAF** - the site imports an empty placeholder snippet, so git.erfi.io
+  gets no WAF processing; the L4 DDoS jail listener wrapper still
+  applies to every HTTPS connection before the TLS handshake.
+- **Long-lived streams** - the reverse proxy disables the
+  response-header timeout and sets `flush_interval -1`, so long git
+  HTTP, LFS, and Actions log streams are not cut or buffered.
+- **SSH** - Caddy's layer4 app listens on 2223 and proxies to
+  Forgejo's built-in SSH server on 2222. Forgejo shows 2223 in clone
+  URLs (`SSH_PORT`) and binds 2222 (`SSH_LISTEN_PORT`). The router
+  firewall accepts 2223 from WAN and LAN.
+
+## Hardening
+
+Forgejo runs from the rootless image as UID 1000:1000 with
+`cap_drop: ALL` and `no-new-privileges`. Postgres drops all
+capabilities and adds back only CHOWN, DAC_OVERRIDE, FOWNER, SETGID,
+SETUID; a live docker inspect shows capdrop=[ALL] on both containers.
+
+Memory limits are 2048M (Forgejo), 1024M (Postgres), 2048M (runner);
+CPU limit 4 each, and the live cgroup limits match. Forgejo's `/tmp`
+is a 512M tmpfs, which counts against the same memory cgroup as the
+process.
+
+The 512M tmpfs is why the OOM loop on 2026-09-26 happened: anon-rss
+reached ~1044MB against a 1GiB limit while the host had ~22GB free,
+the container restarted 30 times, and the limit went from 1024M to
+2048M (also in the rollback file). On 2026-09-29 the container had
+RestartCount=0 and was up 46h.
+
+The runner is the part of the setup with the least separation. Jobs
+get the host Docker socket (`container.docker_host: automount`
+mounts the host socket into job containers)[^fj-docker-access] and
+run `--privileged` (`container.privileged: true` launches job
+containers with `--privileged`)[^fj-actions-sec], so workflow code is
+effectively root on the router. Forgejo's own framing: the runner
+performs remote code execution, which poses significant security
+threats for the host and network it operates on.[^fj-actions] That
+access is what lets a job run its own dockerd for testcontainers-style
+tests - bind mounts, published ports - instead of a sandboxed one. The
+cost is that only trusted code can run here: the instance is
+single-user with registration off, and fork PRs or third-party repos
+must not run on it.
+
+### Incidents that shaped this setup
+
+| Date | What broke | What changed |
+|---|---|---|
+| 2026-08-23 | Job containers on act's per-workflow bridge could not reach the forge (Docker inter-bridge isolation); `git fetch` timed out | Runner moved to the forge network, plus an `--add-host` fallback, both applied by the `runner_seed` init container |
+| 2026-09-21 | Runner 13.0.0 against server 16.0.5 fetched tasks, then the job worker vanished silently | Runner upgraded to 13.2.0; keep server and runner patch levels close |
+| 2026-09-23 | Testcontainers in CI: dials from job containers to published ports were dropped, and an INPUT-chain rule had zero effect because Docker hairpin-DNATs the dial into FORWARD | Forward-chain rule scoped to `ct status dnat` between the Docker bridges |
+| 2026-09-24 | Runner down ~2h20m: a rotated runner token was not a Forgejo-issued runner token | Runner created in the admin UI; identity declared in config, token written to a 0600 file at start |
+| 2026-09-24/25 | Docker's default 10s stop SIGKILLed the runner mid-job and orphaned job containers | `stop_grace_period: 15m` plus an hourly reaper for orphaned job containers |
+| 2026-09-26 | memcg OOM loop on the Forgejo container, described above | Limit raised 1024M to 2048M |
+
+## app.ini choices
+
+| Key | Value | Why |
+|---|---|---|
+| `DISABLE_REGISTRATION` | `true` | Single-user instance; only an admin can create accounts[^fj-cheat] |
+| `DEFAULT_ACTIONS_URL` | `github` | Forgejo's own default is `https://data.forgejo.org`[^fj-cheat]; this instance points it at GitHub instead |
+| `ARTIFACT_RETENTION_DAYS` | `90` | Matches Forgejo's default; individual uploads can set their own `retention-days`[^fj-cheat] |
+| `[webhook] ALLOWED_HOST_LIST` | `private` | Webhooks may only call RFC 1918 / RFC 4193 / RFC 6598 addresses[^fj-cheat]; that is what lets them reach Composer on the router's internal address |
+| `ENABLE_SWAGGER` | `false` | Removes the OpenAPI surface (Forgejo's default is `true`)[^fj-cheat] |
+| `ENABLE_BASIC_AUTHENTICATION` | `false` | Removes basic-auth clone from the edge |
+| `DISABLE_GIT_HOOKS` | `true` | No user-supplied hooks run on the server |
+| `DISABLE_QUERY_AUTH_TOKEN` | `true` | Credentials out of query strings |
+| `OFFLINE_MODE` | `true` | Disables use of CDNs for static files and Gravatar[^fj-cheat] |
+| `DISABLE_GRAVATAR` | `true` | No external lookups |
+| `REVERSE_PROXY_TRUSTED_PROXIES` | The forge bridge subnet | Only the pinned bridge is a trusted proxy |
+| `[mail]` | SMTPS port 465 via Resend | Transactional mail out |
+
+Two operational consequences of the seeding scheme: the one-shot
+`config_seed` init container copies the repo `app.ini` into the data
+volume only if none exists, and `runner_seed` regenerates the runner
+config from its template on every deploy - so editing `app.ini` in the
+repo does not change a running instance; the seeded file in the volume
+is the live one, and `GITEA__` / `FORGEJO__` env vars override it at
+start.
+
+## Backups and the restore drill
+
+A router systemd timer fires at 02:30 with up to 10 minutes of random
+delay. The unit runs `pg_dump -Fc`, checks the dump for the `PGDMP`
+magic, renames it atomically, rsyncs the bare-repo tree, then rsyncs
+both to the storage host's backup dataset over ssh in push mode.
+
+Copy history comes from sanoid snapshots of the backup dataset, not
+from dated files. Per-run git bundles were rejected on size:
+~6.3GB times 7-day retention is ~44GB per box.
+
+Last run on 2026-09-29: 02:38:07 to 02:38:23 +08, Result=success,
+15.7s wall clock, 19.7M sent.
+
+The restore drill passed on 2026-09-23, recorded in the migration plan
+rather than re-run for this page: a clone of a mirrored bare repo on
+the storage host matched the live HEAD. The Postgres dump was mounted
+into a scratch Postgres container (piping it over `ssh ... docker run
+-i` lost the stream and pg_restore saw no magic), and the full restore
+ran with 0 errors, 130 TABLE DATA entries, and 1 user + 268
+repositories, matching live at the time. The timer and snapshot
+pattern is the same one the rest of the storage host uses, covered in
+[Declarative backups on a ZFS homelab: nix timers, sanoid,
+syncoid](/reference/declarative-homelab-backups/).
+
+## Push mirrors to GitHub
+
+206 push mirrors exist, one per mirrored repo. A push mirror syncs
+periodically and, with "Sync when new commits are pushed", as soon as
+there are changes; it mirrors branches, tags, and commits; LFS objects
+are not mirrored; a GitHub push mirror needs a token with repository
+Contents permission, plus Workflows if `.github/workflows`
+exists.[^fj-mirror] Every mirror in the fleet has the 8h interval and
+sync-on-commit set, verified by a `group by` over the `push_mirror`
+table on 2026-09-29.
+
+Forgejo 16 rejects credentials embedded in the mirror URL. The
+GitHub token is stored in each push mirror's username/password fields,
+and Forgejo never returns the password, so which token the fleet uses
+cannot be read back from Forgejo.
+
+GitHub runs no Actions for the mirrored repos; the Actions unit is
+disabled per repo, so the backup stays a git-only copy.
+
+## Deploy path
+
+Composer (GitOps) redeploys a stack when a webhook fires; for this
+stack it runs `docker compose -f docker-compose.router.yml up -d`.
+
+The forgejo stack itself is deliberately sourced from GitHub, not from
+Forgejo: if Composer pulled the forge's config from the forge, a forge
+outage could not be redeployed (bootstrap circle). The flow is push to
+Forgejo -> push mirror lands on GitHub -> the GitHub webhook fires
+Composer -> Composer syncs from GitHub. Verified on 2026-09-29: the
+stack's repo URL on Composer is github.com and its webhook provider is
+`github` only.
+
+13 of the other 14 webhook-carrying stacks are sourced from Forgejo
+over SSH on 2223. That is not circular, because repo git data is
+served from the router volume, not from Silo. The router's
+NixOS config and deploy path live in [Three NixOS hosts, one deploy
+interface](/reference/nixos-fleet/).
+
+<Aside type="note">
+Duplicate webhooks, found and removed on 2026-09-29. A Composer-side
+audit that morning found that of 15 stacks with webhooks, 9 carried both
+a Forgejo (provider `gitea`) and a GitHub (provider `github`) webhook.
+For 8 of them the GitHub-side hook had already been deleted, leaving an
+orphaned Composer row; one stack still had a live GitHub hook, so every
+push fired Composer twice - once from Forgejo, again when the push
+mirror landed on GitHub - plus a stale second GitHub hook returning 404.
+All 9 orphaned rows and both GitHub hooks were deleted (HTTP 204 each).
+Every Forgejo-sourced stack now has exactly one webhook, fed by its
+Forgejo repo hook; the forgejo stack keeps its single GitHub webhook.
+</Aside>
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.35; ranksep=0.55;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="Do you want CI on\nyour own hardware?", shape=diamond];
+  q2 [label="Must development survive\nan outage of your box?", shape=diamond];
+  q3 [label="Does a deploy tool\npull from the forge?", shape=diamond];
+
+  fp [label="Forgejo primary +\nGitHub push mirror"];
+  gp [label="GitHub primary +\nForgejo pull mirror"];
+  fpgh [label="Forgejo primary +\nGitHub push mirror,\nforge's own stack sourced from GitHub"];
+
+  q1 -> q2 [label="yes"];
+  q1 -> gp [label="no"];
+  q2 -> q3 [label="no - a git backup on GitHub is enough"];
+  q2 -> gp [label="yes"];
+  q3 -> fpgh [label="yes"];
+  q3 -> fp [label="no"];
+}
 ```
 
-Runner jobs run in ephemeral Docker containers on the router's daemon. The
-`group_add: 131` grants access to `/var/run/docker.sock` without running as
-root. Capacity 2 means two jobs can run concurrently, enough for the current workload while leaving the router's
-other containers room.
+In list form:
 
-Mirrored repos do not discover `.forgejo/workflows/`, because mirror
-sync is git-data-only. Workflows on mirrored GitHub repos must run via GitHub
-Actions or via a Forgejo Action that clones from GitHub.
+1. CI on your own hardware, and a git copy on GitHub is an acceptable
+   outcome in a box outage: Forgejo primary + GitHub push mirror.
+2. Development must continue on GitHub during a box outage, or GitHub
+   Actions covers CI: GitHub primary + Forgejo pull mirror.
+3. If a deploy tool pulls from the forge, keep the forge's own stack
+   sourced from GitHub; a forge outage must not block redeploying the
+   forge.
 
-## Mirror enrolment
+## Related docs
 
-New GitHub repos are automatically enrolled as Forgejo pull mirrors by a systemd
-timer on the router:
+- [Three NixOS hosts, one deploy interface](/reference/nixos-fleet/) - the edge router's NixOS config, `make deploy`, and per-host deploy keys; host clones now fetch from Forgejo.
+- [Declarative backups on a ZFS homelab: nix timers, sanoid, syncoid](/reference/declarative-homelab-backups/) - the storage host's pg_dump timers + sanoid snapshots pattern that the forge backup lands in.
+- [knotea: one binary that is both your recursive resolver and your authoritative DNS](/reference/knotea-self-hosted-dns/) - the Knot authority that answers the RFC 2136 DNS-01 challenge.
+- [Hot vs bulk: placing app state on a two-tier ZFS homelab](/reference/appdata-tiering-zfs/) - where Silo's data and the backup dataset sit on the storage host.
 
-```
-mirror-forgejo.timer (every 6h)
-  -> mirror-forgejo.service (oneshot)
-       -> mirror-github.sh
-            Lists Forgejo repos (admin API token, generated at runtime)
-            Lists GitHub repos (PAT from a root-only token file, chmod 600)
-            POST /api/v1/repos/migrate (for each missing repo)
-```
+Planned pages, linked once they exist: the runner posture in depth
+(privileged + automount, capacity, cache, liveness restart), porting
+GitHub Actions workflows to Forgejo Actions, Composer webhooks from
+Forgejo (provider, allowed hosts, bootstrap circle), releases on
+Forgejo, Forgejo storage on Silo, and Forgejo recovery from a pg_dump +
+bare-repo mirror.
 
-The timer replaced a GitHub Actions workflow. The script is the same
-`mirror-github.sh` that ships in the stack's compose repo. The timer only
-catches repos created since the last run; ongoing content sync is Forgejo's
-own mirror scheduler (every 8 hours).
-
-## Secrets
-
-All secrets live in `.env` (SOPS-encrypted with age):
-
-- Postgres credentials
-- Forgejo internal secrets (`SECRET_KEY`, `INTERNAL_TOKEN`, `LFS_JWT_SECRET`)
-- Resend API key for transactional mail
-- `FORGEJO_RUNNER_TOKEN` for runner self-registration
-- GitHub PAT for mirror enrolment (in a root-only token file, separate from `.env`)
-
-Secrets are injected via `GITEA__*` / `FORGEJO__*` environment variables at
-container startup. The `app.ini` contains no secrets.
-
-## Deployment
-
-Push to main on GitHub -> Composer webhook fires -> git-sync on the router ->
-`docker compose -f docker-compose.router.yml up -d`. Manual trigger:
-
-```bash
-ssh router "curl -sf -X POST -H 'X-API-Key: \$COMPOSER_API_KEY' \
-  'localhost:8080/api/v1/stacks/forgejo/up?async=true'"
-```
-
-The stack is defined in its own compose repo (private, on GitHub). The old `docker-compose.yml` (servarr
-Gitea) stays as the rollback path.
-
-## What's not here
-
-- **No backups** - the backup sidecar was removed because its MinIO target is
-  on the downed servarr. All repos are git-only mirrors of GitHub, so data loss
-  means re-running `mirror-github.sh`. Backups to be re-added when MinIO moves
-  to the new server.
-- **No issues, PRs, or metadata** - mirrors are git-data-only. This is a hard
-  limit of Forgejo's `POST /api/v1/repos/migrate` with `"mirror": true`.
-- **No CI on mirrored repos** - mirror sync is git-only, so
-  `.forgejo/workflows/` files are not discovered.
-
-## References
-
-- Repo: the stack's compose repo (private, on GitHub)
-- Live instance: https://git.erfi.io
-- Router config: the router's config repo (bridge + timer)
-- Edge Caddy: the edge proxy's config repo (site block + L4 SSH)
+{/* References: cited inline as [^slug]; the numbered list renders below under "References". */}
+[^fj-cheat]: Forgejo, "Configuration Cheat Sheet," Forgejo Documentation. https://forgejo.org/docs/latest/admin/config-cheat-sheet/
+[^fj-storage]: Forgejo, "Storage settings," Forgejo Documentation. https://forgejo.org/docs/latest/admin/setup/storage/
+[^fj-mirror]: Forgejo, "Repository Mirrors," Forgejo Documentation. https://forgejo.org/docs/latest/user/repo-mirror/
+[^fj-actions]: Forgejo, "Forgejo Actions administrator guide," Forgejo Documentation. https://forgejo.org/docs/latest/admin/actions/
+[^fj-actions-sec]: Forgejo, "Securing Forgejo Actions Deployments," Forgejo Documentation. https://forgejo.org/docs/latest/admin/actions/security/
+[^fj-docker-access]: Forgejo, "Utilizing Docker within Actions," Forgejo Documentation. https://forgejo.org/docs/latest/admin/actions/docker-access/
