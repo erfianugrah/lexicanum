@@ -1,0 +1,197 @@
+---
+title: "Releases and the registry decision on a self-hosted Forgejo"
+description: "How a Forgejo-primary fleet publishes releases and images without running its own container registry: the three release lanes a repo can be on, the 2026-09-24 ban on Forgejo release rows and its 2026-09-28 reversal once assets moved off router disk, and the buildkit and QEMU changes that made multi-arch image builds reliable."
+author: Erfi Anugrah
+category: forge
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+A `v*` tag push on this fleet's Forgejo instance means one of three different things, depending on which repo it lands in: a container image on ghcr.io, a Forgejo release with cross-compiled binaries, or a release on the public GitHub mirror. A fourth outcome - a Forgejo container registry with images in it - was considered and turned down. This page covers the three lanes, the ban-then-reverse policy history behind lane 2, why the registry stays off, and the buildkit/QEMU change that made the image lane's multi-arch builds actually finish.
+
+Rows below come from three sources: the repos' own `.forgejo/workflows/release.yml` and `ci.yml` files (read this run against each repo's current commit); `forgejo-compose`'s `AGENTS.md` and its `docs/plans/` history (also read this run); and two live, read-only GET requests against the public Forgejo API for the two CLI repos with the newest release workflows. Nothing here was re-run or re-measured beyond those reads - the 7.4 GB to 892 MB registry cleanup, in particular, is a historical entry in a migration plan, not something reproduced for this page.
+
+## TL;DR
+
+- Three release lanes exist, and each repo uses exactly one: **image repos** tag-trigger a ghcr.io push with no Forgejo release row; **binary CLIs** get a Forgejo release with cross-compiled binaries and a checksums file, using the automatic per-run token instead of a personal access token; **public tools** whose users pull from GitHub get `gh release create` against the public repo instead.
+- A fourth option - Forgejo's own container registry - is technically available (Forgejo's package registry supports a container/OCI type against any OCI-compliant client) and deliberately unused. The reason is availability coupling, not a missing feature.
+- The lane-2 policy flipped twice in five days: banned fleet-wide on 2026-09-24 (Forgejo release rows were judged to cost router disk), reinstated on 2026-09-28 once release assets had moved to the storage host's object store on 2026-09-25.
+- Only one of the three binary CLIs that got a release workflow on 2026-09-28 has actually fired it: one release, three assets. The other two have the workflow in place but have not been proven live yet - one has a tag from before the workflow existed and no release since, the other has no tag at all.
+- The image lane's multi-arch builds used to hang under QEMU user-mode emulation on the arm64 leg (50+ minutes, runner CPU near idle). The fix was to stop asking QEMU to emulate the build and cross-compile natively instead.
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  tag [label="push of a v* tag"];
+
+  subgraph cluster_runner {
+    label="Forgejo Runner"; style=rounded; fontsize=12; margin=12;
+    lane1 [label="Lane 1: image repos"];
+    lane2 [label="Lane 2: binary CLIs"];
+    lane3 [label="Lane 3: public tools"];
+  }
+
+  ghcr  [label="ghcr.io"];
+  fjrel [label="Forgejo release row"];
+  silo  [label="storage host\n(release assets)"];
+  ghrel [label="GitHub Releases"];
+
+  tag -> lane1;
+  tag -> lane2;
+  tag -> lane3;
+  lane1 -> ghcr;
+  lane2 -> fjrel;
+  fjrel -> silo;
+  lane3 -> ghrel;
+}
+```
+
+The same thing in list form:
+
+1. A `v*` tag push is the trigger for all three lanes. Which lane fires depends on which repo the tag lands in, not on anything in the tag itself.
+2. Lane 1 (image repos) builds and pushes a container image to ghcr.io. No Forgejo release row is created.
+3. Lane 2 (binary CLIs) cross-compiles and creates a Forgejo release row with binaries and a checksums file attached.
+4. Every Forgejo release row's assets land on the storage host's object store, not the router's own disk.
+5. Lane 3 (public tools) creates a release on the public GitHub repo instead of a Forgejo one.
+
+## Which lane do I pick
+
+| Your repo | Lane | What the tag does | Where the artifact lives |
+|---|---|---|---|
+| Ships a container image | Lane 1: image repos | Builds and pushes to ghcr.io | ghcr.io only; no Forgejo release row |
+| Ships a CLI binary used inside the fleet | Lane 2: binary CLIs | Creates a Forgejo release, uploads binaries + `checksums.txt` | Forgejo release assets, on the storage host |
+| Ships a CLI binary that outside users pull from GitHub | Lane 3: public tools | `gh release create` on the public GitHub repo | GitHub Releases |
+| A compose stack, a NixOS flake, or anything with a local-only build flow | None | Nothing - a tag would be meaningless | n/a |
+
+## Lane 1: image repos push straight to ghcr.io
+
+A `v*` tag on an image repo runs a Forgejo Actions workflow that builds the image and pushes it to `ghcr.io`, authenticated with a user-level `GHCR_TOKEN` secret. No Forgejo release row exists for these repos - the release *is* the pushed tag plus the image, and the tag on the git repo is the only durable record of it.
+
+composer is the proven case for this lane, at v0.27.4. Its release workflow does two things worth naming:
+
+- It tags the multi-arch image both with the plain version (and `latest`) and with an explicit `-amd64` suffix on the same tags. The suffix exists only because composer's own self-upgrade path needs a fixed single-platform pull target; the plain tags point at the multi-arch index. Provenance attestation is switched off on the push, which keeps the pushed manifests in the older, simpler classic format rather than the newer index-plus-attestation shape - a deliberate compatibility choice, not an oversight.
+- Before anything reaches ghcr.io at all, the workflow builds the amd64 image locally (`load: true`, nothing pushed), runs a trivy scan gated on `CRITICAL,HIGH` severities with `--exit-code 1`, and only repeats the build as the real multi-arch push once that gate passes. A vulnerability that trips the gate fails the release before an image ever reaches the registry.
+
+The workflow's own comment states the policy directly: nothing from this lane is stored on Forgejo.
+
+## Lane 2: binary CLIs get a Forgejo release
+
+Three CLI repos in the fleet - `fjctl` (Forgejo ops), `secretctl` (credential comparison and movement) and `eaves` (a read-only router-operations CLI), all internal tooling rather than repos with an outside user base - carry a near-identical `release.yml`. Shape:
+
+1. Trigger on `push: tags: ['v*']`, with a `release` concurrency group and `cancel-in-progress: false` (a release run is never worth cancelling mid-upload).
+2. Checkout, `setup-go`, and the repo's own test suite - `vet`/`build`/`test` in all three, plus `secretctl`'s cross-implementation parity check against the real `openssl` binary it wraps, and `eaves`'s fixture-smoke script.
+3. Cross-compile `linux/amd64` and `linux/arm64` with `CGO_ENABLED=0` and `-trimpath -ldflags "-s -w"`, into a `dist/` directory, then `sha256sum * > checksums.txt` over everything in it.
+4. A short bash block that GETs the release for the pushed tag first (so a re-pushed tag reuses the existing release instead of failing), creates one if it does not exist, and then POSTs every file in `dist/` as an asset.
+
+The whole thing authenticates with `${{ github.token }}` against `${{ forgejo.server_url }}/api/v1` - the token Forgejo creates automatically for the duration of the workflow run, exposed under both its native `FORGEJO_TOKEN` name and, for compatibility with workflows written against GitHub Actions, as `GITHUB_TOKEN`.[^fj-actions-ref] No personal access token is stored anywhere for this lane.
+
+<Aside type="note">
+Every asset this lane creates - the release row's binaries and `checksums.txt` - lands on the storage host's S3-compatible object store, the same place Forgejo already keeps Actions logs, artifacts, packages, LFS objects and avatars. None of it touches the router's own disk.
+</Aside>
+
+Of the three, only `fjctl` is proven end to end as of this run: its v0.1.1 release carries exactly three assets - `checksums.txt` (168 bytes), a linux/amd64 binary (8,736,928 bytes), and a linux/arm64 binary (8,126,624 bytes). `secretctl` and `eaves` have the workflow committed but have not fired it: `secretctl` carries a single git tag from 2026-08-31, which predates the workflow, and no tag has been pushed since, so the workflow has never run for it; `eaves` carries no tags at all yet. See [Evidence](#evidence) below for the full picture.
+
+## Lane 3: public tools get a GitHub release instead
+
+A small number of the fleet's CLI tools are public, with users who pull binaries straight from GitHub rather than from anywhere inside the fleet. For those, the release step is `gh release create` run against the public GitHub repo, authenticated with a classic personal access token scoped to `repo` plus `write:packages`. No Forgejo release row is created for this lane either - the canonical release location, for these specific repos, stays GitHub, matching where their users already look.
+
+## The policy flip: banned, then brought back
+
+Lane 2 did not exist in its current form until five days before this page was written, and for a stretch before that it was explicitly banned:
+
+- **2026-09-24: no binary releases anywhere.** The stated reason was that a Forgejo release row's assets lived on router disk, and the release jobs that produced Forgejo release rows on two repos were deleted. Fleet-wide Forgejo release count: zero.
+- **2026-09-25: release storage moves off the router.** Everything in Forgejo's storage section - release assets included - moved to the storage host's object store.
+- **2026-09-28: the ban is lifted for lane 2.** With the router-disk reason gone, the three CLI repos above got `release.yml` added, and the same day's review formalised the three-lane split this page describes.
+
+Separately, and worth keeping apart from the ban-and-reversal above: cleaning up Forgejo's own container-package registry - never used to hold a real image, per the "no image releases on Forgejo" decision that was already in force - turned up 30 leftover package versions with orphaned blobs pointing at nothing. Deleting them (the index rows via a direct database delete, the underlying files via their content-hash path layout) took the registry's on-disk packages storage from 7.4 GB down to 892 MB. That cleanup is what made the registry question below worth asking again in the first place - it is what changed between the original 2026-09-24 decision and the 2026-09-28 review.
+
+## Why the registry stays off
+
+Forgejo's package registry does support a container/OCI registry type, for any OCI-compliant client[^fj-packages] - so running one is a real option, not blocked by a missing feature. The 2026-09-28 review recommended against it anyway, for four reasons:
+
+1. **Availability coupling.** A Forgejo-hosted registry would live on the edge router, with its blobs on the storage host. An outage of either one would block every image pull fleet-wide, for deploys and for recovery alike - exactly the moment a pull is most needed. ghcr.io and Docker Hub stay reachable when the router is down.
+2. **Nothing is currently broken.** The ghcr.io push path works, Docker Hub works, and image repos already ship with published signing and verification instructions. There is no failing pull to fix.
+3. **The original reason not to run one is gone, but that alone is not a reason to start.** The 2026-09-24 decision cited router disk; that reason is void now that packages storage lives on the object store. The review's own framing: changing the decision would need a concrete pull failure or a rate limit actually being hit, and there was neither at review time.
+4. **The one real exposure has a cheaper fix than a registry.** A couple of images are pulled from Docker Hub rather than ghcr.io and are therefore subject to its anonymous rate limits. If that ever bites, mirroring those two images to ghcr.io costs less than standing up and operating a registry.
+
+The door is left open rather than closed: enabling the registry later is a one-line units change (the packages storage unit is already on; the container package type is allowed by default) plus pushing an image with a token. The review's position is "not now, no concrete driver" rather than "never."
+
+## Cross-compile instead of emulate: the buildkit and QEMU lessons
+
+The image lane's multi-arch builds used to hang on the arm64 leg under QEMU user-mode emulation - fifty-plus minutes twice, on the same repo, with the runner's CPU sitting near idle the whole time. Idle CPU during a "build" is the tell: the job was not doing work, it was stuck.
+
+<Aside type="caution">
+A hung build under QEMU emulation looks like a slow build from the outside - the job is still running, still consuming a runner slot, still nominally in progress. The idle-CPU reading is what tells them apart: a genuinely slow cross-compile or bundler step burns CPU the whole time; an emulation hang does not.
+</Aside>
+
+The fix, proven on the next release afterwards: stop asking QEMU to emulate the whole build. Each build stage in the Dockerfile runs natively via `FROM --platform=$BUILDPLATFORM`, and the actual compilation step cross-compiles for the target with build args (`GOOS`/`GOARCH` for a Go binary; the frontend build output is architecture-independent regardless, so it only needs to happen once). `docker/setup-qemu-action` stays in the workflow - it is not removed - because the final runtime stage's package install still runs in the target architecture. That one step takes seconds under emulation, so it was never the bottleneck; the multi-minute compile and bundle steps were, and those are the ones now built natively.
+
+The same workflow's `setup-buildx-action` step also pins the builder's network to the forge's own bridge network and keeps a named, non-cleaned-up builder across jobs - both needed so the shared builder can actually reach the runner's other services and survive between parallel jobs, but neither is specific to the QEMU fix itself.
+
+A related fix in the same review pass: the shared buildkit build-cache volume behind that named builder had no garbage-collection policy at all and had grown to 26.1 GB. Every `setup-buildx-action` call site in the fleet - eight of them - now sets a `config-inline` buildkitd policy: garbage collection on, one policy keeping up to 10 GB for 72 hours, and a catch-all capping total usage at 15 GB. The old, ungoverned builder was deleted outright so the next build would recreate it with the policy active from the start, rather than trying to retrofit a GC policy onto an existing 26 GB of state.
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.6;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  start [label="repo makes a v* tag", shape=ellipse];
+  q1 [label="ships a container image?"];
+  q2 [label="users pull binaries\nfrom GitHub?"];
+  q3 [label="needs a tagged\nrelease at all?"];
+
+  lane1 [label="Lane 1: image repos\npush to ghcr.io"];
+  lane3 [label="Lane 3: public tools\ngh release create"];
+  lane2 [label="Lane 2: binary CLIs\nForgejo release + assets"];
+  none  [label="no release workflow"];
+
+  start -> q1;
+  q1 -> lane1 [label="yes"];
+  q1 -> q2 [label="no"];
+  q2 -> lane3 [label="yes"];
+  q2 -> q3 [label="no"];
+  q3 -> lane2 [label="yes"];
+  q3 -> none [label="no"];
+}
+```
+
+In list form:
+
+1. Does the repo ship a container image? If yes, it is lane 1: push to ghcr.io, no Forgejo release row.
+2. If not, do its users pull binaries from GitHub rather than from inside the fleet? If yes, it is lane 3: `gh release create` on the public GitHub repo.
+3. If not, does anything actually need a tagged release? If yes, it is lane 2: a Forgejo release with cross-compiled binaries and a checksums file. If no, skip release plumbing entirely - a config repo or a repo with a local-only build flow gains nothing from one.
+
+## Evidence
+
+What each repo had actually released as of this run, checked against the API rather than the workflow files:
+
+| Repo | Lane | Checked how | State this run |
+|---|---|---|---|
+| composer | Lane 1 | Prior tagged run completed; image inspected on ghcr.io | Proven end to end, at v0.27.4 |
+| fjctl | Lane 2 | `GET /repos/.../releases?limit=1` | Proven: one release (v0.1.1), three assets |
+| secretctl | Lane 2 | Same probe | Workflow in place; one tag predates it; zero releases fired |
+| eaves | Lane 2 | Same probe | Workflow in place; zero tags; zero releases |
+| Lane 3 tools | Lane 3 | Not probed live this run | Design only for this page; not independently re-verified here |
+
+Only one of the three lane-2 repos has actually exercised its release workflow. The other two are correctly configured but unproven - a plan document grouping all three together as "done" is describing the workflow files, not a fired release.
+
+## Related docs
+
+- [Forgejo as the primary forge on the NixOS edge router](/reference/self-hosted-forgejo-router/) - the whole-stack reference this page fulfils; that page named releases and registry storage as a planned follow-up.
+- [The Forgejo Actions runner](/reference/forgejo-actions-runner/) - the runner mechanics (privileged posture, the shared builder's network pin) this page's buildkit section assumes rather than repeats.
+- [Porting a GitHub Actions workflow to Forgejo Actions](/guides/porting-github-actions-to-forgejo/) - the general porting gotchas (licence-gated scanner actions, cross-repo checkouts that fail from a self-hosted runner) that a release workflow inherits from its CI workflow.
+- [Hot vs bulk: placing app state on a two-tier ZFS homelab](/reference/appdata-tiering-zfs/) - where the storage host's object store and its backup dataset physically sit.
+
+{/* References: cited inline as [^slug]; the numbered list renders below under "References". */}
+[^fj-packages]: Forgejo, "Package Registry," Forgejo Documentation. https://forgejo.org/docs/latest/user/packages/
+[^fj-actions-ref]: Forgejo, "Forgejo Actions," Forgejo Documentation. https://forgejo.org/docs/latest/user/actions/

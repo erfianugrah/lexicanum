@@ -1,0 +1,237 @@
+---
+title: Forgejo recovery runbooks
+description: "Ten task-sequenced runbooks for the failures this self-hosted Forgejo instance has actually had: a runner/server version skew that hangs silently, a fetch loop that dies after a forge restart, a token rotation that locks the runner out, orphaned job containers after a SIGKILL, a memcg OOM loop, a tag storm on a freshly native repo, a hand-inserted database row that breaks pushes, fetching job logs when the on-disk copy is missing, and restoring from the nightly backup."
+author: Erfi Anugrah
+category: forge
+---
+
+This instance has hit ten distinct outages and near-misses since the Forgejo-primary migration, and each one already has a fix. The runbooks below reproduce the exact diagnosis and fix used at the time, not a redesigned version of it. Find the runbook whose symptom matches yours; you do not need to read the others first.
+
+Prerequisites: SSH access to the router (`ssh router`), the admin API token read via `secretctl exec` rather than typed by hand, and `fjctl` for the day-to-day CI checks. Runbooks 6 and 10 include SQL statements against the live database - run only the exact statement each runbook calls a fix, never an ad hoc variant against a row you have not first looked at.
+
+## Constants (read this first)
+
+### Access this page assumes
+
+| What | How |
+|---|---|
+| SSH to the router | `ssh router` |
+| Admin/API token | `secretctl exec 'sops:/home/erfi/infra/forgejo-compose/.env#FORGEJO_ADMIN_TOKEN' --as T -- <cmd>` - never echoed, never written to disk |
+| CI status one-liners | `fjctl run status <owner>/<repo>`, `fjctl run list`, `fjctl run view`, `fjctl run logs` |
+| Direct Postgres access | `ssh router 'docker exec postgres_forgejo psql -U gitea -d gitea -Atc "<query>"'` |
+
+### `action_run` / `action_run_job` / `action_task` status codes
+
+Every runbook below that touches the database refers back to this table.
+
+| Code | Meaning |
+|---|---|
+| 1 | success |
+| 2 | failure |
+| 3 | cancelled |
+| 4 | skipped |
+| 5 | waiting |
+| 6 | blocked |
+| 7 | skipped (job level) |
+
+A read-only count against this instance, run this session: `SELECT status, count(*) FROM action_run GROUP BY status` returned only codes 1, 2 and 3 in current use - 289 success, 1278 failure, 129 cancelled. Nothing was sitting in 4 through 7 at the time.
+
+`started` and `stopped` on all three tables are unix seconds, not milliseconds - a query that divides by 1000.0 before converting prints 00:00 for every row. Confirmed live, same session:
+
+| Run id | status | started | stopped |
+|---|---|---|---|
+| 1747 | 2 | 1790643611 | 1790643624 |
+| 1746 | 1 | 1790643425 | 1790643485 |
+| 1745 | 1 | 1790643423 | 1790643435 |
+
+Run 1746's `stopped` minus `started` is exactly 60 seconds, matching the "1m0s" duration `fjctl run list` reports for the same run - the columns are seconds.
+
+### Component versions
+
+| Component | Version |
+|---|---|
+| Forgejo | 16.0.5-rootless |
+| PostgreSQL | 18 (`postgres:18-alpine`) |
+| Forgejo Runner | 13.2.0 |
+
+## Architecture overview
+
+The paired reference pages cover the full topology and hardening baseline; this page only needs the recovery-relevant slice - what runs where, and which router timer touches which piece.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  forgejo [label="Forgejo 16.0.5"];
+  pg [label="PostgreSQL 18", shape=cylinder];
+  runner [label="Forgejo Runner 13.2.0"];
+  job [label="job container\n(per task)"];
+  timers [label="router systemd timers\nrestart 03:00, reap hourly,\ncache prune 02:55,\nbackup 02:30"];
+  store [label="storage host\nbare-repo mirror + pg_dump"];
+
+  runner -> forgejo [label="poll tasks"];
+  forgejo -> job [label="dispatch"];
+  runner -> job [label="spawn, up to 4"];
+  job -> forgejo [label="fetch / push"];
+  forgejo -> pg;
+  timers -> runner [label="restart, reap orphans"];
+  timers -> pg [label="pg_dump"];
+  timers -> store [label="rsync + dump, nightly"];
+}
+```
+
+Text fallback for the diagram:
+
+1. The runner polls Forgejo for tasks and spawns up to four job containers at once.
+2. Job containers fetch from and push to Forgejo directly.
+3. Forgejo keeps its state in Postgres.
+4. Router systemd timers restart the runner daily, reap orphaned job containers hourly, prune the runner's cache nightly, and back up Postgres plus the git repositories nightly to the storage host.
+
+## Runbook 1: runner fetches tasks but jobs never start
+
+Symptom: the runner log shows a task fetched ("task NNN repo is ...") and then nothing - no job container ever appears, no panic, and `docker stats forgejo-runner --no-stream` sits at 0% CPU. Dispatch of every task after it stops too. This is a runner/server version skew: it happened on 2026-09-21 with runner 13.0.0 against a 16.0.5 server, and a goroutine dump taken at the time showed no worker goroutine at all.
+
+- **Diagnosis:** compare `docker inspect forgejo-runner --format '{{.Config.Image}}'` against the Forgejo server's reported version (`GET /api/v1/version`). If the runner tag is more than a couple of point releases behind the server, this is the likely cause. A run stuck in this state often ends up misclassified as a success at `status=1` with a short duration and no logs (Runbook 8 shows how to tell that apart from a real success).
+- **Fix:** upgrade the runner image to 13.2.0 or newer, and keep server and runner patch levels close going forward - do not let a server upgrade run for long against an old runner tag.
+- **Verification:** dispatch a fresh workflow run and confirm CPU activity on the runner container while it runs, then confirm the run's own job logs are non-empty via the endpoint in Runbook 8.
+
+## Runbook 2: runner fetch loop dead after a forge restart
+
+Symptom: after `docker restart forgejo` (or any Forgejo container restart), the runner goes silent - its log's last line is `failed to fetch task`, and no new runs start. Queued runs pile up. The runner's task-fetch loop stops permanently on a lost connection to the forge and does not recover on its own; this is not a version issue, it happens on the healthy, matched-version runner too.
+
+- **Diagnosis:** `ssh router 'docker logs forgejo-runner --tail 20'` - the absence of any recent "poller: request stage from forgejo" line, following a Forgejo restart, is the tell.
+- **Fix:** `ssh router 'docker restart forgejo-runner'`.
+- **Verification:** `ssh router 'docker ps --format "{{.Names}} {{.Status}}"' | grep runner` shows Up, and the next log lines show "runner registered" and "poller: request stage from forgejo".
+
+A daily systemd timer already restarts the runner unconditionally at 03:00 (with up to five minutes of randomised delay) specifically because of this failure mode - do not remove it. It does not replace the manual step above: after any deliberate `forgejo` restart during the day, restart the runner by hand too rather than waiting for 03:00.
+
+## Runbook 3: runner "token not found" after a token rotation
+
+Symptom: the runner container fails to start cleanly and its log reads "runner registration token not found". This happened on 2026-09-24 for roughly two hours: a rotated `FORGEJO_RUNNER_TOKEN` value was not actually a Forgejo-issued runner token.
+
+- **Diagnosis:** `ssh router 'docker logs forgejo-runner --tail 30'` for the exact error string. The runner's identity is not `forgejo-runner register` or a legacy on-disk registration file - it is a declared `server.connections` entry (URL, a non-secret UUID, and a `token_url` pointing at a file the container's bootstrap script writes at start, mode 0600) - so a token value that was minted through any other path will fail this way.
+- **Fix:** create a new runner, or regenerate an existing one's token, from the admin UI at `/admin/actions/runners`. Put the resulting token into `FORGEJO_RUNNER_TOKEN` via `sops .env`; if a new runner was created (rather than an existing one regenerated), update the UUID line in the compose file to match. Commit, push, then redeploy and wait for the sync to finish before bringing the stack up - an `up` fired while an async sync is still running redeploys the old compose file.
+- **Verification:** the runner container comes up without the "token not found" error, and the next CI run on any repo goes green.
+
+## Runbook 4: orphaned job containers after a SIGKILL
+
+Symptom: job containers named `FORGEJO-ACTIONS-TASK-<task id>_...` are still running (or still present, stopped) on the router's Docker daemon well after their run finished. Job containers run on the router's own daemon, not inside the runner container, so the runner only removes one while it is alive at the moment the job ends. If the runner itself gets stopped mid-job - a Composer redeploy, a manual restart, one of the nightly timers - Docker's stop timeout can SIGKILL it before its own cleanup runs, and runner 13.2.0 has no startup scan for containers left behind that way.
+
+- **Diagnosis:** `ssh router 'docker ps -a --filter name=FORGEJO-ACTIONS-TASK-'` lists every job container, live or stopped. Cross-check each task id (the number right after `TASK-` in the name) against its row in `action_task` before touching anything by hand.
+- **Fix:** two layers already exist and should be trusted first. The runner service itself carries `stop_grace_period: 15m` (Docker's default is 10 seconds), so a routine restart or redeploy gives a running job fifteen minutes to finish before anything is killed. An hourly router timer then removes any job container whose task row is no longer waiting (5) or running (6) and which stopped more than ten minutes ago - or, if the task row is missing entirely, whose container age exceeds ten minutes. It never touches a container tied to a waiting or running task. Run it once with its dry-run flag first if you want to see what it would remove without removing anything: `ssh router 'forgejo-reap-orphans --dry-run'`.
+- **Verification:** `docker ps -a --filter name=FORGEJO-ACTIONS-TASK-` returns only containers whose task rows are genuinely waiting or running.
+
+## Runbook 5: memcg OOM loop
+
+Symptom: the Forgejo container restarts repeatedly - 30 times on 2026-09-26 - with no obvious cause in the application log. The host itself was nowhere near out of memory (about 22 GB free at the time); the container's own cgroup was.
+
+- **Diagnosis:** `ssh router 'docker inspect forgejo --format "{{.HostConfig.Memory}}"'` for the configured limit, and check `dmesg` around the restart times for an OOM-killer entry naming the container's cgroup. The root cause here was specific to this image: Forgejo's `/tmp` is a 512M tmpfs, and tmpfs pages count against the same memory cgroup as the process - so the effective ceiling for the application itself is well under the nominal container limit. Anon-rss reached about 1.04 GiB against a 1024M limit.
+- **Fix:** raise the container's memory limit (1024M to 2048M in this case, in both the live and rollback compose variants) rather than trying to shrink the tmpfs, since the tmpfs itself is not the leak.
+- **Verification:** `ssh router 'docker inspect forgejo --format "{{.RestartCount}} {{.State.StartedAt}}"'`. Checked live this session: `0 2026-09-27T00:18:04.568535343Z` - zero restarts and about two days of uptime at probe time, holding since the fix landed.
+
+## Runbook 6: tag storm on a freshly native repo
+
+Symptom: converting a mirrored repo to native, then pushing every historical tag, queues one release-workflow run per old tag - dozens or hundreds of runs, each rebuilding an old commit and potentially re-publishing it under a `latest`-style label. The mechanism: Forgejo evaluates tag-push workflows against the default branch's *current* workflow files, not against whatever existed at the tag's own commit, so tags that predate any `.forgejo/workflows/` directory still queue runs of today's release workflow.
+
+- **Diagnosis:** a sudden run count spike right after a tag push to a newly converted repo, all sharing the same workflow file and firing within seconds of each other.
+- **Prevention (do this instead of hitting the incident at all):** push `main` only on a freshly converted native repo. Prove the release workflow goes green on `main` before ever pushing tags - or skip pushing the old tags altogether if another remote already holds them canonically.
+- **Fix if it already happened:** stop the runner, kill every `FORGEJO-ACTIONS-*` container, then cancel at all three levels in Postgres - `action_run`, `action_run_job`, and `action_task` - because Forgejo re-aggregates a run's status from its jobs, so cancelling only the run row gets overwritten. These are the documented statements, restricted to rows still in status 5 or 6 (waiting or blocked) between two known ids `A` and `B` - never touch a row already in a terminal status:
+
+```sql
+update action_run set status=3 where id between A and B and status in (5,6);
+update action_run_job set status=3 where run_id between A and B and status in (5,6);
+update action_task t set status=3 from action_run_job j
+  where t.job_id=j.id and j.run_id between A and B and t.status in (5,6);
+```
+
+- **Verification:** restart the runner and confirm no `FORGEJO-ACTIONS-*` containers spawn for the cancelled range; `fjctl run list <owner>/<repo>` shows the range as cancelled rather than waiting or blocked.
+
+## Runbook 7: a hand-inserted `repo_unit` row 500s the push hook
+
+Symptom: `git push` over SSH starts returning HTTP-style 500-class failures from the push hook (`git-receive-pack`) on a specific repo, right after someone tried to enable the Actions unit by inserting a `repo_unit` row directly in Postgres instead of through the UI.
+
+A pull-mirrored repo gets no `repo_unit` row for Actions (type 10) at all; a repo created natively via the API does. Lightly unmirroring a repo (flipping `is_mirror` to false) restores `git push` but leaves the Actions unit missing, and on this version there is no API and no CLI path to add the unit afterward - the only working path is the UI (Settings, Units, Overview, tick Actions) or deleting and recreating the repo natively. A raw SQL insert of the missing row does not reproduce what the UI does atomically, and breaks the push hook instead.
+
+- **Diagnosis:** if a repo that recently had a unit "enabled" by hand starts failing pushes, that is the first thing to suspect - check for a `repo_unit` row that was added outside the UI around the same time the push started failing.
+- **Fix:** delete the hand-inserted `repo_unit` row. If the Actions unit is still needed afterward, use the UI toggle, or fall back to the full delete-plus-native-recreate-plus-push runbook for that repo.
+- **Verification:** `git push` succeeds again over SSH.
+
+Never insert a `repo_unit` row by hand for any reason - this is the only fix path documented for it, and the safest outcome is to never trigger it.
+
+## Runbook 8: fetching job logs when the on-disk copy is missing
+
+Symptom: a job's `action_task.log_size` is greater than zero in Postgres, but the on-disk log file under the container's actions-log path is absent. This is not evidence the log was lost - the on-disk path is not the reliable surface for reading logs on this instance.
+
+- **Diagnosis / fix in one step:** always fetch logs through the API rather than the filesystem: `GET /api/v1/repos/{owner}/{repo}/actions/jobs/{id}/logs`. Verified live this session against this site's own repo: `GET /api/v1/repos/erfi/lexicanum/actions/jobs/6532/logs` (the `build-and-deploy` job of run 1746) returned HTTP 200.
+- **A related diagnostic this endpoint enables:** a run whose dispatch was lost mid-flight - the runner hung or restarted while a task was in progress - lands on `status=1` (success) with a duration of roughly 30 seconds and no logs, which looks identical to a real success at a glance. Fetching the job's logs is how to tell the two apart: a real success has logs, a lost-dispatch run does not.
+- **Verification:** the endpoint returns 200 with a non-empty log body for a job you know completed; a `status=1` run with an empty body from this endpoint is the lost-dispatch case above, not a genuine success, whatever the status column says.
+
+## Runbook 9: restoring from the nightly pg_dump + bare-repo mirror
+
+Symptom: you need to prove the backup actually restores, or you are recovering from real data loss on the router.
+
+A nightly router timer (02:30, up to ten minutes of randomised delay) runs `pg_dump -Fc --no-owner --no-acl`, checks the dump for the `PGDMP` magic string before an atomic rename, then rsyncs the bare-repo tree with `--delete`, and pushes both to the storage host over SSH. Per-repo git bundles were rejected on size (the repositories were 6.3GB at the time; seven days of bundle retention would be roughly 44GB per box) in favour of this rsync-mirrored bare-repo tree, which restores with a plain `git clone`. Copy history comes from the storage host's own filesystem snapshots of the backup dataset, not from dated backup files.
+
+- **Diagnosis:** confirm the last backup run actually succeeded before trusting it as a restore point - `ssh router 'systemctl status forgejo-backup'`, or check the timestamp of the storage host's copy.
+- **Fix (git half):** `git clone` directly from the mirrored bare-repo tree on the storage host. This half needs neither Forgejo nor Postgres running.
+- **Fix (Postgres half):** do not pipe the dump over `ssh ... docker run -i` - that path silently loses the stream (`pg_restore` sees no magic string despite the file being intact on disk, which was discovered during the 2026-09-23 drill). Mount the dump file into a scratch Postgres container instead and run `pg_restore` against the mount.
+- **Verification:** the 2026-09-23 drill is the reference point - a `git clone` of the mirrored repo matched the live HEAD, and the mounted-dump restore completed with 0 errors, 130 `TABLE DATA` entries, and row counts (1 user, 268 repositories) matching what was live at the time. Repeat the same two checks - HEAD match, row/repo counts - before trusting any future restore.
+
+## Runbook 10: rotating the admin token
+
+Symptom: routine rotation, not an incident - included because it is destructive if done out of order and belongs next to the other database-touching runbooks.
+
+There is no API self-delete for a Forgejo access token - it returns 401 even when called by the token's own owner - so removing the old one after rotation is a direct SQL delete, not an API call.
+
+- **Step 1:** mint a new token in the UI at `/user/settings/applications`, with the scopes the old one had.
+- **Step 2:** SOPS-encrypt the new value into `.env` as `FORGEJO_ADMIN_TOKEN`.
+- **Step 3 (delete the old one):** `DELETE FROM access_token WHERE name='<old name>';` against `postgres_forgejo`. (Described here, not run as part of this page - this statement is destructive and repo-specific; confirm the name before running it.)
+- **Step 4:** commit and push, so the new value reaches every consumer that reads the SOPS file.
+- **Verification:** any command that used to authenticate with the old token now fails, and the same command with the new token (read via `secretctl exec`, never printed) succeeds.
+
+## Verification
+
+| Runbook | Check | Expected |
+|---|---|---|
+| 1: version skew | Fresh dispatch + job logs | CPU activity during the run; non-empty logs |
+| 2: fetch loop dead | `docker ps` / `docker logs forgejo-runner` | Up; recent "poller: request stage" line |
+| 3: token not found | Runner startup log | No "token not found"; next CI run green |
+| 4: orphaned containers | `docker ps -a --filter name=FORGEJO-ACTIONS-TASK-` | Only containers tied to waiting/running tasks |
+| 5: OOM loop | `docker inspect forgejo --format "{{.RestartCount}} {{.State.StartedAt}}"` | RestartCount steady, no repeated restarts |
+| 6: tag storm | `fjctl run list` over the cancelled range | Status cancelled, not waiting/blocked |
+| 7: repo_unit row | `git push` over SSH | Succeeds |
+| 8: missing on-disk logs | `GET .../actions/jobs/{id}/logs` | 200, non-empty body |
+| 9: restore drill | `git clone` HEAD match; restored row/repo counts | Match live at drill time |
+| 10: token rotation | Old token now fails, new token succeeds | As stated |
+
+## Gotchas and lessons learned
+
+- A run that looks like a plain success (`status=1`) is not proof anything actually ran - both the version-skew hang and an ordinary lost dispatch during a runner restart can leave a run at `status=1` with a short duration and no logs. Check the job logs endpoint before trusting the status column alone.
+- The three status/timestamp tables (`action_run`, `action_run_job`, `action_task`) all need updating together for a cancel to stick - Forgejo re-aggregates run status from its jobs, so a run-level-only update gets silently overwritten.
+- Never insert a `repo_unit` row directly - it is the one documented way to 500 the push hook on an otherwise healthy repo.
+- The runner's own restart does not fix a fetch-loop death that started before the forge came back - it needs the runner itself restarted, not just time.
+- A pg_dump piped over `ssh ... docker run -i` can look like it worked and still be unusable - `pg_restore` reported no magic string from a file that was intact on disk once actually inspected. Mount the file; do not pipe it through a remote docker run.
+- Prevention beats every fix on this page once: pushing `main` only to a freshly native repo, before ever pushing its tags, is what avoids Runbook 6 entirely.
+
+## File reference
+
+| Path | What it is |
+|---|---|
+| `forgejo-compose/docker-compose.router.yml` | Runner `stop_grace_period`, memory limits, seed containers |
+| `forgejo-compose/.env` (SOPS) | `FORGEJO_ADMIN_TOKEN`, `FORGEJO_RUNNER_TOKEN` |
+| Router NixOS config, `systemd.timers.forgejo-runner-restart` | Daily 03:00 runner restart |
+| Router NixOS config, `systemd.timers.forgejo-reap-orphans` | Hourly orphaned job-container reaper |
+| Router NixOS config, `systemd.timers.forgejo-backup` | Nightly 02:30 pg_dump + bare-repo mirror |
+| `forgejo-reap-orphans` (router package) | The reaper script itself, `--dry-run` supported |
+
+## Related docs
+
+- [Forgejo as the primary forge on the NixOS edge router](/reference/self-hosted-forgejo-router/) - full topology, hardening baseline, and the backup design Runbook 9 restores from.
+- [The Forgejo Actions runner: build and lifecycle](/reference/forgejo-actions-runner/) - the runner's config-seed mechanism, capacity, Docker access mode, and the incidents Runbooks 1 through 4 are drawn from, covered there in more architectural depth.
+- [Porting a GitHub Actions workflow to Forgejo Actions](/guides/porting-github-actions-to-forgejo/) - the Actions-unit and mirror-versus-native distinction from the workflow-authoring side, relevant to Runbook 7.
+- [Forgejo webhooks to Composer GitOps](/guides/forgejo-webhooks-composer-gitops/) - the redeploy path a rotation's "commit and push" step lands in, relevant to Runbooks 3 and 10.
+- [Declarative backups on a ZFS homelab: nix timers, sanoid, syncoid](/reference/declarative-homelab-backups/) - the general timer-plus-snapshot pattern Runbook 9's backup timer follows.
+- [secretctl: a single binary for reading, comparing and handing off secrets](/reference/secretctl/) and [Rotating a secret with secretctl](/guides/secretctl-rotation/) - the tool used to read tokens in every runbook here without printing them.

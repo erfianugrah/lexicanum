@@ -1,0 +1,205 @@
+---
+title: "Where Forgejo's data lives: storage, backups and caches"
+description: "A per-subsystem map of where Forgejo's data actually lives, the migrate-storage direction trap that silently no-ops when run in the wrong order, the nightly backup and its 2026-09-23 restore drill, and the two unrelated build caches that grow without their own garbage collection."
+author: Erfi Anugrah
+category: forge
+featured: true
+blurb: "Six kinds of data, three protection mechanisms, and a command that silently does nothing if you run it after the config switch."
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Forgejo's data is not one blob to back up. Git repositories, Postgres, release assets, Actions logs and artifacts, packages, LFS objects, avatars, and two build caches each live somewhere different and are protected by a different mechanism. This page maps each kind of data to where it lives and what protects it, then covers the two operational traps that matter most: running the storage-migration command in the wrong order, and the two caches that grow forever without garbage collection wired in separately. The forge's overall topology, hardening and restore-drill numbers are covered on [Forgejo as the primary forge](/reference/self-hosted-forgejo-router/); this page goes one level deeper on storage, backups and caches specifically.
+
+<Aside type="note" title="Provenance">
+  One forge host running Forgejo, and one storage host holding an S3-compatible object store (named Silo, a fork of MinIO) plus the ZFS pool that backs everything up. Config rows are read from the forge's compose file and the two hosts' NixOS configuration, both clean working trees at the time of writing. Live rows are read-only `systemctl` probes against the forge host and `du` against the storage host, both run 2026-09-29. The 2026-09-23 restore drill is not re-run here; it is linked from the sibling topology page, where its full numbers already live.
+</Aside>
+
+**TL;DR:**
+
+- Git repositories and Postgres live on the forge host's own Docker volumes. Everything in Forgejo's `[storage]` section - release assets, Actions logs, Actions artifacts, packages, LFS objects, avatars - lives on one S3-compatible bucket on the storage host, reachable over exactly one nftables forward rule.
+- The storage-migration CLI copies data FROM whatever storage is configured right now TO the destination its flags name. Run it after switching the config and it copies the new store onto itself: zero files moved, no error.
+- A nightly timer (02:30) `pg_dump`s Postgres and mirrors the bare-repo tree to the storage host; a restore drill on 2026-09-23 proved both restore paths actually work.
+- Two unrelated caches exist. The runner's Actions cache has its own nightly prune (TTL plus size cap); the CI builder's build-layer cache had no garbage collection at all and grew to about 26 GB before a fix shipped as an inline buildkitd policy, not a timer.
+- The object store's own data is protected only by same-pool ZFS snapshots, with no off-pool copy - an accepted risk, unlike the forge host's own git/Postgres data, which does get copied off-host (onto the storage host).
+
+---
+
+## Where each kind of data lives
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_forge {
+    label="Forge host"; style=rounded; fontsize=12; margin=12;
+    repos [label="git repositories\nDocker volume"];
+    pg [label="Postgres\nDocker volume", shape=cylinder];
+    runnercache [label="runner Actions cache\nDocker volume", shape=cylinder];
+  }
+  subgraph cluster_storage {
+    label="Storage host"; style=rounded; fontsize=12; margin=12;
+    bucket [label="S3 bucket (Silo)\nrelease assets, Actions logs\n+ artifacts, packages, LFS, avatars", shape=cylinder];
+    backupds [label="backup dataset\nsanoid snapshots", shape=cylinder];
+  }
+
+  repos -> backupds [label="nightly rsync"];
+  pg -> backupds [label="nightly pg_dump"];
+  runnercache -> runnercache [label="nightly prune\n(TTL + size cap)"];
+  bucket -> bucket [label="same-pool\nsnapshots only"];
+}
+```
+
+| Data | Lives on | Protected by |
+|---|---|---|
+| Git repositories | Forge host volume | Nightly `rsync --delete` mirror to the storage host, plus that host's own snapshots |
+| Postgres | Forge host volume | Nightly `pg_dump -Fc` to the storage host, plus that host's own snapshots |
+| Release assets, Actions logs, Actions artifacts, packages, LFS objects, avatars | S3 bucket on the storage host | Same-pool snapshots on the storage host only - no off-pool copy |
+| Runner Actions cache (`actions/cache`) | Forge host volume, separate from Forgejo's own `[storage]` | Disposable by design; nightly TTL + size-cap prune |
+| CI builder's build-layer cache | Builder container's own state, on the forge host | Inline garbage-collection policy in every image-building workflow, not a timer |
+
+Storage type is set with `STORAGE_TYPE=minio` plus `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY_ID`, `MINIO_SECRET_ACCESS_KEY`, `MINIO_BUCKET`, `MINIO_LOCATION` and `MINIO_USE_SSL=false` - each key duplicated under both the legacy and current environment-variable prefixes, for forward compatibility if the prefix ever changes again. Forgejo defines these eight subsystems as candidates for that storage backend: attachments, avatars, repository avatars, repository archives, packages, LFS, Actions logs, and Actions artifacts.[^fj-storage]
+
+The access key Forgejo uses for the bucket is scoped to that one bucket only, via an explicit bucket-ARN policy set up once by a dedicated setup script, rather than a general-purpose credential. The forge host can reach the storage host's S3 port over exactly one nftables forward rule, scoped to the forge's own bridge network; the forward chain default-drops everything else, so container-initiated traffic that isn't explicitly allowed simply dies rather than escaping the intended path.
+
+The pre-switch local copies of attachments, Actions logs and packages are still physically present on the forge host's own data volume. Forgejo reads everything live from the storage host now, so these are frozen leftovers rather than a second live copy, kept around for a grace period before deletion.
+
+---
+
+## The migrate-storage order trap
+
+Forgejo's storage-migration subcommand copies data FROM the storage type currently configured TO the destination named by its own flags. That means it has to run BEFORE the config is switched over, while the running config still points at the old store. Run it after the switch and it silently copies the new store onto itself - the live server already points at the new store, so the migration reads from there too, and moves zero files. Nothing errors; the run just does nothing useful.
+
+<Aside type="caution" title="Direction, not destination, is the trap">
+Both a pre-switch and a post-switch run point the migration's flags at the same destination bucket. The only thing the order changes is what the migration reads as its SOURCE - and the tool never tells you that source was empty of anything worth moving.
+</Aside>
+
+The migration script used here works around this by forcing the OLD (local) storage type via an environment-variable override, inside a disposable one-shot container that shares the live database - so the running server's config never has to change back and forth. It then points the migration's own `--minio-*` flags at the new bucket, covering all eight storage subsystems Forgejo defines in one pass.
+
+Two more properties of the underlying command shaped the script:
+
+- It aborts at the first missing file, with no skip-missing flag. The script follows it with an `mc mirror --overwrite=false` completeness pass, which only ADDS whatever objects the aborted run left behind - it never overwrites and never deletes.
+- A separate consistency check compares every row in the Actions-log table against what actually exists in the bucket, so a migration that silently dropped files is caught rather than assumed complete.
+
+The bucket itself, and the dedicated bucket-scoped service-account credentials Forgejo uses to reach it, are set up once ahead of any migration by a separate script, which writes the new credential pair straight into the credential store rather than printing it anywhere.
+
+---
+
+## Nightly backup: Postgres and repositories
+
+A nightly timer on the forge host fires at 02:30 with up to ten minutes of randomized delay. The one job it runs: `pg_dump -Fc` Postgres to a `.partial` file, check that file for the dump-format magic bytes, rename it atomically, then `rsync --delete` the bare-repo tree to the storage host. Non-git state is deliberately excluded from this job - it already lives on the storage host's own S3 bucket, protected by that host's own snapshots, so mirroring it a second time here would just be a second copy to keep straight. The staging copy this job used to make of that old non-git mirror is actively deleted on every run, specifically so an old copy on the forge host can never be mistaken for current coverage.
+
+Per-repository nightly git bundles were considered and rejected on size: at roughly 6.3 GB of repositories and 7-day retention, that shape would cost about 44 GB per box. The mirrored bare-repo tree plus the storage host's own snapshot history covers the same point-in-time recovery need for a fraction of the space.
+
+The most recent run, checked 2026-09-29, completed in 16 seconds (02:38:07 to 02:38:23) with a successful result. The mirrored repository backup occupies about 5.7 GiB on the storage host; the object-store bucket data occupies about 50 GiB on the same host.
+
+A restore drill against this exact backup passed on 2026-09-23: a plain clone of the mirrored bare repository reproduced the live HEAD, and the Postgres dump restored cleanly into a scratch container once mounted in directly rather than piped over SSH (piping it had silently lost the stream, so the restore tool saw no magic bytes despite the source file being intact). The full numbers from that drill, and the general nix-timer-plus-sanoid-plus-syncoid pattern this backup follows, are covered on [Forgejo as the primary forge](/reference/self-hosted-forgejo-router/#backups-and-the-restore-drill) and on [Declarative backups on a ZFS homelab](/reference/declarative-homelab-backups/) - not repeated here.
+
+---
+
+## Two caches, two mechanisms
+
+The runner's Actions cache and the CI builder's build-layer cache are unrelated systems that happen to sit on the same forge host. Confusing them is the easiest way to fix the wrong one.
+
+### Runner Actions cache
+
+The runner's built-in cache garbage collector expires entries by age - unused for 7 days, or 30 days since creation - but has no size cap of its own. A separate nightly prune tool adds both a time-to-live and a size cap on top, deleting complete cache entries (both the stored blob and its index row together, so no dangling index survives) and also aging out stale checkout directories older than 30 days.
+
+This prune fires nightly at 02:55, with no jitter, inside the same maintenance window as the runner's daily liveness restart: the runner is stopped first, because it holds an exclusive lock on its cache index for its entire life, then the prune runs, then the runner starts again even if the prune step itself failed. The TTL and size cap were tightened from 14 days and 20 GiB down to 3 days and 10 GiB.
+
+### Builder layer cache (buildkit GC)
+
+The CI builder's build-layer cache is a different thing entirely: it lives in the shared builder container's own state, not in Forgejo's `[storage]` or the runner's Actions-cache volume. It had no garbage collection configured at all, and grew to about 26 GB before anyone added one.
+
+The fix is not a timer - it is a garbage-collection policy passed inline to the build-driver setup step, in every workflow that builds an image:
+
+```yaml
+      - uses: docker/setup-buildx-action@v4
+        with:
+          name: ci-builder
+          driver-opts: network=forgejo_forgejo
+          cleanup: false
+          config-inline: |
+            [worker.oci]
+              gc = true
+            [[worker.oci.gcpolicy]]
+              keepDuration = "72h"
+              maxUsedSpace = "10GB"
+            [[worker.oci.gcpolicy]]
+              all = true
+              maxUsedSpace = "15GB"
+```
+
+Two GC policy tiers, not one: the first keeps entries under 10 GB as long as they're younger than 72 hours; the second, unconditional (`all = true`) tier caps total size at 15 GB regardless of age. The builder garbage-collects itself in the background as part of normal operation - nothing external has to trigger it.
+
+---
+
+## Supporting timers
+
+Beyond the backup and the two caches, four more timers keep the forge host's Actions surface from silently accumulating garbage:
+
+| Timer | Cadence | What it removes |
+|---|---|---|
+| Orphaned job-container reaper | Hourly | Job containers whose task is no longer waiting or running in Postgres, and which ended more than 10 minutes ago |
+| Buildx builder sweeper | Hourly | Leaked per-job builder containers and their dangling state volumes, older than 6 hours - skips the whole run if any job container is still active, and never touches the one shared, pinned builder used by CI |
+| Runner liveness restart | Daily, 03:00 (+ up to 5 minutes) | Restarts the Actions runner, whose task-fetch loop stops permanently (and does not recover on its own) after it loses its connection to Forgejo |
+| Cache prune | Daily, 02:55 | Covered above |
+
+The orphan-reaper and the runner restart are a matched pair: the restart gives in-flight jobs 900 seconds (15 minutes) to finish before force-killing, up from Docker's 10-second default, which had been killing the runner mid-job and orphaning its job containers. The reaper is the safety net for whatever still leaks past that grace period.
+
+Live state checked 2026-09-29: the backup, cache-prune and runner-restart timers each had a recent successful run and a next-fire time consistent with their configured cadence; the two hourly timers had each fired within the hour.
+
+---
+
+## Silo's own protection
+
+Data on the storage host - including the whole Forgejo bucket - is protected only by same-pool snapshots, the policy-driven snapshot-management layer covering this NAS.[^sanoid-syncoid] There is no off-pool copy of it, which is an accepted risk rather than an oversight: the storage host's ZFS replication job only ever moves data OFF the forge host's fast, non-redundant NVMe tier and ONTO the storage host's own redundant bulk array - it does not run a second time to move the storage host's own bulk data anywhere else. The bulk dataset holding the object store gets the same daily/weekly/monthly snapshot policy (7 daily, 4 weekly, 3 monthly, no hourly) as the dataset holding the forge's git/Postgres backups - both sit on the redundant array, but neither has a copy outside it.
+
+Where this dataset sits relative to the storage host's other tiers is covered in [Hot vs bulk: placing app state on a two-tier ZFS homelab](/reference/appdata-tiering-zfs/).
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.35; ranksep=0.55;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="Is the data git\nor Postgres?", shape=diamond];
+  q2 [label="Is it Forgejo\n[storage] data?", shape=diamond];
+  q3 [label="Is it a build\nor Actions cache?", shape=diamond];
+
+  a1 [label="Nightly rsync/pg_dump\nto the storage host"];
+  a2 [label="S3 bucket on the storage host,\nsame-pool snapshots only"];
+  a3 [label="Disposable: nightly prune\n(runner cache) or inline\nbuildkitd GC (builder cache)"];
+
+  q1 -> a1 [label="yes"];
+  q1 -> q2 [label="no"];
+  q2 -> a2 [label="yes"];
+  q2 -> q3 [label="no"];
+  q3 -> a3 [label="yes"];
+}
+```
+
+In list form:
+
+1. Git repositories and Postgres: nightly `rsync`/`pg_dump` to the storage host, restore-drilled.
+2. Anything in Forgejo's `[storage]` section (release assets, Actions logs/artifacts, packages, LFS, avatars): the S3 bucket on the storage host, protected only by same-pool snapshots there.
+3. A build or Actions cache: disposable by design. The runner's cache gets a nightly TTL-plus-size-cap prune; the builder's layer cache gets an inline buildkitd garbage-collection policy instead of a timer.
+
+## Related docs
+
+- [Forgejo as the primary forge on the NixOS edge router](/reference/self-hosted-forgejo-router/) - the forge-wide topology, hardening baseline, and the full restore-drill writeup this page links to rather than repeats.
+- [The Forgejo Actions runner](/reference/forgejo-actions-runner/) - the runner's privileged posture and job-container isolation; this page covers the storage and cleanup side of the same runner.
+- [Declarative backups on a ZFS homelab: nix timers, sanoid, syncoid](/reference/declarative-homelab-backups/) - the general backup pattern the nightly forge backup follows, and why a same-pool snapshot is not an off-pool copy.
+- [Hot vs bulk: placing app state on a two-tier ZFS homelab](/reference/appdata-tiering-zfs/) - where the storage host's object-store dataset sits relative to its other tiers.
+
+{/* References: cited inline as [^slug]; the numbered list renders below under "References". */}
+[^fj-storage]: Forgejo, "Storage settings," Forgejo Documentation. https://forgejo.org/docs/latest/admin/setup/storage/
+[^sanoid-syncoid]: jimsalterjrs, "sanoid," GitHub. https://github.com/jimsalterjrs/sanoid
