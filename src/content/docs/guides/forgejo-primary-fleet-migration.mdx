@@ -1,0 +1,187 @@
+---
+title: Migrating a repo fleet from GitHub-primary to Forgejo-primary
+description: "Moving a fleet of about 270 repositories from GitHub-primary (Forgejo pull mirrors) to Forgejo-primary (GitHub push-mirror backup, no Actions there): the repo-fleet tool's audit, convert, push and drift subcommands and their drift states, native recreate vs light unmirror, the tag-storm gotcha, host deploy keys and clone re-pointing, cleaning up Dependabot on GitHub backups, the public/private visibility decision, frozen forks, rollback, and the live stocktake."
+author: Erfi Anugrah
+category: forge
+---
+
+Before 2026-09-23 every repository in this fleet was a Forgejo *pull* mirror: read-only on Forgejo, no Actions unit, CI running on GitHub. This guide is the conversion the other direction - every repository becomes native on Forgejo (git and CI both), and GitHub is demoted to a *push*-mirror backup that runs no Actions. It covers the tiering that decided conversion order, the fleet's own `repo-fleet` tool and its four subcommands, the native-recreate-vs-light-unmirror decision, the waves the roughly 270-repository fleet was actually converted in, the host clones and deploy keys that depend on the result, the Dependabot cleanup GitHub Actions being off does not itself cover, the public/private visibility decision, forked repositories as their own track, and rollback.
+
+The migration ran 2026-09-23 to 2026-09-27, with cleanup continuing to 2026-09-29. This page draws on the session's own plan document and the tool's git history, plus a read-only re-count against the live Forgejo instance run for this page.
+
+Prerequisites: a Forgejo admin-scoped API token, read through `secretctl` or SOPS by reference rather than minted one-shot for the occasion; the `gh` CLI; `jq`; ssh access to the host running Forgejo, for the one Postgres statement the light-unmirror path still needs; and a local clone of the repository already listed in the tool's own repo-to-path map. The topology this migration produced is covered in [Forgejo as the primary forge on the NixOS edge router](/reference/self-hosted-forgejo-router/); this guide is how it got there.
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  before_fj [label="Forgejo\n(pull mirror,\nno Actions unit)"];
+  before_gh [label="GitHub\n(canonical, CI runs here)"];
+  after_fj [label="Forgejo\n(native, Actions runs here)"];
+  after_gh [label="GitHub\n(push-mirror backup,\nActions disabled)"];
+  before_gh -> before_fj [label="pull, periodic\n(before 2026-09-23)"];
+  after_fj -> after_gh [label="push, on commit + 8h\n(after conversion)"];
+}
+```
+
+The same thing in list form:
+
+1. Before conversion: GitHub is canonical and runs CI; Forgejo holds a read-only pull-mirrored copy with no Actions unit.
+2. After conversion: Forgejo is canonical and runs CI; GitHub holds a push-mirrored copy, kept current on every commit and on an 8-hour interval, with its own Actions disabled.
+
+| Component | Version / state at time of writing |
+|---|---|
+| Forgejo server | 16.0.5 |
+| `repo-fleet` (the conversion tool) | commit `a8cd69d`, "convert is re-runnable and fails closed" |
+| `tier-b.tsv` (repo-to-clone-path map) | 47 active rows, plus a documented exclusion list |
+| forgejo-compose repo (tool's own home) | `d5c565f`, working tree clean |
+
+## Part 1: the tiers
+
+Every repository in the fleet falls into one of three tiers, decided before any conversion ran.
+
+- **The public-backup set** - repositories whose GitHub copy stays public after conversion (Part 7 covers why and how many).
+- **Everything else active** - Forgejo primary, GitHub backup kept private. This is the bulk of the fleet and the waves in Part 4.
+- **Cold or out of scope** - archived repositories, a small number of pull mirrors whose GitHub source had itself been renamed or deleted (their Forgejo copies were duplicates of repositories already converted under the new name, confirmed by checking that the stale head was a strict ancestor of the successor's history before deleting anything), and one repository excluded by name because it is a local clone of someone else's open-source project rather than original work, so it was never a candidate for conversion at all.
+
+## Part 2: the repo-fleet tool
+
+`repo-fleet` has four subcommands: `audit [name]`, `convert <name> [--force]`, `push` (run inside a repository: push `origin`, then best-effort push `backup`), and `drift` (fleet-wide, no name filter, reading the same repo-to-path map every other subcommand does).
+
+`audit` and `drift` are read-only. `audit` does one GET against the Forgejo API, one GET against the GitHub API, and a fetch of the `backup` remote only; `drift` does the same fetch-and-compare with no API calls at all. `convert` is the only subcommand that changes anything - a database statement over ssh for a light unmirror, a git push, and a Forgejo API write to enrol the push mirror.
+
+Both `audit` and `drift` compare `origin/<branch>` against `backup/<branch>` after fetching `backup`, where `<branch>` is resolved per repository (the checked-out branch's own `origin/HEAD` symref if it resolves, otherwise the branch actually checked out, otherwise `main`) because at least three repositories in this fleet default to `master` rather than `main`. The two subcommands report slightly different vocabularies for the same comparison:
+
+| State | Meaning | Reported by |
+|---|---|---|
+| `OK` | `origin` and `backup` point at the same commit | both |
+| `AHEAD` | `origin` is ahead of `backup` by ancestry - the backup push has not landed yet | both |
+| `DIVERGED` | neither is an ancestor of the other - a real problem, needs a human | both |
+| `GH-SOURCE` | no `backup` remote, and `origin` is still GitHub - an unconverted repository, expected | `drift` |
+| `MISSING-BACKUP` | no `backup` remote, but `origin` already points at the forge - a converted repository that lost its backup enrolment, a defect | `drift` |
+| `NO-REFS` / `no-refs` | neither ref resolves (a private repository with no branches pushed yet, for example) | both |
+| `NOBACKUP` / `NO-CLONE` | audit/drift-specific edge cases (one ref present but not the other; no local clone at all) | one each |
+
+Only `OK`, `GH-SOURCE`, `NO-REFS` and `NO-CLONE` are treated as passing states by `drift`'s own exit code - everything else, including `MISSING-BACKUP`, sets a nonzero exit, because those are the states where the fleet's own backup discipline has actually failed rather than simply not started yet.
+
+## Part 3: converting one repository
+
+`convert` refuses to run against a dirty working tree, a checkout that is not on `main`, or a local `main` that is ahead of `origin` - push first, then convert. It then reads whether the target is still a pull mirror, and picks one of two paths:
+
+- **Light unmirror**, for a repository with no `.forgejo/workflows` to run. A single database statement flips `is_mirror` to false and `is_private` to true and removes the mirror row, over ssh, keeping the same repository id. Nothing about the repository's Actions unit changes, because there is nothing to enable - it never needed one.
+- **Native recreate**, for a repository that needs Forgejo Actions to run its CI. The mirror is deleted outright and a new native repository of the same name is created through the repository-creation API, which is the only way to get an Actions unit on Forgejo 16.0.x: there is no API or CLI to add the unit to an existing repository, and inserting the unit's database row by hand was tried once and broke the SSH push hook (a 500) until the row was deleted again by hand. The one working alternative to a native recreate is a single UI click - Settings, Units, Overview, tick Actions - and every wave in Part 4 that needed CI used the recreate path instead, so the whole fleet converts from one script.
+
+Both paths end the same way: the local remotes are swapped (`origin` becomes the forge, `backup` becomes GitHub), `main` is pushed to both, and a GitHub push mirror is enrolled if one is not already there.
+
+### The tag-storm gotcha
+
+A freshly native-recreated repository has no workflow history of its own yet, but its existing tags do. Pushing `main` and pushing `--tags` in the same pass fires one release-workflow run per historical tag, because Forgejo evaluates a tag-push trigger against the *default branch's current* workflow files, not against whatever existed when each tag was originally made - so tags from long before the repository had `.forgejo/workflows` still queue a run of the new workflow, rebuilding old commits and re-publishing them under the new release path.
+
+```bash
+git push forgejo main          # first, alone - prove one green run
+# only after that:
+git push forgejo --tags        # or never, if GitHub already holds the tags canonically
+```
+
+If a tag storm does happen anyway, the recovery is to stop the runner, kill every job container it spawned, and cancel the affected run range at all three levels in Postgres - the run, its jobs, and its tasks - because Forgejo re-aggregates a run's status from its job rows, so cancelling only the run gets silently overwritten by the jobs underneath it still reporting as waiting or running.
+
+Deploy keys are the other thing a native recreate does not carry over: since the recreate deletes the old repository object and creates a new one under the same name, any read-only deploy key registered against the deleted repository is gone, not renamed. Part 5 covers where that bit this migration.
+
+## Part 4: the waves
+
+The fleet converted in waves, ordered by dependency rather than by size.
+
+| Wave | Scope | Repositories (roughly) |
+|---|---|---|
+| 1a | Simple repositories: no CI, nothing else depends on their clone | 15 repositories |
+| 1b | Docker Compose stacks managed by the fleet's own GitOps deploy tool | 7 repositories |
+| 2 | Repositories that run CI, including the deploy tool's own repository | 8 repositories |
+| 3 | The host git clones a deploy path itself depends on | 3 host clones |
+| 4 | The public-backup set (Part 7) | 11 repositories |
+| 5 | Worker and small infra repositories missed by the first four waves | 8 repositories |
+
+These six waves cover the repositories tracked individually with a local dev-box clone (the tool's own repo-to-path map). A separate, larger final sweep, described below, closed out every other pull mirror still remaining across the whole Forgejo instance, most of which had no such clone to track.
+
+Wave 1b needed one extra step the simple waves did not: a compose stack's conversion is incomplete until the GitOps deploy tool's own stored git configuration and on-disk checkout are re-pointed at the new remote too - its own deploy key, its own credential record, its own remote URL - because skipping that step leaves the deploy tool quietly redeploying stale state pulled from GitHub even though the repository itself has already moved. [Wiring a Forgejo push to a Composer GitOps deploy](/guides/forgejo-webhooks-composer-gitops/) is the full recipe.
+
+Wave 2 needed one proven-green Forgejo Actions run before each repository's primary flipped, plus a set of runner-environment fixes - anonymous GitHub API rate limits on version-resolving installers, an absent artifact API forcing job merges, a registry decision - that are the same class of fix worked through in [Porting a GitHub Actions workflow to Forgejo Actions](/guides/porting-github-actions-to-forgejo/) rather than repeated here.
+
+Wave 3's host clones went last among the "infrastructure" waves and only after their deploy keys existed (Part 5), because a deploy on those hosts fetches from the checkout before it does anything else. One intermediate gotcha along the way: while a host's clone still pointed at a Forgejo *pull* mirror of a repository that had not itself converted yet, that mirror could lag GitHub by up to its own sync interval, so a deploy could reset the host's checkout to stale state without any error. The mitigation until each such repository converted was to trigger a manual mirror sync before every deploy that touched it.
+
+Wave 4 converted the public-backup set last among the regular waves on purpose: each repository's GitHub Actions workflow had to be ported and proven green on Forgejo before GitHub Actions was disabled on it, so a repository other people might depend on never went a moment without working CI.
+
+The final sweep closed out the remaining pull mirrors fleet-wide: the bulk converted to native with push mirrors enrolled and GitHub Actions disabled, a smaller set were frozen in place because their GitHub side was already archived or its source no longer existed, and a handful of genuinely empty repositories were deleted on both sides outright rather than converted. The last two repositories still pull-mirrored converted on 2026-09-27, closing the pull-mirror model out entirely.
+
+## Part 5: host clones and deploy keys
+
+Three host git clones - the ones a deploy path itself fetches from before doing anything else - needed their own read-only Forgejo deploy keys: a fresh ed25519 keypair per host, registered read-only against the target repository through the repository keys API, plus a dedicated ssh alias on each host pointing at the forge's SSH port and the forge's host key added to that host's known hosts. Once the keys and aliases existed, each host's checkout had its git remote re-pointed at the forge and a fetch was verified to bring its `main` in line with what GitHub already held at that moment, before any deploy was allowed to rely on the new remote.
+
+Because a native recreate drops per-repository deploy keys (Part 3), every host-clone repository that was itself later native-recreated in Wave 3 needed its deploy key re-registered from scratch afterward - not as a follow-up someone remembered to do, but as a required step of the conversion whenever the target repository backs a host's own deploy checkout. [Forgejo's own mirror documentation](https://forgejo.org/docs/latest/user/repo-mirror/) describes the analogous case for a mirror's own generated key, calling it "added as a deploy key on the target repository" - the same per-repository binding that any manually registered deploy key follows, and the reason none of them survive a delete-and-recreate.
+
+## Part 6: cleaning up Dependabot on GitHub backups
+
+Disabling GitHub Actions on a converted repository does not stop GitHub's own Dependabot: dependency-update pull requests kept auto-merging on at least two already-converted repositories after their GitHub Actions had been switched off, which diverged the GitHub backup from the Forgejo primary until each was fixed by fast-forwarding the local clone from GitHub and re-pushing to Forgejo.
+
+The fix folded into each repository's own conversion afterward: delete `.github/dependabot.yml`, and separately call the endpoints that turn off automated security fixes and vulnerability alerts, so the GitHub backup stops generating commits of its own once conversion is done. A sweep on 2026-09-23 found 18 repositories still carrying a `dependabot.yml`; each was cleared as its own conversion wave reached it.
+
+## Part 7: the visibility decision
+
+A handful of repositories - including this docs site's own - keep a public GitHub backup after conversion; every other repository in the fleet is private on both Forgejo and GitHub. GitHub Actions is disabled everywhere regardless of visibility, public or private: CI runs only on the self-hosted Forgejo runner covered in [the Forgejo Actions runner](/reference/forgejo-actions-runner/).
+
+The public-backup set is not a list maintained by hand at conversion time; it is read from the tool's own configuration and re-checked against GitHub's live visibility directly, so `convert` refuses to touch one of those repositories without an explicit override flag - a public-facing repository cannot flip to a private Forgejo-primary copy by accident.
+
+Two things made the visibility pass itself worth re-checking rather than trusting the first pass:
+
+- An early count of "repositories already private" came out wrong because the filter behind it silently returned a default value on a broken condition rather than erroring, and a broken filter's zero looks identical to a real zero. The fix was to re-derive the count a different way and never trust a total that cannot be seen broken down by group.
+- A repository that GitHub has archived cannot have its visibility changed at all - the API refuses with "Repository was archived so is read-only" - which left a small number of already-public, already-archived repositories public by that constraint rather than by the visibility policy's own choice.
+
+## Part 8: frozen forks
+
+Forked repositories - local copies of other people's open-source projects rather than original work - were handled as their own track, separate from the tiers above. The original plan was to leave every fork public on GitHub and out of scope entirely. That was revised the same day: since none of the forks were still being kept in sync with their upstream, every one of them moved to Forgejo as a frozen, private, non-syncing snapshot, and the GitHub copy was deleted afterward.
+
+The freeze procedure per fork: confirm, from the mirror's own last-synced timestamp rather than the repository's generic "updated" timestamp (which does not move on a sync that pulls no new content), that the GitHub source had actually gone quiet; flip the Forgejo copy from mirror to a plain native repository without deleting anything; remove its mirror row; only then delete the GitHub-side fork. One fork was held back from this pass because it had live CI infrastructure of its own - its build workflow was ported to Forgejo Actions and proven green first, and its GitHub copy was deleted only after that, days after the rest of the forks.
+
+## Part 9: rollback
+
+Rolling back a converted repository does not require touching GitHub content at all, because the migration itself never deletes anything there except in the fork track above: push the local clone (or a bundle of it) back to GitHub, re-point the local `origin` at GitHub, and re-enrol the old GitHub-sourced pull mirror on Forgejo. The only GitHub-side state change the migration makes to a non-fork repository is visibility (Part 7), and that is reversible on any repository GitHub has not itself archived.
+
+## Verification
+
+| Check | How | Result this run (2026-09-29) |
+|---|---|---|
+| Fleet-wide drift | `repo-fleet drift` | 47 of 47 active repositories report `OK`, exit 0 |
+| Spot-check audit | `repo-fleet audit <name>` on the deploy tool's own repository, a private infra repository, and this docs site | all three: native, correct privacy, `fj:`-prefixed origin, resolvable backup, `DELTA OK` |
+| Total repositories on Forgejo | paged `GET /repos/search`, all pages | 269 |
+| Pull mirrors remaining | same pages, counting `.mirror == true` | 0 |
+| Push mirrors enrolled | `GET /repos/{owner}/{repo}/push_mirrors` summed over all 269 repositories | 206, one per enrolled repository, none doubled up |
+
+## Gotchas and lessons learned
+
+- **A bulk git loop that prints "nothing to commit" is not confirmation.** A "remove the old workflow copies" loop silently no-oped on four repositories, and the stale copies sat there unnoticed - re-running both the old and new workflow on every push - until someone checked `git status --short` by hand instead of trusting the loop's own printed line.
+- **A repository's generic "updated" timestamp is not a freshness signal.** It does not move on a mirror sync that pulls no new content; the mirror table's own last-synced column does, and using the wrong one to judge whether a fork's upstream had gone quiet cost real time twice before the fix stuck.
+- **A 200 from the push-mirror sync-all endpoint does not mean a sync happened.** It returns success even when the repository has zero push mirrors enrolled. Check the enrolled-mirror list length before trusting that call.
+- **`convert` itself carried two correctness bugs, both fixed the same day.** Re-running it against an already-native repository could fall through into the light-unmirror database statement a second time and flip the repository private again as a side effect, until an unreadable or absent mirror state was made a hard failure instead of a fallthrough. Separately, an undefined-variable reference inside the push-mirror-enrolment step aborted the script immediately after both pushes had already succeeded, which read as though the pushes themselves had failed when they had not; reading the token through the one shared function used everywhere else fixed it.
+- **Push tags last, and only once**, not because tags are unimportant but because a fresh native recreate re-evaluates every historical tag against the workflow files on `main` right now (Part 3).
+- **Deploy keys are bound to the repository object, not the name.** Anything that depends on a repository's own read-only key - a host clone, a GitOps deploy tool's checkout - needs that key re-registered every time the repository goes through a native recreate, not just the first time.
+
+## File reference
+
+| File | What it is |
+|---|---|
+| `scripts/repo-fleet` | the conversion tool: `audit`, `convert`, `push`, `drift` |
+| `scripts/tier-b.tsv` | repository name to local clone path, one row per active repository, plus a documented exclusion list |
+| `.env` (SOPS-encrypted) | holds the Forgejo admin token the tool reads by reference |
+| `AGENTS.md` | the canonical runbook form of the native-recreate and tag-storm steps |
+| `docs/plans/2026-09-23-forgejo-primary-migration.md` | the full session record this guide draws from |
+
+## Related docs
+
+- [Forgejo as the primary forge on the NixOS edge router](/reference/self-hosted-forgejo-router/) - the topology, storage split and hardening this migration produced.
+- [The Forgejo Actions runner](/reference/forgejo-actions-runner/) - the runner that Waves 2, 4 and 5 had to prove CI green on before each repository's primary flipped.
+- [Porting a GitHub Actions workflow to Forgejo Actions](/guides/porting-github-actions-to-forgejo/) - the per-workflow mechanics behind Wave 2 and Wave 4's CI ports.
+- [Wiring a Forgejo push to a Composer GitOps deploy](/guides/forgejo-webhooks-composer-gitops/) - the re-point recipe Wave 1b's compose stacks needed, including the same deploy-key-does-not-survive-a-recreate gotcha from the stack side.
+- [secretctl: stores, digests and commands](/reference/secretctl/) and [Rotating a credential end to end with secretctl](/guides/secretctl-rotation/) - how the Forgejo admin token itself is read and rotated without ever being printed.

@@ -61,6 +61,13 @@ const FORGEJO_RUNNER = "reference/forgejo-actions-runner";
 const WEBHOOKS_COMPOSER = "guides/forgejo-webhooks-composer-gitops";
 const SECRETCTL = "reference/secretctl";
 const SECRETCTL_ROTATION = "guides/secretctl-rotation";
+const FLEET_MIGRATION = "guides/forgejo-primary-fleet-migration";
+const FORGEJO_RELEASES = "reference/forgejo-releases-and-registry";
+const STORAGE_BACKUPS_CACHE = "reference/forgejo-storage-backups-cache";
+const RECOVERY_RUNBOOKS = "guides/forgejo-recovery-runbooks";
+const SECRETCTL_REGISTRY_COVERAGE = "guides/secretctl-registry-and-coverage";
+const CHOOSING_SECRETS_BACKEND = "reference/choosing-a-secrets-backend";
+const SOPS_COMPOSE = "guides/sops-age-compose-stacks";
 
 const pins: Pin[] = [
   // The two PrivateLink docs went unpinned through the corrections that made
@@ -1063,8 +1070,8 @@ const pins: Pin[] = [
       "Wherever no cache existed, the known-value",
       "`Environment=PATH=`",
       "fails the unit on empty output",
-      // The liveness-signal proposal is explicitly not implemented.
-      "does not exist yet",
+      // The liveness signal, added 2026-09-29.
+      "Since 2026-09-29 both guards report the cache's health",
       // The three-writer lock history and the single protocol that replaced
       // it on 2026-09-29.
       "**Three writers, three lock schemes.**",
@@ -1212,10 +1219,8 @@ const pins: Pin[] = [
   {
   doc: SECRETCTL,
   mustContain: [
-    // The uncommitted `set`-canonicalisation fix this page was specifically
-    // asked to verify against the code and state - pinned so a later edit
-    // cannot claim it shipped before it did, or drop the scope caveat.
-    "uncommitted in this repo's working tree as of 2026-09-29",
+    // The `set`-canonicalisation fix and the commit that shipped it.
+    "fixed 2026-09-29 in commit `cc242ca`",
     // Scope of that fix: dotenv/sops/bw-notes only, keyfile stays byte-for-byte.
     "the source byte-for-byte, trailing newline included",
     // The 2026-08-30 key-derivation invariant: hex string, not decoded bytes.
@@ -1229,9 +1234,8 @@ const pins: Pin[] = [
     // The fix reaches the dotenv codec path only - these would overclaim it.
     "keyfile destinations canonicalise",
     "bw custom field is canonicalised",
-    // It is uncommitted as of this page's provenance date; must not read as shipped.
-    "already released",
-    "committed on 2026-09-29",
+    // Stale 'not yet committed' wording must not creep back.
+    "uncommitted in this repo's working tree",
   ],
   sections: [/^## Topology$/m, /^## Decision guide$/m],
   linksTo: [AGENTGUARD],
@@ -1270,6 +1274,251 @@ const pins: Pin[] = [
     ],
     sections: [/^## Verification$/m, /^## Gotchas and lessons learned$/m],
     linksTo: [AGENTGUARD],
+  },
+  {
+  doc: FLEET_MIGRATION,
+  mustContain: [
+    // The live re-count this run, load-bearing and the easiest thing for a
+    // future edit to quietly drift out of sync with the sibling FORGEJO pin.
+    "47 of 47 active repositories report `OK`, exit 0",
+    "206, one per enrolled repository, none doubled up",
+    // The tag-storm mechanism: evaluated against CURRENT main workflow files,
+    // not against what existed when the tag was made. Easy to state backwards.
+    "Forgejo evaluates a tag-push trigger against the *default branch's current* workflow files",
+    // Why native recreate is unavoidable for a CI repo - the load-bearing
+    // reason a reader must not "just enable it via the API" instead.
+    "there is no API or CLI to add the unit to an existing repository",
+    // Disabling GitHub Actions is not a full stop to GitHub-side automation -
+    // the Dependabot gap this migration had to close separately.
+    "does not stop GitHub's own Dependabot",
+  ],
+  mustNotContain: [
+    // The pre-migration repo total (superseded by the live 269 recount) -
+    // same stale figure the FORGEJO pin already guards.
+    "248 repos",
+    // The opposite of the tag-storm fix: pushing tags before main is
+    // "prove one green run" done backwards.
+    "push tags before main",
+    // No such thing exists on Forgejo 16.0.x; guards against a regression
+    // that reintroduces this migration's very first blocker.
+    "Actions unit can be enabled through the API",
+  ],
+  sections: [/^## Verification$/m, /^## Gotchas and lessons learned$/m],
+  linksTo: [FORGEJO, PORTING_FORGEJO, FORGEJO_RUNNER, WEBHOOKS_COMPOSER],
+  },
+  {
+  // New page (2026-09-29): the release/registry follow-up self-hosted-forgejo-router
+  // named as planned. Pins cover the three-lane split, the two-flip policy history,
+  // the registry decision's four reasons, the buildkit/QEMU cross-compile fix, and
+  // the per-repo evidence split (fjctl proven; secretctl and eaves workflow-only) -
+  // the fact this page's own audit found and that a plan document elides by grouping
+  // all three CLIs together as "done".
+  doc: FORGEJO_RELEASES,
+  mustContain: [
+    // The three-lane split itself, and that each repo uses exactly one.
+    "each repo uses exactly one",
+    // Lane 1 mechanism: ghcr push, no Forgejo release row.
+    "No Forgejo release row is created",
+    // Lane 2 mechanism: the automatic per-run token, not a PAT.
+    "the token Forgejo creates automatically for the duration of the workflow run",
+    // The two-date policy flip - both dates must survive together, not just one.
+    "banned fleet-wide on 2026-09-24",
+    "reinstated on 2026-09-28",
+    // The registry purge figure - a measured number that must not be dropped.
+    "7.4 GB down to 892 MB",
+    // The registry decision's core reason (availability coupling), stated plainly.
+    "An outage of either one would block every image pull fleet-wide",
+    // The QEMU hang diagnosis and its fix, both load-bearing.
+    "runner's CPU sitting near idle the whole time",
+    "FROM --platform=$BUILDPLATFORM",
+    // The per-repo evidence split this page's own audit found - the fact most likely
+    // to erode if a later edit assumes parity across the three lane-2 repos.
+    "only `fjctl` is proven end to end as of this run",
+    "`secretctl` and `eaves` have the workflow committed but have not fired it",
+  ],
+  mustNotContain: [
+    // Would overclaim parity across the three lane-2 repos - the plan document's
+    // own framing, which this page explicitly corrects.
+    "all three CLIs are proven",
+    "all three repos have shipped a release",
+    // Would misdate the flip or collapse it to one event.
+    "banned and reinstated the same day",
+    // Would restate the pre-Silo reason as still current for the registry decision.
+    "the registry stays off because of router disk space",
+  ],
+  sections: [
+    /^## Topology$/m,
+    /^## Which lane do I pick$/m,
+    /^## Decision guide$/m,
+    /^## Evidence$/m,
+  ],
+  linksTo: [FORGEJO, FORGEJO_RUNNER, PORTING_FORGEJO],
+  },
+  {
+    doc: STORAGE_BACKUPS_CACHE,
+    mustContain: [
+      "copies data FROM the storage type currently configured TO the destination named by its own flags",
+      "silently copies the new store onto itself",
+      "aborts at the first missing file, with no skip-missing flag",
+      "grew to about 26 GB before anyone added one",
+      "keepDuration = \"72h\"",
+      "no off-pool copy of it, which is an accepted risk",
+      "3 days and 10 GiB",
+    ],
+    mustNotContain: [
+      // Prior cache-prune values, superseded by the 2026-09-28 tightening -
+      // must read as history, not current policy.
+      "14 days and 20 GiB is the current",
+      // Never state the migrate-storage direction backwards.
+      "copies data TO the storage type currently configured",
+    ],
+    sections: [
+      /^## Where each kind of data lives$/m,
+      /^## The migrate-storage order trap$/m,
+      /^## Decision guide$/m,
+    ],
+    linksTo: [
+      FORGEJO,
+      FORGEJO_RUNNER,
+      "reference/declarative-homelab-backups",
+      "reference/appdata-tiering-zfs",
+    ],
+  },
+  {
+    doc: RECOVERY_RUNBOOKS,
+    mustContain: [
+      // The live memcg-OOM-fix verification (RestartCount + uptime), checked
+      // this session - the number that proves the 2026-09-26 fix is holding.
+      "0 2026-09-27T00:18:04.568535343Z",
+      // The live action_run status-code count, checked this session - ties
+      // the Constants table's status codes to a real, current distribution.
+      "289 success, 1278 failure, 129 cancelled",
+      // The live job-logs-endpoint check on this site's own repo, checked
+      // this session - the reason the logs-over-API runbook is not a guess.
+      "GET /api/v1/repos/erfi/lexicanum/actions/jobs/6532/logs",
+      // The grace period that fixed the orphaned-container incident; easy to
+      // quote as a different duration later.
+      "stop_grace_period: 15m",
+      // The one absolute rule in the repo_unit runbook - it must survive
+      // any future trim of that section.
+      "Never insert a `repo_unit` row by hand for any reason",
+    ],
+    mustNotContain: [
+      // The memory-limit fix direction, reversed. The incident raised the
+      // limit 1024M -> 2048M; the reverse would describe the fix backwards.
+      "2048M to 1024M",
+      // The runner-version fix direction, reversed. The fix was upgrading
+      // TO 13.2.0, not to the version that caused the hang.
+      "upgrade the runner image to 13.0.0",
+    ],
+    sections: [/^## Verification$/m, /^## Gotchas and lessons learned$/m],
+    linksTo: [FORGEJO, FORGEJO_RUNNER, PORTING_FORGEJO, WEBHOOKS_COMPOSER, SECRETCTL, SECRETCTL_ROTATION],
+  },
+  {
+    // New guide (2026-09-29): the task-sequenced how-to for building and
+    // checking the secretctl registry itself (declare stores, exclude
+    // configuration keys, verify with sources/digests, sweep with coverage,
+    // wire a consumer to the digest cache) - distinct from
+    // guides/secretctl-rotation, which assumes the registry already exists.
+    // Its fact pack reused the published 2026-09-29 registry-scale and
+    // coverage-sweep numbers from reference/agent-secret-guard rather than
+    // re-deriving a second, possibly-drifted count from this dev box's live
+    // registry (HELD decision #1); the nightly coverage timer's real unit
+    // name (secret-coverage, not secretctl-coverage) is pinned because it
+    // is the opposite of the guessable name and was confirmed live this run.
+    doc: SECRETCTL_REGISTRY_COVERAGE,
+    mustContain: [
+      // The registry's fail-loud-on-empty design (C4).
+      "an empty registry silently protects nothing",
+      // The 2026-09-29 exclude label-matching fix's worked example (C6/C7).
+      "exclude rbw:ITEM_NAME#*",
+      // The real nightly-timer unit name, which does not match the
+      // secretctl- prefix a reader would otherwise guess (C25).
+      "does not follow the `secretctl-` prefix the digests timer uses",
+      // The published first-run coverage-sweep numbers, reused not
+      // re-measured (C32).
+      "flagged 280 files, of which 70 were already covered and 210 were not",
+      // The digest-cache publish rule: a partial/garbage pass must never
+      // replace a good cache (C27).
+      "first byte `{`, last non-space byte `}`",
+    ],
+    mustNotContain: [
+      // The guessable-but-wrong nightly-timer unit name.
+      "secretctl-coverage.timer",
+      "secretctl-coverage.service",
+      // The exclude-label fix landed 2026-09-29, not 2026-09-23 (that date
+      // is the unrelated digest-herd incident) - must not conflate the two.
+      "committed on 2026-09-23",
+    ],
+    sections: [/^## Verification$/m, /^## Gotchas and lessons learned$/m],
+    linksTo: [AGENTGUARD, SECRETCTL, SECRETCTL_ROTATION],
+  },
+  {
+    // New reference doc (2026-09-29): the decision behind the fleet's split
+    // across SOPS+age, Vaultwarden+rbw, OpenBao and Infisical. OpenBao is
+    // design-only (never deployed) and Infisical is cut; the pins below guard
+    // both the load-bearing vendor facts (re-verified against each vendor's
+    // own repo/docs this run) and the public-safety redactions the fact pack
+    // applied on top of the fleet's internal secrets-architecture notes -
+    // vault content counts, the vault's hostname, personal email, and the
+    // named machine-secret env vars must never creep back into this page.
+    doc: CHOOSING_SECRETS_BACKEND,
+    mustContain: [
+      // The stated constraint the whole comparison is scored against.
+      "services create and set their own secrets, a human memorises exactly one master key, and nothing needs to read a secret programmatically as a routine operation",
+      // The maintainer statement that makes Bitwarden Secrets Manager a dead
+      // end on Vaultwarden specifically, not a general product comparison.
+      "I don't think anything similar to secrets manager will be coming to Vaultwarden",
+      // OpenBao's own migration-plan status - must read as unimplemented, not
+      // as a running system.
+      'migration plan status is, in its own words, "NOT STARTED."',
+      // The CLI shape that makes OpenBao's single-item read leak-safe.
+      "bao kv get -field=<name>",
+      // HashiCorp Vault's licensor, re-verified against its own LICENSE file.
+      "names the licensor as IBM Corp",
+      // Infisical's open-core licence split, re-verified against its own
+      // LICENSE file rather than inferred from marketing copy.
+      "MIT core, separate licence under its `ee/` (Enterprise) directories",
+    ],
+    mustNotContain: [
+      // Vendor version pins go stale; the decision does not depend on them.
+      "OpenBao 2.6.2",
+      "Infisical v0.165.14",
+    ],
+    sections: [/^## Topology$/m, /^## Decision guide$/m, /^## Which do I pick$/m],
+    linksTo: [AGENTGUARD, SECRETCTL, "guides/vaultwarden-multi-site"],
+  },
+  {
+    doc: SOPS_COMPOSE,
+    mustContain: [
+      // The absolute-git-dir mechanism is the load-bearing reason the global
+      // hooksPath chain reaches the templateDir-seeded SOPS check at all,
+      // rather than looping back on itself.
+      "The chain resolves the repo-local hook through `git rev-parse --absolute-git-dir` rather than",
+      // The corrected, two-release account of the self-heal fixes - the
+      // composer skill doc's own "since v0.26.10" phrasing undersells this by
+      // one release; both version numbers have to survive together.
+      "That fix shipped in `v0.26.10`. A second, related fix landed the same day in `v0.26.12`",
+      // The age-key-resolution gotcha that explains the rotation incident
+      // below it: a stale data-directory key file always wins over env vars.
+      "if a data-directory key file exists, it wins outright",
+      // The incident lesson itself.
+      "A rotated age key does not reach an already-running container by itself.",
+      // The false-positive this page warns against when writing a manual
+      // ciphertext check.
+      "an encrypted dotenv's first line is simply the first key's name",
+    ],
+    mustNotContain: [
+      // The imprecise single-version simplification of the self-heal fixes -
+      // guards against re-collapsing the two-release account above.
+      "self-healing since v0.26.10",
+      // The over-broad, corrected verb list for what wraps decrypt/re-encrypt:
+      // `sync` does not run docker compose and was removed from this list
+      // during drafting after checking the source's call sites.
+      "`sync`, `deploy` and others - wraps the compose call",
+    ],
+    sections: [/^## Verification$/m, /^## Gotchas and lessons learned$/m],
+    linksTo: [AGENTGUARD, SECRETCTL, SECRETCTL_ROTATION, "reference/nixos-fleet"],
   },
 ];
 
