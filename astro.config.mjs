@@ -182,7 +182,7 @@ export default defineConfig({
         tag: "meta",
         attrs: {
           property: "og:image",
-          content: "https://erfi.dev/thumbnail.JPG",
+          content: "https://erfi.dev/thumbnail.jpg",
         },
       },
       {
@@ -190,6 +190,20 @@ export default defineConfig({
         attrs: {
           property: "og:image:alt",
           content: "Cover image for erfi.dev technical documentation",
+        },
+      },
+      {
+        tag: "meta",
+        attrs: {
+          property: "og:image:width",
+          content: "1200",
+        },
+      },
+      {
+        tag: "meta",
+        attrs: {
+          property: "og:image:height",
+          content: "630",
         },
       },
       {
