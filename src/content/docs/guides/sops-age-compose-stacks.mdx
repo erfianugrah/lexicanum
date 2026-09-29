@@ -1,0 +1,284 @@
+---
+title: Encrypting Docker Compose .env files with SOPS and age
+description: "Write .sops.yaml creation rules for a compose stack, encrypt a dotenv in place with age, pass the pre-commit gate that refuses unencrypted secrets, and deploy through Composer's decrypt -> compose up -> re-encrypt cycle - worked with a scratch age key and a canary value throughout."
+author: Erfi Anugrah
+category: secrets
+---
+
+A Docker Compose stack's `.env` holds real credentials, so it cannot sit in git as plaintext and cannot be edited on the deploy host either. This guide covers the one workable middle ground for a self-hosted fleet: the `.env` is SOPS-encrypted at rest, decrypted only for the duration of a `docker compose up`, and re-encrypted immediately after. It covers writing the `.sops.yaml` rule that tells `sops` which recipient to encrypt to, the two encrypt/decrypt shell helpers that wrap `sops` for day-to-day use, the git hook that refuses to let an unencrypted secret file land in a commit, and how a Composer-managed deploy runs the decrypt/up/re-encrypt cycle automatically. A shorter section covers the NixOS-host equivalent (`sops-nix`) and hands off to the separate rotation guide.
+
+Prerequisites: `sops` and `age` on `PATH`, and `secretctl` if you want to run the verification step. Every command below runs in an isolated scratch directory against a freshly generated, throwaway age keypair and a canary value (`openssl rand -hex 24`) - nothing here is a real credential, and the demo's own age recipient is never printed, on the same principle that governs a real one.
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  plain [label="plaintext .env\n(never committed)"];
+  encrypt [label="sops --encrypt\n--age <recipient>"];
+  cipher [label="ciphertext .env\n(committed)", shape=note];
+  gate [label="pre-commit gate\nrefuses an unencrypted\n.env / .tfvars / .tfstate"];
+  compose [label="Composer deploy\ndecrypt -> compose up\n-> re-encrypt"];
+  container [label="running container\nplaintext env,\nnever written to disk"];
+  nix [label="sops-nix\nactivation-time decrypt"];
+  runtime [label="runtime secret path\nread by a systemd unit"];
+
+  plain -> encrypt -> cipher -> gate -> compose -> container;
+  cipher -> nix [label="a NixOS host\ninstead of Composer"];
+  nix -> runtime;
+}
+```
+
+Text fallback for the diagram:
+
+1. A plaintext `.env` is never committed.
+2. `sops --encrypt --age <recipient>` turns it into ciphertext.
+3. The ciphertext `.env` is what gets committed.
+4. A pre-commit gate refuses to let an unencrypted `.env`, `.tfvars` or `.tfstate` file reach a commit in the first place.
+5. A Composer-managed stack decrypts on deploy, runs `compose up`, then re-encrypts.
+6. The running container gets a plaintext environment; the plaintext is never written back to disk.
+7. On a NixOS host instead of a Composer stack, the same ciphertext is decrypted at activation time by `sops-nix` into a runtime secret path that a systemd unit reads.
+
+| Component | Version at time of writing |
+|---|---|
+| sops | 3.13.3 |
+| age | 1.3.2 |
+| secretctl | local build (identified by its `help` banner; it has no `version` subcommand) |
+
+## Part 1: writing .sops.yaml creation rules
+
+A `.sops.yaml` file in a repo root tells `sops` which age recipient(s) to encrypt a NEW, not-yet-encrypted file to, via one or more `creation_rules`: a `path_regex` matched against the file path, paired with an `age` value (one recipient, or a YAML list of several). `sops` picks the first rule whose `path_regex` matches. Once a file already carries sops metadata, its baked-in recipient list is what later operations (`updatekeys`, `rotate`) use - `.sops.yaml` only matters again if you add or change recipients.
+
+Four real repos in this fleet use three different shapes of the same rule:
+
+```yaml
+# a compose stack: match every dotenv, one recipient
+creation_rules:
+  - path_regex: \.env$
+    age: <age-recipient>
+```
+
+That single-recipient, `\.env$`-scoped shape is what two separate Compose stacks in this fleet use - one of them notes in a comment that Composer decrypts that stack's `.env` on every sync and up using its own configured key, so the stack's `.sops.yaml` deliberately reuses an existing recipient rather than provisioning a new one.
+
+A NixOS host's secrets directory needs a different shape - a path prefix instead of an extension, and more than one recipient:
+
+```yaml
+# a NixOS host: match a secrets/ subtree, two recipients
+creation_rules:
+  - path_regex: ^secrets/.*$
+    age:
+      - <host-dedicated-recipient>   # private key lives only on the host
+      - <admin-recipient>            # private key lives on the operator's machine
+```
+
+Two recipients means either private key alone can decrypt the file - the host's own key for day-to-day activation, the admin key so the file is still readable from a second machine without copying the host's key off it. A fourth repo scopes the rule to a subdirectory glob rather than a file extension (`esphome/secrets/.*`, one recipient) - the same mechanism, applied to a directory convention instead of a filename pattern.
+
+The rule only has to be a plain regex a shell script can extract with `grep`/`sed`: the pre-commit gate in Part 3 reads `path_regex:` lines out of `.sops.yaml` the same crude way, rather than parsing YAML properly, so a rule with anchors and a `.` a human reads unambiguously is also a rule a text-based check can read unambiguously.
+
+## Part 2: encrypt and decrypt in place
+
+Two zsh functions wrap the raw `sops` invocations for interactive use. `encrypt <file|dir>` resolves the age PUBLIC key by pulling an `age1...`-shaped string out of the `SOPS_AGE_KEYS` environment variable, then runs `sops --encrypt --age <pubkey> --in-place <file>`; given a directory it loops over every file inside (and refuses on an empty one). `decrypt <file|dir>` is the mirror: it pulls the PRIVATE key (the line starting `AGE-SECRET-KEY-`) out of the same variable and runs `SOPS_AGE_KEY="$key" sops --decrypt --in-place <file>` - the private key is exported only for that one command's lifetime, as an inline prefix, never as a persistent shell export. `encrypt_all`/`decrypt_all` are one-line wrappers over the current directory, and `encrypt_tf`/`decrypt_tf` scope the same pair to a fixed short list of Terraform state and var files instead of "everything here".
+
+A related pair, `encrypt_k3s_secret`/`decrypt_k3s_secret`, passes `--encrypted-regex '^(data|stringData)$'` instead of encrypting the whole file. That is the other mode `sops` supports for a structured YAML/JSON document: encrypt only the fields matching a regex and leave the rest of the file - keys, labels, comments - readable. A dotenv has no such structure to preserve, so the compose-stack workflow in this guide always encrypts the whole file; the selective mode is what you reach for when a Kubernetes Secret manifest's `data` map is the only part that needs hiding.
+
+### Worked example
+
+```bash
+mkdir sops-demo && cd sops-demo
+age-keygen -o key.txt
+```
+
+`age-keygen` writes a private identity to `key.txt` and prints its public recipient to stdout. Point `.sops.yaml` at that recipient (shown here as a placeholder - the real value from this run is never printed, on the same principle a real recipient would be):
+
+```yaml
+creation_rules:
+  - path_regex: \.env$
+    age: <recipient-from-age-keygen>
+```
+
+```bash
+openssl rand -hex 24 > canary.val
+printf 'CANARY_TOKEN=%s\n' "$(cat canary.val)" > demo.env
+sops --encrypt --in-place demo.env
+echo "exit: $?"
+```
+
+```
+exit: 0
+```
+
+`sops` reads the recipient from `.sops.yaml` because `demo.env` carries no sops metadata yet. The encrypted file's one data line and its metadata (values truncated):
+
+```
+CANARY_TOKEN=ENC[AES256_GCM,data:neMlDVSYX5BpmyyB9btylHx5QQXcAh6BDklBj...
+sops_age__list_0__map_enc=-----BEGIN AGE ENCRYPTED FILE-----\nYWdlLWVu...
+sops_age__list_0__map_recipient=<recipient-from-age-keygen>
+sops_lastmodified=2026-09-29T01:05:50Z
+sops_mac=ENC[AES256_GCM,data:m0e4AJyeUi+VzZUOP8ndVKWNkerpnUVS1PMI33XZ...
+sops_unencrypted_suffix=_unencrypted
+sops_version=3.13.3
+```
+
+Decrypt with `SOPS_AGE_KEY_FILE` pointed at the identity file, rather than `decrypt`'s `SOPS_AGE_KEY` variable - both work, this is the other of the two ways `sops` accepts an age identity:
+
+```bash
+SOPS_AGE_KEY_FILE=key.txt sops --decrypt demo.env > decrypted.env
+diff decrypted.env <(printf 'CANARY_TOKEN=%s\n' "$(cat canary.val)")
+echo "exit: $?"
+```
+
+```
+exit: 0
+```
+
+The decrypted file is byte-identical to the original. Part 4's verification step continues this same demo with `secretctl`.
+
+## Part 3: the pre-commit gate
+
+A global git hook backs up the discipline of "always encrypt before committing" with an actual refusal. Two config lines make it apply to every repo on the box: `core.hooksPath` points at a shared hooks directory, and `init.templateDir` seeds every NEW repo's own `.git/hooks/` at `git init` or `git clone` time.
+
+```
+[core]
+	hooksPath = ~/.config/git/hooks
+[init]
+	templateDir = ~/.git-template
+```
+
+The hook at the global `hooksPath` runs first on every commit, in every repo. Its main job is a non-blocking reminder about confidential identifiers (unrelated to encryption, and only fires when the repo has a remote and files are staged) - the encryption check itself lives in the repo-local hook that `init.templateDir` seeded, so the global hook's last job is chaining to it:
+
+```bash
+self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
+if [ -n "$git_dir" ] && [ -x "$git_dir/hooks/pre-commit" ]; then
+  local_hook_abs="$(cd "$git_dir/hooks" && pwd)/pre-commit"
+  if [ "$local_hook_abs" != "$self" ]; then
+    exec "$local_hook_abs" "$@"
+  fi
+fi
+```
+
+The chain resolves the repo-local hook through `git rev-parse --absolute-git-dir` rather than `--git-path hooks/pre-commit` - under a global `hooksPath`, `--git-path` resolves back to the global hooks directory instead of the repo's own, so the absolute-git-dir form is what makes the chain reach the templateDir-seeded hook at all rather than looping.
+
+That chained hook does the actual check. For every staged file (`git diff --cached --name-only`):
+
+- A `.env`, `.tfvars`, `.tfstate` or `.tfstate.backup` file MUST already be encrypted.
+- A file whose path matches a `path_regex` pulled out of a repo-local `.sops.yaml` MUST already be encrypted - independent of extension, which is what covers a NixOS host's `secrets/` subtree in Part 1.
+- A `.yaml`, `.yml` or `.json` file is only flagged if it contains something secret-shaped: `(password|secret|token|api_key|private_key|credentials?|client_secret|encryption_key|access_key)["']?\s*[:=]\s*["']?[a-zA-Z0-9+/=_-]{8,}`, with matches that are only a variable reference (`${VAR}`, `{$VAR}`, `$VAR`) excluded.
+
+"Already encrypted" is a content check, never a filename or extension check: the hook greps for a `ENC[AES256_GCM,` marker, a `^sops_` dotenv-metadata line, a `^sops:` YAML line or a `"sops"` JSON key, or a raw age-armoured header (`-----BEGIN AGE ENCRYPTED FILE-----` as the file's first line). A file renamed or copied without carrying one of those markers reads as unencrypted regardless of its previous name.
+
+Two escape hatches exist, checked before anything else: a `.allow-unencrypted` file in the repo root skips every check for that repo, and a `.allow-unencrypted-paths` file holds one glob per line (blank lines and `#`-comments stripped) so only files matching a listed glob are skipped. When the hook blocks a commit, it prints the offending file list and its own suggested fix, `sops --encrypt --in-place <file>`.
+
+## Part 4: Composer's deploy path
+
+A Composer-managed stack's `.env` is ciphertext at rest in the repo checkout. Every lifecycle method that runs `docker compose` - create, deploy, build, stop (`down`), restart, pull, and a shared helper behind the streamed `up` action - wraps the compose call the same way: decrypt first, then defer the re-encrypt so it runs however the call ends.
+
+```
+decryptSopsSecrets(...)
+docker compose <cmd>
+defer reEncryptSopsSecretsCtx(...)
+```
+
+The decrypt step checks the `.env` for a sops payload; if present, it decrypts it, saves the ORIGINAL ciphertext bytes to `.env.sops` next to it, then overwrites `.env` with plaintext. The re-encrypt step reads `.env.sops` back over `.env` and deletes the backup - or, if no backup exists, does nothing, which is how a stack whose `.env` was never sops-encrypted passes through untouched. A compose file gets the identical treatment via `<file>.sops`. Running `docker compose` by hand against a checkout skips this cycle entirely and hands the container literal ciphertext strings as environment values (`POSTGRES_DB=ENC[AES256_GCM,...]`), which fails a database container's healthcheck rather than doing anything useful - the API path is what does the decrypt/up/re-encrypt cycle in order.
+
+### Two self-heal fixes, same day, different releases
+
+The re-encrypt step is explicitly re-parented onto a background context rather than the request's - a code comment explains that every caller reaches it from a deferred cleanup, by which point the request context is frequently already cancelled (a client that disconnects right after a streamed action completes), and a dead context previously made a lookup fail in a way that let the re-encrypt silently no-op, leaving `.env` plaintext on disk. That fix shipped in `v0.26.10`. A second, related fix landed the same day in `v0.26.12`: the DECRYPT phase now re-encrypts an `.env` it finds ALREADY plaintext, on a best-effort basis, whenever a key is available. Together, a single `up`, `sync` or `restart` on a current binary repairs a `.env` left bare by either of the failure modes the two fixes closed - a stack does not need a special "fix the plaintext" step, just a normal deploy.
+
+### Where the age private key comes from
+
+`LoadGlobalAgeKey` resolves the age private key in a fixed order, stopping at the first one present:
+
+1. A data-directory key file (UI-saved) - wins over every env var below, even if it holds an older key than one of them.
+2. `COMPOSER_SOPS_AGE_KEY`
+3. `SOPS_AGE_KEY`
+4. `SOPS_AGE_KEYS` (multi-line; literal `\n` sequences are unescaped first)
+5. `COMPOSER_SOPS_AGE_KEY_FILE` (a path to a key file)
+6. `SOPS_AGE_KEY_FILE` (a path to a key file)
+7. `~/.config/sops/age/keys.txt` (the standard sops location, resolved against the container's own `$HOME`)
+
+Step 1 is the one worth remembering during a rotation: if a data-directory key file exists, it wins outright, so updating an environment variable alone leaves an already-running container's decrypt/re-encrypt cycle using the OLD key from the file. See the Gotchas section for what that produces.
+
+Verify a checkout is ciphertext again after a deploy with `grep -q sops_version <checkout>/.env` - the marker is present only in the encrypted form. Checking the first bytes of the file for `ENC` or `sops` gives a false "plaintext" positive, because an encrypted dotenv's first line is simply the first key's name (`CANARY_TOKEN=ENC[...`, not `ENC[...` at column zero).
+
+## Part 5: NixOS hosts - sops-nix and a per-host age key
+
+A NixOS host that is not Composer-managed uses `sops-nix` instead: secrets decrypt during activation (`nixos-rebuild switch`), not on a per-deploy cycle, and each secret becomes a runtime file a service reads by path rather than an environment variable a container inherits.
+
+One real host declares a dedicated, generated age key rather than deriving one from its SSH host key:
+
+```nix
+sops.age.keyFile = "/var/lib/sops-nix/key.txt";
+sops.defaultSopsFile = ../secrets/samba-password.sops.yaml;
+sops.secrets.samba-erfi-password = { };
+```
+
+A consuming service reads the decrypted value at `config.sops.secrets.samba-erfi-password.path` - a path into a runtime-only location, never the literal value in a Nix store path or a unit's environment block. `sops-nix` also supports deriving the age identity from the host's existing SSH ed25519 key via a bundled conversion tool, `sshKeyPaths`, as an alternative to maintaining a separate generated key file; this host uses the dedicated-key-file form instead.
+
+This fleet's own convention is that the age key, not the host's read-only git deploy key, is the credential worth escrowing offline - a deploy key regenerates in about thirty seconds and is not worth the trouble. [Three NixOS hosts, one deploy interface](/reference/nixos-fleet/) covers the rest of that deploy model: the force-reset checkout, the pre-switch acceptance gate, and the post-switch runtime doctor.
+
+## Part 6: rotation
+
+Rotating a value inside a sops-encrypted `.env` is covered end to end in a separate guide rather than repeated here: `secretctl set` on a `sops:PATH#KEY` destination decrypts the file in memory, upserts the one field, and re-encrypts to the file's OWN existing recipients - never a `.sops.yaml` creation rule, which only matters for a brand-new file. It refuses outright on a structured `.yaml`/`.yml`/`.json` destination, since sops's rotation-by-field mode there is a different write path than the dotenv upsert this guide's `.env` files use. See [Rotating a credential end to end with secretctl](/guides/secretctl-rotation/) for the full sequence, including the Composer redeploy step and the `fp`/`cmp` propagation check.
+
+## Verification
+
+Continuing Part 2's scratch demo, with `SOPS_AGE_KEY_FILE` exported so `secretctl` can decrypt the sops source in-process (it has no CLI flag for this - the identity has to be in its own environment):
+
+```bash
+export SOPS_AGE_KEY_FILE="$PWD/key.txt"
+secretctl cmp "sops:$PWD/demo.env#CANARY_TOKEN" "dotenv:$PWD/plain.env#CANARY_TOKEN"
+```
+
+```
+sops:.../demo.env#CANARY_TOKEN     MATCH  44fa90f9e829 (48B)
+dotenv:.../plain.env#CANARY_TOKEN  MATCH  44fa90f9e829 (48B)
+
+=== MATCH: every source holds the same credential. ===
+exit: 0
+```
+
+`plain.env` here is the decrypted copy from Part 2's round trip. The same digest on both rows, and exit 0, is what proves the ciphertext and the plaintext copy hold the same credential without either value appearing anywhere in the output. Before `SOPS_AGE_KEY_FILE` was exported, the identical command against the `sops:` source printed `UNRESOLVED` (sops's own "no identity matched any of the recipients" error) and exited 2 - not a MISMATCH, and not a false MATCH from two failed reads happening to look equal.
+
+| Check | How | Expected |
+|---|---|---|
+| A new `.env` encrypts | `sops --encrypt --in-place <file>` | exit 0; file gains `sops_version` and an `ENC[AES256_GCM,` line |
+| The round trip is exact | `SOPS_AGE_KEY_FILE=<key> sops --decrypt <file>` vs. the pre-encryption original | byte-identical (`diff` exits 0) |
+| Ciphertext and a plaintext copy agree | `secretctl cmp sops:<file>#KEY dotenv:<plaintext-copy>#KEY` | `MATCH`, exit 0 |
+| No identity available yet | same `cmp` call with no age key in secretctl's environment | `UNRESOLVED`, exit 2 - never a silent MATCH or MISMATCH |
+| An unencrypted `.env` is staged | `git commit` in a repo with the templateDir hook active | commit refused, file listed, remediation printed |
+| A stack's checkout is ciphertext again after deploy | `grep -q sops_version <checkout>/.env` | present |
+
+## Gotchas and lessons learned
+
+- **A rotated age key does not reach an already-running container by itself.** An internal incident from a fleet-wide key rotation: a Composer container still holding the OLD key kept failing to decrypt, and stale ciphertext reached a running stack's container environment, because Composer only re-reads the age key on its own decrypt/re-encrypt cycle (Part 4). The fix is to redeploy the affected stack - decrypt, up, re-encrypt - once the container is running with the CURRENT key, rather than assuming a live container picks up a rotated key on its own.
+- **The data-directory key file always wins, even if it is the stale one.** Because step 1 of the resolution order beats every environment variable, rotating `COMPOSER_SOPS_AGE_KEY` or `SOPS_AGE_KEYS` alone does nothing if an older key still sits in the data-directory key file - update or remove that file too.
+- **Encryption detection is by content, not by name.** A renamed or copied file keeps whatever markers made it "encrypted" in the first place; a plaintext file with a misleading `.sops` extension is still flagged, because nothing in the check looks at the filename.
+- **Two escape hatches exist for the pre-commit gate**, and both are deliberate rather than an oversight: `.allow-unencrypted` for a whole repo, `.allow-unencrypted-paths` for specific globs.
+- **A decrypted private key never persists past one command.** Both the `decrypt` shell helper and Composer's own decrypt cycle scope the age private key to a single invocation - an inline env-var prefix, or a value read fresh from its resolution order each time - rather than exporting it into a longer-lived shell or process environment.
+- **`secretctl` fails closed rather than guessing.** An unresolved source (no identity available, a typo'd path) reports `UNRESOLVED` and exits 2; it never reports a MATCH or MISMATCH for a value it could not actually read, which is what makes the exit code safe to script against.
+
+## File reference
+
+| File | What it is |
+|---|---|
+| `.sops.yaml` | Creation rules: `path_regex` to age recipient(s), read by `sops` on a new file and, less rigorously, by the pre-commit gate |
+| `<repo>/.env` | The dotenv a Compose stack reads; ciphertext at rest, plaintext only for the duration of a compose call |
+| `<repo>/.env.sops` | The ciphertext backup Composer writes during decrypt and restores during re-encrypt; present only mid-deploy |
+| `~/.gitconfig` | `core.hooksPath` and `init.templateDir` - the two settings that make the pre-commit gate apply everywhere |
+| `.allow-unencrypted`, `.allow-unencrypted-paths` | Per-repo and per-glob escape hatches for the pre-commit gate |
+| `sops.age.keyFile`, `sops.secrets.<name>` | The NixOS-side equivalents: where a host's age identity lives, and where a decrypted secret's runtime path comes from |
+
+## Related docs
+
+[Keeping credentials out of coding-agent transcripts](/reference/agent-secret-guard/) covers a different problem next to this one - masking a credential's VALUE from an agent's own transcript and tool output, rather than encrypting it at rest. The two are complementary: this guide's gate stops an unencrypted secret from being committed at all, the guard stops a decrypted one from being printed once it exists.
+
+[secretctl: stores, digests and commands](/reference/secretctl/) is the reference behind the `sops:`/`dotenv:` sources used in the Verification section.
+
+[Rotating a credential end to end with secretctl](/guides/secretctl-rotation/) is the full rotation walkthrough Part 6 hands off to.
+
+[Three NixOS hosts, one deploy interface](/reference/nixos-fleet/) covers the fleet deploy model Part 5's host sits inside, and states the age key as the one credential in that fleet worth escrowing offline.
