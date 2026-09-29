@@ -57,6 +57,10 @@ const FORGEJO = "reference/self-hosted-forgejo-router";
 const AGENTGUARD = "reference/agent-secret-guard";
 const PORTING_FORGEJO = "guides/porting-github-actions-to-forgejo";
 const GH_ACTIONS_CF = "guides/gh-actions-cloudflare";
+const FORGEJO_RUNNER = "reference/forgejo-actions-runner";
+const WEBHOOKS_COMPOSER = "guides/forgejo-webhooks-composer-gitops";
+const SECRETCTL = "reference/secretctl";
+const SECRETCTL_ROTATION = "guides/secretctl-rotation";
 
 const pins: Pin[] = [
   // The two PrivateLink docs went unpinned through the corrections that made
@@ -1033,10 +1037,6 @@ const pins: Pin[] = [
       // The runner's old concurrency before the capacity 1 -> 4 change.
       "capacity: 2",
       "Capacity 2 means",
-      // Internal bridge subnet and the Unraid box's LAN IP - replaced with
-      // roles per the public-safety pass.
-      "172.20.",
-      "10.0.0.56",
     ],
     sections: [/^## Topology$/m, /^## Decision guide$/m],
     linksTo: [
@@ -1139,6 +1139,137 @@ const pins: Pin[] = [
       "erfianugrah/erfi-dev-docs/blob/main/.github/workflows/deploy.yml",
     ],
     linksTo: [PORTING_FORGEJO],
+  },
+  {
+    // New reference (2026-09-29): the runner posture in depth. Guards the
+    // live cache-prune policy against the router's stale nix comment
+    // (14-day/20 GiB) being read back as current.
+    doc: FORGEJO_RUNNER,
+    mustContain: [
+      "RUNNER_CONFIG_REV",
+      "does not survive the next deploy",
+      "capacity 4",
+      "stop_grace_period: 15m",
+      "effectively root on the router",
+      "3-day TTL and a 10 GiB cap",
+    ],
+    mustNotContain: [
+      // The stale nix comment must not be read back as the CURRENT policy.
+      "currently a 14-day TTL",
+      "the cache prune runs a 14-day TTL and a 20 GiB cap",
+    ],
+    sections: [
+      /^## Topology$/m,
+      /^## Which do I pick$/m,
+      /^## Decision guide$/m,
+      /^## Incidents that shaped this runner$/m,
+    ],
+    linksTo: [FORGEJO, PORTING_FORGEJO],
+  },
+  {
+    doc: WEBHOOKS_COMPOSER,
+    mustContain: [
+      // The provider-pairing mechanism: this is the fact a reader most needs
+      // and is most likely to get backwards (provider gitea, not github, for
+      // a native Forgejo hook).
+      "with a Composer webhook whose provider is `gitea`",
+      "A native Forgejo hook satisfies a `gitea`-provider webhook",
+      // The host-reachability pin: without this the whole mechanism reads as
+      // a mystery (how does a bridge container reach a host-bound service).
+      "`[webhook] ALLOWED_HOST_LIST = private`",
+      "traffic from any docker bridge to that one host-bound address on 443 is allowed",
+      // The git source URL and the port distinction that makes it work.
+      "`ssh://git@git.erfi.io:2223/erfi/<repo>.git`",
+      "not the router's own sshd on 22 and not Forgejo's docker-network-only SSH bind on 2222",
+      // Composer cannot update repo_url in place - the reason the no-delete
+      // recipe exists at all, and the easiest claim to get backwards later.
+      "no endpoint that updates a git-backed stack's `repo_url` in place",
+      "The only Composer path that actually clones a repository is stack creation",
+      // The 2026-09-29 audit counts, load-bearing and easy to silently drift.
+      "5 classified CLEAN, 9 DEDUPE, 1 KEEP-GITHUB",
+      "9 orphaned Composer `github`-provider webhook rows",
+      // The SSH auth fallback regression and its fix.
+      "returns the first key file that decrypts and parses, in directory-listing order",
+    ],
+    mustNotContain: [
+      // Genericised per the parent session's HELD decision: no Composer
+      // stack names beyond the deliberately-named exceptions (Silo, knotea,
+      // the forge's own stack).
+      "atuin",
+      "copyparty",
+      // There is no dedicated Forgejo docs page for deploy keys - do not
+      // imply one exists via a fabricated citation or URL.
+      "forgejo.org/docs/latest/user/deploy-keys",
+      // The opposite of the load-bearing claim above would be a real
+      // regression: Composer does NOT support updating repo_url through the
+      // stack update endpoint.
+      "`PUT /stacks/{name}` accepts a `repo_url` field",
+      "updates the repo_url field directly",
+    ],
+    sections: [/^## Verification$/m, /^## Gotchas and lessons learned$/m],
+    linksTo: [FORGEJO, PORTING_FORGEJO],
+  },
+  {
+  doc: SECRETCTL,
+  mustContain: [
+    // The uncommitted `set`-canonicalisation fix this page was specifically
+    // asked to verify against the code and state - pinned so a later edit
+    // cannot claim it shipped before it did, or drop the scope caveat.
+    "uncommitted in this repo's working tree as of 2026-09-29",
+    // Scope of that fix: dotenv/sops/bw-notes only, keyfile stays byte-for-byte.
+    "the source byte-for-byte, trailing newline included",
+    // The 2026-08-30 key-derivation invariant: hex string, not decoded bytes.
+    "The key material is the salt's hex string",
+    // classify's inverted exit-code polarity relative to cmp.
+    "`classify`'s polarity is the inverse of `cmp`'s",
+    // The 2026-09-29 exclude label-matching fix and its worked example.
+    "exclude rbw:ITEM_NAME#*",
+  ],
+  mustNotContain: [
+    // The fix reaches the dotenv codec path only - these would overclaim it.
+    "keyfile destinations canonicalise",
+    "bw custom field is canonicalised",
+    // It is uncommitted as of this page's provenance date; must not read as shipped.
+    "already released",
+    "committed on 2026-09-29",
+  ],
+  sections: [/^## Topology$/m, /^## Decision guide$/m],
+  linksTo: [AGENTGUARD],
+  },
+  {
+    // New guide (2026-09-29): the task-sequenced rotation how-to that pairs
+    // with reference/agent-secret-guard. Its fact pack's HELD decision #4
+    // matters here: `secretctl set`'s dotenv-newline refusal was overly
+    // strict until 2026-09-29 (it did not canonicalise a trailing newline
+    // before checking, unlike fp/cmp) and was fixed the same day; this page
+    // states the fixed behaviour, re-verified this run against HEAD
+    // `730896f4`, and must not describe the old refusal as a still-open
+    // trap. It also keeps the Postgres role-rotation aside generic (no
+    // named stack), per the same HELD list.
+    doc: SECRETCTL_ROTATION,
+    mustContain: [
+      // The 2026-09-29 fix statement itself.
+      "As of 2026-09-29, `set` applies that same canonicalisation",
+      // The narrower guard rail that must survive alongside the fix: an
+      // interior newline or a second trailing newline still refuses.
+      "A value with an interior newline is still refused, and so is a value with two trailing newlines",
+      // The freshly-minted-value blind spot (C4/C5) and its incident.
+      "the guard had nothing to compare it against",
+      // The forced post-`set` refresh's lock behaviour (C20).
+      "flock -w 60",
+      // The empty-salt-file refusal, exact CLI wording (C19).
+      "salt file salt-file is too short (0 bytes, need >= 16)",
+      // The Postgres aside kept generic - no stack named.
+      "a stack whose database role password is rotating",
+    ],
+    mustNotContain: [
+      // The pre-fix framing: this page must not describe the dotenv-newline
+      // refusal as a standing trap once the fix is stated.
+      "cannot be `set` into a dotenv or sops destination without regenerating it newline-free",
+      "a genuine day-one trap",
+    ],
+    sections: [/^## Verification$/m, /^## Gotchas and lessons learned$/m],
+    linksTo: [AGENTGUARD],
   },
 ];
 

@@ -1,0 +1,179 @@
+---
+title: "The Forgejo Actions runner: build and lifecycle"
+description: How the self-hosted Forgejo Actions runner on the edge router is built from a regenerated config template, how a job container gets host Docker access, and the timers and incidents that shaped its capacity, cache and restart posture.
+author: Erfi Anugrah
+category: forge
+---
+
+The Forgejo Actions runner is the container that polls Forgejo for CI tasks over the forge's bridge network and executes each one as an ephemeral Docker container on the router's own Docker daemon, under two labels - `ubuntu-latest` and `ubuntu-22.04` - both mapped to `ghcr.io/catthehacker/ubuntu:act-22.04`. This reference is for anyone changing the runner's config, capacity, Docker access, cache policy, or restart behaviour: the pieces [the whole-stack forge reference](/reference/self-hosted-forgejo-router/) names but does not cover in depth. Pair it with [porting a GitHub Actions workflow to Forgejo Actions](/guides/porting-github-actions-to-forgejo/) to act on a workflow rather than just understand the runner underneath it.
+
+Live rows below (marked LIVE) come from a probe run against the router on 2026-09-29: `docker inspect forgejo-runner` and `systemctl show` on the runner's four related timers. Config rows come from the compose file's runner service and seed container, and from the router's NixOS config, at their pinned commits.
+
+## TL;DR
+
+- The runner container polls Forgejo for tasks over the forge bridge network and runs each job as an ephemeral container on the router's own Docker daemon, under two labels - `ubuntu-latest` and `ubuntu-22.04` - both mapped to `ghcr.io/catthehacker/ubuntu:act-22.04`.
+- A one-shot seed container regenerates `/data/config.yml` from `forgejo-runner generate-config` on every deploy, then applies a fixed set of `sed` edits and appends the `server.connections` block. Hand edits to the live file do not survive the next deploy.
+- `RUNNER_CONFIG_REV`, currently `3`, has no meaning to the runner itself; its only job is to force `docker compose up` to recreate the container, because the daemon reads `config.yml` only once, at process start.
+- Job containers are forced onto the forge's own bridge network, instead of act's default per-workflow bridge, via a `sed` on `container.network` plus an `--add-host` fallback pinning the forge's bridge address in every job container's `/etc/hosts`.
+- The actions cache is pinned to `/data/cache` on the runner's volume.
+- The runner service carries `stop_grace_period: 15m`, overriding Compose's 10-second default, so a running job gets fifteen minutes to finish before a stop or redeploy kills the daemon.
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  forgejo [label="Forgejo\n(forge bridge network)"];
+
+  subgraph cluster_runner {
+    label="forgejo-runner container"; style=rounded; fontsize=12; margin=12;
+    daemon [label="runner daemon\ncapacity 4\ntoken file, mode 0600"];
+  }
+
+  subgraph cluster_job {
+    label="job container (per task)"; style=rounded; fontsize=12; margin=12;
+    job [label="ubuntu-latest /\nubuntu-22.04\nghcr.io/catthehacker/ubuntu:act-22.04"];
+  }
+
+  hostsock [label="host Docker socket", shape=cylinder];
+  cache [label="/data/cache", shape=cylinder];
+
+  daemon -> forgejo [label="poll tasks\n(forge bridge)"];
+  daemon -> job [label="spawn, up to 4 at once"];
+  job -> forgejo [label="git fetch\n(forge bridge + --add-host)"];
+  job -> hostsock [label="automount +\nprivileged"];
+  daemon -> cache [label="actions cache"];
+}
+```
+
+The same thing in list form:
+
+1. The runner daemon polls Forgejo for tasks over the forge bridge network, waiting for the forge's health endpoint to pass before it starts, and authenticates with a token written to a mode-0600 file at container start.
+2. Capacity 4 lets it run up to four job containers at once.
+3. Each job container runs one of two labels, `ubuntu-latest` or `ubuntu-22.04`, both the image `ghcr.io/catthehacker/ubuntu:act-22.04`.
+4. Job containers join the forge bridge network directly, plus an `--add-host` fallback, so they can reach Forgejo even though act's default per-workflow bridge network is isolated from it.
+5. Job containers get the host Docker socket automounted and run privileged, which makes workflow code effectively root on the router - accepted here because this is a single-user, trusted-repos-only instance.
+6. Privileged mode sits on top of automount so that jobs needing their own Docker daemon (for example, ones whose tests use testcontainers-style bind mounts or published ports) can start one, rather than reusing the shared host socket for those operations.
+7. The runner writes its actions cache to `/data/cache` on its persistent volume.
+
+## Which do I pick
+
+Forgejo documents three ways a job container can reach Docker.[^fj-docker-access]
+
+| Docker access mode | What it buys | Cost | This runner |
+|---|---|---|---|
+| No access (`docker_host: "-"`, the default) | Nothing extra to secure | A job cannot build or run containers at all | Not used |
+| Host-socket automount (`docker_host: "automount"`) | The simplest way for a job to build and run containers[^fj-docker-access] | "No security isolation"[^fj-docker-access] - a job container is root on the host[^fj-actions-sec] | Used, plus `privileged: true` |
+| Docker-in-Docker (an isolated daemon reachable over TCP) | Jobs get their own daemon, no host access | Its own duplicated image storage, and containers within that instance stay visible to each other | Not used |
+
+## Seed-generated config
+
+A one-shot seed container regenerates `/data/config.yml` on every deploy: it runs `forgejo-runner generate-config`, then applies a fixed set of `sed` edits - capacity, network, options, `docker_host`, cache directory, privileged - and appends the `server.connections` block. The seed script's own comment states the intent plainly: the live config is always exactly template plus the declared edits below, with no hand edits.
+
+Editing `/data/config.yml` directly on the running instance does not survive the next deploy; the seed overwrites it from the template every time. Any change has to go into the seed script instead.
+
+The runner service also carries an environment variable, `RUNNER_CONFIG_REV`, presently `3`. The runner daemon does not read it; each seed edit bumps it, which changes the container's declared environment and makes `docker compose up` recreate the container. That recreation is necessary because the runner daemon reads `config.yml` only once, at process start; without a reason to recreate the container, a config edit applied by a fresh seed run would sit on disk unread until the next unrelated restart.
+
+## Identity: UI-created runner, token file
+
+Forgejo supports two ways to register a runner: interactively, where an admin creates it in one of four UI scopes (system, organisation, user, or repository) and Forgejo issues a UUID and a one-time-displayed token; or offline, via `forgejo forgejo-cli actions register --secret <secret>`, which also yields a UUID.[^fj-registration] This runner's identity is created in the Forgejo admin UI, not via `forgejo-runner register` or a legacy on-disk registration file.
+
+Both registration paths end in the same config shape: the generated `config.yml` declares identity as a `server.connections` entry - a URL, a UUID (not itself secret), and a `token_url` pointing at a local file path. The connection token itself is supplied at container start from a secret environment variable, and the container's bootstrap script writes it to that file at mode 0600 before the runner daemon starts. Concretely, the bootstrap script waits for the forge's health endpoint to pass, sets `umask 077`, creates the credentials directory, writes the token file, then execs `forgejo-runner daemon --config /data/config.yml`.
+
+This identity scheme is also what a 2026-09-24 outage turned on. The runner was down for roughly two hours twenty minutes because a rotated token was not a Forgejo-issued runner token at all - the daemon logged "runner registration token not found" and never came up. The fix was to create the runner fresh in the admin UI and supply its real token; the next CI runs going green confirmed it.
+
+## Capacity, labels and the network pin
+
+Runner capacity - concurrent jobs - is 4, set by a `sed` changing the generated default. Forgejo's own runner-configuration reference documents the label format (`<name>:<type>://<default-image>`) and a separate cache section for the runner's built-in actions-cache server, but does not itself state a numeric capacity default; this instance treats the generated default as `1` and raises it.[^fj-runner-config] Capacity 4 was chosen because the edge router's CPU is the strongest machine in the operator's lab, which the operator's own compose comments call out as suiting a CI runner.
+
+Job containers are forced onto the forge's own bridge network - instead of act's default, isolated per-workflow bridge - via a `sed` on the generated `container.network` setting, plus a belt-and-braces `--add-host` entry pinning the forge container's bridge address in every job container's `/etc/hosts`. Forgejo's security guidance explains why both are needed: the default `container.network` isolates job containers from each other and from the host per job, and switching to a named custom network removes isolation between job containers, though not from the host.[^fj-actions-sec] Isolation between job containers is a trade this instance already accepts given the automount and privileged posture below; isolation from the forge is what the network pin exists to remove.
+
+The pin exists because of an incident. On 2026-08-23, job containers landed on act's default, per-workflow bridge network, which Docker's inter-bridge isolation blocked from reaching the forge container; `git fetch` against the forge timed out. `container.network` was pinned to the forge bridge so every job joins it directly, with the `--add-host` fallback as a second line of defence.
+
+## Docker access: automount and privileged
+
+Job containers get the host's Docker socket automounted (`container.docker_host: automount`) and run with `container.privileged: true`. Both are runner-config settings applied by the seed, not upstream defaults. Forgejo's own framing of Actions is direct about the risk this carries: "Forgejo Runner performs remote code execution. That poses significant security threats for the host and network that it operates upon."[^fj-actions] Its security guidance is equally direct about `privileged`: setting it to `true` lets a job container operate as root on the runner machine, compromising the confidentiality, integrity and availability of the host.[^fj-actions-sec] Because job containers here share the host socket and also run privileged, workflow code on this runner is effectively root on the router: any job can start containers on the router with arbitrary bind mounts. That is a published, user-accepted posture for a single-user, trusted-repos-only instance - not a sandboxed CI runner.
+
+`privileged: true` was added after automount already existed, for a narrower reason than "more access": some CI jobs bind-mount the workspace or dial published ports on localhost, and that only resolves correctly if the job starts its own private Docker daemon - its own `vfs` storage driver, its own socket, a `DOCKER_HOST` override - rather than reusing the shared host socket for those operations (for example, jobs whose tests use testcontainers). Privileged mode is what lets a job start that private daemon; it adds no new trust boundary beyond what automount already grants, since a job with the host socket can already do anything automount permits.
+
+## Cache: directory, prune timer, and a second cache that had none
+
+The runner's actions cache directory is pinned explicitly to `/data/cache` on the runner's persistent volume; the generated default is an implicit, less predictable location on the same volume.
+
+A nightly router timer, `forgejo-cache-prune.timer`, prunes that directory to a 3-day TTL and a 10 GiB cap, and separately deletes cached Actions checkouts older than 30 days. The runner container is stopped for the duration of the prune - it holds an exclusive lock on the cache's index file - and started again afterward even if the prune step itself fails. Confirmed live on 2026-09-29 via `systemctl show forgejo-cache-prune.timer`: scheduled 02:55, last fired 2026-09-29T02:55:12+08, next due 2026-09-30T02:55. The nix comment above this service still describes the previous policy (a 14-day TTL and a 20 GiB cap); the `ExecStart` flags carry the tightened values and are the live behaviour.
+
+A second, independent cache exists for CI image builds: the shared BuildKit builder's layer cache. It had no garbage collection at all and had grown to about 26 GB before a fix landed on 2026-09-28. The fix adds a BuildKit GC policy, passed as `config-inline` to `setup-buildx-action`, at every workflow that builds images: `[worker.oci] gc = true` plus two `[[worker.oci.gcpolicy]]` stanzas, one keeping up to 10 GB for 72 hours and a fallback keeping up to 15 GB regardless of age. This runs inside the builder process itself, so no separate timer is needed for it. The same rollout also tightened the actions-cache prune above from its previous 14-day/20 GiB policy to the current 3-day/10 GiB one.
+
+## Lifecycle: grace period, reapers, and the liveness restart
+
+The runner service carries `stop_grace_period: 15m`, overriding Compose's 10-second default: a running job gets fifteen minutes to finish before a stop or redeploy kills the daemon. That period was set after Docker's 10-second default SIGKILLed the runner mid-job during deploys and restarts on 2026-09-23/24, orphaning job containers that the runner's own cleanup never reaches - the runner has no startup scan for stale containers.
+
+An hourly router timer, `forgejo-reap-orphans.timer`, is the safety net for whatever still leaks past that grace period: it removes any `FORGEJO-ACTIONS-TASK-*` container whose task row in Postgres is no longer waiting or running, and which stopped (or, if its task row is missing, was created) more than a grace period - default 10 minutes - ago. It never touches a container tied to a waiting or running task. Confirmed live 2026-09-29: hourly, last fired 08:00:24 +08.
+
+A daily timer, `forgejo-runner-restart.timer`, restarts the runner container unconditionally at 03:00, with up to five minutes of randomised delay. The reason is that the runner's task-fetch loop stops permanently after it loses its connection to the forge - for example, after the forge container itself restarts - and does not recover on its own. Live `docker inspect` of the runner container on 2026-09-29 confirms the effect: `RestartCount=0`, started 2026-09-28T19:04:22Z (2026-09-29 03:04:22+08, matching the timer's last trigger), memory limit 2147483648 bytes (2048 MiB), CPU limit 4.0, configured stop timeout 900 seconds - matching the fifteen-minute grace period above.
+
+A related hourly timer, `buildx-builder-sweeper.timer`, removes leaked BuildKit builder containers and their state volumes once they are more than six hours old, skipping the sweep entirely while any job container is running; it never matches the one shared, persistent builder used by CI. Confirmed live: hourly, last fired 08:00:24+08.
+
+Runner and server versions are pinned close together on purpose: the runner image is `data.forgejo.org/forgejo/runner:13.2.0` against a Forgejo server at 16.0.5, after an earlier mismatch - runner 13.0.0 against the same 16.0.5 server - caused a silent hang on 2026-09-21: the runner fetched a task and logged it, then the job worker vanished with no panic, no job container, 0% CPU, and no worker visible in a goroutine dump. Dispatch of later tasks stopped until the runner was upgraded to 13.2.0; the policy since then is to keep server and runner patch levels close.
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.35; ranksep=0.55;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="Do any jobs need to\nbuild or run containers?", shape=diamond];
+  q2 [label="Is every repo on this\nrunner trusted?", shape=diamond];
+  q3 [label="Do jobs bind-mount the\nworkspace or dial\npublished ports?", shape=diamond];
+
+  none [label="No Docker access\n(the default)"];
+  dind [label="Docker-in-Docker\n(isolated daemon over TCP)"];
+  automount [label="Host-socket automount"];
+  privileged [label="Automount + privileged\n(this runner)"];
+
+  q1 -> none [label="no"];
+  q1 -> q2 [label="yes"];
+  q2 -> dind [label="no - untrusted or\nfork-PR code runs here"];
+  q2 -> q3 [label="yes"];
+  q3 -> automount [label="no"];
+  q3 -> privileged [label="yes"];
+}
+```
+
+In list form:
+
+1. If no job needs to build or run containers, leave Docker access at the default - nothing extra to secure.
+2. If some job does, and this runner ever executes untrusted or fork-PR code, isolate with Docker-in-Docker instead of the host socket - it costs its own image storage, but it does not hand out host access.
+3. If every repo on the runner is trusted and no job needs a private daemon of its own, host-socket automount alone is enough.
+4. If a trusted job also bind-mounts the workspace or dials published ports on localhost, add `privileged: true` on top of automount, as this runner does - it grants no access beyond what automount already gave, and it is what lets the job run its own dockerd for those operations.
+
+Capacity is a separate knob from Docker access, and it trades off against the same host: four concurrent job containers here share one CPU limit, one memory limit, and one actions-cache lock, so the nightly prune stops the whole runner rather than one job. Capacity 4 was set because the router's CPU is the strongest machine available for it (see above); a runner on a smaller or more contended host would want a lower number, since Forgejo's own configuration reference does not publish a numeric default to raise from.[^fj-runner-config]
+
+## Incidents that shaped this runner
+
+| Date | What broke | What changed |
+|---|---|---|
+| 2026-08-23 | Job containers landed on act's default, per-workflow bridge network, which Docker's inter-bridge isolation blocked from reaching the forge container; `git fetch` against the forge timed out. | `container.network` pinned to the forge bridge, so every job joins it directly, plus an `--add-host` fallback. |
+| 2026-09-21 | Runner 13.0.0 against server 16.0.5: the runner fetched a task and logged it, then the job worker vanished with no panic, no job container, 0% CPU, and no worker visible in a goroutine dump; dispatch of later tasks stopped. | Upgraded the runner image to 13.2.0; policy since then is to keep server and runner patch levels close. |
+| 2026-09-23/24 | Docker's 10-second default stop timeout SIGKILLed the runner mid-job during deploys and restarts, orphaning job containers that the runner's own cleanup never reaches. | `stop_grace_period: 15m` on the runner service bounds the common case; an hourly reaper is the safety net for anything that still leaks past it. |
+| 2026-09-24 | The runner was down for roughly two hours twenty minutes because a rotated runner token was not a Forgejo-issued runner token at all. | Created the runner fresh in the admin UI and supplied its real token; confirmed by the next CI runs going green. |
+| 2026-09-28 | A second, unrelated cache - the CI image-build layer cache on the shared BuildKit builder - had no garbage collection and had grown to about 26 GB. | Added a BuildKit GC policy to every image-building workflow; also tightened the runner's own actions-cache prune from a 14-day/20 GiB policy to 3 days/10 GiB. |
+
+## Related docs
+
+- [Forgejo as the primary forge on the NixOS edge router](/reference/self-hosted-forgejo-router/) - the forge-wide topology, the storage split, edge TLS and SSH, the hardening baseline, and the other incidents (the memcg OOM loop, the testcontainers DNAT fix) that belong there rather than here.
+- [Porting a GitHub Actions workflow to Forgejo Actions](/guides/porting-github-actions-to-forgejo/) - the task-sequenced guide for moving a workflow onto this runner.
+
+{/* References: cited inline as [^slug]; the numbered list renders below under "References". */}
+[^fj-actions]: Forgejo, "Forgejo Actions administrator guide," Forgejo Documentation. https://forgejo.org/docs/latest/admin/actions/
+[^fj-actions-sec]: Forgejo, "Securing Forgejo Actions Deployments," Forgejo Documentation. https://forgejo.org/docs/latest/admin/actions/security/
+[^fj-docker-access]: Forgejo, "Utilizing Docker within Actions," Forgejo Documentation. https://forgejo.org/docs/latest/admin/actions/docker-access/
+[^fj-registration]: Forgejo, "Forgejo Runner Registration," Forgejo Documentation. https://forgejo.org/docs/latest/admin/actions/registration/
+[^fj-runner-config]: Forgejo, "Forgejo Runner Configuration," Forgejo Documentation. https://forgejo.org/docs/latest/admin/actions/configuration/

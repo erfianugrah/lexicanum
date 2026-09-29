@@ -1,0 +1,186 @@
+---
+title: Wiring a Forgejo push to a Composer GitOps deploy
+description: "Wiring a Forgejo repository push hook to a self-hosted Composer GitOps deploy: the webhook, the host-reachability pin that lets a bridge container call a host service, moving a stack's source from GitHub to Forgejo without downtime, the bootstrap circle that keeps the forge's own stack on GitHub, CI-triggered deploys for stacks with no hook, and the 2026-09-29 duplicate-webhook audit."
+author: Erfi Anugrah
+category: forge
+---
+
+A Forgejo repository push can redeploy a Docker Compose stack seconds after the commit lands, through Composer's GitOps webhook receiver. This guide wires that path end to end: the webhook itself and why it can reach a host-bound service from inside a docker bridge, moving an existing stack's git source from GitHub to Forgejo without an outage window, the one stack in this fleet that stays GitHub-sourced on purpose, a CI-triggered deploy for a stack that carries no webhook at all, and the four-source method used to find and remove duplicate webhooks across the fleet on 2026-09-29.
+
+This is the how-to underneath [Forgejo as the primary forge on the NixOS edge router](/reference/self-hosted-forgejo-router/), which covers the same topology, the `ALLOWED_HOST_LIST` setting and the bootstrap circle at a summary level. It pairs with [Porting a GitHub Actions workflow to Forgejo Actions](/guides/porting-github-actions-to-forgejo/): that guide is the CI-runner half of the same migration, this one is the GitOps-deploy half - a push to Forgejo now does two separate jobs.
+
+Prerequisites: admin access to a Forgejo repository and to a Composer instance it can reach, comfortable use of `curl` against both APIs, and, for the repoint recipe in Part 2, a shell on the Composer host and direct access to its SQLite database.
+
+## Architecture
+
+Everything past the first hop depends on one fact: Composer runs as a service bound to the router host itself, not to any docker bridge, so a webhook from a bridge container can only reach it through a narrow, explicitly punched hole.
+
+Composer creates one webhook receiver per configured webhook, at a stable path, `/api/v1/hooks/{id}`. The path is public and unauthenticated; the request itself carries the authentication, an HMAC signature validated per provider. Composer supports four: GitHub (`X-Hub-Signature-256`), GitLab (`X-Gitlab-Token`), Gitea (`X-Gitea-Signature`), and a generic provider (`X-Webhook-Signature`).
+
+For a Forgejo-sourced stack, pair a Forgejo repository hook of type Forgejo (the API reports its `type` as `"forgejo"`) with a Composer webhook whose provider is `gitea`. The pairing works because Composer's `gitea` provider validates the same HMAC-SHA256-over-`X-Gitea-Signature` mechanism as its `github` provider, and its Gitea payload parser reuses the GitHub one outright (`parseGiteaPayload` calls `parseGitHubPayload` - the push-event JSON shape is identical). A native Forgejo hook satisfies a `gitea`-provider webhook because nothing about the payload distinguishes them.
+
+:::note
+Forgejo's own webhook delivery sends several compatibility headers alongside its own on every request - `X-Forgejo-Delivery`, `X-GitHub-Delivery`, `X-Gogs-Delivery` and `X-Gitea-Delivery` are all present on one delivery.[^fj-webhooks] That is the documented mechanism letting a single Forgejo-side hook satisfy a receiver written against an older Gitea- or GitHub-shaped webhook contract - the same property this pairing depends on.
+:::
+
+Forgejo's own default policy would block a webhook aimed at a private address, treating it as an SSRF-shaped request. This instance sets `[webhook] ALLOWED_HOST_LIST = private` in `app.ini`, one of Forgejo's documented values for that key (alongside `external`, `loopback`, and a custom allow-list)[^fj-cheat], which restricts webhook targets to RFC 1918 / RFC 4193 / RFC 6598 address space - the setting that makes an outbound webhook to a service on the operator's own network possible in the first place.
+
+Reachability past that point is narrower than the whole private range. Forgejo runs in a docker bridge container; Composer is bound to the host, not to that bridge. The compose file pins the gap with an `extra_hosts` entry mapping Composer's public hostname to the router's internal service-plane address, so Forgejo's own DNS resolution inside the container points straight at it rather than out to the public internet and back. The compose file's own comment explains why: bridge containers may reach host services only at that one address on port 443, because the router's nftables input chain carries a rule of the shape `iifname { <bridge-set> } ip daddr <service-plane address> tcp dport 443 accept` - traffic from any docker bridge to that one host-bound address on 443 is allowed, and nothing else on the host is reachable from a bridge container this way. The same rule and the same split-horizon Caddy vhost also carry CI registry pushes.
+
+The service-plane address itself is a stable loopback alias on the router, bound to the host's own Caddy rather than to any single container, and distinct from the router's LAN-facing management address and from the LAN resolver's address. Moving the underlying service later is a matter of moving the /32, not re-teaching every client that calls it.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  forgejo [label="Forgejo\n(docker bridge container)"];
+  nft [label="router nftables\ninput chain\niifname bridge-set,\ndaddr service-plane, tcp/443\naccept", shape=note];
+  svc [label="service-plane address\n(loopback alias,\nhost-bound Caddy)"];
+  composer [label="Composer\n(host-bound service)\nwebhook receiver"];
+  stack [label="stack containers\ndocker compose up -d"];
+  github [label="GitHub\n(one exception stack only)"];
+  forgejo -> nft [label="webhook POST 443\nHMAC-signed"];
+  nft -> svc [label="accept"];
+  svc -> composer [label="same host,\nCaddy proxies"];
+  composer -> stack [label="auto_redeploy"];
+  github -> composer [label="webhook\n(github provider)"];
+}
+```
+
+Text fallback for the diagram:
+
+1. Forgejo, a docker bridge container, sends an HMAC-signed webhook POST to Composer's public webhook path on 443.
+2. The router's nftables input chain accepts that one destination and port from the docker bridges; nothing else on the host is reachable from a bridge container this way.
+3. The accepted traffic lands on a stable loopback alias, the service-plane address, where the host's own Caddy is bound.
+4. Caddy, on the same host, proxies to Composer.
+5. Composer looks up the webhook by id, validates the signature, and, if `auto_redeploy` is set, redeploys the stack.
+6. One stack in this fleet is the exception: its webhook comes from GitHub, not Forgejo (Part 3).
+
+| Component | State at time of writing |
+|---|---|
+| Composer | commit `0c8137c` |
+| forgejo-compose (the forge's own stack) | commit `1c3a9cc` |
+| caddy-compose (the edge proxy) | commit `ee2672d` |
+
+## Part 1: create the webhook, both sides
+
+1. Create the Composer-side webhook first, so you have the secret before touching Forgejo:
+
+   ```bash
+   curl -X POST https://composer.erfi.io/api/v1/webhooks \
+     -H "Authorization: Bearer $COMPOSER_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"stack_name":"<name>","provider":"gitea","branch_filter":"main","auto_redeploy":true}'
+   ```
+
+   The response carries the plaintext HMAC secret exactly once. Copy it now: every later read of the same webhook redacts it to `****<last4>`.
+
+2. `auto_redeploy: true` is what makes a push actually run the deploy pipeline; a webhook with it `false` still records every delivery (visible via `GET /webhooks/{id}/deliveries`) without acting on any of them. `stack_name` can also be the reserved scope `_system`, which triggers a Composer self-upgrade instead of a stack redeploy - not what you want for a stack webhook.
+
+3. On the Forgejo side, create a repository webhook (Settings -> Webhooks -> Add Webhook -> Forgejo), target URL `https://composer.erfi.io/api/v1/hooks/<id>`, and paste the secret from step 1. Leave the event scope at pushes to the branch configured in `branch_filter`.
+
+4. If the stack is not yet git-backed on Composer, its source URL for a Forgejo-hosted repository is `ssh://git@git.erfi.io:2223/erfi/<repo>.git`. Port 2223 is the edge Caddy's TCP proxy to Forgejo's built-in SSH server, not the router's own sshd on 22 and not Forgejo's docker-network-only SSH bind on 2222 - a URL built against either of those ports never reaches Forgejo from outside the forge bridge network.
+
+5. Push to the branch and confirm delivery: `GET /webhooks/{id}/deliveries` on Composer should show the push with a 2xx response, and `GET /stacks/{name}` should report the new commit as synced.
+
+## Part 2: move an existing stack's source from GitHub to Forgejo
+
+Composer has no endpoint that updates a git-backed stack's `repo_url` in place. `PUT /stacks/{name}` accepts only a `compose` field. `POST /stacks/{name}/convert/git` exists but is documented to refuse a stack that is already git-backed, and even where it runs it only writes git config and marks the stack synced without cloning - the on-disk checkout keeps its old working tree, has no `.git`, and the next sync fails with an HTTP 500. The only Composer path that actually clones a repository is stack creation (`POST /stacks/git`).
+
+That leaves two ways to move a git-backed stack's source. Delete the stack and recreate it against the new URL, which is a real outage window - the stack does not exist between the two calls. Or, where even a brief teardown is not acceptable, a no-delete recipe that edits the stored git config directly and repoints the on-disk checkout's own git remote to match.
+
+### The no-delete recipe
+
+In order:
+
+1. Generate a fresh ed25519 keypair.
+2. Register the public half as a read-only (`read_only: true`) deploy key on the target Forgejo repository: `POST /api/v1/repos/{owner}/{repo}/keys` with a repo-scoped token.
+3. `PUT /api/v1/stacks/{name}/credentials` with `{"ssh_key": "<PEM>"}`. This call has full-replace semantics on the credentials object, and it also sets `auth_method` to `ssh_key` as a side effect of that field being populated - there is no separate `auth_method` field to set on this endpoint.
+4. Update the stack's stored git config directly in the database, since there is no API for it: `UPDATE stack_git_configs SET repo_url=<new-url>, auth_method='ssh_key' WHERE stack_name=<name>`.
+5. Repoint the checkout's own git remote to match: `docker exec -u composer composer git -C /opt/stacks/<name> remote set-url origin <new-url>`. Composer's git client (go-git) fetches from the checkout's own remote, not from the database row, so the two have to agree or the next sync fetches from the wrong place.
+6. `POST /api/v1/stacks/{name}/sync`, then poll `GET /stacks/{name}` until `git_config.sync_status` reads `synced` at the commit you expect, before doing anything else with the stack.
+
+The per-stack SSH key set in step 3 is stored AES-256-GCM encrypted at rest (an `enc:` prefix on the stored value), one of four encrypted stores covered by Composer's encryption-key rotation. `GET /stacks/{name}/credentials` reports only whether a key is set (`ssh_key_set: bool`); it never returns key material, so an existing PEM cannot be read back through the API or copied onto another stack. That is also why a shared or reused deploy key is not an option here: each stack's private key exists only as that one stack's own encrypted database row, or not at all if never set. There is no shared keychain to read a previous key back out of, so every repoint needs its own freshly generated keypair and its own deploy-key registration on the target repository.
+
+### Run on 2026-09-29
+
+This recipe was run for real on 2026-09-29, recorded here rather than re-probed for this page. Before the repoint, the stack's Composer checkout remote was a GitHub SSH URL at commit `1405e86f...`, and its stored git config showed `auth_method=none`. After: sync state `synced` at the same commit - the repoint changes the remote, not the code, so no new commit was expected or produced - `repo_url` now a `git.erfi.io` SSH URL on port 2223, `auth_method=ssh_key`.
+
+Verification that the repoint caused no incidental redeploy: the stack's app container and its cache sidecar reported identical container-start timestamps before and after the change (`2026-09-28T04:45:20.900591197Z` and `2026-09-26T23:57:36.007359367Z` respectively), diffed byte for byte with no difference. The Composer webhook and the Forgejo repository hook feeding that stack were both unchanged by the repoint.
+
+## Part 3: the bootstrap circle - why the forge's own stack stays on GitHub
+
+The forge's own Composer stack is deliberately kept GitHub-sourced even though its git data is native to Forgejo. If Composer pulled the forge's own compose config from the forge, a Forgejo outage would make the forge itself un-redeployable - the stack you would need to fix the forge lives on the thing that is down. GitHub is the break-glass source for this one stack only.
+
+Concretely: the forge's own Composer stack sources from a GitHub SSH URL with `auth_method: none`, and carries exactly one Composer webhook, provider `github`, `auto_redeploy: true`. There is no Forgejo-side repository hook on it at all. The deploy flow is push to Forgejo's `main` -> the repository's push mirror, syncing on commit, lands the same commit on GitHub -> GitHub's own repository webhook fires Composer -> Composer syncs from GitHub and runs its compose file.
+
+The same pattern recurs once elsewhere in this fleet, in the opposite direction. Silo, the S3-compatible object store this forge itself uses for release assets, logs, artifacts and packages, has its own Composer stack sourced from Forgejo - and that is not a bootstrap circle, because Composer's sync there is git-over-SSH served from Forgejo's own repository storage, never through Silo's S3 API. A Silo outage cannot block resyncing the stack that would restart Silo. The generalisation: a stack whose compose config is needed to redeploy the very system that would host its own deploy trigger should not source that config from that same system.
+
+## Part 4: CI-triggered deploys for a stack with no webhook
+
+Some stacks run on the router's own Docker daemon and carry no webhook at all. For those, a push to `main` does nothing until something explicitly calls the deploy endpoint. The working pattern in this fleet is a CI job - Forgejo Actions or GitHub Actions, run after a version-bump commit - that authenticates with a Composer API key held as a CI secret, calls `POST /api/v1/stacks/<name>/deploy?async=true`, and then polls `GET /api/v1/stacks/<name>` in a loop, comparing the reported `last_commit_sha` against the commit it just pushed, until they match or a timeout is hit.
+
+knotea, this fleet's own LAN DNS resolver, is the case that makes an extra constraint visible: its CI job has to call Composer on the router's direct internal address rather than its public hostname, because the public hostname resolves through the very resolver the deploy is trying to update. Composer's own documentation for this calls it resolver-down mode: any operation that has to survive the LAN resolver being unavailable needs a direct address, never a name that resolver would answer. [knotea: one binary that is both your recursive resolver and your authoritative DNS](/reference/knotea-self-hosted-dns/) covers the resolver itself.
+
+## Part 5: auditing for duplicate webhooks
+
+This fleet ran the Forgejo-primary migration - GitHub demoted to a push-mirror backup - across every stack over 2026-09-23 to 2026-09-27, and the webhook side of that migration left orphaned rows behind. The audit on 2026-09-29 was entirely read-only: for every stack, cross-reference four independent sources - Composer's own git source for the stack, every Composer webhook row for it, the Forgejo repository's own hooks, and the GitHub repository's own hooks - then classify:
+
+- **CLEAN** - exactly one Composer webhook, matching the stack's actual git source.
+- **DEDUPE** - an extra, orphaned Composer webhook row whose git-host-side hook no longer exists.
+- **KEEP-GITHUB** - the one deliberate GitHub-sourced exception from Part 3, excluded from any change.
+- **STALE** - a hook on the git-host side itself that 404s, or duplicates a working one.
+
+Of 20 total stacks, 15 carried at least one webhook: 5 classified CLEAN, 9 DEDUPE, 1 KEEP-GITHUB, plus one additional STALE finding layered onto one of the DEDUPE stacks (a second, already-dead GitHub-side hook).
+
+The applied fix deleted the 9 orphaned Composer `github`-provider webhook rows (`DELETE /api/v1/webhooks/{id}`, HTTP 204 each) across the 9 DEDUPE stacks, and, on the git-host side, 2 GitHub repository hooks on the one stack that had them - one a live duplicate of the surviving Forgejo-sourced hook, one already returning 404. No Forgejo-side repository hook, and no stack's git config, was touched by this pass; the GitHub-sourced exception stack from Part 3 was excluded entirely. Re-checking afterward, every affected stack's `GET /webhooks` shows exactly one `gitea`-provider row, its Forgejo repository hook is unchanged and still active, and the one stack with a git-host-side deletion shows no GitHub hooks remaining.
+
+One of the 9 DEDUPE stacks looked different on paper from the other 8: it is the same stack repointed in Part 2, and at audit time its Composer git source was still a GitHub URL, not yet migrated - by a literal reading of "source is Forgejo" it should not have qualified for the DEDUPE bucket at all. But its actually-firing, actually-succeeding webhook was already the Forgejo-side one (its Forgejo repository is independent, not a mirror of the GitHub one), and its Composer `github`-provider webhook had already lost its GitHub-side counterpart, with its last delivery already failed. The cleanup for it was the same orphaned-row deletion as the other 8; whether to repoint its actual git source was a separate question, flagged and deferred rather than folded silently into the webhook cleanup - and resolved by the Part 2 repoint on the same day.
+
+## Verification
+
+| Check | How | Expected |
+|---|---|---|
+| Provider pairing | Forgejo repo hook `type` vs Composer webhook `provider` | `"forgejo"` paired with `gitea` |
+| Delivery reached Composer | `GET /webhooks/{id}/deliveries` after a push | non-empty, most recent delivery 2xx |
+| Redeploy ran | `GET /stacks/{name}` | `last_commit_sha` (or `git_config.sync_status`) matches the pushed commit |
+| Repoint landed | `GET /stacks/{name}` after the no-delete recipe | `sync_status: synced` at the expected commit, `repo_url` updated |
+| Repoint caused no incidental redeploy | container-start timestamps before vs after | identical |
+| CI-triggered deploy | poll loop in the release workflow | `last_commit_sha` matches the pushed commit before the timeout |
+| No duplicate webhooks | `GET /webhooks` filtered to the stack | exactly one row, provider `gitea` (or `github` for the one exception) |
+
+## Gotchas and lessons learned
+
+- **A burst of webhook deliveries can be blocked before Composer ever sees them.** Composer's public hostname sits behind an edge WAF running a credential-detection rule and a rate/DDoS rule; the Forgejo public hostname's own site block runs no WAF at all. A rate-limited delivery to Composer's public receiver never reaches Composer's own process - the tell is the webhook's own delivery log showing nothing for a request the sender's side logged as a non-2xx. The fix is a path exemption for the hooks path at the edge, not a retry loop.
+- **The SSH auth fallback for `auth_method: none` picks the first key that decrypts, not the intended one.** A 2026-09-23 regression, fixed 2026-09-24: Composer's fallback scans its SSH key directory and returns the first key file that decrypts and parses, in directory-listing order - lexicographic, not intent. An extra key file that happened to sort earlier than the intended one made every GitHub-sourced, no-auth stack authenticate with the wrong key and fail. The fix was operational: keep only the intended key file in that directory, rather than changing the code to prefer a named key.
+- **Deploy keys do not survive a mirror-to-native conversion.** Deploy keys are registered per repository. Converting a mirrored repository to native elsewhere in this fleet deletes the old repository and creates a new one with the same name; Forgejo's own repository-mirror documentation describes a mirror's own key as added as a deploy key on the target repository[^fj-mirror], the same per-repository binding a deploy key from the no-delete recipe follows. Any deploy key registered against the deleted repository does not carry over and has to be re-added on the new one - a real gotcha if a repository that already carries a Composer deploy key from a prior repoint is later put through that conversion.
+- **The duplicate-webhook audit and the repoint are the same underlying fix, seen from two angles.** A stack's webhook hygiene and its actual git source are separate facts about it, and they can disagree for a while without anything failing loudly: an orphaned-looking Composer row can coexist with an already-working Forgejo webhook, right up until the stack's git source itself gets moved.
+
+## File reference
+
+| File | Where | What it is |
+|---|---|---|
+| `app.ini` | forgejo-compose | `[webhook] ALLOWED_HOST_LIST = private` |
+| `docker-compose.router.yml` | forgejo-compose | the `extra_hosts` pin to the service-plane address |
+| `configuration.nix` | router | the nftables input rule and the service-plane loopback alias |
+| `webhook.go` | composer | provider validation (`ValidateSignature`) and payload parsing (`parseGiteaPayload`, `parseGitHubPayload`) |
+| `webhook_crud.go` | composer | webhook create, list and delete handlers |
+| `stack_service.go` | composer | `UpdateCredentials` and the `auth_method` side effect |
+| `client.go` | composer | the SSH auth fallback (first-decryptable-key order) |
+| `release.yml` | knotea, `.forgejo/workflows/` | the CI-triggered deploy job and its direct-address poll loop |
+| `Caddyfile` | caddy-compose, edge | the WAF site blocks for `composer.erfi.io` vs `git.erfi.io` |
+
+## Related docs
+
+- [Forgejo as the primary forge on the NixOS edge router](/reference/self-hosted-forgejo-router/) - the topology, `ALLOWED_HOST_LIST` and the bootstrap circle at a summary level; this guide is the step-by-step underneath it.
+- [Porting a GitHub Actions workflow to Forgejo Actions](/guides/porting-github-actions-to-forgejo/) - the CI-runner half of the same migration.
+- [drawbridge: an mTLS-gated, route-allowlisted proxy for the Docker socket](/reference/drawbridge-docker-socket-proxy/) - how Composer reaches its other docker daemon, on the storage host; a stack's containers can live on either one while its webhook always lands on the router-side Composer described here.
+- [knotea: one binary that is both your recursive resolver and your authoritative DNS](/reference/knotea-self-hosted-dns/) - the resolver behind Part 4's resolver-down mode.
+- [the Forgejo Actions runner in depth](/reference/forgejo-actions-runner/) - the runner side of this same forge, including the job container's Docker access.
+
+{/* References: cited inline as [^slug]; the numbered list renders below under "References". */}
+[^fj-cheat]: Forgejo, "Configuration Cheat Sheet," Forgejo Documentation. https://forgejo.org/docs/latest/admin/config-cheat-sheet/
+[^fj-webhooks]: Forgejo, "Webhooks," Forgejo Documentation. https://forgejo.org/docs/latest/user/webhooks/
+[^fj-mirror]: Forgejo, "Repository Mirrors," Forgejo Documentation. https://forgejo.org/docs/latest/user/repo-mirror/
