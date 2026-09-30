@@ -22,6 +22,23 @@ const C = {
   accent: "hsl(217, 70%, 62%)",
 };
 
+const FONT_FILES = {
+  sans600:
+    "node_modules/@fontsource/ibm-plex-sans/files/ibm-plex-sans-latin-600-normal.woff",
+  sans400:
+    "node_modules/@fontsource/ibm-plex-sans/files/ibm-plex-sans-latin-400-normal.woff",
+  mono400:
+    "node_modules/@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-400-normal.woff",
+  mono600:
+    "node_modules/@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-600-normal.woff",
+};
+
+const TITLE_FONTS = {
+  "plex-sans-600": { family: "IBM Plex Sans", weight: 600, file: "sans600", size: 96 },
+  "plex-sans-400": { family: "IBM Plex Sans", weight: 400, file: "sans400", size: 96 },
+  "plex-mono-600": { family: "IBM Plex Mono", weight: 600, file: "mono600", size: 72 },
+};
+
 const countDocs = async (root, sub) =>
   (await readdir(join(root, "src/content/docs", sub))).filter((f) =>
     f.endsWith(".mdx"),
@@ -35,25 +52,18 @@ const mono = (children, style = {}) => ({
   },
 });
 
-export async function writeOgCard(root, outDir) {
+// opts.titleFont: key into TITLE_FONTS (default plex-mono-600).
+// opts.outFile: output filename (default thumbnail.jpg).
+export async function writeOgCard(root, outDir, opts = {}) {
+  const titleFont = TITLE_FONTS[opts.titleFont ?? "plex-mono-600"];
   const [guides, reference] = await Promise.all([
     countDocs(root, "guides"),
     countDocs(root, "reference"),
   ]);
 
-  const [plexSans, plexMono, markRaw] = await Promise.all([
-    readFile(
-      join(
-        root,
-        "node_modules/@fontsource/ibm-plex-sans/files/ibm-plex-sans-latin-600-normal.woff",
-      ),
-    ),
-    readFile(
-      join(
-        root,
-        "node_modules/@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-400-normal.woff",
-      ),
-    ),
+  const [titleData, plexMono, markRaw] = await Promise.all([
+    readFile(join(root, FONT_FILES[titleFont.file])),
+    readFile(join(root, FONT_FILES.mono400)),
     readFile(join(root, "public/ea_favicon.png")),
   ]);
 
@@ -108,8 +118,9 @@ export async function writeOgCard(root, outDir) {
                       type: "div",
                       props: {
                         style: {
-                          fontSize: 96,
-                          fontWeight: 600,
+                          fontFamily: titleFont.family,
+                          fontSize: titleFont.size,
+                          fontWeight: titleFont.weight,
                           letterSpacing: "-0.015em",
                           lineHeight: 1.05,
                         },
@@ -155,12 +166,17 @@ export async function writeOgCard(root, outDir) {
     width: 1200,
     height: 630,
     fonts: [
-      { name: "IBM Plex Sans", data: plexSans, weight: 600, style: "normal" },
+      {
+        name: titleFont.family,
+        data: titleData,
+        weight: titleFont.weight,
+        style: "normal",
+      },
       { name: "IBM Plex Mono", data: plexMono, weight: 400, style: "normal" },
     ],
   });
 
-  const out = join(outDir, "thumbnail.jpg");
+  const out = join(outDir, opts.outFile ?? "thumbnail.jpg");
   await sharp(Buffer.from(svg)).jpeg({ quality: 88 }).toFile(out);
   return { out, guides, reference };
 }
