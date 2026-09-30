@@ -33,6 +33,25 @@ const fmHash = (/** @type {string} */ f) => {
     return null;
   }
 };
+// Renders dist/thumbnail.jpg (og:image) from src/lib/og-card.mjs at build
+// time - doc counts on the card are measured from src/content/docs, so they
+// cannot drift. public/thumbnail.jpg is not committed.
+const ogCard = {
+  name: "og-card",
+  hooks: {
+    "astro:build:done": async ({ dir, logger }) => {
+      const { writeOgCard } = await import("./src/lib/og-card.mjs");
+      const { out, guides, reference } = await writeOgCard(
+        fileURLToPath(new URL(".", import.meta.url)),
+        fileURLToPath(dir),
+      );
+      logger.info(
+        `wrote ${out} (${guides} guides, ${reference} reference)`,
+      );
+    },
+  },
+};
+
 const taxonomyWatcher = {
   name: "taxonomy-frontmatter-restart",
   hooks: {
@@ -160,7 +179,7 @@ export default defineConfig({
       ],
     },
   ],
-  integrations: [sitemap(), taxonomyWatcher, starlight({
+  integrations: [sitemap(), taxonomyWatcher, ogCard, starlight({
     title: "Erfi's Lexicanum",
     favicon: "/ea_favicon.png",
     customCss: ["./src/styles/custom.css"],
