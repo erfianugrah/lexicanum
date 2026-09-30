@@ -11,7 +11,7 @@
  * than being noticed on the published page.
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import {
   headlessTableRuns,
   markerLines,
@@ -238,6 +238,16 @@ describe.skipIf(!CHECK_BUILT)("built output", () => {
       (alias) => !existsSync(join(DIST, alias.slice(1), "index.html")),
     );
     expect(missing).toEqual([]);
+  });
+
+  test("the og card is generated at build time", () => {
+    // dist/thumbnail.jpg is rendered by the ogCard integration
+    // (src/lib/og-card.mjs) with doc counts measured from the corpus; a
+    // missing or stub-sized file means the card silently stopped building
+    // and social unfurls fall back to no image.
+    const card = join(DIST, "thumbnail.jpg");
+    expect(existsSync(card)).toBe(true);
+    expect(statSync(card).size).toBeGreaterThan(10_000);
   });
 
   test("no page leaks an unrendered footnote marker", () => {
