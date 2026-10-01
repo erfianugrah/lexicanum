@@ -15,8 +15,9 @@ claim whether the behaviour comes from the docs or from a live test here;
 several of them disagree.
 
 The measured numbers come from a battery written against throwaway
-projects on the Management API (Free, Pro, and Team orgs; 2026-08-19),
-each project deleted in the same run. The compute-disk RUNLOG does not
+projects on the Management API (Free, Pro, and Team orgs; 2026-08-19,
+paid-plan fill and grow steps added 2026-10-01 in `ap-southeast-1`), each
+project deleted in the same run. The compute-disk RUNLOG does not
 record the AWS region (the platform-downtime run cross-referenced below
 was in `ap-southeast-1`; the compute-disk RUNLOG does not record its own
 region). Claims
@@ -26,9 +27,15 @@ that were not run are still cited to the docs and labelled as such.
 
 - Compute never upgrades itself; disk never shrinks. Compute resize is a
   1-2 minute window (measured); disk decrease is rejected outright.
-- Disk autoscale grows at 90% usage by a configurable percent (default
-  50%). That config cannot be read or written through the Management API
-  at all (measured) - the dashboard is the only surface.
+- Disk autoscale fires at ~90% usage (measured on Pro). A new Pro project
+  starts on 2 GB and the first grow went to 8 GB, the next +50% to 12 GB.
+  Its settings read back as nulls and cannot be written through the
+  Management API (measured) - the dashboard is the only surface.
+- Paid-plan read-only at 95% disk holds (measured) and lifted by itself once
+  autoscale grew the disk. A fast import after autoscale had already grown
+  the disk once skipped read-only in one run of two and filled the disk:
+  `53100 No space left on device` and a seven-minute outage while the
+  project status read healthy.
 - The Free-plan read-only wall is not the documented 500 MB: measured
   reads accepted to ~726 MB database size, then
   `ERROR: 25006: cannot execute INSERT in a read-only transaction`.
@@ -213,12 +220,17 @@ UI-only (measured, below).
 Database size = `pg_database_size()` (tables + indexes + materialised
 views). Disk = that + WAL + system files + an empty baseline of ~40-60
 MB.[^sb-db-size] The Free plan quota is on the first; paid-plan read-only
-trips on the second at 95%.[^sb-db-size]
+trips on the second at 95%.[^sb-db-size] WAL is not a rounding error on a
+small volume: Micro runs `min_wal_size` 1GB and `max_wal_size` 4GB, and
+under bulk inserts `pg_wal` held 816-992 MB of a 2 GB disk, so read-only
+tripped with an 803 MB database (D10, measured).
 
 - Delete data: database size does not drop until vacuum runs (dead tuples);
   TRUNCATE drops instantly. Both measured.
 - Disk util endpoint (`GET /config/disk/util`) answered 200 on Free and
-  Pro (measured) - usable in org-wide cost probes.
+  Pro (measured) - usable in org-wide cost probes. It is a five-minute
+  sample: the same timestamp and value came back for up to five minutes, and
+  once it returned the pre-fill baseline while the disk was full (D10).
 
 ### Autoscale: defaults and the missing surface
 
@@ -226,9 +238,9 @@ Docs describe: trigger 90% usage, grow by growth percent (default 50%),
 min increment 1 GB, bounded by max size default 8 GB with the spend cap
 on.[^sb-db-size]
 
-None of it is visible or settable through the Management API (measured). On both
-Pro and Team orgs the autoscale GET returned an empty shape and PUT/POST
-/PATCH all answered 404. A re-probe on a platform-plan org in September 2026
+The settings are readable as nulls and not settable through the Management
+API (measured). On both Pro and Team orgs the autoscale GET answered 200 with
+every field null and PUT/POST/PATCH all answered 404. A re-probe on a platform-plan org in September 2026
 got the same 404 on PATCH, PUT, POST and DELETE, carrying the identical
 `Cannot VERB /v1/projects/<ref>/config/disk/autoscale` body that an entirely
 unknown path returns, and the GET read
@@ -254,17 +266,34 @@ On the Free tier: measured baseline disk was 2 GB (docs claim 1 GB) and
 the disk did not grow at 90%+ through a fill, so autoscale did not
 prevent read-only.[^sb-db-size]
 
+On Pro it fires (D10, 2026-10-01). A fresh project also starts on 2 GB.
+With the fill paced at ~25 MB per util sample, the sample crossed 90%
+(91.1%) and the volume grew 2 GB -> 8 GB within about two minutes, with no
+write refused. A later grow on the same project went 8 GB -> 12 GB. The first
+step lands on the 8 GB plan baseline rather than adding 50%, although the
+notification email says "Each expansion increases the disk by 50%" directly
+above "Disk Size: 2GB -> 8GB". The second grow came ten minutes after the
+first, while a manual `POST /config/disk` on the same project was answering
+the four-hour 429, so that cooldown binds manual changes and not autoscale.
+
 ### Manual expansion + modification quota
 
 Increase is OK (HTTP 201, +200 GB cap per change); decrease is refused
 (HTTP 400, measured).[^sb-db-size]
 
+From the 2 GB starting volume the smallest grow is 6 GB (D11, measured).
+4 and 5 GB are refused on the gp3 IOPS floor:
+`400 Invalid IOPS value for gp3 volume 3000. Minimum is 3000. Max is 500
+IOPS per GB or 80,000, whichever is lower.` 6 GB answered `201` with an empty
+body and read back within 10 seconds. The 80,000 in that message is not the
+16,000 gp3 maximum in the table above, which comes from the docs.
+
 Modification quota measured: 429 `Database disk can only be modified
 once per four hours. Last modified at <UTC>`, where the docs say "four
 modifications within a rolling 24-hour window".[^sb-db-size] One run also accepted 5 consecutive increases in
 one burst, so enforcement was nondeterministic across runs; plan for a
-cooldown that can fire on the second change, and raise the disk
-before bulk imports bigger than ~1.5x the current database size. HTTP 429 is also the Management API's general rate-limit signal -
+cooldown that can fire on the second change, and raise the disk before a
+bulk import that would take the volume past 90%. HTTP 429 is also the Management API's general rate-limit signal -
 a separate mechanism from this quota; its budget and back-off are worked
 through in [the Management API
 guide](/guides/supabase-platform-management-api/).
@@ -279,7 +308,28 @@ recovery required DELETE (TRUNCATE was rejected) or the override GUC
 `set default_transaction_read_only = 'off'` once below the
 threshold.[^sb-db-size]
 
-Paid plans: docs trigger at 95% disk util (not run here).[^sb-db-size]
+Paid plans (Pro, D10, measured): read-only at ~95% disk util as
+documented,[^sb-db-size] with the same `25006` error, `GET /readonly`
+reading `{"enabled":true}`, and about three minutes of `57P03 the database
+system is not accepting connections` before it. Autoscale grew the disk about
+four minutes after the trip, and read-write came back by itself once the grow
+landed, without a Postgres restart.
+
+The documented ">1.5x the current size" import rule[^sb-db-size] did not
+fire as written: 385 MB loaded onto a 203 MB database (1.90x) in 26 seconds
+was accepted with read-only off. The trigger is disk utilisation; the ratio
+matters only when it pushes utilisation over the line.
+
+Read-only is not guaranteed to come first. With autoscale's grow already
+spent (a manual POST answering the four-hour 429), a burst of 100 MB every
+6 seconds crossed the 90-95% band between two five-minute util samples. In
+one run it failed on `ERROR: 53100: could not extend file ...: No space left
+on device`; every query then answered `57P03` for seven minutes and Postgres
+restarted, while `GET /projects/{ref}` read `ACTIVE_HEALTHY` throughout. The
+reproduction run at the same rate got read-only at 95.1% instead and was
+writable again 492 seconds later, also after a restart. In both, autoscale
+grew the disk 8 GB -> 12 GB and the project came back read-write with nothing
+done by the caller.
 
 ### Disk IOPS/throughput gate (dashboard-only)
 
@@ -307,10 +357,12 @@ and the
 [instance-sizing RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/d386347/experiments/instance-sizing/RUNLOG.md).
 A line marked "docs" or "design choice" is not a measurement.
 
-- **Expand the disk before a bulk import**: measure; if the import is larger than ~1.5x the
-  current database size, expand the disk manually first (single POST), or the
-  quota kills it mid-import and read-only follows. Then re-check the
-  quota status before a second attempt (D03 quota; D06 read-only).
+- **Expand the disk before a bulk import**: size the import against free
+  disk (data + WAL + system), not against database size. If it would take the
+  volume past 90%, expand manually first (single POST). A fast import outruns
+  the five-minute util sample and autoscale, and after autoscale has grown the
+  disk once it ended in a full disk and an outage in one run of two. Then
+  re-check the quota before a second attempt (D03 quota; D10 fill).
 - **Schedule the next disk change from the 429 body**: once the quota
   fires, its message carries `Last modified at <UTC>`, so parse the timestamp and schedule
   from it rather than re-trying blind (D03).
@@ -344,7 +396,14 @@ A line marked "docs" or "design choice" is not a measurement.
   `/config/disk/util` answers on Free (D05) if you also want the disk
   figure.
 - **Verify a fresh project's disk with `GET /config/disk`** before relying
-  on the documented baseline: Free started at 2 GB, not 1 GB (D05).
+  on the documented baseline: Free started at 2 GB, not 1 GB (D05), and Pro
+  started at 2 GB, not 8 GB (D10). The first manual grow from there is 6 GB
+  (D11).
+- **Watch database health, not project status, during a disk event**: the
+  project read `ACTIVE_HEALTHY` through a seven-minute full-disk outage
+  (D10). Probe with a query.
+- **Count WAL when alerting on a small volume**: `pg_wal` held about half
+  of a 2 GB disk under bulk load (D10).
 - **Raise IOPS on a Micro via the API only if you accept the bill**: the
   POST was accepted and applied on Micro, and IOPS billing starts
   regardless of the dashboard's Large-only text (D08). Whether IO
@@ -352,7 +411,7 @@ A line marked "docs" or "design choice" is not a measurement.
 - **Size on CPU and IO burn**: CPU utilisation + `Disk IO % consumed` (the
   burst-budget drain metric: >0 means past baseline). Over it ->
   upgrade.[^sb-compute] (docs)
-- **Pin autoscale settings outside the API**: they cannot be observed or set via API, and the disk
+- **Pin autoscale settings outside the API**: the API reads them as nulls and cannot set them, and the disk
   write returns 201 while ignoring the keys - so do not treat a 2xx there as a
   cap being applied. Pin their intended state in IaC and audit the dashboard
   manually (D04, D07). If you bill on provisioned capacity, poll
@@ -360,8 +419,9 @@ A line marked "docs" or "design choice" is not a measurement.
   once approved; that schedules the charge but does not stop
   autoscale firing between polls.
 
-Not measured: paid-plan read-only at 95% disk; autoscale firing on any
-plan (D05 saw it not fire on Free); resize windows above Large or from a
+Not measured: recovery from paid-plan read-only by freeing space under the
+override GUC (every refusal in D10 was cleared by autoscale first); autoscale
+on Team or the platform plan; resize windows above Large or from a
 non-local vantage; whether the D09 REST gaps are per-client or
 per-vantage; the disk quota's determinism (D03 varied run to run).
 
@@ -372,12 +432,16 @@ per-vantage; the disk quota's determinism (D03 varied run to run).
 | read-only at 500 MB database (Free) | read-only at ~726 MB, reads survive | docs stale |
 | 4 modifications / 24 h | 429 once/4h, nondeterministic | docs text differs, quota exists |
 | Free disk starts 1 GB | started 2 GB | docs understate |
+| autoscale "increases the disk by 50%" (docs and email) | first grow 2 -> 8 GB, then 8 -> 12 GB | first step differs |
+| read-only at 95% protects the disk | true when the fill is slow; a fast burst after a spent grow hit `53100` disk full and a 7 min outage in one run of two | gap in the guarantee |
+| import >1.5x current size trips read-only | 1.90x accepted, read-only off | rule does not hold as written |
+| gp3 max IOPS 16,000 | API message: 500 per GB or 80,000 | docs and API disagree |
 | Large-only for IOPS/throughput | accepted + applied on Micro | UI-only gate |
 | autoscale config via API | verbs 404; GET empty or all-null; `POST /config/disk` takes the keys, returns 201, applies nothing | surface gap, and it fails silently |
 
 Each measured row above comes from the
 [supabase-lab](https://github.com/erfianugrah/supabase-lab) pvlab harness,
-module ids D01-D09 under
+module ids D01-D09 (2026-08-19) and D10-D11 (2026-10-01) under
 [experiments/compute-disk](https://github.com/erfianugrah/supabase-lab/tree/0769afb/experiments/compute-disk),
 2026-08-19, and re-runs are driven from the experiment's probe scripts -
 the full run log is
@@ -408,7 +472,7 @@ the documented and not-run rows rest on the cited pages only.
 | Per-size pg floors: Micro max_connections 60, wal senders 10, rep slots 10; Small 90 / 10 / 10 | measured | [D01](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/compute-disk/tests/d01-compute-pg-limits.ts) - pg_settings read on a Pro org, resize to Small, re-read |
 | Disk decrease refused (HTTP 400); increase accepted (HTTP 201) | measured | [D02](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/compute-disk/tests/d02-disk-mutations.ts) - attribute mutations on a fresh Pro project |
 | Modification quota: 429 "once per four hours"; a 5-mod burst accepted in one run | measured | [D03](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/compute-disk/tests/d02-disk-mutations.ts) - serial +1 GB increases until one rejected |
-| Autoscale on a Pro org: GET empty shape, PUT/POST/PATCH 404 | measured | [D04](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/compute-disk/tests/d04-autoscale-surface.ts) - verb probes against the autoscale endpoint |
+| Autoscale on a Pro org: GET all-null, PUT/POST/PATCH 404 | measured | [D04](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/compute-disk/tests/d04-autoscale-surface.ts) - verb probes against the autoscale endpoint |
 | Free-org baseline disk 2 GB (docs: 1 GB); no growth at 90%+ through a fill | measured | [D05](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/compute-disk/tests/d05-free-org-autoscale-readonly.ts) - continuous fill on a Free project |
 | Free read-only at ~726 MB database size (docs: 500 MB); reads kept answering; TRUNCATE rejected, DELETE required for recovery | measured | [D06](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/compute-disk/tests/d05-free-org-autoscale-readonly.ts) - write rejection, endpoint SELECT, and recovery in the same fill run |
 | Autoscale gap identical on a Team org | measured | [D07](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/compute-disk/tests/d04-autoscale-surface.ts) - the same verb probes as [D04](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/compute-disk/tests/d04-autoscale-surface.ts) |
@@ -418,8 +482,12 @@ the documented and not-run rows rest on the cited pages only.
 | Legacy free-era paused project on a Pro org: wake ~30 min, then `400 Project is not free-tier` on pause | measured | instance-sizing [I03](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/instance-sizing/tests/i03-legacy-pause-lifecycle.ts), 2026-08-18 |
 | `platform`-plan org creates Nano by default (224 MB `shared_buffers`), and it can pause | measured elsewhere | sfp-platforms [S01](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/sfp-platforms/tests/s01-entitlement-sweep.ts) via the instance-sizing addendum, 2026-08-24/25 |
 | Per-size price, IO ceiling, and pg ceiling tables, incl. 24XL/48XL at 3,750 / 5,000 MB/s baseline | documented | not run; cited to the Compute and Disk page |
-| Disk autoscale defaults: 90% trigger, 50% growth, 1 GB minimum, 8 GB maximum | documented | not run; cited to the Database Size page |
-| Paid-plan read-only at 95% disk util | not run | cited to the Database Size page; not run here |
+| Disk autoscale defaults: 1 GB minimum, 8 GB maximum with spend cap | documented | not run; cited to the Database Size page |
+| Pro starts on 2 GB; autoscale fires at ~90% util: 2 -> 8 GB, then 8 -> 12 GB; not bound by the manual 4 h cooldown | measured | [D10](https://github.com/erfianugrah/supabase-lab/blob/afe770d/experiments/compute-disk/tests/d10-paid-fill-readonly.ts) - paced fill with a fresh util sample per batch, then a burst |
+| Paid-plan read-only at ~95% (`25006`), lifted automatically after the grow | measured | [D10](https://github.com/erfianugrah/supabase-lab/blob/afe770d/experiments/compute-disk/tests/d10-paid-fill-readonly.ts) run 1 - unpaced fill on a 2 GB Pro project, recorded in the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/afe770d/experiments/compute-disk/RUNLOG.md) |
+| 1.90x import onto a 203 MB db: no read-only | measured | [D10a](https://github.com/erfianugrah/supabase-lab/blob/afe770d/experiments/compute-disk/tests/d10-paid-fill-readonly.ts) - seed then back-to-back burst |
+| Burst after a spent grow: `53100` disk full and a 7 min `57P03` outage with status healthy (1 of 2 runs); read-only at 95.1%, writable after 492 s (the other) | measured | [D10c/D10d](https://github.com/erfianugrah/supabase-lab/blob/afe770d/experiments/compute-disk/tests/d10-paid-fill-readonly.ts) - burst with the manual POST answering 429, then hands-off recovery poll |
+| Grow from 2 GB: 4/5 GB `400` on the gp3 IOPS floor, 6 GB `201` | measured | D11 - curl replay, recorded in the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/afe770d/experiments/compute-disk/RUNLOG.md) |
 
 ## Modules
 
@@ -436,6 +504,8 @@ the documented and not-run rows rest on the cited pages only.
 | D07 | compute-disk | [`d04-autoscale-surface.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/compute-disk/tests/d04-autoscale-surface.ts) | none published |
 | D08 | compute-disk | [`d08-storage-type-gate.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/compute-disk/tests/d08-storage-type-gate.ts) | none published |
 | D09 | compute-disk | [`d09-compute-resize-timing.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/compute-disk/tests/d09-compute-resize-timing.ts) | none published |
+| D10 | compute-disk | [`d10-paid-fill-readonly.ts`](https://github.com/erfianugrah/supabase-lab/blob/afe770d/experiments/compute-disk/tests/d10-paid-fill-readonly.ts) | none published |
+| D11 | compute-disk | curl replay ([RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/afe770d/experiments/compute-disk/RUNLOG.md), 2026-10-01) | none published |
 | I01 | instance-sizing | [`i01-nano-availability.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/instance-sizing/tests/i01-nano-availability.ts) | none published |
 | I03 | instance-sizing | [`i03-legacy-pause-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/instance-sizing/tests/i03-legacy-pause-lifecycle.ts) | none published |
 | I04 | instance-sizing | [`i04-free-org.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/instance-sizing/tests/i04-free-org.ts) | none published |
