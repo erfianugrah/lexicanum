@@ -1,0 +1,333 @@
+---
+title: "pgmig: what a logical-replication move carries, and the gates around it"
+description: The scope of a Postgres-to-Postgres logical replication migration - table rows replicate, everything else is a pre-step (roles, extensions, schema, the auth.users FK trap) - plus why sequences need a resync at cutover, the write-stop and lag-drain gates, the chunked-checksum reconcile that proves the copy, and the separate pg_upgrade rehearsal lab.
+author: "Erfi Anugrah"
+category: supabase
+group: migrations
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+pgmig is a Postgres-to-Postgres migrator built on native logical
+replication[^pg-logical], published at
+[github.com/erfianugrah/pgmig](https://github.com/erfianugrah/pgmig).[^pgmig-repo]
+It creates a publication on the source, a subscription on the target, streams the
+initial copy and the ongoing changes, checksums the two sides, and stops the world
+for the few seconds it takes to drain lag, resync sequences, and drop the
+subscription.[^pgmig-readme] This page is the reference for the tool's own
+decisions: what the replication carries, what the schema pre-step has to restore
+first, where the cutover gates sit, how the reconcile proves the copy, and what
+the separate `pg_upgrade` rehearsal lab does.
+
+The two task-sequenced guides are the implementation of this page:
+[moving a project to another region](/guides/supabase-region-migration-e2e/)
+runs the pipeline cross-region,[^region-guide] and
+[upgrading to a new Postgres major version](/guides/supabase-postgres-major-upgrade-e2e/)
+runs it into a new PG 17 project or rehearses the upgrade in the lab.[^upgrade-guide]
+
+Naming: the tool is `pgmig` now, was `sbshift` until 2026-09-28, and was `pgshift`
+before the 2026-07-03 rename recorded in `CHANGELOG.md`. Older notes that say
+either name are the same program.
+
+Provenance: this page describes documented behaviour - the repository's `README.md`,
+`docs/RUNBOOK.md`, `docs/MIGRATION-SCOPE.md`, `CHANGELOG.md` and `src/cli.ts` at
+commit [`ba5f88c`](https://github.com/erfianugrah/pgmig/tree/ba5f88c) - plus the
+live cross-region measurements published in the two companion guides and their
+supabase-lab modules (W05, W09, W14, W15). Nothing here was re-run for this page;
+the evidence table at the end splits documented from measured.
+
+**TL;DR**
+
+- **Logical replication carries table rows and nothing else.** No DDL, no roles,
+  no extensions, no sequences, no `auth`/`storage` schemas. The schema pre-step
+  (`bootstrap`) restores the first three; the rest is a documented hand-off
+  (RUNBOOK section 6).
+- **The `auth.users` FK is what breaks the copy if you skip the pre-step.** A
+  `public.<table>.user_id` reference into `auth.users` rejects every child row
+  until the referenced auth rows exist on the target.
+- **Sequences do not replicate, so `cutover` `setval()`s every owned sequence
+  from the write-stopped source.** Without it the next serial or IDENTITY insert
+  collides with a replicated primary key. It is a no-op on uuid and text keys.
+- **The gates are a lag drain to zero, a clean chunked checksum, and a
+  quiescent source.** `watch` aborts on WAL bloat or a lost slot on its own; the
+  lag gate refuses to close if writes are still arriving.
+- **The point of no return is repointing the app, not the cutover.** Before it,
+  `teardown` plus re-enabled source writes is lossless. After it, rollback loses
+  every write the target took unless reverse replication was set up first.
+- **`pg_upgrade` rehearsal is a separate workflow.** It needs no
+  `migrate.config.yaml` and no billable project: it captures the source, times a
+  real `pg_upgrade --link` in Docker, and proves the result identical with the
+  same checksum engine `reconcile` uses.
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  app [label="app writes\nstopped at cutover"];
+  source [label="source\npublication + slot"];
+  target [label="target\nsubscription"];
+  pre [label="bootstrap pre-step\nroles, extensions,\nschema, auth rows"];
+  app -> source;
+  source -> target [label="initial copy + WAL stream"];
+  pre -> target [label="before replicate"];
+  target -> app [label="repoint after cutover"];
+}
+```
+
+Text fallback, the same pipeline in order:
+
+1. `bootstrap` restores roles, extensions and schema onto the target, and with
+   `--with-auth-data` the `auth` rows the FKs need.
+2. `replicate` creates the publication, the slot and the subscription
+   (`copy_data=true`), so the initial copy starts against a schema that already
+   exists.
+3. `watch` polls until every table is `srsubstate='r'` and aborts if the slot or
+   the WAL watchdog trips.
+4. The app stops writing to the source.
+5. `reconcile` checksums both sides; `cutover` drains lag, resyncs sequences and
+   drops the subscription.
+6. The app is repointed at the target. The source is never written to again.
+
+## Which move is this
+
+| Move | Downtime | Reconfiguration after | Pick when |
+|---|---|---|---|
+| Logical replication (pgmig) | the lag drain, seconds | new project: new ref, new API keys, new JWT secret, the whole non-data surface | the downtime budget is smaller than a dump-and-restore window, or the move doubles as a region change |
+| Dump and restore | the copy time | same new-project list | the database is small, or the pipeline is not worth rehearsing |
+| Supabase clone (Restore to a new project) | the restore window | same new-project list, minus storage bytes | rehearsal, not a migration - the clone is a copy of a backup |
+| `pg_upgrade` rehearsal lab | n/a - rehearsal only | n/a | you want the blocker audit and a downtime estimate without creating a billable project |
+
+Logical replication is the only one of the four that needs the target to exist
+with a loadable schema *before* the copy starts, which is why the pre-step is a
+first-class command rather than a suggestion.
+
+## What replicates, and what the pre-step carries
+
+| Artifact | Carrier | Note |
+|---|---|---|
+| Table rows and the changes to them | `replicate` + `watch` | the only thing logical replication carries |
+| Schema: tables, views, functions, triggers, RLS policies | `bootstrap` | pre-step; for a Supabase source it excludes the roughly 27 managed schemas and filters the cluster-level objects a plain dump still emits |
+| Roles and permissions | `bootstrap` | `pg_dumpall --roles-only --no-role-passwords`, so custom LOGIN roles arrive without passwords |
+| Extensions | `bootstrap` | enabled on the target before the schema load; `doctor` diffs the two sides and prints the `CREATE EXTENSION` statements still missing |
+| `auth` row data | `bootstrap --with-auth-data`, or a manual dump/restore | the `auth.users` FK pre-step; `auth.schema_migrations` is excluded because the target carries its own ledger |
+| Sequences | schema DDL for the object, `cutover` for the value | values do not replicate; a no-op for uuid and text primary keys |
+| Generated columns (for example a STORED `tsvector`) | recomputed on the subscriber | excluded from the reconcile hash, because hashing them reports a mismatch that is not one |
+| Project config, integration secrets, billable infra, Edge Functions, storage objects | `config-sync`, `provision`, `functions`, `storage` | a separate surface from the data plane; the JWT signing secret and API keys are never copied |
+| Org settings, org members and roles, entitlements | nothing | read-only on the Management API; the only org-level action is claiming a project into another org |
+| Read replicas, custom domains, realtime publications, custom role passwords | hand work | no clean API path; recreate or re-enter after cutover |
+
+The exhaustive version of this table, including every dashboard surface and its
+API endpoint, is the repository's `MIGRATION-SCOPE.md`.[^pgmig-scope]
+
+<Aside type="caution" title="The copy fails row by row, not loudly">
+
+Every FK from a replicated table into `auth.users` is checked on the target at
+insert time. If the referenced auth rows are not there yet, the initial copy
+rejects those child rows and the failure surfaces as a table that never reaches
+`srsubstate='r'`, not as a preflight error. `doctor` flags any cross-schema FK
+before you start; `bootstrap --with-auth-data` is the fix.
+
+</Aside>
+
+## The pipeline
+
+| Command | What it does | Gate behaviour |
+|---|---|---|
+| `doctor` | Readiness report: connection shape, versions, `wal_level`, replica identity, extension diff, cross-schema FKs, foreign slots, SQL-level GUC overrides | read-only; `--source-only` for before the target exists |
+| `bootstrap` | Target preparation: extensions, roles, schema, optionally auth rows | preview by default; `--confirm` mutates |
+| `preflight` | Hard-gate checks: `CREATE SUBSCRIPTION` grant, replication capacity, a replica identity on every published table | fails closed |
+| `replicate` | Empty publication plus `ADD TABLE` (never `FOR ALL TABLES`, which needs superuser), slot, subscription with `copy_data=true` | re-running issues `REFRESH PUBLICATION` for a newly added table |
+| `watch` | Polls `pg_subscription_rel` until every table is `r`, with live copy percentage | aborts on retained WAL over the watchdog threshold, slot `wal_status='lost'`, or rising error counts |
+| `reconcile` | Chunked checksum, 256 buckets by default: one scan per side, bucket by primary-key hash, drill only the mismatched buckets | authoritative only after writes stop |
+| `cutover` | Samples WAL LSN twice, drains lag, `setval()`s every owned sequence, drops the subscription | refuses without the writes-stopped assertion on the autonomous path |
+| `teardown` | Drops subscription, slot, publication in that order | idempotent |
+| `verify` | Post-migration advisor health gate on the target | fails closed if the advisors are unreachable |
+
+`run` chains the phases for automation: `run --through reconcile --json` exits 0
+only if preflight, replicate, watch and reconcile all passed, and `status
+--require-synced` is the wait loop for a script that needs the copy ready.
+
+## The schema pre-step
+
+`bootstrap` is the answer to "logical replication carries rows only".[^pgmig-runbook]
+In order:
+
+1. Enable the non-default extensions the source has and the target lacks.
+2. Restore roles from a roles-only dump. Supabase's reserved roles are filtered
+   out the same way `supabase db dump --role-only` filters them, so only your
+   application roles are created - and they arrive with no passwords.
+3. Restore the schema: DDL, RLS policies, functions, triggers.
+4. With `--with-auth-data`, dump and restore the `auth` schema rows with
+   `session_replication_role = replica`, so FK triggers are deferred during the
+   load rather than checked per row. `auth.schema_migrations` is excluded: the
+   managed target grants the `postgres` role SELECT only on it, and it has its
+   own migration history.
+
+The manual equivalent for a non-Supabase pair is a `pg_dumpall --roles-only`
+plus a `pg_dump --schema-only`, restored with `ON_ERROR_STOP=1`, with any
+cross-schema reference data loaded under `session_replication_role = replica`.
+`doctor` gives you the same diff either way.
+
+Two failure modes recur in the window. A part-way `bootstrap` can
+be recovered by running the auth-data dump and restore commands it printed rather
+than re-applying the whole schema, because a re-run re-plans the schema restore
+against tables that now exist. And any custom LOGIN role reaches the target with
+`rolpassword` NULL, so every service using one needs
+`ALTER ROLE <name> WITH PASSWORD '...'` before it is repointed.
+
+## Sequences, and why cutover resyncs them
+
+A sequence is schema, so the pre-step creates it on the target and carries the
+value it held at dump time. Rows inserted on the source between `bootstrap` and
+the write stop replicate with their explicit primary keys, which the sequence on
+the target never sees. The first insert after cutover then picks a value the
+sequence has already handed out, and the primary-key unique index rejects it.
+
+`cutover` closes that gap by resynchronising every sequence owned by a replicated
+column, using the write-stopped source as the authority. Serial and IDENTITY
+columns are covered; uuid and text primary keys have no sequence to resync, so
+the step is a no-op for them. The companion upgrade guide records the check that
+proves it - an insert after cutover returns the next id rather than colliding.
+
+## The cutover gates
+
+The tool owns the data-plane gates; your dashboards own the app-tier ones. Decide
+the app-tier numbers before the window, from a baseline.
+
+| Phase | Data plane (the tool) | App tier (your dashboards) |
+|---|---|---|
+| Initial copy | retained WAL under `watchdog.maxRetainedWalMb`, slot active, `wal_status` still `reserved` or `extended`, apply and sync error counts flat | source CPU, disk IOPS and latency headroom; connections not near saturation |
+| Reconcile | zero mismatched buckets | - |
+| Lag drain | lag reaches 0 inside `--max-lag-wait` (300 s by default), the source WAL reads as quiescent | the app is confirmed read-only or down; no write retries still hitting the source |
+| After the repoint | the cutover log shows a `setval` per sequence | target p95 and p99 within your margin of the baseline, error rate flat, pool not spiking on retries |
+
+The hard stops, in the tool's own words: `watch` aborts on retained WAL over the
+threshold and immediately on `wal_status='lost'`; a lag drain that times out
+means writes were not actually stopped, so do not proceed; any reconcile mismatch
+means the cutover is not finished, whatever the lag says. Those are not advisory.
+
+**Never re-enable writes on the source after the repoint.** Two databases
+accepting writes is split-brain, and nothing in the pipeline reconciles it.
+
+## Reconcile, and why the hash is comparable cross-region
+
+`reconcile` scans each side once, buckets rows by a hash of the primary key,
+and compares bucket checksums. Only the buckets that differ are drilled, and the
+report names the rows as `missing_on_target`, `extra_on_target` or `hash_diff`.
+Full-table mode is available for small tables and is not the default because a
+single aggregate scan of a real database is both slower and less specific about
+where the difference is.
+
+The comparison only works if both sides render the same row values the same way.
+The row hash is taken over the row's text form, which depends on `TimeZone`,
+`DateStyle`, `IntervalStyle`, `extra_float_digits` and `bytea_output`. Every
+connection in both pools therefore pins those settings identically and sets
+`statement_timeout = 0`, so a cross-region run compares values and not two
+machines' display conventions.[^pgmig-skill]
+
+Two consequences: timestamptz comparisons are stable across regions, and a STORED
+generated column has to be excluded from the hash - the subscriber recomputes it,
+and hashing it would report a mismatch on every row that has one.
+
+## The pg_upgrade rehearsal lab
+
+This is a separate workflow from the migration pipeline. It needs no
+`migrate.config.yaml` and no Supabase project, and it exists to put a number on
+the in-place upgrade window before you take one. The underlying step is
+`pg_upgrade --link`.[^pg-upgrade]
+
+| Step | Command | What it produces |
+|---|---|---|
+| Audit | `upgrade doctor --to <version>` | read-only readiness report: extensions deprecated on the target major, `reg*` columns referencing system OIDs, foreign replication slots, roles on md5 password storage, and a downtime estimate from the database size. Exit 1 on a hard blocker |
+| Capture | `upgrade capture --out-dir capture --max-gb <n>` | roles, schema and data dumped locally with a `manifest.json`; refuses to capture past the size limit unless forced; `--with-auth-data` for a Supabase source |
+| Lab | `upgrade lab --capture-dir capture --runs 3 --keep` | starts an old-version and a new-version container, snapshots the old data directory, runs `pg_upgrade --link` N times with a fresh snapshot per run, then `ANALYZE`, and prints the timings. `--keep` leaves both containers up for the verify step; `--seed-gib` inserts fixture data instead of real data; `--prod-bytes` extrapolates the production window |
+| Verify | `upgrade verify` | pre-upgrade copy at `SOURCE_DB_URL` against the upgraded cluster at `TARGET_DB_URL`, through the same chunked-checksum reconcile, plus extension versions, auth schema sanity and md5-role status. Exit 0 only when the data is identical |
+
+The lab is the only phase that needs Docker; the audit and the capture run
+anywhere `psql` does. Because verify is the reconcile engine, a pass there means
+the same thing a pass before cutover means - the two sides checksum identical
+under the same GUC pinning.
+
+## Rollback, by phase
+
+| Phase | Position | What rollback costs |
+|---|---|---|
+| A: before writes stop | the source has served continuously, the target is a throwaway | free: `teardown` removes the replication objects and the source is untouched |
+| B: writes stopped, app not repointed | the target has taken no application writes | still lossless: `teardown`, then re-enable writes on the source and bring the app up unchanged |
+| C: app repointed | the target is authoritative and nothing streams back | roll forward, accept the loss window and re-apply it by hand, or use the reverse path below. Re-enabling writes on both sides is split-brain |
+
+Reverse replication keeps phase C lossless. It is a second config with the source
+and target swapped, distinct slot, publication and subscription names, and
+`copyData: false` - the data already matches, so only new changes stream back.
+Set it up after `reconcile` passes and before the repoint; roll back inside the
+window by stopping writes on the target, draining the reverse lag, repointing at
+the source, and tearing down both directions. It is not active-active: only one
+side ever takes application writes.
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  q [label="what is being moved?"];
+  data [label="rows, into an\nexisting schema"];
+  all [label="a whole project\nto another region"];
+  ver [label="a Postgres major\nversion, in place"];
+  rep [label="replicate -> watch\n-> reconcile -> cutover"];
+  pre [label="bootstrap first,\nthen replicate"];
+  lab [label="upgrade doctor ->\ncapture -> lab -> verify"];
+  q -> data [label="same schema"];
+  q -> all [label="new project"];
+  q -> ver [label="no new project"];
+  data -> rep;
+  all -> pre -> rep;
+  ver -> lab;
+}
+```
+
+Text fallback:
+
+1. A Postgres major-version change in place, no new project - the `pg_upgrade`
+   rehearsal lab, then the upgrade itself.
+2. A whole project to another region or a new major version as a new project -
+   `bootstrap` first, then the replication pipeline; this is the region guide.
+3. Data only, into a schema you already created and control - `replicate` onward,
+   with the pre-step done by your own tooling.
+4. Small database, downtime acceptable - dump and restore, and skip the pipeline.
+
+## Evidence
+
+| Claim | How it was checked |
+|---|---|
+| Logical replication carries rows, not DDL, roles, extensions or sequences | Postgres logical replication documentation, and pgmig's own scope document (`MIGRATION-SCOPE.md`, commit `ba5f88c`) |
+| `bootstrap` restores extensions, roles and schema, and `--with-auth-data` adds the `auth` rows with FK triggers deferred | pgmig `README.md` and `docs/RUNBOOK.md` section 6 (documented procedure); exercised live on 2026-07-30 per the region guide's measured run |
+| `auth.schema_migrations` is SELECT-only for the `postgres` role on a managed target | RUNBOOK section 6, recorded as verified 2026-07-30; reproduced in the upgrade guide's gotchas |
+| A sequence collision follows a skipped resync, and `cutover` closes it | The companion upgrade guide's sequence check (an insert after cutover returns the next id after 300 seeded rows) |
+| `watch` aborts on the WAL watchdog and on `wal_status='lost'` | pgmig `README.md` command table and the scale harness's `WATCHDOG_FIRE=1` negative mode, which exits non-zero if the abort does not fire |
+| A write that continues through cutover makes the lag gate fail | The scale harness's `WRITE_THROUGH_CUTOVER=1` mode, which asserts the `lag did not drain` failure |
+| A STORED generated column is the initial-copy bottleneck | pgmig's large-scale rehearsal, reported in `README.md` and repeated in the companion upgrade guide (about 7x slower copy) |
+| Cross-region row hashes match only because the GUCs are pinned | pgmig `skills/pgmig/SKILL.md` and the reconcile implementation; the cross-region pass itself is the region guide's measured run |
+| DDL on the source stalls the stream until the same DDL is applied on the target | supabase-lab W15, cited in both companion guides (about 6.1 s to resume with backfill) |
+
+The rollout mechanics that vary by environment - how long a paused source stays
+useful, the watchdog threshold, whether to match target compute with `provision` -
+are operator decisions in the RUNBOOK. No run set them.
+
+## References
+
+[^pgmig-repo]: pgmig, "Postgres-to-Postgres logical-replication migrator," GitHub. https://github.com/erfianugrah/pgmig
+[^pgmig-readme]: pgmig, "README," GitHub, commit `ba5f88c`. https://github.com/erfianugrah/pgmig/blob/ba5f88c/README.md
+[^pgmig-runbook]: pgmig, "docs/RUNBOOK.md," GitHub, commit `ba5f88c`. https://github.com/erfianugrah/pgmig/blob/ba5f88c/docs/RUNBOOK.md
+[^pgmig-scope]: pgmig, "docs/MIGRATION-SCOPE.md," GitHub, commit `ba5f88c`. https://github.com/erfianugrah/pgmig/blob/ba5f88c/docs/MIGRATION-SCOPE.md
+[^pgmig-skill]: pgmig, "skills/pgmig/SKILL.md," GitHub, commit `ba5f88c`. https://github.com/erfianugrah/pgmig/blob/ba5f88c/skills/pgmig/SKILL.md
+[^pg-logical]: PostgreSQL Global Development Group, "Logical replication," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/current/logical-replication.html
+[^pg-upgrade]: PostgreSQL Global Development Group, "pg_upgrade," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/current/pgupgrade.html
+[^region-guide]: Anugrah, "Migrate a Supabase project to another region, end to end." https://erfi.dev/guides/supabase-region-migration-e2e/
+[^upgrade-guide]: Anugrah, "Upgrade a Supabase project to a new Postgres major version, end to end." https://erfi.dev/guides/supabase-postgres-major-upgrade-e2e/
