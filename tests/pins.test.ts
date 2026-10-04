@@ -1020,6 +1020,11 @@ const pins: Pin[] = [
       "by reload or by restart",
       // S18: the trail is the logs endpoint, not the admin audit table.
       "returned 200 with 0 entries",
+      // A01d plus A03b/A03c (2026-09-08): the default statement class is
+      // `ddl`, so the deletion of an audit row is not itself logged - and
+      // pgaudit is an install, not a toggle. Both halves are load-bearing.
+      "17.1 available to install",
+      "in a 191 s search",
     ],
     mustNotContain: [
       // S19 drove HIBP at signup; the old hedge must not return.
@@ -1072,6 +1077,11 @@ const pins: Pin[] = [
       // page then quoted 1800/hour, and the run did not settle which unit the
       // field carries.
       "agree only if the field is per five minutes rather than per hour",
+      // identity-transfer ITL1b (2026-09-11): the lookup reads the
+      // `provider_id` column and not the JSON copy, which is what makes the
+      // one-column remap safe to publish.
+      "The column is what the lookup reads",
+      "provider_email_needs_verification",
     ],
     mustNotContain: [
       // The retracted claim.
@@ -1603,6 +1613,38 @@ const pins: Pin[] = [
     ],
     sections: [/^## Verification$/m, /^## Gotchas and lessons learned$/m],
     linksTo: [AGENTGUARD, SECRETCTL, SECRETCTL_ROTATION, "reference/nixos-fleet"],
+  },
+  {
+    doc: PLATFORM_MGMT,
+    mustContain: [
+      // Z01 (2026-09-09): the parked-project sweep answers empty `200`s on
+      // three project-scoped reads, so a status-code sweep reports parked
+      // tenants healthy. The count is three, not the four the first pass
+      // listed - `/advisors/security` is empty on a fresh project too.
+      "scores every parked tenant clean",
+      "and is not one - a fresh project's lint list is empty awake as well",
+      "/advisors/security` looks like a",
+      // The auto-pause arm is untestable on the staging control plane, which
+      // is the reason Z04 cannot fire; losing this line sends the next reader
+      // back to staging to re-learn it.
+      "never exercised auto-pause",
+      // The hibernation arm returned a null, not a pending result.
+      "Hibernation was not reachable on any account available here",
+    ],
+    sections: [/^## 8\. Gotchas and lessons learned$/m, /^## Verified \/ tested$/m],
+  },
+  {
+    doc: "reference/supabase-branching-two-projects-one-repo",
+    mustContain: [
+      // MS15d (2026-09-30): a merge is accepted and applies nothing without
+      // migration files. The tempting softening is "the branch merges its
+      // schema", which is exactly what the run rules out.
+      "applies nothing when there are no migration\nfiles",
+      "Cannot delete persistent branch.",
+      // The push timing is the one number that makes the branch a usable
+      // staging database, and the only figure a rewrite tends to drop.
+      "14859 ms",
+    ],
   },
 ];
 
