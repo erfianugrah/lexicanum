@@ -292,6 +292,10 @@ const pins: Pin[] = [
     ],
     sections: [/^#{2,3} .*Verification/m, /^#{2,3} .*Gotchas/m],
     anchors: [
+      "path-b-cut-over-to-a-new-pg-17-project-with-pgmig",
+      "optional-rehearse-pg_upgrade-itself-in-docker-pgmig-upgrade-lab",
+      // Pre-rename slugs (sbshift -> pgmig, 2026-09-28), kept as explicit
+      // <a id> anchors so links made before the rename still land.
       "path-b-cut-over-to-a-new-pg-17-project-with-sbshift",
       "optional-rehearse-pg_upgrade-itself-in-docker-sbshift-upgrade-lab",
       "measured-run-2026-07-30",
@@ -306,7 +310,7 @@ const pins: Pin[] = [
       "what-carries-over-and-what-does-not",
     ],
     linksTo: [REGION],
-    htmlContains: ["Manual checklist", "UI / API", "sbshift", "https://github.com/erfianugrah/sbshift"],
+    htmlContains: ["Manual checklist", "UI / API", "pgmig", "https://github.com/erfianugrah/pgmig"],
   },
   {
     doc: REGION,
