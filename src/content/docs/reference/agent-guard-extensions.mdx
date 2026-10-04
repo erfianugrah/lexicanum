@@ -1,0 +1,400 @@
+---
+title: Guard extensions that enforce prose and process rules in a coding agent
+description: "Six harness extensions that turn written rules into mechanical enforcement at the tool call: a provenance gate for unverified specifics, blockers for AI prose tells and mojibake-prone punctuation, a user-confirmed confidential-identifier guard, a confirmation gate on mutating git and gh commands, and a guard that surfaces a child repo's AGENTS.md on first cd - plus the 2026-08-27 stow-link incident, where a written, tested and committed guard could not load because nothing symlinked it into the live config."
+author: Erfi Anugrah
+category: workstations
+---
+
+A system-prompt rule is read once, at session start, by the same model that
+will later ignore it under pressure. Every process rule that matters on this
+fleet eventually gets a second existence as code: a harness extension that
+hooks the tool call and blocks, prompts or annotates when the rule is about
+to be broken. This page describes six of those guards - what each catches,
+how it decides, its kill switch, and the failure that made it exist - and
+the stow-link incident that turned "it will load after a restart" into a
+banned claim. It is the sibling of [Keeping credentials out of coding-agent
+transcripts](/reference/agent-secret-guard/), which covers the secret layer;
+this page covers everything else the harness enforces, and does not restate
+that page's registry design or its numbers.
+
+Everything below was read on 2026-10-04 from the extension sources and their
+headers in the dotfiles repo (`.pi/agent/extensions/` and
+`.pi/agent/extensions/lib/`), the repo's AGENTS.md, and the epistemics
+skill. The dotfiles repo is private, so file names and commit subjects are
+cited as text rather than links.
+
+## TL;DR
+
+- A rule the model can forget is enforced at the tool call instead. Each
+  guard is a small TypeScript extension: a pure, harness-agnostic core in
+  `lib/*-core.ts` (no harness imports) plus a thin adapter per harness, so a
+  rule cannot exist in one harness and not the other.
+- The pi harness's `tool_call` hook can only block a call, not rewrite it,
+  and it short-circuits remaining handlers on the first block. Two design
+  consequences follow: block reasons must tell the agent exactly how to
+  resubmit, and guards that can block the same compound command share state
+  so the agent is not blocked twice.
+- `epistemic-guard` treats the session itself as a provenance corpus: a
+  version, flag, path, URL, CVE or number that appears in the agent's output
+  but in no tool result is recalled from training, and a write carrying one
+  is blocked.
+- `ai-tell-guard` and `ascii-punctuation-guard` guard what prose persists:
+  the sentence shapes readers pattern-match as generated, and the smart
+  punctuation that mis-decodes when pasted into a non-UTF-8 composer.
+- `confidential-write-guard` has no denylist to lean on: the agent is the
+  classifier, the user's answer is recorded as a block or allow decision,
+  and blocked terms are then enforced deterministically.
+- `git-gh-gate` prompts before any mutating git/gh command and always
+  refuses one in a background job, and `cd-agents-reload` surfaces a child
+  repo's AGENTS.md the first time the agent `cd`s into it.
+- On 2026-08-27 a guard was written, unit-tested, committed and documented
+  but never stow-linked, so no restart could ever load it. The drift check
+  now treats an unlinked file in a loader-scanned tree as fatal, and
+  start-time config is verified in a fresh process, not assumed.
+
+## The shared shape
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  call [label="tool call\n(write / edit / apply_patch / bash)"];
+  subgraph cluster_guards {
+    label="tool_call gates - first block wins";
+    gitgh [label="git-gh-gate\nprompt on mutating git/gh\nblock in bg_bash / no UI"];
+    cdreload [label="cd-agents-reload\nsurface AGENTS.md on first cd"];
+    confidential [label="confidential-write-guard\nblock user-blocked terms\nnudge to ask once per repo"];
+    ascii [label="ascii-punctuation-guard\nblock smart punctuation"];
+    aitell [label="ai-tell-guard\nblock AI prose tells"];
+    epistemic [label="epistemic-guard\nblock unprovenanced specifics"];
+  }
+  run [label="tool runs"];
+  msg [label="message_end hook\nepistemic-guard footer\n(non-blocking annotation)"];
+
+  call -> gitgh; call -> cdreload; call -> confidential;
+  call -> ascii; call -> aitell; call -> epistemic;
+  gitgh -> run; cdreload -> run; confidential -> run;
+  ascii -> run; aitell -> run; epistemic -> run;
+  run -> msg [style=dashed];
+}
+```
+
+In words:
+
+1. Every guard lives in the harness's extension directory, stow-linked into
+   the live config. Each is a default-exported function that receives the
+   extension API, registers a `tool_call` handler, and returns
+   `{ block: true, reason }` to stop the call or nothing to let it through.
+2. The detection logic is pure: `lib/epistemic-guard-core.ts`,
+   `lib/ai-tell-core.ts`, `lib/ascii-core.ts`,
+   `lib/confidential-write-guard-core.ts`, `lib/git-gh-gate-core.ts` and
+   `lib/cd-agents-reload-core.ts` import nothing from either harness and are
+   shared verbatim between the pi adapter and the Claude Code hook, which
+   runs the same checks as PreToolUse. Only the hook mechanics differ: pi's
+   hook can only block, so a blocked write is resubmitted by the agent with
+   the offending text fixed; the Claude Code port of the ASCII guard can
+   rewrite the input in place via `updatedInput` and let the call proceed.
+3. The adapters share one trait that the incident history forced on them:
+   the reason string is the remediation. A block that does not say what
+   matched and what to do instead produces a retry loop, and several of the
+   fixes below are reason-string fixes.
+
+| Guard | Catches | Kill switch |
+|---|---|---|
+| `epistemic-guard` | specifics with no provenance in the session: versions, flags, paths, URLs, CVEs, dates, prices, performance numbers, entity attributions | `PI_EPISTEMIC_GUARD_OFF=1`; `PI_EPISTEMIC_FOOTER_OFF=1` (chat annotation only); `PI_EPISTEMIC_MAX_BLOCKS=0` (observe-only unattended) |
+| `ai-tell-guard` | the high-precision AI prose tells, in prose files and commit messages | `PI_AI_TELL_GUARD_OFF=1` |
+| `ascii-punctuation-guard` | em/en dashes, smart quotes, ellipsis characters in any written payload | `PI_ASCII_GUARD_OFF=1`; `PI_ASCII_GUARD_SCOPE=prose` (prose files only) |
+| `confidential-write-guard` | user-blocked identifiers in writes, commit messages and staged diffs; nudges the ask-loop on first prose write and first commit per repo | `PI_CONFIDENTIAL_GUARD_OFF=1` |
+| `git-gh-gate` | mutating git/gh commands without a human yes; writes to `.git` internals; any mutation in a background job | none by design |
+| `cd-agents-reload` | a `cd` into a repo whose AGENTS.md was never loaded | `PI_NO_CD_AGENTS_RELOAD=1` |
+
+## epistemic-guard: specifics need provenance
+
+**What it catches.** A specific literal in the agent's own output that
+appears in nothing the agent saw this session: a version (`Caddy 2.8.4`), a
+flag (`--dns-01`), a system path, a deep URL, a CVE id, a date, a price, a
+performance number, or an entity attribution. The claim classes are version,
+url, cve, perf, flag, syspath, date, price and entity. A literal with no
+provenance is recalled from training by construction - the one thing the
+"do not be confidently wrong" system-prompt rule asks the model not to
+emit, stated in a form the harness can check.
+
+**How it decides.** The session is the corpus. Every tool result, bash
+output, user message and the system prompt is absorbed into a set of seen
+literals; the set is re-derived from the session manager rather than
+accumulated in-process, so a resumed or forked session inherits its
+provenance. A write, edit, patch or commit message is scanned for claims,
+and each claim is looked up in the corpus. The check is self-healing: the
+moment the agent verifies a claim with any tool, the literal enters the
+corpus and never flags again, so the guard rewards checking rather than
+punishing it. Three surfaces carry the result:
+
+- A `tool_call` gate on write/edit/write_stream/apply_patch and on the
+  message half of a `git commit` / `gh pr` bash command, which blocks and
+  lists the unprovenanced specifics.
+- A `message_end` hook that appends a one-line "recalled, not verified"
+  footer to a final chat answer. Non-blocking; off when there is no UI,
+  where the assistant text is the stdout.
+- A `/epistemics` command reporting corpus size and what has been flagged
+  this session.
+
+Noise control is the part that makes it survivable. Targets are classified:
+prose files get every claim class, code files get only dependency pins and
+CVEs, and scratch paths (`/tmp`, lockfiles, vendored and build directories)
+are skipped. A fenced code block inside a markdown doc is treated as code -
+a `--help` flag in a usage example is an instruction to the shell, not a
+claim about the world. A claim labelled `unverified` or `from memory`
+within 160 characters of itself counts as labelled, and the window is small
+deliberately: the exemption has to cost about as much as verifying, or
+"unverified" becomes a magic word sprinkled once per document. A
+performance number sitting in a because-clause (`shares one link, so it
+caps at ...`) is flagged as derived rather than recalled - a number reasoned
+to is a recalled rule applied without checking its preconditions, and it
+needs a different correction. Unattended runs get a block budget
+(`PI_EPISTEMIC_MAX_BLOCKS`, default 3) because `pi -p` restarts with an
+empty corpus each pass and would otherwise re-block the same specifics
+forever; 0 makes the gate observe-only.
+
+**Motivating failure.** No single incident; the failure shape is named in
+the extension header. The system prompt carries an epistemic-calibration
+section and two skills cover adjacent ground (one for claims about your own
+work, one for external runtime behaviour), and all three are read-time
+guidance. None of them fire at claim time, which is the moment that
+matters: the model states a version, a flag, a path and nothing in the
+harness knows whether it read that or remembered it. The companion
+epistemics skill documents the three honest exits when the guard fires, in
+preference order: verify (one tool call, the intended path), label the
+claim next to the claim, or drop the specific.
+
+## ai-tell-guard: sentence shapes that read as generated
+
+**What it catches.** The highest-precision subset of the AI prose tells:
+negative parallelism (`not just X, but Y`; `isn't about X, it's about Y`;
+the cross-sentence form), the compressed aphorism (`No X, no Y. Just Z.`),
+mystery-tease framing (`hides a classic ...`), importance-announcing
+(`worth noting`, `important to note`), and the slop watchlist words
+(`delve`, `tapestry`, `game-changer`, `stands as a testament`, `nestled`,
+`undergird`). Seven rules, each a regex with a reason string that states
+the fix.
+
+**How it decides.** A `tool_call` gate over write/edit/write_stream/
+apply_patch payloads on prose paths only (`.md`, `.mdx`, `.txt`, `.rst`,
+`.adoc`, `.org`, `.markdown`, anything under a `docs/` directory) plus
+bash commands that write or commit, so a commit message carrying a tell is
+blocked. Precision is the design constraint, and the core header is blunt
+about why: a guard that false-positives gets disabled, and only the shapes
+unambiguous enough to gate are rules. Code spans and double-quoted spans in
+a file are masked before matching, so a doc that quotes a tell as an
+example passes. The fuzzy tells - decorative bold, participle tails,
+triplets, metaphor coherence - stay as guidance in the voice skill rather
+than as gates. The adapter caps blocks at two per rule per session: a
+weaker model that cannot rephrase must not loop forever.
+
+**Motivating failures.** The rule set comes from a 2026-08-27 Reddit thread
+roasting an AI-written post, which itemised the tells readers flag on
+sight; readers pattern-match these instantly and prose carrying them reads
+as generated regardless of who wrote it. The second failure was in the
+guard itself: the bash surface initially reused the file surface's masking,
+and a commit message lives inside the quotes, so masking quoted spans
+blanked the payload. Measured: `git commit -m "not just X, but Y"` scanned
+clean while the single-quoted form was caught - a silent half-dead guard.
+The bash surface now masks code spans only. A third fix narrowed the bash
+trigger to write-ish commands after read-only search commands were blocked
+for carrying a tell as a search pattern.
+
+## ascii-punctuation-guard: mojibake-prone punctuation
+
+**What it catches.** Smart punctuation in any payload the agent writes:
+em/en dashes, curly quotes, the ellipsis character. These are the
+characters that mis-decode as garbage when pasted into a non-UTF-8 web
+composer, so the rule is ASCII equivalents in anything that gets committed
+or copy-pasted.
+
+**How it decides.** Deterministic: a code point either is mojibake-prone or
+it is not, so there is no precision trade-off and no per-rule cap. The
+`tool_call` hook blocks a write/edit/write_stream/apply_patch payload or a
+write-ish bash command (a commit, a heredoc, a `tee`, an append) containing
+one of the characters, and the reason names exactly which characters to
+swap for which ASCII forms; the agent resubmits. Bash that merely prints
+unicode - echoing search results, say - is ignored, because the bash
+trigger matches only commands that write or commit. Chat text is out of
+scope: the harness has no assistant-output hook the guard can use, so the
+prose register there is handled by prompt rules instead.
+
+**Motivating failure.** 2026-06-30: the agent emitted em dashes into a
+GitHub issue draft, and pasted into a web composer they rendered as garbage
+- UTF-8 em-dash bytes mis-decoded as CP437/Latin-1. The user could not
+cleanly copy-paste their own draft.
+
+## confidential-write-guard: novel identifiers out of tracked files
+
+**What it catches.** Confidential third-party identifiers - customer,
+partner or client names, internal program or deal codenames, named
+individuals, unreleased roadmap - in tracked files in a repo with a remote.
+The dangerous case is a novel name appearing for the first time, which no
+denylist can know about, so the design splits the work: the agent is the
+classifier, the user is the source of truth, and the guard is the memory.
+
+**How it decides.** Three parts. A system-prompt rule tells the agent to
+vet its own draft before persisting prose to a repo with a remote, and to
+ask the user about any term it is not certain is safe, using a placeholder
+until they answer. The `confidential_terms` tool then records that answer
+as a `block` or `allow` in a local, never-committed store: per-repo under
+`.git/info/`, global under the agent directory. From then on the guard
+deterministically blocks any write, patch or commit whose payload contains
+a blocked term - the commit payload is the message text, any `-F` /
+`--body-file` contents and the staged diff, so an identifier in staged
+content is caught. The block reason masks the term as `[REDACTED]` in a
+short context snippet, because echoing the term into the block reason would
+re-propagate it into the session log: the exact mistake the guard exists
+to prevent. Two moments get a once-per-repo nudge to run the ask-loop, each
+tracked independently: the first prose-file write into a repo, and the
+first commit/PR/issue persist, because a commit message plus staged diff is
+the highest-risk persist-to-remote moment for a novel identifier. The
+enforcement deliberately never scans arbitrary bash: a read or search
+command that carries the term as a pattern - including the `git
+filter-repo` run that removes it - must not be blocked. The cross-session
+gap (a commit authored in a prior session, before a term was blocked) is
+closed by a git pre-push hook installed via `core.hooksPath`, which scans
+the push rev-range against the same blocked-term stores plus gitleaks.
+
+**Motivating failure.** 2026-06-26: the agent summarised a pasted internal
+message into a plan doc, committed it, and pushed to a public repo. A
+regex or denylist could not have helped; it only knows terms already
+flagged.
+
+## git-gh-gate: confirmation before mutation
+
+**What it catches.** Every mutating git subcommand - commit, push, reset,
+rebase, merge, revert, cherry-pick, tag, branch delete, stash drop/clear/
+pop, checkout, restore, switch, clean, am, apply, rm, mv, filter-branch/
+filter-repo, update-ref, config, remote add/remove/set-url, submodule,
+worktree - and every mutating gh command (pr, issue, release, repo, gist,
+api, auth, secret, variable, workflow, run). Plus writes to `.git`
+internals (COMMIT_EDITMSG, hooks, refs, config) through the write/edit
+tools, which would otherwise bypass the bash gate entirely.
+
+**How it decides.** A compound command is split into segments first, so
+`cd /repo && git commit -m ...` triggers the `git commit` pattern against
+its segment rather than the whole line. Read-only commands stay unblocked.
+With a UI, the gate shows the command - truncated to one logical line plus
+a hidden-lines hint, because a 20-line heredoc in the dialog used to
+balloon the modal and trigger a repaint cascade - and waits for a yes.
+Without a UI it blocks outright: there is nobody to answer the prompt. The
+third layer of the same policy is prompt-only, not code: the ban on
+`Co-Authored-By` trailers and AI-attribution footers lives in the global
+system-prompt rules, because it is a content rule the other guards already
+enforce.
+
+**Motivating failure.** The gate is a port of the retired opencode fork's
+permission gate; its own incident is newer. A headless writer subagent,
+refused by the bash gate (no UI to prompt), committed the same change
+through `bg_bash`, whose detached tmux session has no prompt either. Since
+2026-10-04 a mutating git/gh command inside `bg_bash` is always blocked:
+background jobs never commit or push, the parent session does.
+
+## cd-agents-reload: the mid-session cd context gap
+
+**What it catches.** Both harnesses load AGENTS.md / CLAUDE.md from the
+startup directory and its parents at session start, and neither re-loads
+when the agent `cd`s into another repo mid-session. Project instructions in
+the target repo - canonical build commands, Makefile targets, repo-specific
+gotchas - are invisible, and the agent substitutes generic `docker compose
+build` / `npm run build` calls for the repo's own commands.
+
+**How it decides.** A `tool_call` gate on bash: extract every `cd <dir>`
+segment, resolve it against the startup cwd, skip targets already covered
+by the startup load, and once per session per target directory, block the
+call with a bounded head of the repo's AGENTS.md (80 lines or 4,000
+characters, whichever comes first) as the reason. The agent acknowledges
+the rules and re-runs. Two refinements came from the same incident: the
+block reason states that the entire command was swallowed - no segment
+executed, including any heredoc or `git add` - and must be re-run verbatim,
+and when the blocked command is also a commit persist, this guard delivers
+the confidential-write guard's once-per-repo nudge itself and marks it
+delivered, because pi short-circuits remaining `tool_call` handlers on the
+first block and the agent would otherwise be blocked a second time on the
+verbatim re-run.
+
+**Motivating failure.** 2026-07-07: a compound command of the form
+`cat > /tmp/msg <<'EOF' ... EOF` followed by `cd ~/repo && git add ... &&
+git commit -F /tmp/msg && git push` was blocked by this guard. The reason
+said only "re-run your bash", so the agent retried the `git commit` suffix
+alone, failed on the message file that was never written, burned four
+turns, and when it finally re-ran the full compound the confidential guard
+blocked it again - its nudge had never fired - swallowing the heredoc and
+the `git add` a second time. The shared "re-run the full command" notice
+and the shared nudge registry are the fix, and they live in a module both
+guards import.
+
+## A guard that is not linked cannot load
+
+All six guards above share one deployment property: the harness loads its
+extension directory at process start, and that directory is stow symlinks
+into the dotfiles repo. Editing a repo file changes nothing about live
+behaviour on its own; a new repo file has no link until `stow` makes one.
+
+On 2026-08-27 the ai-tell-guard was written, unit-tested, committed and
+documented - and never stow-linked. The extension directory is a real
+directory of per-file symlinks, and only `lib/` is a folded directory link,
+so the missing link was invisible to a casual look: `lib/` resolved, the
+new top-level file did not, and no restart could ever have loaded the
+guard. Three surfaces failed to catch it, and all three were fixed the same
+day:
+
+1. The drift check already detected the missing link and stayed silent -
+   a repo file with no live symlink classified as MISSING, hidden and
+   non-fatal by default, which is correct for files that legitimately
+   belong to other machines. It gained the notion of live trees -
+   directories a harness enumerates at startup (`.pi/agent/extensions/`,
+   `.pi/agent/prompts/`) - where an unlinked repo file is dead config:
+   always printed, always exit 1, with the fix command in the message.
+   Direct children only; `lib/` and the test tree are not loader-scanned.
+   Red-green verified against the real incident: exit 1, stow, exit 0.
+2. The dotfiles AGENTS.md had the correct add-an-extension checklist at
+   line ~225 - structurally invisible to an agent arriving mid-session,
+   because cd-agents-reload injects only the 80-line head. The stow-link
+   and verify rule moved to the top of the file, with a test asserting it
+   stays inside the injected head. The incident and the guard that let it
+   happen are the same system, which is why the fix was tested against
+   the guard.
+3. The global rules gained a sentence: "it will work after a restart" is
+   an untested claim, not a caveat. Start-time config is testable now, in
+   a fresh process - `timeout -s KILL 120 pi -p '<a prompt that should
+   trip the guard>' </dev/null` (the stdin redirect matters: from a
+   non-TTY tool, print mode blocks on an open stdin) - and an install-path
+   change is verified at its live path, not assumed from the repo.
+
+The general form: a guard's liveness is a property of the deployment, not
+the source. A unit test proves the logic; only a probe against the live
+load path proves the guard is there.
+
+## What they do not catch
+
+- Chat text is only annotated, never blocked: the harness exposes no hook
+  that can mutate an assistant message before it renders, so the
+  epistemic footer and the prompt-level rules are the ceiling there.
+- A confidential term nobody has asked about yet. The nudges make the ask
+  likely; they cannot make the classifier right. The pre-push hook is the
+  backstop, and it fires after the term is in history.
+- Anything in an unattended run past its block budget, and anything on a
+  guard whose kill switch is set. The kill switches exist so a stuck guard
+  never wedges a session; a set switch is a signal to fix the guard, not
+  to leave it off.
+- The fuzzy prose tells - triplets, participle tails, decorative bold,
+  metaphor coherence - are judgement, not a gate, and live in the voice
+  skill's guidance rather than in a regex.
+
+## Related docs
+
+[Keeping credentials out of coding-agent transcripts](/reference/agent-secret-guard/)
+is the secret layer over the same hook machinery: a registry of secret
+stores, keyed digests, and the read-block / typed-value / output-mask
+guards, with its own incidents and registry-scale numbers. [A cross-client
+memory store for coding agents](/reference/agent-memory-store/) is the
+store the transcripts sync to, and the reason anything a guard misses is
+durable. [Kanban board for coding agents](/reference/kanban-board-for-coding-agents/)
+covers the work-tracking half of the same harness setup.
