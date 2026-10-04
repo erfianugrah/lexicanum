@@ -1,0 +1,319 @@
+---
+title: "A self-hosted web research stack for coding agents"
+description: "Architecture and design choices of a self-hosted web research stack for coding agents: multi-engine metasearch via SearXNG, multi-tiered web extraction from curl_cffi to Playwright, session-walled browsing over CDP, tool integration through MCP, and token-gated edge authentication."
+author: Erfi Anugrah
+category: homelab
+---
+
+A self-hosted research stack provides local coding agents with search, page extraction, and session-gated web access without relying on third-party search APIs or hosted scraping platforms. The architecture decouples search discovery, static content extraction, dynamic JavaScript rendering, and authenticated browsing into independent services exposed through the Model Context Protocol (MCP). Alongside general search and content retrieval, the host also exposes lightweight OSINT investigation endpoints.
+
+Coding agents spend a significant share of their execution budget locating external documentation, evaluating package APIs, and inspecting remote state. Routing those lookups through commercial metasearch APIs introduces per-query latency, ongoing subscription costs, strict rate limits, and external data leakage. Running the search and extraction pipeline locally on homelab infrastructure provides unmetered queries, custom extraction pipelines, and access to authenticated sessions that headless cloud scrapers cannot reach.
+
+:::note[Provenance]
+Based on the production deployment of the containerised research stack running across the homelab fleet, fronted by the edge reverse proxy, and consumed by local coding agents via stdio MCP tools. Network topology, authentication snippets, and port mappings reflect the live NixOS and Docker Compose configurations.
+:::
+
+## TL;DR
+
+- Multi-engine metasearch aggregates independent search engines through SearXNG, avoiding vendor lock-in, commercial API fees, and single-source query bias or scraping bans.
+- Content extraction uses a tiered execution model: a static fast path (`curl_cffi` with browser TLS fingerprinting) resolves standard documentation in a single round-trip before escalating to headless Playwright for client-rendered applications.
+- Session-gated platforms run in a dedicated, isolated browser tier with persistent profiles and Chrome DevTools Protocol (CDP) control, requiring explicit `use_walled` opt-in to safeguard authenticated cookies.
+- Coding agents consume the stack through an MCP tool layer running over JSON-RPC, delivering token-optimised Markdown with navigation boilerplate stripped.
+- Ingress is guarded by the edge reverse proxy: pre-shared bearer tokens (`RESEARCH_TOKEN`) for external requests, with transparent subnet bypass for local LAN and WireGuard or Tailscale clients as documented in [Edge Caddy as a native NixOS service](/reference/edge-caddy-on-nixos/).
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_client {
+    label="workstation";
+    agent [label="coding agent\n(Pi / Claude Code)"];
+    mcp [label="MCP server\nresearch-server.py"];
+  }
+
+  subgraph cluster_edge {
+    label="edge router";
+    caddy [label="edge proxy (Caddy)\nresearch_auth"];
+  }
+
+  subgraph cluster_backend {
+    label="search host";
+    searxng [label="SearXNG\nmetasearch on :8888"];
+    valkey [label="Valkey\ncache + rate-limiting"];
+    crawler [label="crawler service\nfast path + Playwright on :8889"];
+    browser [label="walled browser\nheaded Chromium under Xvfb"];
+  }
+
+  agent -> mcp [label="stdio JSON-RPC"];
+  mcp -> caddy [label="HTTPS (Bearer or LAN bypass)"];
+  caddy -> searxng [label="HTTP proxy"];
+  caddy -> crawler [label="HTTP proxy"];
+  searxng -> valkey [label="internal cache"];
+  crawler -> browser [label="CDP over forwarded port"];
+}
+```
+
+The topology partitions responsibility between local agent processes and centralized backend services:
+
+1. **Client layer:** The coding agent executes on the developer workstation and communicates with `research-server.py` over standard I/O using JSON-RPC.
+2. **Transport and security:** The MCP server issues HTTPS calls to the edge reverse proxy, attaching a pre-shared bearer token when connecting from external networks, or relying on CIDR bypass when on the local LAN or tailnet.
+3. **Edge ingress:** The edge proxy evaluates client credentials against policy rules before forwarding requests across the internal network to the search host.
+4. **Metasearch tier:** SearXNG dispatches concurrent queries to configured upstream search engines, deduplicates results, and caches engine availability in Valkey.
+5. **Extraction tier:** The crawler service attempts static retrieval using browser TLS impersonation and readability extraction, falling back to an in-container Playwright browser for client-rendered applications.
+6. **Walled browser tier:** When explicitly requested, the crawler connects over CDP to an isolated, headed Chromium instance maintaining persistent session state.
+
+## Request routing and execution tiers
+
+Selecting the appropriate tool depends on whether the agent requires link discovery, raw text extraction, full browser execution, or authenticated session access.
+
+| Objective | Target tier | Primary mechanism | Latency profile | Resource profile |
+|---|---|---|---|---|
+| Query discovery across the web | Metasearch | SearXNG upstream aggregation | Concurrent upstream network I/O | Low CPU, zero browser overhead |
+| Static documentation, articles, specs | Crawler fast path | `curl_cffi` + `trafilatura` | Single HTTP round-trip | Minimal memory, no process spawn |
+| Client-rendered SPAs, dynamic tables | Crawler rendered path | Headless Playwright (Chromium) | Full DOM and script evaluation | High CPU, 100-300 MB RAM per page |
+| Anti-bot challenge interstitials | Challenge solver | Automated challenge resolution | Multi-step challenge solving | High latency, transient browser worker |
+| Session-gated portals and platforms | Walled browser | Headed Chromium over CDP | Navigation with session restoration | Persistent memory profile, manual login |
+
+## Why multi-engine metasearch over one API
+
+Coding agents frequently rely on proprietary search APIs such as Exa[^exa], Brave Search[^brave-search], or Google Custom Search[^google-cse]. While single-provider APIs offer straightforward integration, adopting a self-hosted metasearch aggregator such as SearXNG[^searxng] resolves several architectural constraints:
+
+### Economic and quota insulation
+
+Agentic workflows are exploratory. A complex debugging or architectural planning session can emit dozens of search queries across successive tool-calling iterations. Commercial search APIs charge per request or impose strict monthly tier quotas. When an agent enters a self-correcting or deep-research loop, commercial quotas quickly exhaust or generate unexpected billing spikes. A self-hosted engine running on existing homelab hardware delivers unmetered search capacity.
+
+### Index diversity and specialized engines
+
+Single search engines have distinct indexing biases. Google and Bing prioritised commercial and search-engine-optimised content; DuckDuckGo relies heavily on syndicated feeds; independent crawlers such as Mojeek[^mojeek] maintain their own indexes with alternate ranking signals. SearXNG aggregates across multiple categories simultaneously:
+
+- **General web:** DuckDuckGo, Startpage, Google, and independent crawlers.
+- **Developer and technical:** GitHub, Stack Overflow, and technical documentation hubs.
+- **Academic and publications:** arXiv, Crossref, and PubMed for scientific research.
+- **Media and news:** Categorised engines for timely reporting and press releases.
+
+Aggregating diverse indexes prevents an agent from getting trapped in a single provider's algorithmic blind spots or sponsored result clusters.
+
+### Privacy and query sanitisation
+
+Passing sensitive queries containing proprietary variable names, infrastructure components, or error logs directly to commercial search APIs exposes engineering intent and intellectual property to third-party profiling. SearXNG acts as an anonymising gateway: requests dispatched to upstream search engines originate from the self-hosted egress IP without persistent tracking cookies, client identifiers, or search history profiles.
+
+## Tiered web crawling: fast path before Playwright
+
+Once candidate URLs are identified, extracting readable content presents a trade-off between execution speed, resource consumption, and rendering fidelity. Early scraping architectures routed all URLs directly through a headless browser. In practice, running a full browser engine for every document creates severe performance bottlenecks.
+
+### The headless browser tax
+
+Launching and executing pages inside headless Chromium via Playwright[^playwright] imposes substantial overhead:
+
+- **Memory footprint:** Each browser page context requires between 100 MB and 300 MB of RAM, limiting container concurrency on shared hardware.
+- **CPU consumption:** Parsing CSS stylesheets, executing untrusted client JavaScript, and computing visual layouts consumes significant CPU cycles.
+- **Latency penalty:** A full headless render requires navigating network lifecycles (`domcontentloaded`, `networkidle`), introducing several seconds of latency before extraction can even start.
+
+Because the majority of technical documentation, RFCs, issue trackers, and technical blogs consist of server-rendered HTML, paying the browser tax on every request is inefficient.
+
+### The two-phase extraction model
+
+The crawler service implements a two-phase retrieval model that prioritises static extraction while preserving browser fallback capabilities:
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  req [label="URL extract request"];
+  check_walled [label="use_walled == true?"];
+  walled [label="CDP adapter\nheaded Chromium"];
+  fast [label="fast path: curl_cffi\nChrome TLS impersonation"];
+  eval_fast [label="content valid\nand length >= threshold?"];
+  playwright [label="rendered path:\nheadless Playwright"];
+  eval_rendered [label="render successful?"];
+  solver [label="challenge solver tier\ninterstitial bypass"];
+  clean [label="trafilatura extraction\nboilerplate stripping"];
+  out [label="token-shaped Markdown"];
+
+  req -> check_walled;
+  check_walled -> walled [label="yes"];
+  check_walled -> fast [label="no"];
+  fast -> clean;
+  clean -> eval_fast;
+  eval_fast -> out [label="yes"];
+  eval_fast -> playwright [label="no (empty or SPA shell)"];
+  playwright -> clean;
+  clean -> eval_rendered;
+  eval_rendered -> out [label="yes"];
+  eval_rendered -> solver [label="no (CAPTCHA / block)"];
+  solver -> clean;
+  walled -> clean;
+}
+```
+
+Text fallback for extraction flow:
+1. An incoming URL extract request is evaluated for the `use_walled` parameter; if true, it routes immediately to the CDP browser sidecar.
+2. Standard requests enter the fast path using `curl_cffi` with modern Chrome TLS impersonation.
+3. Raw HTML is processed through `trafilatura` to extract clean text.
+4. If extraction yields meaningful content exceeding minimum length thresholds, formatted Markdown is returned immediately.
+5. If the fast path returns an empty response, a client-rendered SPA shell, or an HTTP 403 or 429 status, the crawler escalates to headless Playwright.
+6. If Playwright encounters bot-challenge interstitials, the crawler invokes the automated challenge solver tier.
+
+### TLS fingerprinting with curl_cffi
+
+Standard Python HTTP clients (`requests`, `urllib3`, default `httpx`) are blocked by content delivery networks and anti-bot systems such as Cloudflare or CloudFront. These systems inspect the client's TLS ClientHello fingerprint (JA3/JA4 signatures) and HTTP/2 settings frames[^tls-fingerprint]. Python's standard `ssl` module emits identifiable cipher suites and extension orders that differ from real web browsers.
+
+The fast path incorporates `curl_cffi`[^curl-cffi], which embeds a customized `libcurl` compiled with modern browser TLS and HTTP/2 fingerprints. By impersonating a standard desktop browser at the transport layer, the fast path retrieves content from protected sites without triggering anti-bot interstitials or launching Chromium.
+
+## Walled browser tier: session isolation and authenticated sites
+
+Modern software engineering and market research often require inspecting platforms protected by mandatory authentication, complex bot-detection algorithms, or session walls.
+
+### Persistent profile architecture
+
+Anonymous headless browsers fail on authenticated platforms: login forms trigger multi-factor authentication (MFA) or CAPTCHAs, and session cookies cannot be established headlessly without credentials. The walled browser tier solves this with a dedicated, persistent browser environment:
+
+- **Isolated container service:** A dedicated container runs a headed Chromium build inside an Xvfb (X Virtual Framebuffer)[^xvfb] virtual display server.
+- **Persistent storage mount:** The Chromium profile directory (`--user-data-dir=/profile`) is mounted to persistent host storage, ensuring that cookies, session storage, and local device identifiers survive container recreations.
+- **Out-of-band operator bootstrap:** An embedded `x11vnc` server binds only to the host loopback interface. The human operator connects once using a VNC viewer to log into required accounts, complete MFA challenges, and solve CAPTCHAs manually. Once established, session cookies remain valid for weeks or months.
+
+### The security imperative of session isolation
+
+The walled browser must remain strictly separated from the general-purpose crawler. Automatic escalation from standard crawl requests to the logged-in browser is prohibited.
+
+If the crawler automatically fell back to the authenticated profile whenever an unauthenticated fetch failed, an agent researching arbitrary, untrusted web links could navigate the logged-in browser to malicious destinations. This exposes the operator to session hijacking, cross-site scripting (XSS), cross-site request forgery (CSRF), and accidental account modification.
+
+To eliminate this threat surface, navigation within the walled browser requires an explicit parameter:
+
+```python
+# The agent must explicitly opt in to the authenticated session tier
+extract_result = crawler.extract(
+    url="https://internal-portal.example.com/item/12345",
+    use_walled=True
+)
+```
+
+Requests lacking `use_walled=True` cannot interact with the persistent profile.
+
+### DevTools Protocol mechanics and host validation
+
+The crawler controls the walled browser using the Chrome DevTools Protocol (CDP)[^cdp]. In modern Chromium versions, `--remote-debugging-port` binds strictly to container-local loopback (`127.0.0.1`). Chromium lacks an explicit flag to bind debugging endpoints across external container interfaces.
+
+To expose the debugging port to the internal Docker network, the browser container executes a lightweight `socat` process forwarding traffic:
+
+```sh
+socat TCP-LISTEN:<published-port>,fork,reuseaddr TCP:127.0.0.1:<devtools-port>
+```
+
+Chromium DevTools also enforces a strict security check on the HTTP `Host` header for all `/devtools/*` requests, rejecting requests where the `Host` header does not match `localhost` or a raw IP address. Connecting to `http://browser:9223` fails because the service name is rejected by Chromium's anti-DNS-rebinding protection. The crawler's CDP adapter resolves the container hostname to its internal IP address (`socket.gethostbyname("browser")`) before establishing the CDP connection.
+
+## Agent-facing MCP tool layer
+
+Coding agents interact with the research infrastructure through the Model Context Protocol (MCP)[^mcp]. The MCP server (`research-server.py`) is implemented using Python standard libraries to avoid external dependency conflicts on developer workstations.
+
+### Context window optimization
+
+Language models operate within bounded context windows. Returning raw HTML or unfiltered web extracts pollutes context, increases inference costs, and degrades reasoning capabilities. The MCP formatting layer applies strict compression heuristics:
+
+- **Boilerplate stripping:** `trafilatura`[^trafilatura] strips navigation headers, footers, advertisement containers, and copyright notices, preserving only primary prose, tables, and code snippets.
+- **Markdown normalisation:** Extracted DOM structures are transformed into terse GitHub Flavored Markdown (GFM).
+- **Hard truncation caps:** Search result snippets and article bodies are capped at predefined token thresholds (typically 8,000 characters for quick reads, extendable to 64,000 characters for in-depth documentation).
+- **Structured error payloads:** Upstream failures (HTTP 404, TLS timeouts, bot walls) return actionable diagnostic summaries rather than multi-kilobyte HTML error pages.
+
+### Asynchronous job handling
+
+Certain research operations (such as deep multi-query synthesis or complex challenge solving) exceed standard tool execution timeouts. The MCP server incorporates an asynchronous job manager: when an operation runs longer than inline communication thresholds, the server returns a unique `job_id` and registers background polling routines. The agent calls a lightweight `wait_job` tool to check task completion without blocking its operational turn.
+
+## Authentication model and edge network ingress
+
+Access to the research stack is governed by the edge reverse proxy running on the fleet's NixOS router. The edge proxy enforces security policies before traffic touches backend container ports.
+
+### The research_auth policy
+
+The proxy configuration defines a dedicated authentication snippet (`research_auth`) that separates internal trusted traffic from external invocations:
+
+```caddy
+(research_auth) {
+    @denied {
+        not remote_ip 10.0.0.0/8 100.64.0.0/10 172.16.0.0/12 192.168.0.0/16
+        not header Authorization "Bearer {$RESEARCH_TOKEN}"
+    }
+    respond @denied 401
+}
+```
+
+As detailed in [Edge Caddy as a native NixOS service](/reference/edge-caddy-on-nixos/), this structure provides two distinct access paths:
+
+1. **Subnet bypass for local and tailnet clients:** Requests originating from private RFC 1918 subnets[^rfc1918] or Tailscale CGNAT IP ranges (`100.64.0.0/10`)[^rfc6598] are forwarded without requiring authentication headers. Coding agents executing on local workstations or mobile machines connected to the VPN access search and extraction services transparently.
+2. **Bearer token authentication for external requests:** Requests arriving from public internet addresses or untrusted networks must provide a valid `Authorization: Bearer <token>` header containing the pre-shared secret (`RESEARCH_TOKEN`).
+
+This dual-tier approach eliminates secret configuration overhead on local development machines while securing endpoints against unauthorized internet traffic.
+
+## Operational failure modes and defenses
+
+Operating a distributed research stack exposes several failure modes across network, process, and engine boundaries.
+
+| Failure mode | Root cause | Diagnostic signature | Mitigation and defense |
+|---|---|---|---|
+| Silent zero-result engine degradation | Residential IP blocks or CAPTCHAs triggering SearXNG circuit breakers | Search returns empty result arrays or missing engine attributes | Disable degraded engines (such as Bing) in `settings.yml`; implement custom challenge-solver modules for resilient engines; rely on multi-engine aggregation |
+| Background agent token loss | Tmux server inherits frozen environment at launch, omitting shell secrets | Background agent tasks fail with HTTP 401 from edge proxy | Sync secrets to tmux global environment (`tmux set-environment -g`) or load secrets dynamically via vault integration wrappers |
+| Chromium CDP Host header rejection | DevTools rejects non-IP Host headers as anti-DNS-rebinding defense | CDP connection by container hostname refused with HTTP 500/400 | Resolve container hostname to internal IP address (`socket.gethostbyname`) prior to establishing CDP connection |
+| Stale browser profile singleton lock | Container crash leaves `SingletonLock` symlink in mounted profile | Chromium fails to start on container boot with exit code 21 | Entrypoint supervision script removes stale `SingletonLock` files before launching browser process |
+| Walled session expiration | Platform invalidates cookies or rotates session identifiers | Extracted content is under 50 characters or matches login form DOM | Heuristic length and title checks detect login walls and prompt operator for one-time VNC re-authentication |
+
+### Mitigating silent zero-result engines in SearXNG
+
+The most insidious failure mode in self-hosted metasearch is the silent disappearance of search results. Because SearXNG is designed to be resilient, an upstream engine that returns HTTP 403, presents a CAPTCHA, or times out does not crash the search request. Instead, SearXNG's internal reliability tracker marks the engine as suspended and returns results from whatever engines remain.
+
+When upstream providers (such as Bing) degrade their search results for specific IP classes, or when engines such as Startpage deploy proof-of-work challenges (e.g. Anubis challenges), the search pool can silently narrow until queries return irrelevant or empty result sets.
+
+Defenses against silent engine degradation include:
+
+- **Aggressive engine pruning:** Disabling engine families that exhibit erratic behavior or serve low-quality results to automated request shapes.
+- **Proof-of-work solving:** Implementing engine-specific offline solvers in Python to complete client challenges (such as computing SHA-256 difficulty targets) and maintain session cookies.
+- **Egress pool health checks:** Running periodic automated probe queries across individual engines to verify result relevance and detect IP-reputation bans early.
+
+### Background agent environment inheritance
+
+When coding agents spawn background tasks or subagents (for example, executing detached workflows via `tmux`), environment variables loaded into the active shell do not automatically propagate to the background session.
+
+The tmux server initializes its global environment table when the server process starts. Subsequent `tmux new-session` invocations inherit the global tmux environment, not the environment of the shell running the spawn command. If `RESEARCH_TOKEN` was populated into the parent shell via an on-demand secret loader, background tasks launched in detached panes find the variable empty. When the subagent issues requests to the edge proxy, it receives HTTP 401 Unauthorized errors.
+
+The mitigation requires synchronising secrets into the tmux server's global table:
+
+```sh
+# Push current secret value into the global tmux server environment
+tmux set-environment -g RESEARCH_TOKEN "$RESEARCH_TOKEN"
+```
+
+Alternatively, tool wrappers can query the local secret store or vault CLI directly on demand rather than relying on inherited shell variables.
+
+## Architectural trade-offs
+
+Building and running a self-hosted research stack involves deliberate operational commitments:
+
+- **Maintenance overhead vs API simplicity:** A commercial API requires only an API key and an HTTP client. A self-hosted stack requires managing container lifecycles, monitoring upstream search engine changes, maintaining crawler sidecars, and pruning broken engines.
+- **Residential IP reputation:** Outbound requests originate from residential ISP connections. While residential IPs avoid the wholesale data-center blocks applied to cloud providers (AWS, Hetzner), they remain susceptible to localized rate limits from high-volume search engines.
+- **Resource utilization:** Running persistent browser containers and headless rendering pipelines requires dedicated memory and CPU capacity on the host machine.
+
+For autonomous coding agents, the investment pays off in total privacy, unmetered multi-step exploration, and access to documentation behind session barriers that external services cannot penetrate.
+
+## References
+
+[^searxng]: SearXNG Community, "SearXNG Documentation," SearXNG. https://docs.searxng.org/
+[^trafilatura]: A. Barbaresi, "Trafilatura: A Web Scraping Library and Text Discovery Tool for Python," Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics. https://github.com/adbar/trafilatura
+[^playwright]: Microsoft, "Playwright for Python," Microsoft Docs. https://playwright.dev/python/
+[^curl-cffi]: Y. Zhou, "curl_cffi Documentation," GitHub. https://github.com/yifeikong/curl_cffi
+[^cdp]: Chrome DevTools Protocol contributors, "Chrome DevTools Protocol Specification," Chrome DevTools. https://chromedevtools.github.io/devtools-protocol/
+[^mcp]: Model Context Protocol, "Model Context Protocol Specification," Anthropic. https://modelcontextprotocol.io/
+[^xvfb]: X.Org Foundation, "Xvfb - Virtual Framebuffer 'fake' X server," X.Org. https://www.x.org/releases/X11R7.7/doc/man/man1/Xvfb.1.xhtml
+[^rfc1918]: Y. Rekhter, B. Moskowitz, D. Karrenberg, G. J. de Groot, and E. Lear, "Address Allocation for Private Internets," RFC 1918, BCP 5. https://www.rfc-editor.org/rfc/rfc1918
+[^rfc6598]: J. Weil, V. Kuarsingh, C. Donley, C. Liljenstolpe, and M. Azinger, "IANA-Reserved IPv4 Prefix for Shared Address Space," RFC 6598. https://www.rfc-editor.org/rfc/rfc6598
+[^tls-fingerprint]: J. Althouse, J. Atkinson, and J. Matson, "TLS Fingerprinting with JA3 and JA4," Salesforce Engineering. https://github.com/salesforce/ja3
+[^exa]: Exa, "Exa API Documentation," Exa. https://docs.exa.ai/
+[^brave-search]: Brave Software, "Brave Search API," Brave. https://brave.com/search/api/
+[^google-cse]: Google, "Custom Search JSON API," Google Developers. https://developers.google.com/custom-search/v1/overview
+[^mojeek]: Mojeek Ltd, "Mojeek Search Documentation," Mojeek. https://www.mojeek.com/
