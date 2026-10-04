@@ -1,0 +1,290 @@
+---
+title: "Composer: a GitOps control plane for Docker Compose stacks"
+description: "How Composer owns this fleet's Docker Compose stacks: a git checkout per stack on the edge router, lifecycle verbs through one REST API, remote daemons reached through drawbridge, SOPS ciphertext decrypted only for the duration of a compose call, a per-stack lock, an allowlisted read-only exec console, and pipelines that replaced cron containers."
+author: Erfi Anugrah
+category: homelab
+---
+
+Composer is the self-hosted service that owns this fleet's Docker Compose stacks. A stack is registered once, gets a git checkout of its compose file, and is then driven entirely through a REST API: Composer runs the compose command, decrypts the stack's SOPS secrets for the duration of that command, and routes the call to the docker daemon that actually runs the containers. It is the self-hosted manager of that name, not the PHP dependency manager.
+
+Several docs in this corpus tell you to use `POST /stacks/{name}/...` instead of `docker compose`. This is the page that explains what sits behind that API, and why the hand-run command is not equivalent.
+
+:::note[Provenance]
+Read from the private Composer source tree at `v0.29.3`, the tag the edge router pins: the route definitions in `internal/api/handler/`, the git and deploy path in `internal/app/git_service.go`, the exec plumbing in `internal/infra/docker/`, and Composer's own hand-maintained `docs/api-reference.md`. The instance facts - image pin, mounts, host-network port - come from the router configuration that starts the container. No live API call was made for this page, so every figure below is a property of the code rather than a measurement of the running instance.
+:::
+
+## TL;DR
+
+- Call the API for anything Composer manages. The checkout, the SOPS cycle, the host routing and the per-stack lock all live inside `composerd`; a hand-run `docker compose` skips all four.
+- `composerd` runs on the edge router as a host-network container on `:8080`, and every stack's checkout lives on the router, including stacks whose containers run on the storage host's daemon through drawbridge.
+- `POST /stacks/{name}/deploy` is the full pipeline, `up` recreates only what compose considers changed, and `up?force_recreate=true` or `POST /stacks/{name}/redeploy` covers everything compose does not.
+- `POST /stacks/{name}/exec` is a read-only compose console: an allowlist (`up` and `down` answer 422) with a 1 MiB per-stream cap and a `truncated` flag, so a cut-off log tail cannot pass as complete.
+- Pipelines run steps on a schedule or on an event, which is what replaced a host crontab entry plus a cron-wrapper image.
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_router {
+    label="edge router";
+    composerd [label="composerd\nAPI + UI on :8080"];
+    checkout [label="stack checkouts\none per stack"];
+    routerd [label="docker daemon\nrouter-local"];
+    forgejo [label="Forgejo\nrepo + push webhook"];
+  }
+
+  bridge [label="drawbridge\nmTLS + route allowlist"];
+  storaged [label="storage host\ndocker daemon"];
+  operator [label="operator or agent"];
+
+  operator -> composerd [label="REST via edge proxy"];
+  composerd -> checkout;
+  composerd -> routerd [label="local socket"];
+  composerd -> bridge [label="tcp + client cert"];
+  bridge -> storaged;
+  forgejo -> composerd [label="push -> hooks endpoint"];
+  composerd -> forgejo [label="fetch + hard reset"];
+}
+```
+
+Reading it as text:
+
+1. An operator or an agent reaches the API through the edge proxy; the API is also on the router's own `:8080`.
+2. `composerd` holds one git checkout per stack, on the router, next to itself.
+3. A lifecycle verb is routed to one of two docker daemons: the router's own socket, or a remote endpoint reached through drawbridge.
+4. A push to a stack's repo hits the webhook receiver on the same `composerd`, which syncs the checkout and redeploys the stack.
+
+## Where it runs and what it owns
+
+`composerd` is a single Go binary serving the REST API and an embedded Astro frontend; there is no end-user CLI, so the API is the interface[^composer-source]. On the edge router it runs as an `oci-container` with `--network=host` and `COMPOSER_PORT=8080` - the host's forward chain drops bridge publishing, so host mode plus an input rule is how the port becomes reachable[^router-config] - and the public entry point is the edge proxy in front of it. The native `edgectl`/`wafctl` service on that host is on `:8082`; the two ports are not interchangeable.
+
+The container is the one piece of this host that NixOS starts rather than Composer: everything else on the router - the DNS resolver, the edge services - is managed by Composer from git, so a rebuild always brings the management plane back from the pinned tag before it manages anything else. That pin is also why Composer's own self-upgrade does not apply here; a rebuild returns to the version in the router configuration.
+
+| Path inside the container | Holds |
+|---|---|
+| `/opt/stacks` | one git checkout per stack, on the router |
+| the data directory | SQLite database, encryption key, age key, uploaded docker-host certificates |
+| the ssh directory of the `composer` user | git deploy keys, encrypted at rest by a startup hook |
+| `/certs`, read-only | the legacy per-host `ca.pem`/`cert.pem`/`key.pem` directory |
+| the docker socket | the router-local daemon |
+
+The startup hook that encrypts the ssh directory decides where the binary may run: it AES-256-GCM-encrypts every key under its ssh directory with a key held in the data directory, so a run with a temporary data directory leaves keys no later process can decrypt without it. Keep it in the pinned container and use `go test` or the deploy compose file for local work.
+
+## Two docker daemons behind one control plane
+
+Docker hosts are a registry (`/api/v1/hosts`): a name, an endpoint, and optionally certificate material. The daemon `composerd` itself runs against is implicit - no registry row, the reserved API name `local`, stacks with a null host id. Everything else is addressed by name, a stack records its host in the `host` field of its detail response, and most resource endpoints take a `?host=` selector.
+
+The remote daemon here is the storage host, reached through drawbridge, the mTLS-gated socket proxy:
+
+- The endpoint is a TLS one, `tcp://<host>:2376`, and client certificates are uploaded through the API or the UI, AES-256-GCM encrypted in the database, and materialised on demand. Database certificates take precedence over a mounted certificate directory, which stays as the fallback.
+- Each compose child process is given the certificate environment explicitly (`DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH`) rather than inheriting it from `composerd`, because the process environment is only correct for the default host.
+- `POST /api/v1/hosts/{id}/test` does a throwaway ping against the material currently in force. Run it after any certificate or endpoint change.
+
+Host routing is enforced on the deploy path rather than left to the compose command: resolving the compose client for a host-pinned stack fails the redeploy if that host cannot be built, instead of falling back to the local daemon and creating networks and containers on the wrong machine.
+
+## The checkout is on the router even when the containers are not
+
+This is the fact that makes most hand-run compose commands fail before they start, and the reason a path that works in Composer does not exist over ssh on the target host.
+
+| Thing | Resolves on |
+|---|---|
+| compose file, `.env`, checkout path | the router - `/var/lib/composer/stacks/<stack>`, or `/opt/stacks/<stack>` inside the container |
+| containers, networks, volumes | the stack's docker daemon, router-local or remote |
+| every bind-mount source in the compose file or `.env` | the daemon host, so a storage-host stack must name a path on that host |
+| a relative `build:` context | the router's checkout, which is also where the build runs |
+
+So `ssh <storage-host> "docker compose -f /opt/stacks/<stack>/compose.yaml ps"` fails with no such file on a stack that deploys perfectly through the API, and a bind-mount written as a router path mounts an empty directory on the storage host.
+
+## The GitOps path
+
+A stack becomes git-backed when it is created from a repository: Composer clones the repo into the stack directory and registers the source, and the stack is created but not deployed. From then on the source config carries the repo URL, the branch, the compose file path, the env file path, `auto_sync`, and the last synced commit.
+
+`POST /api/v1/stacks/{name}/sync` fast-forwards the checkout and reports whether the compose file changed. The sync is a fetch followed by a hard reset of the worktree and the local branch to the tracked remote branch, which has three consequences:
+
+- An amended or force-pushed commit is pulled correctly, where a plain pull would refuse.
+- A dirty worktree is discarded. That is deliberate: between deploys a stack's `.env` is SOPS ciphertext, and an interrupted decrypt would otherwise leave a modified file the sync could not move past.
+- Local edits to a managed checkout do not survive a sync. `GET /stacks/{name}/git/diff` shows them before you lose them, and `POST /stacks/{name}/rollback` pins the worktree to a chosen commit. Rollback does not deploy.
+
+`POST /api/v1/stacks/{name}/deploy` is the full pipeline, and its own description is the clearest summary of what Composer is for:
+
+> `git pull` -> SOPS decrypt `.env` -> `docker compose pull` -> `docker compose up -d` -> re-encrypt
+
+The pull step is what refreshes mutable tags: a redeploy pulls images before the up, and if the pull fails the deploy continues on the cached images rather than stopping. `?async=true` on any of these returns a job id instead of holding the request open.
+
+### Webhooks: push to deploy
+
+Creating a webhook returns its delivery URL, `POST /api/v1/hooks/{id}`, and a secret. The receiver reads at most 1 MiB of body, validates the provider's signature against that secret, applies the branch filter, records a delivery, and then runs sync plus redeploy for the stack as a background job. `GET /stacks/{name}/webhook` is the honest way to ask whether it worked: the configured webhooks with the secret redacted, the newest delivery with a normalised outcome, and the commit that was synced. A stack with no webhook answers that endpoint with `configured=false` and still returns HTTP 200.
+
+The redeploy half of that path is gated on the stack's own `auto_sync`, not on the webhook record: with `auto_sync` false the receiver syncs and stops, returning `synced_pending_manual`. The webhook's `auto_redeploy` flag is stored, returned by the webhook endpoints and shown in the UI, and nothing on the delivery path reads it - so treat the delivery record, not the flag, as the evidence that a push deployed.
+
+The reserved stack scope `_system` is a sentinel for the manager itself; a release webhook against it dispatches the self-upgrade path instead of a stack deploy.
+
+## SOPS: ciphertext at rest, plaintext for one compose call
+
+A managed stack's `.env` is committed encrypted, and Composer's decrypt step wraps every compose invocation it makes - create, deploy, build, down, restart, pull, and the `up` behind the streamed action. The shape is decrypt, run, then a deferred re-encrypt that runs however the call ends:
+
+```
+decryptSopsSecrets(...)
+docker compose <cmd>
+defer reEncryptSopsSecretsCtx(...)
+```
+
+The decrypt step saves the original ciphertext to `.env.sops` beside the file before overwriting `.env` with plaintext; the deferred step puts the ciphertext back and deletes the backup. A compose file gets the same treatment. On the deploy path the re-encrypt is deferred before the up is attempted, so a failed deploy still leaves the checkout encrypted.
+
+Two fixes from the same day closed the way this can go wrong. `v0.26.10` re-parented the re-encrypt onto a background context, because a client that disconnects right after a streamed action had cancelled the request context, and a dead context made a lookup fail in a way that let the re-encrypt no-op and leave `.env` plaintext on disk. `v0.26.12` made the decrypt phase re-encrypt an `.env` it finds already plaintext. A normal deploy therefore repairs a checkout left bare by either failure mode.
+
+[Encrypting Docker Compose .env files with SOPS and age](/guides/sops-age-compose-stacks/) works this same path end to end, including the age key resolution order - a data-directory key beats every environment variable, which is the trap during a rotation.
+
+## One writer per stack
+
+Compose verbs for a given stack are serialised by a per-stack in-process lock, and the flows that touch more than one compose command hold that lock across the whole sequence:
+
+- The sync-and-redeploy path takes the lock, syncs, and only then decrypts and deploys, so a webhook delivery cannot interleave with a manual deploy of the same stack.
+- `POST /stacks/{name}/redeploy` runs `down` and then `up -d` as one operation under the lock, so nothing can slip a deploy between the two halves. Named volumes survive, because the down is issued without `--volumes`.
+- A batch deploy groups stacks into waves by their in-batch dependencies, deploys each wave concurrently, and reports a dependent of a failed stack as `skipped` rather than starting it.
+
+The reason to care is a fixed container address: two separate API calls let the up run before the old container is gone, and the address is lost.
+
+## Choosing the verb
+
+| Verb | Endpoint | What it runs | Use it when |
+|---|---|---|---|
+| Sync | `POST /stacks/{name}/sync` | fetch + hard reset to the tracked branch | you want the tree current without deploying |
+| Deploy | `POST /stacks/{name}/deploy` | the full pipeline above | CI has pushed an image; nothing needs a rebuild |
+| Up | `POST /stacks/{name}/up` | `compose up -d --no-build` | git cannot see the reason to recreate: a new `:latest` image id, or a killed container |
+| Up, forced | `POST /stacks/{name}/up?force_recreate=true` | the same, plus `--force-recreate` | the change is one compose does not act on |
+| Redeploy | `POST /stacks/{name}/redeploy` | `down` then `up -d` under one lock | network, IPAM or fixed-address changes |
+| Pull | `POST /stacks/{name}/pull` | `compose pull` | refresh images only; it does not redeploy |
+| Build | `POST /stacks/{name}/build` | `compose up -d --build` | the stack has an in-repo `build:` context |
+| Restart | `POST /stacks/{name}/restart` | `compose restart` | same containers, same config |
+| Down | `POST /stacks/{name}/down` | `compose down` | stop and remove containers; volumes and networks stay |
+| Batch | `POST /stacks/deploy-batch` | `up -d` in dependency waves | several stacks sharing a network |
+
+`up` passes `--no-build`, so a stack whose service declares a build context is not built by it - the verb order for such a stack is sync, then build, then up. A synchronous `up` also times out at 10 minutes, which is the reason the async form exists.
+
+Forced recreation exists because compose decides whether to recreate a container from the service configuration and image it compares, and a network or IPAM change is not that: the documented failure mode is a plain `up` reporting success while the container keeps its old address and a fixed container IP is silently lost. The flag underneath is compose's own - "Recreate containers even if their configuration and image haven't changed"[^compose-up] - which is also the shape of the bind-mounted config case: the file's contents are not part of what compose compared.
+
+## The exec console
+
+`POST /api/v1/stacks/{name}/exec` runs an allowlisted `docker compose <args>` in the stack directory. It exists for inspection, and the allowlist enforces that:
+
+| Caller | Subcommands |
+|---|---|
+| operator | `build`, `config`, `events`, `images`, `logs`, `ls`, `port`, `ps`, `top`, `version` |
+| admin | `cp`, `exec` |
+
+Two refusals mean two different things. A subcommand outside the allowlist is a `422` naming the permitted set, and `up` and `down` are simply not in it - there is no path from the exec console to a lifecycle change, which is what the dedicated endpoints are for. A permitted but admin-only subcommand called by an operator is a `403`.
+
+The compose file is resolved before the subcommand is parsed: a leading `-f` is a compose global option, not a subcommand, so Composer strips it, checks that the requested file sits inside the stack directory, and otherwise runs against the stack's configured compose file. Passing no `-f` therefore renders the file the stack actually deploys, which is what makes `exec config` meaningful here.
+
+Output is capped at 1 MiB per stream, stdout and stderr independently. That cap used to be silent, and a `logs --since` that returned 1,048,577 bytes covering 2 of 22 minutes looked like a complete tail (2026-10-01). Since `v0.29.2` both exec paths capture through a capped buffer, the truncated stream ends with `[output truncated at N bytes/stream]`, and the response carries a `truncated` flag. Read the flag before concluding a log is short.
+
+For the common reads, the dedicated endpoints are better: `GET /stacks/{name}/logs` merges every container's log in timestamp order, prefixes each line with its service name and caps at 2000 lines; `GET /stacks/{name}/containers` returns the stack's containers from the status snapshot; `GET /stacks/{name}/diff` shows the on-disk compose file against docker's normalised config with variable references left unexpanded.
+
+## What the API tells you it did
+
+- Long operations are jobs. `?async=true` returns a job id to poll; since `v0.28.0` a failed job reports its reason rather than an empty status.
+- Stack status is a snapshot, not a live call. A refresher ticks every 15 seconds and, since `v0.29.3`, a docker container event or a compose action also kicks a debounced out-of-cycle refresh (300 ms, so a bulk stop's burst collapses into one). A snapshot response with `cached=false` means no refresh has seen that stack yet, which is not the same as nothing running.
+- After each refresh that saw a change, the refresher publishes `stacks.refreshed` naming the stacks whose containers changed; it is on the event stream with a `{stacks, ts}` payload, and the frontend refetches the affected views on it. `stack.deployed` and `stack.error` are the corresponding lifecycle events.
+
+## Pipelines: steps instead of a cron container
+
+A pipeline is an ordered set of steps plus one or more triggers. It is the mechanism that replaced a crontab entry on a host plus a small wrapper image built only to call an API on a schedule. The step types are `compose_up`, `compose_down`, `compose_pull`, `compose_restart`, `shell_command`, `docker_exec`, `http_request`, `wait` and `notify`.
+
+| Step | What it does | Notes |
+|---|---|---|
+| `compose_up`, `compose_down`, `compose_pull`, `compose_restart` | resolves the stack by name, then runs the same sequence a lifecycle call runs | it holds the per-stack lock and decrypts and re-encrypts SOPS secrets, so a scheduled pipeline gets the same guarantees as the API. Extra config fields from older design drafts are not implemented |
+| `shell_command` | `sh -c <command>` on the Composer host | admin-only; the environment is scrubbed to `PATH`, `HOME=/tmp`, `HISTFILE=/dev/null` and `TERM=xterm`, so no API token or database URL is inherited |
+| `docker_exec` | exec inside an already-running container | admin-only, for post-deploy hooks. The container must be up; to run something in a throwaway container, use a `shell_command` with `compose run --rm` |
+| `http_request` | GET with a fixed 30 s timeout | returns the status code, not the body; private and link-local addresses are blocked unless the host config allows them |
+| `wait` | a Go duration, 5 s by default | honours pipeline cancellation |
+| `notify` | a placeholder | it logs and returns success; nothing is delivered yet |
+
+Triggers are manual, webhook, schedule and event. The distinction between the two automatic ones matters: a webhook trigger fires as the delivery arrives, in parallel with the stack's own sync and redeploy, while an event trigger fires after the publishing operation completes, which is what you want for "after that stack was deployed". Step output is captured into the run record; `shell_command` and `docker_exec` are capped and flagged the same way the exec console is, and the compose steps are not capped.
+
+## Why a hand-run `docker compose` is not the same thing
+
+| What the API does | What a hand-run command skips |
+|---|---|
+| decrypts a SOPS `.env` for the call, re-encrypts after | hands the container `ENC[AES256_GCM,...]` strings as environment values, which typically fails a healthcheck instead of failing visibly |
+| routes the call to the stack's daemon | runs against whichever daemon the shell points at, so a wrong daemon creates containers and networks on the wrong host |
+| holds the per-stack lock | races any webhook delivery or API deploy of the same stack |
+| runs from the router-side checkout | the checkout does not exist on the target host, so the paths in a copied command usually do not resolve |
+| records the action in the audit log and enforces roles | no record, no role boundary |
+
+Read-only `docker ps` and `docker logs` over ssh are fine and often faster than the API. Lifecycle verbs are not: use the endpoints, and when the API key is unavailable, ask for it rather than improvising git and compose surgery on a live checkout.
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  start [label="a compose stack change"];
+  managed [label="Composer-managed?"];
+  hand [label="plain docker compose\non the dev box"];
+  shape [label="what changed?"];
+  src [label="source in git"];
+  net [label="network, IPAM,\nfixed address"];
+  conf [label="bind-mounted config,\nor a moved image tag"];
+  bare [label="containers only"];
+  deploy [label="POST .../deploy"];
+  redeploy [label="POST .../redeploy"];
+  force [label="POST .../up?force_recreate=true"];
+  up [label="POST .../up"];
+  restart [label="POST .../restart"];
+
+  start -> managed;
+  managed -> hand [label="no"];
+  managed -> shape [label="yes"];
+  shape -> src [label="yes"];
+  shape -> net [label="yes"];
+  shape -> conf [label="yes"];
+  shape -> bare [label="no"];
+  src -> deploy;
+  net -> redeploy;
+  conf -> force;
+  bare -> up;
+  up -> restart [label="same config"];
+}
+```
+
+The same decision as text - take the first row that matches:
+
+1. Not managed by Composer, so compose runs on the dev box - nothing to consider here.
+2. The change is in git - `deploy`, which syncs, pulls and deploys in order.
+3. The change is network, IPAM or a fixed container address - `redeploy`, which takes the old containers down first.
+4. The change is a bind-mounted config file's contents or a moved image tag, so the compose configuration itself is unchanged - `up?force_recreate=true`.
+5. Only containers need recreating for a reason git cannot see - `up`.
+6. The configuration is unchanged and you want the same containers restarted - `restart`.
+
+## Gotchas and lessons learned
+
+1. A stack created without a host lands on the router-local daemon and nothing in the response warns. A create that omitted `host` once put a new app on the wrong daemon; the delete-and-recreate that followed took the live media stack down. Treat a create without an explicit host as a bug, and read the `host` field on `GET /stacks/{name}` before the first `up`.
+2. A compose project name collision replaces containers. Deploying a stack whose project name matches an existing stack on the same daemon is how the media stack was lost, so check the host before the first up rather than after.
+3. A network or IPAM edit is not a reason for compose to recreate anything. A plain `up` reports success and the container keeps its old address; a fixed address is a `redeploy`, or a forced `up`.
+4. The exec console's cap can make a log look complete. `truncated` is the signal, added after a cut-off `logs --since` returned 1,048,577 bytes covering 2 of 22 minutes.
+5. The router's host network carries `composerd` on `:8080` and the native `edgectl`/`wafctl` on `:8082`. Pointing tooling at the wrong one is a bind race, not a configuration error.
+6. Rollback does not deploy. `POST /stacks/{name}/rollback` resets the worktree to a commit and the running containers keep running until a deploy or up follows.
+
+## Related docs
+
+- [Wiring a Forgejo push to a Composer GitOps deploy](/guides/forgejo-webhooks-composer-gitops/) - the forge-side recipe: provider `gitea`, the delivery path, and how the hook reaches a host-bound service.
+- [Encrypting Docker Compose .env files with SOPS and age](/guides/sops-age-compose-stacks/) - the worked encrypt/deploy/re-encrypt cycle whose deploy half is Composer's.
+- [drawbridge: an mTLS-gated, route-allowlisted proxy for the Docker socket](/reference/drawbridge-docker-socket-proxy/) - the remote daemon endpoint Composer deploys to on the storage host.
+- [Forgejo as the primary forge on the NixOS edge router](/reference/self-hosted-forgejo-router/) - the host that runs both the forge and Composer.
+- [Where Forgejo's data lives: storage, backups and caches](/reference/forgejo-storage-backups-cache/) - the repo side of the push that triggers a deploy.
+- [Forgejo recovery runbooks](/guides/forgejo-recovery-runbooks/) - what a redeploy interrupts when a runner is stopped mid-job.
+- [A kanban board for coding agents](/reference/kanban-board-for-coding-agents/) - a stack that is git-synced and webhook-deployed by Composer rather than by hand.
+
+[^compose-up]: Docker, "docker compose up," Docker Docs. https://docs.docker.com/reference/cli/docker/compose/up/
+[^composer-source]: Composer (private repository), source at `v0.29.3`: `internal/api/handler/`, `internal/app/git_service.go`, `internal/infra/docker/`, and the hand-maintained `docs/api-reference.md`.
+[^router-config]: The edge router's NixOS configuration, the `oci-containers` block that starts Composer: image pin, `--network=host`, `COMPOSER_PORT=8080`, and the volume list.
