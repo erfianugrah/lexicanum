@@ -1,0 +1,277 @@
+---
+title: Keeping /run/user alive across Docker Desktop stops on WSL2
+description: On a systemd-enabled WSL2 distro, every Docker Desktop stop can delete /run/user/1000 or leave it root-owned and empty while systemd still reports the session as active - breaking systemd --user, gpg-agent, and any agent with a socket under XDG_RUNTIME_DIR. The cause is mount propagation - /run/user/1000, the WSLg copy and Docker Desktop's bind mount share one peer group, so the teardown unmount propagates back. Fix it with a boot unit that makes /run/user a private mount, plus a 30-second watchdog timer as backstop, and verify against a real Docker Desktop stop.
+author: "Erfi Anugrah"
+category: workstations
+---
+
+Every time Docker Desktop stopped on this box, `/run/user/1000` was either deleted outright or left behind as an empty `root:root` 0700 directory - while `user@1000.service` and `user-runtime-dir@1000.service` both still read active. The session manager was never told, so everything with a socket under `XDG_RUNTIME_DIR` broke silently: `systemctl --user` could not reach its bus, gpg-agent exited with "can't connect my own socket", and the password-manager agent's socket vanished. The cause is not Docker Desktop deleting anything - it is Linux shared-subtree propagation. Docker Desktop's WSL integration bind-mounts the distro's `/run` into its own tree; because `/run` is a shared mount, those binds join the same peer group as the originals, and when Docker Desktop tears down, its unmount propagates back into the distro.
+
+This guide builds the fix: a oneshot boot unit that takes `/run/user` out of the peer group (`mount --make-rprivate`) before Docker Desktop starts, plus a watchdog timer that repairs the directory if the private mount ever fails to hold. It was written against an Arch WSL2 distro with systemd enabled; the mechanism is WSL- and Docker Desktop-side, so any systemd distro shows it. Prerequisites: systemd running as PID 1 (`systemd=true` under `[boot]` in `/etc/wsl.conf`), and Docker Desktop's WSL integration enabled for the distro. Nothing here stops Docker Desktop until the verification step at the end.
+
+## Constants (read this first)
+
+Everything that follows was observed on one box. The mount facts are read from `/proc/self/mountinfo`; the dates and journal lines from `journalctl`.
+
+| Fact | Consequence |
+|---|---|
+| `/run` is a shared mount (`shared:18`) | Any bind of a path under it joins the source mount's peer group; mount and unmount events propagate both ways.[^kernel-sharedsubtree] |
+| `/run/user` is its own tmpfs (`shared:21`), self-bound once | It is a mountpoint already, which makes the `--make-rprivate` fix a one-liner. |
+| `/run/user/1000` is a tmpfs, mode 700, owned by uid 1000 | Its health check is four facts: exists, is a directory, owned by the uid, still a mountpoint. |
+| `/run/user/1000`, `/mnt/wslg/run/user/1000` and `/mnt/wsl/docker-desktop-bind-mounts/archlinux/<id>/user/1000` are one mount in one peer group (`shared:333`) | An unmount on any member propagates to the others. The third path is Docker Desktop's WSL integration bind-mounting this distro's `/run` into its own tree. |
+| The journal signature of a Docker Desktop stop is `EXT4-fs (sdX): shut down requested` alongside a `p9io AcceptAsync` cancel | That pair, immediately followed by `/run/user/1000` problems, is what tied the teardown to the breakage. |
+| systemd is not notified when the mount disappears | `user@1000.service` and `user-runtime-dir@1000.service` keep reporting active. The session state lies. |
+
+The three observed incidents:
+
+| When | Shape of the breakage |
+|---|---|
+| 2026-09-30 18:00 | `/run/user/1000` gone or root-owned (first occurrence; the pattern was not yet recognised) |
+| 2026-10-01 08:39 | `/run/user` itself unmounted - bare `/run`, no `1000` at all |
+| 2026-10-01 09:59 | `/run/user/1000` unmounted - the root-owned 0700 mountpoint dir systemd created underneath shows through |
+
+What breaks downstream, in the order it was noticed:
+
+| Symptom | Cause |
+|---|---|
+| `systemctl --user` cannot reach its bus | The user manager's socket lived under `/run/user/1000` |
+| Password-manager agent fails ("agent not running", or `Permission denied (os error 13)`) | Its socket was in `/run/user/1000` and is gone |
+| `gpg-agent` exits with "can't connect my own socket" | Its sockets under `/run/user/1000/gnupg` went away under it |
+| An empty `pubring.db.lock` left in `~/.gnupg` | keyboxd was killed mid-write; the stale lock then blocks the next gpg until removed |
+
+The manual repair, before the fix existed:
+
+```bash
+systemctl restart user-runtime-dir@1000 user@1000
+# then re-unlock whatever agents the user manager restarts (rbw unlock, gpg)
+```
+
+## How a Docker Desktop stop reaches /run/user
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_pg {
+    label="one peer group (shared:333)";
+    ru [label="/run/user/1000\ntmpfs, uid 1000, mode 700"];
+    wslg [label="/mnt/wslg/run/user/1000\nWSLg copy"];
+    dd [label="/mnt/wsl/docker-desktop-bind-mounts/.../user/1000\nDocker Desktop bind of /run"];
+  }
+  ru -> wslg [dir=both, label="mount/unmount\npropagates"];
+  wslg -> dd [dir=both, label="mount/unmount\npropagates"];
+  stop [label="Docker Desktop stops", shape=box];
+  stop -> dd [label="unmount", style=dashed];
+}
+```
+
+The peer-group members are not three mounts that happen to show the same files - they are one `vfsmount` registered at three mountpoints, and unmounting any member unmounts the others.[^kernel-sharedsubtree] The two observed outcomes differ only in how much of the tree Docker Desktop's teardown took: the 09:59 incident unmounted just `/run/user/1000` (exposing the root-owned 0700 directory systemd had created as its mountpoint), and the 08:39 incident unmounted `/run/user` with it (exposing bare `/run`).
+
+The fix has two layers:
+
+1. **Prevention.** Make `/run/user` (and therefore everything under it) a private mount at boot. A private mount does not forward or receive propagation, so Docker Desktop's bind no longer joins this peer group and its unmounts stay on its side of the fence.
+2. **Backstop.** A watchdog on a 30-second timer that checks the four health facts and, only if systemd still believes the session is alive, restarts `user-runtime-dir@1000.service` and `user@1000.service` - the same repair that was being run by hand.
+
+Both live in the `system/` directory of the dotfiles repo (a private repo, so no link - the files are quoted verbatim below where it matters).
+
+## Part 1: Confirm the peer group on your box
+
+Before changing anything, confirm the mechanism applies. The propagation column of `findmnt` is the whole story:
+
+```bash
+findmnt -o TARGET,PROPAGATION /run /run/user /run/user/1000
+findmnt -o TARGET,PROPAGATION | grep -E 'wslg/run/user|docker-desktop-bind-mounts'
+```
+
+If the box matches the incident state, all three of `/run/user/1000`, `/mnt/wslg/run/user/1000` and the Docker Desktop bind path report the same `shared:<n>` number - that number is the peer-group id. If `/run/user/1000` reports `private` already, the fix is in place (or your Docker Desktop version does not bind `/run` and you never had the bug).
+
+A more direct check that it is one mount, not three: create a file in `/run/user/1000` and see it appear at the other two paths.
+
+## Part 2: The private-mount boot unit
+
+`run-user-private.service`, verbatim:
+
+```ini
+# Make /run/user a private mount tree so a Docker Desktop teardown cannot
+# propagate an unmount into it.
+#
+# Mechanism (observed 2026-10-01, mountinfo): /run/user/1000,
+# /mnt/wslg/run/user/1000 and Docker Desktop's
+# /mnt/wsl/docker-desktop-bind-mounts/.../user/1000 are one mount in one
+# shared peer group, so Docker Desktop's teardown unmount propagates back and
+# removes the real /run/user/1000. rprivate cuts /run/user out of the group.
+# Verified 2026-10-01 11:43 (Docker Desktop stop, dir intact) - see
+# system/README.md for the re-check commands.
+#
+# /run/user is normally already a tmpfs mountpoint on this box; the bind is a
+# fallback for the case where it is not (then --make-rprivate on it alone would
+# only mark whatever is at that path, so a mountpoint is established first).
+[Unit]
+Description=Make /run/user a private mount tree (Docker Desktop teardown mitigation)
+After=systemd-logind.service
+Wants=systemd-logind.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'set -e; mountpoint -q /run/user || mount --bind /run/user /run/user; mount --make-rprivate /run/user'
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Three details carry the weight:
+
+- `--make-rprivate`, not `--make-private`. The `r` applies the flag recursively to everything under `/run/user`, including future mounts like `/run/user/1000` itself.
+- The self-bind fallback. `--make-rprivate` only marks mounts; if `/run/user` were a plain directory on the root filesystem, there would be nothing to mark. Binding it onto itself first creates the mountpoint, then the flag applies. On this box `/run/user` is already a tmpfs, so the fallback has never fired.
+- `After=systemd-logind.service` orders it before any user session exists, which is before Docker Desktop's integration has anything to bind against.
+
+One known side effect, quoted from the repo README because it has not bitten in practice but is real: Docker Desktop no longer sees mounts created under `/run/user` after it binds. Nothing on this box relies on that direction of visibility.
+
+## Part 3: The watchdog backstop
+
+The private mount is the fix; the watchdog exists for the day it does not hold (a Docker Desktop update that re-binds differently, a distro rebuild that loses the unit). It polls every 30 seconds and automates the manual repair.
+
+`run-user-watchdog@.service` and `run-user-watchdog@.timer`, verbatim:
+
+```ini
+# Repair /run/user/%i when a Docker Desktop teardown removed or
+# root-owned it while user@%i.service stayed active. Driven by the
+# matching @.timer. Script: system/run-user-watchdog.sh in the dotfiles repo.
+[Unit]
+Description=Check and repair /run/user/%i (Docker Desktop teardown)
+Documentation=file:///usr/local/libexec/run-user-watchdog.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/run-user-watchdog.sh %i
+```
+
+```ini
+# Poll for a torn-down /run/user/%i. 30s is short enough that a Docker
+# Desktop stop is repaired before the next interactive shell needs rbw.
+[Unit]
+Description=Periodically check /run/user/%i
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+```
+
+The instance is the uid (`run-user-watchdog@1000.timer`). The script's health check is the four facts from the constants table - exists, is a directory, owned by the uid, is a mountpoint - and one failed fact names itself on stderr before the repair runs:
+
+```sh
+# check_run_user PATH UID
+# Healthy = PATH exists, is a directory, is owned by UID, and is a mountpoint.
+# Prints the failed check (one line) on stdout and returns 1 when unhealthy.
+check_run_user() {
+	_path="$1"
+	_uid="$2"
+
+	[ -e "$_path" ] || { echo "path does not exist: $_path"; return 1; }
+	[ -d "$_path" ] || { echo "not a directory: $_path"; return 1; }
+
+	_owner="$(stat -c '%u' "$_path" 2>/dev/null || echo '?')"
+	[ "$_owner" = "$_uid" ] || {
+		echo "owner mismatch: $_path is owned by uid $_owner, expected $_uid"
+		return 1
+	}
+
+	mountpoint -q "$_path" || { echo "not a mountpoint: $_path"; return 1; }
+
+	return 0
+}
+```
+
+The repair itself is the two-unit restart, gated on the session still being alive:
+
+```sh
+cmd="systemctl restart user-runtime-dir@$uid.service user@$uid.service"
+```
+
+That gate matters: the watchdog restarts only when `user@<uid>.service` is `active` or `activating`. Without the gate, running the timer on a box where the user has never logged in would *start* a session every 30 seconds rather than repair one. The gate is also why a repair shows up in the journal as a single line - `journalctl -t run-user-watchdog` - and a healthy box logs nothing at all.
+
+For testing without breaking anything, the script takes `RUN_USER_BASE` (point the check at a different directory) and `DRY_RUN=1` (print the restart command instead of running it):
+
+```bash
+RUN_USER_BASE=/tmp/nope DRY_RUN=1 /usr/local/libexec/run-user-watchdog.sh 1000
+# run-user-watchdog: DRY RUN: /tmp/nope/1000 unhealthy (path does not exist: /tmp/nope/1000); would run: systemctl restart ...
+```
+
+The repo also carries `test-run-user-watchdog.sh`, which exercises the check function and the restart invocation against a stub `systemctl` on `PATH` - missing path, not-a-directory, owner mismatch, not-a-mountpoint, the healthy real path, the inactive-session no-op, `DRY_RUN`, and a non-numeric uid being rejected. The tests never touch live systemd.
+
+## Part 4: Install
+
+`system/install.sh` in the dotfiles repo installs the script to `/usr/local/libexec`, the units to `/etc/systemd/system`, then enables and starts the private-mount unit and the watchdog timer for the instance uid (default 1000, override with `RUN_USER_UID=<uid>`). It is idempotent, and takes `--dry-run` and `--uninstall`. It touches root-owned paths and calls `systemctl`, so the user runs it - this is deliberately not something an agent shell does:
+
+```bash
+sudo system/install.sh              # from the dotfiles checkout
+sudo system/install.sh --dry-run    # print what would happen, change nothing
+sudo system/install.sh --uninstall
+```
+
+Sanity-check the units before installing. `systemd-analyze verify` needs the `ExecStart` binary to exist, so point it at the checkout copy first:
+
+```bash
+sed 's#^ExecStart=.*#ExecStart='"$PWD"'/run-user-watchdog.sh %i#' \
+  system/run-user-watchdog@.service > /tmp/verify@.service
+systemd-analyze verify /tmp/verify@.service
+```
+
+## Verification
+
+Two checks, one static and one live.
+
+**Static: the peer group is cut.** After enabling `run-user-private.service`, the propagation column changes:
+
+```bash
+findmnt -no PROPAGATION /run/user/1000   # expect: private
+```
+
+Re-running the Part 1 `findmnt` should now show `/run/user/1000` with a different propagation setting from the `/mnt/wslg` and Docker Desktop paths - they may still share a group with each other, and that no longer matters.
+
+**Live: stop Docker Desktop and look.** This is the check that counts, and it is the one that produced the verified result:
+
+1. `findmnt -o TARGET,PROPAGATION /run/user/1000` - note the peer-group id before.
+2. Stop Docker Desktop on the Windows side: quit it from the system tray, or run `wsl.exe --terminate docker-desktop` to stop its distro. (Do not use `wsl.exe --shutdown` for this - it terminates every running distro, including the one you are verifying from.)
+3. `stat -c '%U %a' /run/user/1000` - expect your user and `700`.
+4. `mountpoint -q /run/user/1000 && echo still a mountpoint`
+5. `systemctl list-timers 'run-user-watchdog@*'` - NEXT should be at most 30 seconds away, and `journalctl -t run-user-watchdog` should show no repairs.
+
+Measured on this box, 2026-10-01: the unit was installed at 11:41 (`findmnt` showed `/run/user/1000` out of the peer group), Docker Desktop was stopped at 11:43:50 with the usual `EXT4-fs ... shut down requested` journal signature, and `/run/user/1000` stayed `erfi 700` and a mountpoint, with the password-manager agent still unlocked. The watchdog logged nothing - the backstop was present but not needed.
+
+## Gotchas and lessons learned
+
+- **The session state lies.** `user@1000.service` reading active means systemd was never told the mount went away, not that the session is healthy. Trust `stat` and `mountpoint` on the directory, not `systemctl status`.
+- **The breakage has two shapes.** Sometimes `/run/user/1000` alone is unmounted and the root-owned 0700 mountpoint directory shows through; sometimes `/run/user` goes too and there is no `1000` at all. A fix tested against only the first shape (checking that the dir is root-owned) misses the second (dir absent). The watchdog's "exists and is a mountpoint" check covers both.
+- **Restarting the user manager re-locks your agents.** The repair restarts `user@1000.service`, so agent sockets come back fresh but locked - re-run `rbw unlock` (and re-seed gpg) after a repair. The watchdog automates the restart, not the re-unlock.
+- **A stale gpg lock survives the repair.** keyboxd killed mid-write leaves an empty `pubring.db.lock` in `~/.gnupg` that blocks the next gpg invocation. On this box a shell helper removes it; elsewhere, check for and delete the empty lock file by hand.
+- **Do not gate the repair on the dir being root-owned alone.** The root-owned 0700 directory is a symptom of one of the two shapes; the 08:39 incident had no directory to check the owner of.
+- **Read the mechanism from the live mount table, not from documentation guesses.** The diagnosis stalled until `/proc/self/mountinfo` showed the three paths sharing `shared:333`. `findmnt -o TARGET,PROPAGATION` is the tool; the peer-group id matching is the proof.
+
+## File reference
+
+All paths are relative to `system/` in the dotfiles repo (private).
+
+| File | Purpose |
+|---|---|
+| `run-user-private.service` | Boot oneshot: `mount --make-rprivate /run/user` after `systemd-logind`. The fix. |
+| `run-user-watchdog.sh` | The check + repair script. Takes a uid (default 1000); `RUN_USER_BASE` and `DRY_RUN` for testing. Installed to `/usr/local/libexec`. |
+| `run-user-watchdog@.service` | Oneshot that runs the script for instance uid `%i`. |
+| `run-user-watchdog@.timer` | Fires 1 minute after boot, then every 30 seconds (`AccuracySec=5s`). |
+| `install.sh` | Idempotent installer; `--dry-run`, `--uninstall`, `RUN_USER_UID` override. Run by the user with sudo. |
+| `test-run-user-watchdog.sh` | Tests for the check function and the restart invocation against a stub `systemctl`. |
+
+## Related docs
+
+- [Reclaiming disk space from WSL2 and Docker Desktop](/guides/wsl2-disk-reclaim/) - the same rig and the same Docker Desktop; that guide covers the space it costs, this one covers the mount it breaks
+- [Making cliamp play sound on WSL2](/guides/cliamp-wsl2-audio/) - the WSLg side of this box; `/mnt/wslg/run/user/1000` in the peer group above is the same WSLg that provides the audio socket
+
+[^kernel-sharedsubtree]: The Linux Kernel documentation, "Shared Subtrees" - peer groups, bind/unmount propagation semantics, private mounts. https://www.kernel.org/doc/html/latest/filesystems/sharedsubtree.html
