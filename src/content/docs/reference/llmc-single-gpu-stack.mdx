@@ -1,0 +1,263 @@
+---
+title: "Scheduling one GPU between LLM, image and training work"
+description: How a single consumer GPU is shared between an LLM server, ComfyUI and a LoRA trainer through one mode-switching proxy - the scheduler event loop, TOML presets and their live reload, drain-before-swap with its grace deadline, the lock TTL with its FIFO queue, what an eviction costs a long agent session, and the incidents the stack's own notes record from making this work
+author: Erfi Anugrah
+category: workstations
+---
+
+A local model stack has one scarce resource and several consumers. This page is the design of the layer that arbitrates it: a proxy that owns container lifecycle for an LLM server, an image-generation server and a training service, all sharing one GPU, and the operating rules its incidents produced.[^llama-swap] It is the scheduling counterpart to [the bench numbers](/reference/local-model-bench/), which measure the models rather than the machinery around them.
+
+Provenance: the behaviour below is read from the stack's own source and its incident notes, not measured by a bench run. The hardware is the same as the bench page states - an RTX 5090 (32 GB, sm_120) in a WSL2 dev box, CUDA containers throughout. The stack's repository is private, so file paths are named but not linked. Where a claim is an operating rule rather than a code path, it says so.
+
+## TL;DR
+
+- One proxy owns the GPU. It runs exactly one of `llama-server`, `ninfer-server` (a second LLM engine), ComfyUI or `lora-train`, and swaps between them on demand; the GPU services live outside Compose and are spawned through the Docker API.
+- A swap drains first: in-flight requests on the outgoing model finish before its container is killed, up to a 60 s grace deadline. Past the deadline the swap proceeds anyway and long generations die mid-stream.
+- A swap wipes the engine's context cache. A ~200k-token agent session re-prefills from scratch on the next turn, which clients report as 40-90 s of time-to-first-token and a 0% cache-hit rate.
+- A preset lock pins a model against evicting swaps. It has a 900 s TTL, is refreshed by traffic or explicitly, and a contended lock returns 409 rather than hijacking the running model. `--wait` joins a FIFO queue instead.
+- The two failure modes that cost the most time were both contention, not engine bugs: a lock that silently lapsed mid-leg, and two clients on different presets swapping the GPU back and forth. A third - the retracted 2.2x decode regression - was contention misread as a regression.
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  client [label="agent harness\n(pi, Claude Code, curl)"];
+  proxy  [label="model-proxy-go :11434\nscheduler event loop\nstate in active.toml"];
+  llama  [label="llama-server :8080\nGGUF presets"];
+  ninfer [label="ninfer-server :8080\n.ninfer artifacts"];
+  comfy  [label="comfyui :8188"];
+  train  [label="lora-train :8787"];
+  gpu    [label="one GPU\none workload at a time"];
+
+  client -> proxy [label="/v1/*"];
+  proxy -> llama  [label="mode llm"];
+  proxy -> ninfer [label="mode llm"];
+  proxy -> comfy  [label="mode comfyui"];
+  proxy -> train  [label="mode train"];
+  llama -> gpu;
+  ninfer -> gpu;
+  comfy -> gpu;
+  train -> gpu;
+}
+```
+
+Text fallback: an agent harness sends OpenAI-compatible and Anthropic-compatible requests to the proxy on port 11434. For `mode = llm` the proxy spawns and forwards to whichever engine the resolved preset names - `llama-server` for GGUF presets, `ninfer-server` for `.ninfer` artifacts - both on port 8080 in their own container. For `mode = comfyui` it forwards to ComfyUI on 8188, and for `mode = train` to the LoRA trainer on 8787. All four GPU containers are candidates for the same card and only one exists at a time; the proxy persists the current mode and model to `active.toml` so a restart knows what it left running.
+
+## What the proxy routes
+
+| Path | Target | Notes |
+|---|---|---|
+| `/v1/chat/completions`, `/v1/completions` | active LLM engine | body `model` selects a preset; `auto` selects a route alias |
+| `/v1/messages` | active LLM engine | Anthropic shim, so Claude Code can point `ANTHROPIC_BASE_URL` here |
+| `/v1/models` | preset store | lists preset names as `id`, engine-side ids under `meta.model_id` |
+| `/v1/presets` (POST, DELETE) | ephemeral preset registry | in-memory presets for sweep runs; TOML wins on a model-id collision |
+| `/comfyui/*` | ComfyUI | forwards to 8188 |
+| `/train/*` | LoRA trainer | forwards to 8787 |
+| `/mode` (GET, POST) | scheduler | mode switch, lock, unlock, renew |
+| `/lock`, `/unlock` (POST) | scheduler | aliases for the lock calls |
+| `/status`, `/health` | scheduler | mode, model, lock owners, queue, in-flight counts |
+
+Modes are `llm`, `comfyui`, `train` and `idle`. A write request for a path in an inactive mode triggers the swap; a read-only request does not, and returns 503 `service_inactive` instead. `mode llm` is a single mode covering two engines, so a request cannot be routed by mode alone - the preset decides the container.
+
+## What a swap does
+
+A swap is a state machine on one goroutine, with the container work handed to a goroutine that reports back on the same channel. The scheduler is adopted from llama-swap's internal router[^llama-swap], with drain, capability routing and the lock API added on top.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  req [label="request for preset B\n(resident: A)"];
+  drain [label="drain\nin-flight A finish\nnew A requests deferred"];
+  serve [label="serve in place\n(alias or capability\nstill satisfiable by A)"];
+  grace [label="grace deadline\n60 s (LLMC_DRAIN_GRACE_S)"];
+  stop [label="stop A's container\nstart B's container"];
+  health [label="health wait\n900 s (LLMC_HEALTH_TIMEOUT)"];
+  fwd [label="grant waiters\nforward request"];
+
+  req -> drain;
+  drain -> serve [label="optional"];
+  drain -> stop [label="A drained"];
+  drain -> grace [label="A still busy"];
+  grace -> stop [label="swapping anyway"];
+  stop -> health;
+  health -> fwd [label="healthy"];
+  health -> fwd [label="timeout: 503 to waiters"];
+}
+```
+
+Text fallback: a request for a preset other than the resident one starts a pending swap and records the resident as the drain key. While draining, new requests for the same target join the pending swap as waiters; a request an alias or capability can still satisfy on the resident model is granted in place with no swap; anything else is deferred. The swap starts when the resident's in-flight count reaches zero, or when the grace deadline fires and logs that it is swapping with requests still in flight. Starting a swap stops the outgoing container before creating the incoming one, then waits for the health endpoint. On success the waiters are granted with the in-flight key under the new model. On failure the state is re-derived from Docker rather than assumed - a health-check timeout leaves a container up but unhealthy, so both "idle" and "still running" would be wrong in one of the two cases - and the waiters get a 503.
+
+| Control | Default | Effect |
+|---|---|---|
+| `LLMC_DRAIN_GRACE_S` | 60 s | how long in-flight requests may hold a swap off before it proceeds anyway |
+| `LLMC_HEALTH_TIMEOUT` | 900 s | readiness wait after spawning any GPU service |
+| `LLMC_VRAM_LIMIT_GB` | 32 | card budget used for the pre-swap gate |
+| `LLMC_VRAM_RESERVE_GB` | 6 | headroom subtracted from it, so a preset must fit 26 GB |
+| `LLMC_LOCK_TTL_S` | 900 s | lock and queue-entry lifetime |
+
+The VRAM gate is checked twice: on a preset before the scheduler sees the request (422 `model_unavailable`), and on the chain head of a route alias at swap-decision time. The reserve is the reason a preset that fits the card can still be refused the swap.
+
+Swap latency is dominated by the model read. Cold storage is 30-60 s per swap; a page-cache-warm swap is 5-10 s. An agent session that hits a swap pays that once, plus the re-prefill described below.
+
+## Presets
+
+A preset is a TOML file in the presets directory, mounted read-only into the proxy. It declares the model (`repo` plus `file`, or a local path), an optional multimodal projector and chat template, a `[runtime]` block, an optional `[bench]` tokenizer, and a `capabilities` list.
+
+- The schema is strict. One unknown key fails the entire reload, not just that file, so a preset added with a newer key silently freezes `/v1/models` at its last good state. A key that exists in the Python preset loader but not in the Go one is the common way to hit this.
+- Reload is live. `/v1/models` rescans the directory, so adding or editing a TOML needs no rebuild and no restart. A schema-shape change to the proxy itself does need one.
+- Presets deduplicate by model id, derived from the artifact filename stem. Two presets naming one file is a load error rather than a duplicate entry, so an A/B arm on the same weights needs a second filename - a hardlink costs no disk.
+- Ephemeral presets can be registered at runtime through `POST /v1/presets`. They survive reloads, are never written to disk, and are lost on restart; an on-disk preset wins a model-id collision.
+- `capabilities = ["vision", ...]` lets a request name a capability rather than a model, either as an `X-LLM-Capability` header or as a `cap:<name>` model. If the resident model has it, the request is served in place and the swap is skipped entirely.
+- The listing carries the metadata clients need to size themselves: effective context, whether reasoning is on, the output cap, the VRAM estimate, and which preset is currently loaded.
+
+A second TOML file, `routes.toml`, maps model aliases to ordered preset chains. `auto` resolves the `default` chain and `auto:<name>` a named one; a request naming an alias walks the chain, serves in place when the resident preset is already in it, and otherwise swaps to the chain head. An empty chain means "whatever is resident, never swap" - the alias for a client that should never be the reason a model changes. A chain entry that does not resolve fails the request with 404 `unknown_route` rather than silently degrading.
+
+## Locks
+
+A lock pins a preset so evicting swaps are refused. It exists because the alternative - trusting every client to know when the GPU is occupied - did not hold: an unattended loop and an interactive session on different presets will swap the card back and forth indefinitely.
+
+| Call | Body or flag | Result |
+|---|---|---|
+| lock, uncontended | `{"lock": "<preset>", "owner": "<id>"}` | 200, with owners and expiry |
+| lock, contended | same | 409 `refusing to hijack`, with the current owners and queue |
+| lock, contended, waiting | `{"lock": ..., "owner": ..., "wait": true}` | 202 `{"queued": true, "position": N}` |
+| lock the resident model | `{"lock": true}` | pins whatever is loaded |
+| renew | `{"renew": true, "owner": "<id>"}` | extends the TTL; works for a queued waiter too |
+| unlock one owner | `{"lock": false, "owner": "<id>"}` | releases that owner, drops its queue entry |
+| unlock all | `{"lock": false}` | clears every owner |
+
+Rules that matter in practice:
+
+- **A contended lock never hijacks the running model.** Before the FIFO queue existed it did, and that killed a running loop mid-iteration. The queue exists to make "wait your turn" the cheap answer.
+- **Only the queue head may take a free lock, and only for the model it queued for.** Joining an already-locked model's owner set is never gated, because adding an owner to a lock that is already held carries no eviction risk.
+- **The TTL lapses a silent leg.** Traffic under the lock refreshes it; a leg that makes no request for longer than the TTL - long local thinking, or waiting in the queue - loses the pin without an error anywhere. Heartbeat from anything that can go quiet for 15 minutes.
+- **Requests under a lock are policed.** A request for a different preset while a lock is held is rejected 422 `model_unavailable` rather than swapping, and an unknown model name is rejected rather than passed through to silently run on the locked model.
+- **The queue holds names, not swaps.** A queued owner waits for the preset; the swap itself happens lazily, on the winner's first request. Entries carry a timestamp and are pruned once their owner has been silent for a TTL, so a dropped queue heals itself and a waiter re-enqueues on its next poll. The state file carries the queue as well as the lock, so the lock is restart-safe; a waiter's own polling loop is what makes its place survive.
+- **Bench and audit modules take the lock with their own owner name and fail fast** rather than queueing, so a measurement either runs on an uncontended card or refuses to run.
+
+## What an eviction costs
+
+This is the part clients feel, and the reason a lock is worth holding. Stopping the engine discards its context cache: the reused-prefix state that makes a long agent session cheap to continue.
+
+| Symptom | Cause | Observed figure |
+|---|---|---|
+| Time to first token balloons | full re-prefill of the session after the cache is dropped | 40-90 s on a ~200k-token session |
+| Cache-hit rate reads 0% | client-side prefix cache is invalidated by the respawn | pi reported `cache 0.0%` every turn |
+| Container appears to crash-loop | each new request swaps to a different preset, so the container is torn down and rebuilt repeatedly | once per ~90 s over 13 minutes of two clients fighting |
+| Long generation dies mid-stream | the swap proceeded at the grace deadline with the request still in flight | `upstream_died_midstream` in the proxy log |
+| Decode looks like a regression | the outgoing and incoming engines coexist briefly during drain, and both hold the GPU | 55-60 tok/s against a 139 tok/s baseline |
+
+The last row is the one that misleads. Draining means the two engines overlap, and the overlap starves decode until the outgoing container is gone. On a locked card the same probes measured 127-131 tok/s on the older engine revision and 129-131 on the newer one; the "regression" was another client POSTing through the proxy during the measurement window.
+
+## Which control for which situation
+
+| Situation | Do this | Why |
+|---|---|---|
+| Unattended loop or long build | `llmc lock <preset> --owner <session-id>` before starting | the loop is the workload that must not be interrupted, and it cannot detect a swap |
+| Two loops | same preset, one owner each; different presets queue with `--wait` | different presets on one card swap against each other forever |
+| Interactive work alongside a loop | lock the same preset the loop uses, or accept the queue | a second preset is a second swap |
+| Measuring throughput | lock the preset, and name the locked model in the request | an unlocked probe measures whoever else is using the card |
+| One image or a short training run | just call ComfyUI or `/train/*` | the proxy swaps when it can, and refuses when a lock is held |
+| A client that must never trigger a swap | a route alias with an empty chain | resolves to whatever is resident, or fails cleanly |
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q [label="does the work\nneed the GPU\nexclusively\nfor minutes?"];
+  lock [label="lock the preset\n+ heartbeat the TTL"];
+  held [label="lock refused?"];
+  wait [label="retry with wait\njoin the FIFO queue"];
+  coord [label="coordinate, or\nshare the preset"];
+  shared [label="no lock\nshare the card,\nexpect swaps"];
+
+  q -> lock [label="yes, unattended"];
+  q -> held [label="no"];
+  lock -> wait [label="409"];
+  wait -> coord;
+  held -> shared;
+  held -> wait [label="another preset is\nbeing measured"];
+}
+```
+
+Text fallback: if the work holds the GPU exclusively for minutes - an unattended loop, a benchmark, a training run - take a preset lock and heartbeat its TTL. If the lock is refused with a 409, either retry with `--wait` to join the FIFO queue, or coordinate with whoever holds it; for two loops, the answer is to share one preset rather than queue. If the work does not need exclusivity - a short generation, a chat turn - do not lock: send it and accept that the proxy may swap the model under you.
+
+## Incidents the notes record
+
+Every row here is a dated entry in the stack's own incident log, not a hypothetical. They are the reason the current design is shaped this way.
+
+| Date | What happened | What changed |
+|---|---|---|
+| 2026-08-17 | A `lock` for a different preset while one was held took the GPU anyway, killing a loop mid-iteration | contended locks return 409, or queue with `wait`; never hijack |
+| 2026-08-19 | A 30-minute leg that made no requests found its lock silently lapsed | TTL documented as a heartbeat obligation; `lock --renew` added |
+| 2026-08-21 | A container killed out of band left the proxy 502-looping | a connection-level upstream death flips mode to idle, keeping the model name; the next acquire respawns (verified: kill, 502, idle, respawn served in about 7 s) |
+| 2026-09-07 | A swap failed after the outgoing container was already stopped; the proxy reported a model loaded with no container behind it and refused to respawn | swap failure re-derives mode from Docker instead of trusting pre-swap state |
+| 2026-09-08 | A bare unlock while a bench was running handed the GPU away and produced a fake result | lock discipline became a measurement precondition, with the lock held for the whole run |
+| 2026-09-14 | A client abort mid-materialization wedged the engine's single slot for 89 minutes: 17.6 tok/s prefill, host at 0%, then self-recovery - the wedged request's own client never disconnected[^ninfer-184] | an engine-side transport watchdog patch, a proxy watchdog enabled in production, and per-request diagnostics logging |
+| 2026-09-18 | A ~2.2x decode slowdown was blamed on an engine bump; it was another client POSTing during the measurement windows, with drain overlap starving decode. Retracted | speed probes must hold the lock; the retraction is recorded in the bench page |
+| 2026-09-19 | A loop and an interactive session on different presets fought for 13 minutes; the container was rebuilt every ~90 s, TTFT reached 40-90 s, generations died at the grace deadline | one winner, or share a preset; the diagnosis is alternating model names in the proxy log |
+| 2026-09-28 | Every swap failed with a dial error on the container runtime socket | the socket is mounted as its parent directory rather than as a file, so a recreated socket is not pinned to a dead inode |
+
+Two of these are worth separating in kind. The wedge is an engine bug with a client-side trigger: the damage landed on the request *after* the one that was aborted, which is why the defence is a probe on the next request rather than a fix to the aborted one. The swap war is a scheduling failure with two ordinary clients - each client's behaviour was correct in isolation, and reading the proxy log for the pair reproduced it in minutes.
+
+## Reading the numbers
+
+- Swap latency is a storage number first. Cold 30-60 s and warm 5-10 s per swap says the swap cost is dominated by reading tens of gigabytes of weights, not by container start, and that a second swap five minutes later is cheap. A loop that alternates presets therefore pays the expensive case repeatedly only when something else evicts the cache between turns.
+- TTFT after a swap is a session-size number. 40-90 s on a ~200k-token session is the re-prefill of the whole conversation, so the same swap on a short chat is invisible. Any report of "the local model got slow" is worth reading as a session-size question before an engine question.
+- Throughput under an unlocked card is not a measurement of the engine. 55-60 tok/s versus 127-131 tok/s is the spread a second client can induce, so an unlocked number carries an error bar larger than any engine revision this stack has shipped.
+- The drain overlap is bounded but not free. Both engines hold the card until the outgoing container stops, which is precisely the window in which a concurrent benchmark is invalid.
+
+## Known gaps
+
+- **Idle auto-unload is specified but not implemented.** A spec describes releasing the GPU after a configured idle period by stopping the engine and keeping the model name so the next request respawns it; the shipped proxy has no handling for the environment variable it names. Until that lands, a model stays resident after its last request, holding its VRAM and power.
+- **Residency detection covers one engine.** The probe that reports which model is loaded understands the llama.cpp engine and not the second one, so a proxy restart with that engine resident forces one needless swap.
+- **The proxy schedules its own three workloads only.** A sister transcription stack keeps a model resident outside the proxy on the same card (about 5.6 GiB), which the VRAM budget does not account for and which has twice invalidated measurements taken through the proxy.
+
+## Reproducing
+
+The paths below are in the stack's private repository. Requests are against the proxy's own HTTP surface, so everything in the locks section can be exercised with `curl` against `127.0.0.1:11434` without touching the Docker API.
+
+| Surface | Where in the source |
+|---|---|
+| Scheduler event loop, drain, lock and queue | `proxy-go/internal/proxy/scheduler.go` |
+| Persisted state, modes, queue entries | `proxy-go/internal/proxy/state.go` |
+| Preset schema, live reload, capability list, model-id dedup | `proxy-go/internal/proxy/presets.go` |
+| Routes, ephemeral presets, mode handler, VRAM gate | `proxy-go/internal/proxy/server.go` |
+| Container lifecycle and health waits | `proxy-go/internal/proxy/orchestrator.go` |
+| Defaults for every setting in the table above | `proxy-go/cmd/proxy/main.go` |
+| Alias chains (`auto`, `auto:<name>`) | `routes.toml` |
+| Incident log and operating rules | the repository's `AGENTS.md` |
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| One workload at a time; four GPU containers, one card | asserted | architecture section of the repository's notes and Compose comments |
+| Drain-before-swap, grace deadline, waiter and in-place rules | design-read | `scheduler.go`; the grace path logs when it swaps with requests in flight |
+| Swap failure re-derives mode from Docker | design-read | comment and code path in `handleSwapDone` |
+| Lock semantics: 409, 202, TTL, FIFO gate, 422 under a lock | design-read | `handleLock`, `handleUnlock`, `expireLockIfNeeded`, `pruneQueue` |
+| Lock is persisted, queue entries are pruned on the TTL | design-read | `state.go` plus the pruning path |
+| Preset strictness, live reload, model-id dedup, ephemeral presets | design-read | `presets.go`, `handleModels`, `handlePresetRegister` |
+| Route aliases and the VRAM gate | design-read | `acquireRoute`, `CheckVRAMBudget`, the gate in `server.go` |
+| Cold 30-60 s and warm 5-10 s swap latency | measured | recorded in the repository's README |
+| Lock-hijack incident | measured | dated incident entry, 2026-08-17 |
+| TTL lapse on a silent leg | measured | dated postmortem, 2026-08-19 |
+| Idle-unload spec with no implementation | design-read (absence) | spec present; no handling of its variable anywhere in the proxy source |
+| Drain overlap starving decode; retracted 2.2x | measured then retracted | dated entry 2026-09-18 and the retraction in [the bench page](/reference/local-model-bench/) |
+| Swap war, container rebuild cadence, TTFT, mid-stream deaths | measured | dated entry 2026-09-19 |
+| Engine wedge, 89 minutes, one request later | measured | dated entry 2026-09-14 and the engine's upstream issue |
+
+No figure on this page was measured for it. The throughput and latency numbers that justify the lock rules are in [Qwen3.8-27B for agentic work](/reference/qwen38-agentic-tuning/) and [the bench numbers](/reference/local-model-bench/); this page explains what the proxy was doing while those were taken.
+
+[^llama-swap]: mostlygeek, "llama-swap," GitHub. https://github.com/mostlygeek/llama-swap
+[^ninfer-184]: Neroued, "NInfer issue #184," GitHub. https://github.com/Neroued/ninfer/issues/184
