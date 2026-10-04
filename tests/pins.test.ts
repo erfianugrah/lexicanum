@@ -993,6 +993,16 @@ const pins: Pin[] = [
       // The cache-window numbers that make the rotation warning concrete.
       "282 probes in 37 minutes",
       "116 probes in 20 minutes",
+      // The rate-limit boundary and the throughput ceiling, so neither drifts
+      // back to "the docs say 30" without a run behind it.
+      "`429` at request **31** of 60 on a fresh bucket",
+      "refused `429 over_email_send_rate_limit",
+      "102/105/110ms sequential to 411/368/366ms at concurrency 8",
+      "`db_max_pool_size=10`",
+      // The unresolved unit rather than a tidy number: AR01c read 150 and the
+      // page then quoted 1800/hour, and the run did not settle which unit the
+      // field carries.
+      "agree only if the field is per five minutes rather than per hour",
     ],
     mustNotContain: [
       // The retracted claim.
@@ -1000,6 +1010,7 @@ const pins: Pin[] = [
     ],
     sections: [
       /^## Which shape do I pick$/m,
+      /^## Rate limits and sign-up throughput$/m,
       /^## What to do about it$/m,
       /^## Where the docs disagree with runtime$/m,
       /^## Reading the numbers$/m,
