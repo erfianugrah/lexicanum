@@ -1,0 +1,275 @@
+---
+title: "slskarr: one process for Soulseek, the PIA tunnel, and the Lidarr import"
+description: "A single Go process that replaced slskd, the wg-pia-slskd WireGuard container, and soularr on the music pipeline: native Soulseek transfer state, an in-process PIA tunnel with port-forward and kill switch, why it runs as root and how downloads still land owned by Lidarr's user, and the ManualImport pipeline with its data-loss guards."
+author: Erfi Anugrah
+category: homelab
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+slskarr is a single Go binary that runs the Soulseek client, its own PIA WireGuard tunnel, and the bridge that hands finished albums to Lidarr. It replaced three containers - `slskd`, the `wg-pia-slskd` tunnel container, and `soularr` - on the servarr NAS on 2026-09-30. This doc covers why the three-container design was retired, what the in-process tunnel and the root-owned download tree cost, and how the import pipeline is arranged so a failed import never loses a library file.
+
+<Aside type="note" title="Provenance">
+  One host: the servarr NAS (NixOS, Docker Compose via composer). The three-container design ran until 2026-09-30; slskarr has been the production pipeline since, deployed by image tag. Figures below are read from the design record and from live runs between 2026-09-30 and 2026-10-02: 4032 wanted albums at first sync, 10 SQLite `database is locked` errors in the first production hour, 33 folders falsely marked imported, 385 quarantined folders requeued after the artist-id fix, and 186 tracks across 12 albums imported through `ManualImport` on 2026-10-01. slskarr is a private repository, so no source link is given; the claims are attributed to the component that produced them.
+</Aside>
+
+**TL;DR:**
+
+- Transfers are native in-memory state. There is no REST API to poll and no in-memory mirror that can desync, which was the failure mode that let a completed download become invisible.
+- The PIA WireGuard session, the port-forward lease, and the tunnel-liveness probe all run inside slskarr. The Soulseek session starts only from the tunnel's up callback, so a failed tunnel means no Soulseek connection at all.
+- slskarr runs as root because the in-process WireGuard needs `CAP_NET_ADMIN`; run as `--user 1000:100` the effective capability set is empty and `ip link add ... type wireguard` returns `Operation not permitted`.
+- Root writes are corrected at the point of writing (`internal/config/perm.go`: directories `0775`, files `0664`, owner `SLSKARR_FILE_UID`/`SLSKARR_FILE_GID`), with a one-time marker-gated walk over trees written before the owner was configured.
+- Imports go through Lidarr's `ManualImport` command with the artist id passed explicitly. The older `DownloadedAlbumsScan` command parses the artist from the folder name, so a folder named `c<id>` imports as `Unknown Artist c72`.
+- Lidarr deletes the library file it is replacing before it moves the new one in. When the move failed on a root-owned download, three library tracks were permanently deleted. Every guard in the import path exists because of that ordering.
+
+---
+
+## What replaced what
+
+| Retired service | Address | Replaced by | How |
+|---|---|---|---|
+| `soularr` | `.8` | `slskarr` | slskarr took the slot and the job: Lidarr wanted-list to Soulseek download |
+| `slskd` | `.16` | `slskarr` | The Soulseek protocol client is now in-process, not a daemon behind REST |
+| `wg-pia-slskd` | `.16` | `slskarr` | PIA session, WireGuard netlink setup, and port-forward lease are all in-process |
+
+`beets` stayed in the stack. Its fingerprinting half is duplicated by the bundled `fpcalc`, but its library-wide acoustic dedup has no replacement yet, so the container is still there.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  lidarr [label="Lidarr"];
+  subgraph cluster_slskarr {
+    label="slskarr - one process"; style=rounded; fontsize=12; margin=12;
+    pia [label="PIA session\nWireGuard, port-forward"];
+    soulseek [label="Soulseek client\ntransfers + share index"];
+    importer [label="Import bridge\nManualImport + verify"];
+    reconciler [label="Reconciler\n60s tick"];
+  }
+  downloads [label="/downloads\nincomplete, imported,\nquarantine, failed_imports"];
+  music [label="/music\nlibrary, read-only"];
+
+  pia -> soulseek [label="listen port"];
+  reconciler -> soulseek [label="search, download"];
+  reconciler -> importer [label="trigger, verify"];
+  soulseek -> downloads [label="write"];
+  importer -> downloads [label="move"];
+  importer -> lidarr [label="ManualImport"];
+  lidarr -> music [label="import"];
+  music -> soulseek [label="share, verify"];
+}
+```
+
+Text fallback for the diagram:
+
+1. Lidarr and slskarr sit next to each other on the `servarr` bridge network, in the reserved address block the [arr stack patterns](/guides/arr-stack-docker-patterns/) guide documents.
+2. Inside slskarr: the PIA session (WireGuard plus port-forward lease), the Soulseek client (transfers and share index), the import bridge, and the reconciler.
+3. The PIA session tells the Soulseek client which port to listen on.
+4. The reconciler drives the Soulseek client (search, download) and the import bridge (trigger, verify).
+5. The Soulseek client writes into `/downloads`; the import bridge moves folders within it.
+6. The import bridge calls Lidarr's `ManualImport`; Lidarr moves the files into `/music` and tags them.
+7. `/music` is mounted read-only into slskarr, which uses it for sharing and for verifying what it already has.
+
+---
+
+## Which do I pick: one process or the three-container design
+
+| If you have | One process (slskarr) | Separate client behind REST (slskd + soularr) |
+|---|---|---|
+| A large share index | The scan runs in-process; the API stays up | The HTTP listener serves nothing until the share scan finishes[^slskd-1160] |
+| Cross-container port-forward | The lease is a goroutine and a session field | A bash sidecar PATCHes a second container; a failed PATCH is silent |
+| Quality and delay profiles | Scored natively against Lidarr's profile mirror | Not modelled unless the bridge implements it |
+| Interest in running non-root | Not possible: in-process WireGuard needs `CAP_NET_ADMIN` | Possible, if you do not mind the extra hop |
+| Upgrades | One image, one migration set, one state model | Three projects, three release cadences, three state models |
+
+The tradeoff is real and one-directional: consolidation buys a single state model and costs the privilege separation that separate containers gave. Everything in the ownership section below exists to pay that cost back.
+
+---
+
+## Why the three containers went
+
+Each retired service added a failure boundary, and the interesting failures happened where two of them met.
+
+1. **The bridge's in-memory `grab_list` was the source of truth.** If slskd was briefly unreachable when the poll fired, soularr cleared the dict and the actual download state became invisible. Restarting soularr forgot everything in flight.
+2. **The share scan blocked the HTTP listener.** On a large library the first scan runs for minutes, and the daemon reports an empty reply from the server for the whole window.[^slskd-1160] The bridge's poll saw a connection error, dropped its list, and when the daemon came back the files completed with no record they had ever existed. A 2022 album was orphaned exactly this way.
+3. **The port-forward sync was a bash sidecar in a different container,** PATCHing slskd's runtime config over REST every 15 minutes. Firing that during the scan blackout failed silently, and the published port diverged from the listening port.
+4. **No quality-profile or delay-profile awareness.** The bridge searched by text and took the first match, bypassing Lidarr's per-album quality profile, custom formats, and "wait N minutes before falling back" knob.
+5. **Polling on a 300s tick** missed fast state changes, and re-running on the same state did not always converge.
+
+With the client in-process, transfer state is native memory, the scan cannot block its own API, the forwarded port is a field on the session struct, and every reconcile operation is gated on durable rows.
+
+---
+
+## The PIA tunnel, in-process
+
+The control plane runs once at startup and then holds the session open:
+
+| Step | What happens |
+|---|---|
+| 1 | Authenticate to PIA for a token, then resolve the region (`PIA_REGION=sg`; the value is a region id, not a city name) |
+| 2 | Generate a WireGuard keypair and register the public half with PIA's `addKey` endpoint |
+| 3 | Bring the tunnel up through Go netlink (`wg0`), installing the LAN and bypass routes |
+| 4 | Request a port-forward lease on that endpoint; a background refresher re-requests it roughly every 15 minutes |
+| 5 | On every new forwarded port: re-bind the peer listener first, then tell the Soulseek session the new port (which re-sends the server's `SetWaitPort`) |
+
+Step 5's order is load-bearing. A failed bind keeps the old port serving and the session is not told to publish a port nothing is listening on, which is the in-process replacement for the REST PATCH that used to fail silently.
+
+The keypair lifecycle is the reason the tunnel cannot be left to idle. WireGuard keys expire at PIA's end after several hours without traffic, so the reference PIA containers set `PersistentKeepalive` to 25 seconds on an idle link,[^pia-wg] and slskarr holds the same kind of continuous session rather than reconnecting per download.
+
+### Kill switch and liveness
+
+- The Soulseek session and its listener start only from the tunnel's up callback, fired after the netlink configure call returns successfully. If the tunnel never comes up, both stay down for the process lifetime. `SLSKARR_REQUIRE_VPN=true` makes that gate explicit rather than incidental.
+- Separate from the firewall rules a PIA container would install, this is a kill switch by ordering: there is no window in which the client is connected and the tunnel is not, because the client has no route to the network before then.
+- Liveness is read from the kernel: the peer's latest handshake via `wg show wg0 latest-handshakes`. A handshake older than three minutes means the session is stale, because WireGuard rekeys every two minutes and a stale handshake means nothing has crossed for at least one full rekey window.
+- A port-forward lease that ends while the tunnel is still up is a degraded state, not a failure: the tunnel stays, the client keeps working without an inbound port, and the condition is surfaced on the health endpoint as a PIA port-forward degradation.
+
+---
+
+## Running as root, and keeping the library owned by Lidarr
+
+### Why root
+
+`CAP_NET_ADMIN` covers interface configuration, routing tables, and firewall administration,[^cap-net-admin] which is exactly what creating and configuring `wg0` needs. Docker's `--user 1000:100` leaves a process with an empty effective capability set, so the netlink call to create the WireGuard interface fails with `Operation not permitted`. The capability is added to the container (`cap_add: [NET_ADMIN]`), and the process runs as root so it is in the effective set.
+
+Two sysctls come with that: `net.ipv4.conf.all.rp_filter=2` and `net.ipv4.conf.all.src_valid_mark=1`. The second is what makes the fwmark-based policy routing survive strict reverse-path filtering, and omitting it drops inbound packets on the tunnel.[^pia-wg]
+
+### Why that is not the end of it
+
+Root writes root-owned files. Lidarr's containers run with `PUID=1000 PGID=100 UMASK=0002`, so Lidarr could read what slskarr wrote and could not move it. Its import then failed with `UnauthorizedAccessException` - after it had already deleted the library file it was replacing. That is the whole reason the ownership rules exist.
+
+`internal/config/perm.go` applies one policy at every write into the download tree:
+
+| Path kind | Mode | Owner |
+|---|---|---|
+| Directory | `0775` | `SLSKARR_FILE_UID`:`SLSKARR_FILE_GID` |
+| File | `0664` | same |
+| Owner unset (`-1`, the default) | modes only, no chown | unchanged |
+
+`0775`/`0664` match Lidarr's `UMASK 0002`, so a group member can write. The helper covers more than `open`: `MkdirAll` chmods each component it creates so the process umask cannot strip the group-write bit, and `Rename` re-applies the mode and owner to the destination because a rename carries the source inode's mode with it - a folder staged before the owner was configured stays `0755`/root otherwise. The chown is `Lchown`, so a symlink is never followed.
+
+### One-time repairs
+
+Four startup repairs run before the reconciler starts, each guarded by a marker row in a `repair_markers` table so later starts are a no-op:
+
+| Marker | What it fixes |
+|---|---|
+| `repair.false_completed_imports.v1` | Folders Lidarr marked imported while importing nothing: move them back to the pending-import state and append a `pending` import row to re-run the import |
+| `repair.download_ownership.v1` | Apply owner and modes to every entry under the downloads root, skipping symlinks |
+| `repair.quarantined_missing_artist.v1` | Folders quarantined only because their release had no artist id yet: move back and requeue |
+| `repair.quarantined_other_album.v1` | Folders quarantined only because every item belonged to a different album: move back and requeue |
+
+The ownership repair runs after the false-import repair on purpose, so folders that repair just moved back are covered by the walk. It logs the entry count, deletes nothing, and a missing downloads root is a no-op that is deliberately NOT marked applied - a later start with the mount present still fixes the tree. The requeue repairs rename the sidecar to `<dir>.slskarr.json.requeued` rather than deleting it, so the reason a folder was quarantined survives its requeue.
+
+---
+
+## The Lidarr import pipeline
+
+### Folder naming and why the first import attempt failed
+
+A download lands in a folder named `c<candidate id>` - one safe path segment, derived from the transfer row before any peer connection is opened. That is what makes the import path interesting: Lidarr's `DownloadedAlbumsScan` command, given a folder and no artist, parses the artist from the folder name. `c72` names no artist, so the log reads `Processing path: /downloads/c72`, then `Parser|Unable to parse c72`, then `Unknown Artist c72`, then `Failed to import`. Every slskarr import failed this way.
+
+The command also throws `ArgumentException("A path must be provided")` when its `Path` is null or whitespace, and its body is only `path`, `downloadClientId`, and `importMode` - there is no artist id to pass.[^lidarr-downloaded-albums]
+
+### The ManualImport path
+
+The import bridge therefore uses Lidarr's manual-import API, which takes the artist explicitly:
+
+1. `GET` the manual-import preview for the transfer's folder with the artist id, which comes from the mirror of Lidarr's wanted/missing list.
+2. Keep only the items belonging to the transfer's album, with at least one track and no `permanent` rejection.
+3. Queue `ManualImport` with `importMode: move` and `replaceExistingFiles: false`, passing the item quality through as raw JSON.
+4. If nothing is importable, or the artist id is missing, that is an error before any command is sent. The trigger refuses; it never falls back to `DownloadedAlbumsScan`.
+
+### Status is not the outcome
+
+Lidarr reports `status: completed` with `result: unsuccessful` when an import command matched nothing.[^lidarr-downloaded-albums] Reading only the status is what produced 33 folders under `imported/` with zero matching `trackFileImported` events in Lidarr's history, back when the trigger sent the scan command instead of a manual import. The verification step reads both halves:
+
+| Lidarr status | Result | slskarr outcome |
+|---|---|---|
+| `completed` | `successful`, or absent (older Lidarr) | completed |
+| `completed` | `unsuccessful` | failed, `lidarr imported nothing (result unsuccessful)` |
+| `completed` | any unrecognised value | failed, with the value in the reason |
+| `failed`, `cancelled` | any | failed |
+| `queued`, `started`, unknown status | any | still pending, re-checked next tick |
+| API error | - | error returned, row stays triggered |
+
+The last row matters: a transient API error must never be recorded as a failed import, or a working transfer gets quarantined because Lidarr restarted.
+
+### On-disk layout
+
+The downloads root is a four-state contract, classified by shape only:
+
+| Path | State |
+|---|---|
+| `incomplete/<transfer id>/` | in flight; partial files carry a `.part` suffix |
+| `<transfer id>/` | complete, pending import |
+| `imported/<transfer id>/` | imported successfully |
+| `quarantine/<transfer id>/` | quarantined: failed import, or a rejection |
+| `failed_imports/` | sidecar area, never classified |
+
+Classification reads the first path segment, then falls back to a `.part` suffix anywhere, then calls the rest pending-import. Hidden files are never classified, which keeps the sidecars out of the state machine.
+
+A resolved import moves the folder to `imported/` or `quarantine/`. The quarantine sidecar is `failed_imports/<dir>.slskarr.json` with five keys: `transfer_id`, `lidarr_command_id` (null when no import row exists), `reason`, `quarantined_at` (RFC 3339 UTC), and `request_id`. The cleanup is idempotent - a missing source folder is a no-op, because the move already happened - and the sidecar is still written in that case. The folder key is validated as a single safe segment (non-empty, not `.` or `..`, no path separator, no NUL) before anything touches disk.
+
+### Data-loss guards
+
+The import path never deletes a file, in any state, including the repairs. That rule is here because of the ordering inside Lidarr: it removes the library file it is replacing BEFORE moving the new one in. When the move failed against a root-owned download, the library tracks were already gone - three of them, restored from a ZFS snapshot (`tank/media@autosnap_2026-10-01_00:00:37_monthly`). Lidarr's recycle bin is now `/data/.lidarr-recycle` with 30 days of retention, which is a second copy of what it removes rather than a substitute for the ownership fix.
+
+The four guards, in the order they act:
+
+1. Ownership and modes applied at write time, so the move Lidarr wants to make is permitted in the first place.
+2. The `ManualImport` trigger refusing to run without an artist id, so an import that cannot match an album fails loudly instead of half-importing.
+3. Verification reading `result` as well as `status`, so a completed-but-empty import quarantines instead of being filed as success.
+4. Cleanup that moves and never deletes, with the reason preserved in a sidecar.
+
+---
+
+## The reconciler loop
+
+One tick converges the whole pipeline, on a 60 second cadence:
+
+| Step | What it does |
+|---|---|
+| sync | Refresh Lidarr's wanted/missing list, quality profiles, custom formats, and artist tags into local tables |
+| inventory | Walk `/downloads` and diff it against the transfer ids the Soulseek session says are live; orphans and missing entries are the tick's input |
+| plan searches | Enqueue searches for eligible releases, honoring the delay profile's `soulseekDelay` (default 60 minutes after the Usenet delay), capped by `SLSKARR_SEARCH_BUDGET` (default 10 per tick) |
+| start downloads | Turn the best non-rejected candidate into a transfer: write the `c<id>` row, then request the download per file |
+| trigger imports | Trigger Lidarr imports for completed transfers, capped at 10 per tick |
+| verify imports | Resolve triggered imports, apply the folder move, record the outcome |
+
+Every step is gated on durable rows rather than memory, so a tick that dies mid-way leaves a consistent state and the next tick resumes. Re-running on unchanged state performs no actions. Each action carries the tick's request id, and transfer events also stream over a WebSocket for the UI.
+
+Two caps bound the loop. The import trigger cap is 10 per tick because the Lidarr command queue is serial - a large backlog fired at once would stall the resolves owed to earlier triggers behind it, so the rest of the backlog keeps its pending row and waits for the next tick. A re-search after a successful enqueue backs off from 6 hours, doubling per attempt up to a 7 day cap. The 6 hour hygiene tick (filesystem scan, detectors, queued actions) is designed but not built; the fast tick is the whole loop today.
+
+---
+
+## Operational notes
+
+| Item | Value |
+|---|---|
+| Network | `servarr` bridge, in the stack's reserved address block |
+| Exposed | `8080` for the API and UI, `5030` for the Soulseek server port |
+| Capability | `cap_add: [NET_ADMIN]`, plus the two `net.ipv4.conf.all` sysctls |
+| Volumes | SQLite database under `/data`, downloads root under `/downloads`, `/music` read-only for sharing and verification |
+| Auth | Login page with a signed session cookie; `X-Api-Key` and HTTP Basic accepted for scripts; `/healthz` and `/metrics` exempt |
+| Edge | A name under the internal servarr domain, through the edge Caddy proxy to the container's API port |
+
+Downloads share a filesystem with the library so imports are renames rather than copies. The downloads root lives on the scratch pool because the bytes are re-derivable; the library is on the redundant pool because they are not.
+
+**Reading the numbers.** The production defects in the first days were all boundary problems between the two systems, not protocol problems: a SQLite writer pool that allowed concurrent writers (10 `database is locked` errors in the first hour, fixed by capping the pool at one connection), a listener rebind that compared address strings (`[::]:53642`) instead of ports after every 15 minute port-forward refresh, a stale artist id erased on every sync (385 folders requeued once fixed), and the false-completed import above. None of them were visible in a unit test; all were visible in a day of live traffic against real Lidarr.
+
+**What generalises.** Pushing a process's privilege down is only half the job when it writes to a shared tree - the other half is making the artifacts it writes usable by whoever consumes them next, at the moment of writing, not in a periodic fixup. And a verification step that reads a status without reading the outcome is not verification. Both of these cost a library file or a folder before they were fixed.
+
+## Related docs
+
+- [slskd and WireGuard: port forwarding with PIA](/guides/slskd-wireguard-port-forward/) - the retired three-container design, kept for the PIA control-plane mechanics slskarr reimplements in-process.
+- [Docker Servarr patterns](/guides/arr-stack-docker-patterns/) - the compose conventions, PUID/PGID, and path layout this service sits inside.
+- [Docker Servarr stack security](/reference/docker-servarr-security/) - the privilege-separation tradeoff that in-process WireGuard forces you to spend.
+- [Hot vs bulk: placing app state on a two-tier ZFS homelab](/reference/appdata-tiering-zfs/) - why the database and the download tree sit where they do.
+
+[^slskd-1160]: slskd, "The HTTP server is not active until the share scan is complete," GitHub issue #1160. https://github.com/slskd/slskd/issues/1160
+[^cap-net-admin]: Linux man-pages project, "capabilities(7)," man7.org. https://man7.org/linux/man-pages/man7/capabilities.7.html
+[^pia-wg]: thrnz, "docker-wireguard-pia," GitHub. https://github.com/thrnz/docker-wireguard-pia
+[^lidarr-downloaded-albums]: Lidarr, `DownloadedAlbumsCommandService.cs` (develop), Lidarr source. https://raw.githubusercontent.com/lidarr/lidarr/develop/src/NzbDrone.Core/MediaFiles/DownloadedAlbumsCommandService.cs
