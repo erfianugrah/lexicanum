@@ -968,6 +968,41 @@ const pins: Pin[] = [
     ],
   },
   {
+    doc: "reference/supabase-wrapper-delete-scope",
+    mustContain: [
+      // X01b: the statement and the scope. The measure is the wrapper, not the
+      // row that was clicked, and that is the whole doc.
+      "`drop foreign data wrapper if exists <name> cascade`",
+      "servers 5 -> 0",
+      // X01c: Edit is as destructive as Delete, which is the row people
+      // disbelieve.
+      "Edit is a delete plus a create, so saving a row unchanged is as destructive as deleting it",
+      // X01b's Vault half: the secrets are not cleaned up.
+      "all five credentials stayed in Vault",
+      // X01d: the RESTRICT refusals that make the safe path demonstrable.
+      "`2BP01 ... because other objects depend on it`",
+      // X01e: where a shared wrapper comes from at all.
+      "`42710: foreign-data wrapper \"...\" already exists`",
+      // The provenance limit: the SQL is generated from a pinned commit, not
+      // captured from a browser, so a Studio change is out of scope.
+      "a later Studio release could change it",
+    ],
+    mustNotContain: [
+      // Run 1's hand copy is superseded and its secret name was wrong; it must
+      // not be reintroduced as evidence.
+      "`<fdw>_sa_key`, where Studio deletes",
+    ],
+    sections: [
+      /^## What each Dashboard action runs$/m,
+      /^## Removing one connection$/m,
+      /^## What to do about it$/m,
+      /^## Reading the numbers$/m,
+      /^## Reproducing$/m,
+      /^## Evidence$/m,
+      /^## Related docs$/m,
+    ],
+  },
+  {
     doc: "reference/supabase-data-surface-lockdown",
     mustContain: [
       // S21 (2026-09-03): the anon-only revoke left every RPC callable; the
@@ -1680,6 +1715,7 @@ const practicePages: Array<[doc: string, heading: RegExp]> = [
   ["reference/supabase-multi-tenant-placement", PRACTICES_HEADING],
   ["reference/supabase-platform-operation-cost", PRACTICES_HEADING],
   ["reference/supabase-rls-policy-cost", PRACTICES_HEADING],
+  ["reference/supabase-wrapper-delete-scope", PRACTICES_HEADING],
 ];
 
 describe.each(practicePages)("%s ends in practices", (doc, heading) => {

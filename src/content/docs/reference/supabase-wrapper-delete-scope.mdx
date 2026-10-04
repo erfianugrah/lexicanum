@@ -1,0 +1,181 @@
+---
+title: "Deleting a Supabase wrapper in the Dashboard: what one row's drop takes with it"
+description: "The Dashboard's Wrappers list is one row per remote server but names each row after its foreign data wrapper, and Delete runs drop foreign data wrapper if exists <name> cascade - so on a wrapper that several connections share, one row's Delete removes all of them, their foreign tables and any view built on them, and leaves the Vault secrets behind. Measured on Postgres 17.6 with wrappers 0.6.2 against Studio's own generated SQL, beside the RESTRICT route that removes exactly one connection."
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+A wrapper connection created in the Dashboard owns its foreign data wrapper, so deleting the row removes the connection and nothing else. The list also renders connections that were created in SQL, where several remote servers can sit on one foreign data wrapper - and there the same Delete is a statement about every one of them.
+
+<Aside type="note">
+Measured on 2026-09-23 by the [supabase-lab](https://github.com/erfianugrah/supabase-lab) `wrappers-delete-scope` experiment (Run 2, X01a-X01e): one throwaway free-plan project per sub-case, Postgres 17.6, `wrappers 0.6.2`, `ap-southeast-1`, five BigQuery connections per sub-case with one foreign table each and dummy credentials, so only the catalog was exercised and no remote endpoint was contacted. Three consecutive executions gave identical counts. Every statement was issued through the Management API's query endpoint; nothing clicked the Dashboard.
+
+The Dashboard's SQL is generated rather than hand-copied: `scripts/gen-studio-sql.ts` imports `getCreateFDWSql`, `getDeleteFDWSql` and `getUpdateFDWSql` from a pg-meta checkout pinned at `supabase/supabase` `ab7783f2ca` (2026-09-23) and replays what Studio would send.[^sb-pgmeta] Run 1 used a hand copy of that SQL and had the Vault secret name wrong, so only Run 2 is cited here. The exact SQL source is the pinned file, not a browser capture: a later Studio release could change it.
+</Aside>
+
+**TL;DR:**
+
+- **The list is one row per remote server, named after its wrapper.** `getFDWsSql` reads one row per `pg_foreign_server` and labels it with `w.fdwname`, so five servers on one foreign data wrapper render as five rows with the same name and nothing on the page distinguishes them (X01b).[^sb-pgmeta]
+- **Delete runs `drop foreign data wrapper if exists <name> cascade`, then deletes one Vault secret named after the wrapper.**[^sb-pgmeta] On a shared wrapper that is a statement about all five connections: servers 5 -> 0, foreign tables 5 -> 0, and the view and materialized view built on the siblings' tables 2 -> 0 (X01b).
+- **The dialog does warn, and the SQL is not refused.** It names the wrapper and reads "This will also remove all tables created with this wrapper"; the cascade then removes what a shared wrapper holds beyond that (X01b).[^sb-pgmeta]
+- **The Vault secrets are left behind.** The delete removes only the secret named after the wrapper, so in the shared case all five credentials stayed in Vault after every server that used them was gone (X01b).
+- **Edit is a delete plus a create, so saving a row unchanged is as destructive as deleting it.** Editing one of the five rows and changing no field left 1 server, 1 foreign table, 0 of the 2 views, and added a sixth secret `<fdw>_sa_key_id` beside the five originals (X01c).
+- **Removing exactly one connection is a SQL sequence, and Postgres refuses the shortcuts.** The default `RESTRICT` rejected `drop foreign data wrapper`, `drop server` and `drop foreign table` with `2BP01 ... because other objects depend on it` until the dependent object was gone first; dropping view, then table, then server removed one connection and left the siblings, their view and their materialized view intact (X01d).
+- **The Dashboard cannot create a shared wrapper.** Create always emits `create foreign data wrapper <wrapper_name>` and names the server `<wrapper_name>_server`, and reusing an existing wrapper's name is refused `42710: foreign-data wrapper "..." already exists` with the transaction rolled back; a connection made in the Dashboard was removed alone, with its secret (X01e, X01a).
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  list [label="Wrappers list\none row per pg_foreign_server\nlabelled with w.fdwname"];
+  fdw [label="foreign data wrapper\n(the row's name)"];
+  servers [label="remote servers\n5 of them, shared case"];
+  tables [label="foreign tables\n5"];
+  views [label="view + matview\n2"];
+  secrets [label="Vault secrets\n5, untouched"];
+
+  subgraph cluster_shared {
+    label="one shared wrapper (SQL-created)";
+    fdw;
+    servers;
+    tables;
+    views;
+  }
+
+  list -> fdw [label="Delete: DROP ... CASCADE"];
+  fdw -> servers;
+  servers -> tables;
+  servers -> views;
+  list -> secrets [label="deletes one secret named after the wrapper"];
+}
+```
+
+Reading the diagram as text:
+
+1. Each list row is a `pg_foreign_server` row, labelled with its wrapper's name rather than the server's, so a shared wrapper produces several identically labelled rows (X01b).
+2. Delete drops the wrapper with `cascade`, which takes every server on it, then every foreign table on those servers, then any view or materialized view over those tables (X01b).
+3. The Delete's Vault step removes one secret, named after the wrapper, and leaves the per-connection secrets in place (X01b).
+4. A wrapper created by the Dashboard owns its single server, so for those rows the path above stops after step 2's first level, and the 5 -> 4 counts in X01a are what a Dashboard-created connection looks like when removed.
+
+## What each Dashboard action runs
+
+Read from the pinned source (2026-09-23), which is what the replay used:[^sb-pgmeta]
+
+| Action | Statement | Confirmation text | Vault |
+|---|---|---|---|
+| Delete | `drop foreign data wrapper if exists <name> cascade` | "This will also remove all tables created with this wrapper", naming the wrapper | deletes the secret named `<name>_<encrypted option>`, e.g. `<name>_sa_key_id` |
+| Edit | the same delete, then a create for the edited row only | "Saving changes will drop the existing wrapper and recreate it." | the delete's secret removal, then the new one |
+| Create | `create foreign data wrapper <wrapper_name>` plus a server named `<wrapper_name>_server` | - | creates the secret the new server references |
+
+Two consequences follow from the shapes rather than from the wording. Delete and Edit are statements about a *wrapper*, while the row you clicked is a *server*; and Edit re-creates only the row you edited, so its Delete half takes the same scope as a Delete.
+
+## The measured blast radius
+
+Five BigQuery connections per sub-case, one foreign table each, a Vault secret per server, a view on server 2's table and a materialized view (`with no data`) on server 3's (X01, 2026-09-23):
+
+| Case | Setup | Action | List rows / distinct names | Servers | Foreign tables | Views + matviews | Vault secrets |
+|---|---|---|---|---|---|---|---|
+| X01a | one wrapper per connection (Dashboard create x5) | Dashboard delete | 5 / 5 | 5 -> 4 | 5 -> 4 | - | 5 -> 4 |
+| X01b | one shared wrapper | Dashboard delete | 5 / 1 | 5 -> **0** | 5 -> **0** | 2 -> **0** | 5 -> 5 |
+| X01c | one shared wrapper | Dashboard edit, saved unchanged | 5 / 1 | 5 -> **1** | 5 -> **1** | 2 -> **0** | 5 -> 6 |
+| X01d | one shared wrapper | `drop view` / `drop foreign table` / `drop server` | 5 / 1 | 5 -> 4 | 5 -> 4 | 3 -> 2 | 5 -> 5 |
+| X01e | one shared wrapper | Dashboard create reusing the wrapper's name | 5 / 1 | 5 -> 5 | 5 -> 5 | 2 -> 2 | 5 -> 5 |
+
+The distinct-name column is the one to read first: with five servers on one wrapper, the list gives five rows that all say the same thing, so the page cannot show a user which rows their Delete is about.
+
+X01c is the row that catches people who think of Edit as a safer action than Delete. Nothing was changed in the form; the save still ran the delete half, and the surviving connection is the one being edited. The extra secret is the re-create's, named `<fdw>_sa_key_id`, while the five originals stayed.
+
+X01e explains where a shared wrapper comes from. The Dashboard refuses the name of an existing wrapper (`42710: foreign-data wrapper "..." already exists`) and rolls back with no secret left behind, so the shared shape is only reachable through SQL - which is also the shape a migration guide reaches for when it writes `create server ... foreign data wrapper <name>` against a wrapper created once.
+
+## Removing one connection
+
+The same removal, done in SQL, is refused three times before it is allowed. Postgres takes `RESTRICT` as the default for the drop commands, and each over-reach came back with the same SQLSTATE (X01d):[^pg-drop-fdw]
+
+| Statement | Result while dependants exist |
+|---|---|
+| `drop foreign data wrapper <name>` (no cascade) | `2BP01 ... because other objects depend on it`, since servers exist[^pg-errcodes] |
+| `drop server <name>` | `2BP01`, since its foreign table exists |
+| `drop foreign table <table>` | `2BP01`, since a view depends on it |
+
+In that order - dependants first, `cascade` never - one connection goes and the other four keep working, with the siblings' view and materialized view intact (5 -> 4 servers, 5 -> 4 tables, 3 -> 2 views, 5 secrets untouched). The two catalog queries a DBA needs to answer "what else is on this wrapper" also ran in X01d and returned the expected rows: a connection-to-wrapper query, and the foreign tables belonging to one server via `pg_foreign_table.ftserver`.
+
+The wrapper you leave in place is the account of what the project can still reach. A server removed without its wrapper leaves the wrapper in the list with no server behind it, and its Vault secret in place.
+
+## What this did not settle
+
+- No browser session was used. Studio's SQL is imported from pg-meta at a pinned commit and replayed through the Management API, so what a click does in a later Studio release is that release's file, not this measurement.
+- Run 1's secret handling is not evidence: its hand copy deleted `<fdw>_sa_key` where Studio deletes `<fdw>_sa_key_id`. Only Run 2's counts are cited.
+- The legacy branch was not run. Projects on an older Postgres with the `pgsodium`-based secret handling (`wrappers` at or below the last version in Studio's legacy list) are governed by different code, and Postgres 15 was not exercised.
+- Whether a `cascade` reaches a function body that references a foreign table was not tested, so the blast radius above is bounded by servers, foreign tables, views and materialized views.
+- Only BigQuery wrappers were used, with dummy credentials; the counts are catalog counts and no remote endpoint was ever contacted.
+- One project per sub-case on a free plan, `ap-southeast-1`, one run day (2026-09-23).
+
+## Reading the numbers
+
+- The counts are catalog reads taken before and after each action - servers, foreign tables, views and materialized views, and Vault secrets - on one project per sub-case, and three consecutive executions agreed.
+- The X01d view count starts at 3 rather than 2 because that sub-case adds a view of its own to drive the `RESTRICT` refusals, then drops it; the two views X01b and X01c destroy are the shared setup's.
+- "Left behind" for Vault is a count of rows in the secrets store, not a claim about how long they live: nothing here expired, rotated or was revoked.
+- The `2BP01` and `42710` SQLSTATEs are verbatim from the run; the dialog sentences are verbatim from the pinned Studio source, not from a rendered page.
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Do not delete a wrapper from the Dashboard until you know how many servers are on it | Delete is `drop foreign data wrapper ... cascade`, and the list labels every row with the wrapper's name, so five connections can read as five different rows | [X01b](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts) |
+| Ask the catalog before the click, not the page | A connection-to-wrapper query and a foreign-table query via `pg_foreign_table.ftserver` both returned the expected rows in the run | [X01d](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts) |
+| Remove one connection with the dependants first and no `cascade` | `RESTRICT` refused all three over-reaches with `2BP01`, and the ordered path left the siblings running | [X01d](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts) |
+| Treat Edit as a delete of the row plus a re-create, and do not save one to "look at it" | Saving one of five rows unchanged left 1 server and 1 foreign table and destroyed the siblings' view and materialized view | [X01c](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts) |
+| Delete the Vault secrets yourself after a Dashboard delete | The delete removes only the secret named after the wrapper; in the shared case all five connection secrets survived | [X01b](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts) |
+| Keep Dashboard-created connections as the default, and prefer one connection per wrapper | A Dashboard-created connection is removed alone with its secret; the shared shape only arrives through SQL, and reusing a wrapper's name is refused `42710` | [X01a](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts), [X01e](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts) |
+
+## Reproducing
+
+The experiment is [`experiments/wrappers-delete-scope`](https://github.com/erfianugrah/supabase-lab/tree/a1b10ea/experiments/wrappers-delete-scope) in supabase-lab. The Studio SQL is regenerated from source, which is what keeps the replay honest:
+
+```
+git -C <supabase-checkout> archive origin/master packages/pg-meta | tar -x -C <dir>
+bun experiments/wrappers-delete-scope/scripts/gen-studio-sql.ts <dir>/packages/pg-meta/src <commit>
+```
+
+Then each sub-case runs against a disposable project through the query endpoint with `--experiment wrappers-delete-scope --only X01 --destructive`. Every project is created and deleted within the hour, because a free-plan organization cannot take the instance size the other experiments pass.
+
+## Evidence
+
+| Claim | How it was checked |
+|---|---|
+| The list is one row per remote server, labelled with the wrapper's name | Read from the pinned Studio source, `getFDWsSql`; the 5 rows / 1 distinct name in X01b is the measurement of it[^sb-pgmeta] |
+| Delete runs `drop foreign data wrapper if exists <name> cascade` and one Vault secret delete | Pinned Studio source, replayed as generated SQL; the counts are [X01b](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts) |
+| One Delete removed 5 servers, 5 foreign tables, a view and a materialized view, and left 5 secrets | Measured, [X01b](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts), catalog counts before and after, three executions |
+| Edit saved unchanged left 1 server and added a secret | Measured, [X01c](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts) |
+| The ordered drop removes exactly one connection | Measured, [X01d](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts) |
+| `RESTRICT` refused each over-reach with `2BP01` | Measured, [X01d](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts), verbatim SQLSTATE; the default is documented[^pg-drop-fdw], [^pg-errcodes] |
+| A Dashboard create refuses an existing wrapper name with `42710` | Measured, [X01e](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts) |
+| A Dashboard-created connection is removed alone, with its secret | Measured, [X01a](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts) |
+| One wrapper can front several remote servers with independent foreign tables | Documented, not tested[^sb-wrappers] |
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| X01a | wrappers-delete-scope | [`x01-delete-scope.ts`](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts) | none published |
+| X01b | wrappers-delete-scope | [`x01-delete-scope.ts`](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts) | none published |
+| X01c | wrappers-delete-scope | [`x01-delete-scope.ts`](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts) | none published |
+| X01d | wrappers-delete-scope | [`x01-delete-scope.ts`](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts) | none published |
+| X01e | wrappers-delete-scope | [`x01-delete-scope.ts`](https://github.com/erfianugrah/supabase-lab/blob/a1b10ea/experiments/wrappers-delete-scope/tests/x01-delete-scope.ts) | none published |
+
+## Related docs
+
+- [Migrating a static MongoDB archive into Postgres with the Supabase MongoDB wrapper](/guides/mongodb-wrapper-archive-migration/) - the decommission step that this doc's X01d column describes, done in SQL on a connection the guide created itself.
+- [Supabase Auth end to end](/reference/supabase-auth-end-to-end/) and [Locking down Supabase](/reference/supabase-data-surface-lockdown/) - the credential boundaries around Vault, which is where a deleted connection's secrets are left.
+- [Foreign Data Wrappers](https://supabase.com/docs/guides/database/extensions/wrappers/overview) - what a remote server and a foreign table are, and the wrappers this project supports.
+
+[^sb-wrappers]: Supabase, "Foreign Data Wrappers," Supabase Docs. https://supabase.com/docs/guides/database/extensions/wrappers/overview
+[^sb-pgmeta]: supabase/supabase, "packages/pg-meta/src/sql/studio/database/fdw.ts" (Studio's own SQL builders: `getFDWsSql`, `getDeleteFDWSql`, `getUpdateFDWSql`, `getCreateFDWSql`). https://github.com/supabase/supabase/blob/ab7783f2ca/packages/pg-meta/src/sql/studio/database/fdw.ts
+[^pg-drop-fdw]: PostgreSQL Global Development Group, "DROP FOREIGN DATA WRAPPER," PostgreSQL Documentation. https://www.postgresql.org/docs/current/sql-dropforeigndatawrapper.html
+[^pg-errcodes]: PostgreSQL Global Development Group, "Appendix A. PostgreSQL Error Codes," PostgreSQL Documentation. https://www.postgresql.org/docs/current/errcodes-appendix.html
