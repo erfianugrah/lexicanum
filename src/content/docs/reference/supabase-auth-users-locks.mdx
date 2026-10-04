@@ -1,0 +1,180 @@
+---
+title: "Foreign keys to auth.users: the lock that freezes sign-in, and the NOT VALID path"
+description: "An ADD CONSTRAINT that references auth.users takes SHARE ROW EXCLUSIVE on it for the whole validation scan, which is the lock every sign-in's UPDATE needs, so the migration freezes sign-in until it commits. Measured on Free, Pro and Team: the lock each form takes, the verbatim 55P03 a blocked sign-in gets, the NOT VALID then VALIDATE path that holds only ROW SHARE during validation, and the idle-in-transaction reader that wedges the change instead."
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+An application table that references `auth.users` is Supabase's own recommended shape for a profile row, and the foreign key is where a routine migration can stop every sign-in on the project. The constraint needs a lock on the table it references; on `auth.users` that lock is the one an ordinary sign-in's `UPDATE` cannot share.
+
+<Aside type="note">
+Every lock mode below was measured on 2026-09-08 by the [supabase-lab](https://github.com/erfianugrah/supabase-lab) `auth-users-locks` experiment against one throwaway project in each of a Free, a Pro and a Team organization, all in `ap-southeast-1`, then destroyed: 9 pass / 0 fail per tier, and the same lock mode in all three. Each row names its module id; the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/RUNLOG.md) is public and no `out/` artifact was published (the run kept its project refs out of the repo).
+
+Two limits on the method, both deliberate. Everything ran through the session pooler on port 5432, because the modules hold a transaction open to keep a lock visible, which transaction mode would break. And every blocking probe carried a `lock_timeout`, so a real block surfaces in seconds as `55P03 lock_not_available` instead of hanging the run. No statement here alters the `auth` schema, which the platform restricts: the foreign key lives on a public table that references `auth.users`, which is the case an application actually creates.
+</Aside>
+
+**TL;DR:**
+
+- **`ADD CONSTRAINT ... REFERENCES auth.users` holds `SHARE ROW EXCLUSIVE` on `auth.users` for the whole validation scan** (AL01a), the mode Postgres documents for a foreign key on the referenced table.[^pg-altertable]
+- **That mode conflicts with the `ROW EXCLUSIVE` an `UPDATE` takes**, so sign-in is blocked for the duration: a sign-in-shaped `UPDATE auth.users` on a second connection failed with `55P03 canceling statement due to lock timeout` (AL01b), and a real password sign-in at `POST /auth/v1/token` hung until the client's 15 s timeout (AL01c).
+- **`NOT VALID` then `VALIDATE CONSTRAINT` is the same constraint without the freeze.** `ADD CONSTRAINT ... NOT VALID` skips the scan and holds `AccessShareLock, ShareRowExclusiveLock` briefly (AL02a); `VALIDATE` holds only `AccessShareLock, RowShareLock` on `auth.users` (AL02b), and the same sign-in-shaped `UPDATE` succeeded through it (AL02c). `ROW SHARE` does not conflict with `ROW EXCLUSIVE`.[^pg-locking]
+- **An abandoned transaction wedges the change just as effectively as the change wedges sign-in.** An idle-in-transaction reader holding `AccessShareLock` blocked an `ADD COLUMN` with `55P03` (AL03a), and the same statement succeeded once the reader committed (AL03b).
+- **Tier is not a factor.** The same lock modes reproduced on Free, Pro and Team, which is what a Postgres-level property should do.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  migration [label="your migration\nALTER TABLE ... ADD CONSTRAINT"];
+  public_table [label="public.profiles\n(the FK lives here)"];
+  authusers [label="auth.users"];
+  signin [label="a sign-in\nUPDATE auth.users"];
+
+  subgraph cluster_auth {
+    label="auth schema (platform-managed)";
+    authusers;
+  }
+
+  migration -> public_table [label="SHARE ROW EXCLUSIVE\n+ the scan"];
+  migration -> authusers [label="SHARE ROW EXCLUSIVE\nfor the whole scan"];
+  signin -> authusers [label="ROW EXCLUSIVE\ndoes not share"];
+}
+```
+
+Reading the diagram as text:
+
+1. The migration alters your own table, which takes `SHARE ROW EXCLUSIVE` there too, and it references `auth.users`, which takes `SHARE ROW EXCLUSIVE` on the referenced table (AL01a).
+2. While that lock is held, a sign-in's `UPDATE auth.users` asks for `ROW EXCLUSIVE`, which the lock conflict table says cannot share with `SHARE ROW EXCLUSIVE`,[^pg-locking] so the sign-in waits (AL01b, AL01c).
+3. `NOT VALID` then `VALIDATE CONSTRAINT` takes `ROW SHARE` on `auth.users` during validation (AL02b), which a sign-in's `ROW EXCLUSIVE` can share, so validation runs beside live sign-ins (AL02c).
+
+## Which form do I pick
+
+| You are creating | Lock on `auth.users` | Sign-in blocked | Evidence |
+|---|---|---|---|
+| A foreign key on a table that already has rows, as one `ALTER TABLE ... ADD CONSTRAINT` | `SHARE ROW EXCLUSIVE` for the entire scan, held until the transaction commits | yes: `UPDATE auth.users` blocked with `55P03`, and a real password sign-in hung to the client's 15 s timeout | AL01a, AL01b, AL01c |
+| The same constraint as `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT` | `SHARE ROW EXCLUSIVE` briefly with no scan, then `ROW SHARE` during validation | no: the sign-in-shaped `UPDATE` succeeded while `VALIDATE` held the lock | AL02a, AL02b, AL02c |
+| A new table with `id uuid references auth.users` inline in `CREATE TABLE` | `SHARE ROW EXCLUSIVE` on the referenced table, per Postgres; not measured here | not measured here | documented[^pg-createtable] |
+
+For anything on a project that takes sign-ins, the second row is the migration to write, whichever plan the project is on. The first row is safe only when the table is empty and the scan is trivial, or during a window where nobody is signing in.
+
+## The lock on the referenced table
+
+A foreign key needs a lock on both tables, and the one that matters is on the table you do not own. Postgres states it plainly: `ADD FOREIGN KEY` takes `SHARE ROW EXCLUSIVE` on the table the constraint is declared on and also on the referenced table,[^pg-altertable] and the reason the lock is held for the length of the scan is that other updates to the table are locked out until the command commits.[^pg-altertable]
+
+Measured on a public table referencing `auth.users` (AL01a):
+
+| Session | Statement | Locks recorded in `pg_locks` on `auth.users` |
+|---|---|---|
+| 1 | `ALTER TABLE public.<t> ADD CONSTRAINT ... REFERENCES auth.users` | `ShareRowExclusiveLock` (with `AccessShareLock` and `RowShareLock`) |
+| 2 | `UPDATE auth.users` shaped like a sign-in | blocked, `55P03 canceling statement due to lock timeout` |
+
+The mode matched the documentation on all three plans. The blocked statement's error is the probe's own `lock_timeout` firing, not Postgres refusing the lock: without that setting, the same `UPDATE` waits, and a waiting statement also blocks everything queued behind it.
+
+## What a frozen sign-in looks like
+
+The lock does not announce itself as a lock. What the client sees is a sign-in that never returns (AL01c):
+
+- a real password grant, `POST /auth/v1/token` with a valid email and password, hung until the probe's 15 s HTTP client timeout while the constraint's lock was held on a second connection;
+- the same request succeeded once the lock was released.
+
+The 15 s is the probe's own client timeout, not a platform timeout, and it is the number a customer would report as "sign-in is down". The Auth server's `UPDATE auth.users` behind that request is an ordinary write, so it queues behind the migration exactly as the sign-in-shaped probe did. Refreshes, admin calls and other endpoints were not exercised under the held lock, so this measurement does not bound what else waits.
+
+## The two-statement path
+
+Both halves are needed, and the second is what makes the first cheap (AL02, measured):
+
+| Step | Lock held on `auth.users` | Scan |
+|---|---|---|
+| `ADD CONSTRAINT ... NOT VALID` | `AccessShareLock, ShareRowExclusiveLock`, briefly | none: `NOT VALID` skips the table scan, so the constraint applies to later writes only[^pg-altertable] |
+| `VALIDATE CONSTRAINT` | `AccessShareLock, RowShareLock` | the validating scan, which needs to check pre-existing rows only because concurrent writers enforce the constraint themselves[^pg-altertable] |
+
+`ROW SHARE` on the referenced table is the documented lock for the validation step of a foreign key,[^pg-altertable] and it is weaker than the declarative form in the one way that matters here: a sign-in's `ROW EXCLUSIVE` can share it. The sign-in-shaped `UPDATE` succeeded while `VALIDATE` was running (AL02c), which is the whole argument for the two-statement form.
+
+The validating scan itself still costs time proportional to the table, and it runs in its own transaction. What it does not do is hold a lock that sign-in needs.
+
+## The lock you take on your own table
+
+The same arithmetic applies in the other direction, and it catches migrations that have nothing to do with `auth` (AL03, measured):
+
+| Reader state | Statement | Result |
+|---|---|---|
+| an idle-in-transaction session holding `AccessShareLock` | `ALTER TABLE ... ADD COLUMN` (which wants `ACCESS EXCLUSIVE`) | `55P03 canceling statement due to lock timeout` |
+| the reader committed | the same `ADD COLUMN` | succeeded |
+
+An idle transaction that has merely read the table is enough, because `ACCESS EXCLUSIVE` conflicts with every lock including `ACCESS SHARE`.[^pg-locking] A migration author cannot see the other sessions on the project, which is why `pg_stat_activity` is worth reading before the deploy rather than after.
+
+## What this did not settle
+
+- The FK was never added to `auth.users` itself, because the platform restricts DDL on the `auth` schema. The lock arithmetic is a Postgres-level property of the reference, so the module used a public table and measured the lock the statement took on `auth.users` as the referenced table.
+- Only the password grant was exercised under a held lock (AL01c). Whether token refresh, the admin API or other Auth endpoints wait behind the same lock was not run.
+- No `CREATE TABLE ... REFERENCES auth.users` was timed or locked; its row in the table above is documented, not measured.
+- The lock was never held for a real multi-minute scan. The probes hold it for the seconds their `lock_timeout` allows, so the shape of the outage is measured and its duration on a large table is not.
+- Whether a Supabase-managed migration ever takes this lock is out of scope: the run only measures what an application's own DDL does to the platform's table.
+- Everything ran in `ap-southeast-1`, through the session pooler.
+
+## Reading the numbers
+
+- The lock modes come from `pg_locks` read inside the same transaction that holds the lock, so they are the locks the statement actually took, not the locks the docs predict. The docs agreed.
+- `55P03 lock_not_available` in these rows is the probe's `lock_timeout` expiring, so read it as "the statement would have waited" rather than as a database error a client will receive.
+- The 15 s in AL01c is the probe's HTTP client timeout. The platform did not time the sign-in out; the client gave up.
+- Every reading reproduced on Free, Pro and Team. That is why the doc says a lock mode instead of a per-plan figure.
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Write the constraint as `NOT VALID`, then `VALIDATE` it | The validating form of an `ADD CONSTRAINT` holds `SHARE ROW EXCLUSIVE` on `auth.users` for the whole scan and blocks sign-in; the two-statement form holds `ROW SHARE` during validation | [AL02a](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al02-not-valid-validate.ts), [AL02b](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al02-not-valid-validate.ts), [AL02c](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al02-not-valid-validate.ts) |
+| Treat an FK to `auth.users` as a write dependency on the Auth server, not only a data-integrity choice | The lock it takes is the one a sign-in's `UPDATE` needs, so an unrelated table's constraint can stop authentication | [AL01a](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al01-fk-add-locks.ts), [AL01b](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al01-fk-add-locks.ts) |
+| Set `lock_timeout` on DDL that references `auth.users` | The probes fail in seconds with `55P03` rather than hanging, which is how the block was found; without one a statement waits with no upper bound | [AL01b](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al01-fk-add-locks.ts) |
+| Rehearse the migration against a project that takes sign-ins, and sign in while it runs | The visible symptom is a hung client, not an error the migration reports: the constraint applied cleanly and a real sign-in hung until its client gave up | [AL01c](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al01-fk-add-locks.ts) |
+| Check for idle-in-transaction sessions holding a read before DDL on a busy table | One idle reader holding `ACCESS SHARE` blocked an `ADD COLUMN` until it committed | [AL03a](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al03-idle-txn-blocks.ts), [AL03b](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al03-idle-txn-blocks.ts) |
+| Do not plan a plan upgrade as the fix | The lock modes were identical on Free, Pro and Team, so a bigger instance changes the scan's duration, not the lock it takes | [AL01a](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al01-fk-add-locks.ts) |
+
+## Reproducing
+
+The experiment is [`experiments/auth-users-locks`](https://github.com/erfianugrah/supabase-lab/tree/677c101/experiments/auth-users-locks) in supabase-lab. `make apply` provisions one throwaway project, `make probe` runs `AL01`-`AL03` through the session pooler, and `make destroy` tears the project down. The modules read `pg_locks` from the session that holds the lock, and they set `lock_timeout` on every blocking probe so a real block reports as `55P03` in seconds.
+
+## Evidence
+
+| Claim | How it was checked |
+|---|---|
+| An FK to `auth.users` holds `ShareRowExclusiveLock` on it | Measured, [AL01a](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al01-fk-add-locks.ts), `pg_locks` in the holding transaction, identical on Free, Pro and Team, 2026-09-08 |
+| A sign-in-shaped `UPDATE auth.users` blocks while the constraint's lock is held | Measured, [AL01b](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al01-fk-add-locks.ts), `55P03 canceling statement due to lock timeout` on a second connection |
+| A real password sign-in hangs while the lock is held | Measured, [AL01c](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al01-fk-add-locks.ts), `POST /auth/v1/token` to the probe's 15 s client timeout |
+| `NOT VALID` skips the scan and holds the lock only briefly | Measured, [AL02a](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al02-not-valid-validate.ts), `AccessShareLock, ShareRowExclusiveLock` |
+| `VALIDATE CONSTRAINT` holds `ROW SHARE` on `auth.users`, not `SHARE ROW EXCLUSIVE` | Measured, [AL02b](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al02-not-valid-validate.ts), `AccessShareLock, RowShareLock` |
+| The same sign-in-shaped `UPDATE` succeeds through `VALIDATE` | Measured, [AL02c](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al02-not-valid-validate.ts) |
+| An idle-in-transaction reader blocks an `ADD COLUMN`, and committing releases it | Measured, [AL03a](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al03-idle-txn-blocks.ts), [AL03b](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al03-idle-txn-blocks.ts), both `55P03` then success |
+| A profile table references `auth.users` in Supabase's own guidance | Documented, not tested[^sb-user-data] |
+| The lock modes Postgres assigns to each form | Documented[^pg-altertable] |
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| AL01a | auth-users-locks | [`al01-fk-add-locks.ts`](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al01-fk-add-locks.ts) | none published |
+| AL01b | auth-users-locks | [`al01-fk-add-locks.ts`](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al01-fk-add-locks.ts) | none published |
+| AL01c | auth-users-locks | [`al01-fk-add-locks.ts`](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al01-fk-add-locks.ts) | none published |
+| AL02a | auth-users-locks | [`al02-not-valid-validate.ts`](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al02-not-valid-validate.ts) | none published |
+| AL02b | auth-users-locks | [`al02-not-valid-validate.ts`](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al02-not-valid-validate.ts) | none published |
+| AL02c | auth-users-locks | [`al02-not-valid-validate.ts`](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al02-not-valid-validate.ts) | none published |
+| AL03a | auth-users-locks | [`al03-idle-txn-blocks.ts`](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al03-idle-txn-blocks.ts) | none published |
+| AL03b | auth-users-locks | [`al03-idle-txn-blocks.ts`](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-users-locks/tests/al03-idle-txn-blocks.ts) | none published |
+
+## Related docs
+
+- [Supabase incidents: what a client can do](/reference/supabase-incident-resilience/) - the statement-timeout and lock signatures this lock produces, in the class list.
+- [Supabase Auth end to end](/reference/supabase-auth-end-to-end/) - what the blocked `UPDATE auth.users` is part of, and the rate limits a throttled sign-in can be confused with.
+- [Locking down Supabase](/reference/supabase-data-surface-lockdown/) - the roles and grants around the `auth` schema.
+- [Migrating PBKDF2 password hashes into Supabase Auth](/reference/pbkdf2-supabase-auth-migration/) and [Consolidating tenants](/guides/supabase-tenant-consolidation/) - the two places in this corpus where a table is created that references `auth.users`.
+
+[^pg-altertable]: PostgreSQL Global Development Group, "ALTER TABLE," PostgreSQL Documentation. https://www.postgresql.org/docs/current/sql-altertable.html
+[^pg-createtable]: PostgreSQL Global Development Group, "CREATE TABLE," PostgreSQL Documentation. https://www.postgresql.org/docs/current/sql-createtable.html
+[^pg-locking]: PostgreSQL Global Development Group, "Explicit locking," PostgreSQL Documentation. https://www.postgresql.org/docs/current/explicit-locking.html
+[^sb-user-data]: Supabase, "User Management," Supabase Docs. https://supabase.com/docs/guides/auth/managing-user-data

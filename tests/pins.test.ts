@@ -934,6 +934,40 @@ const pins: Pin[] = [
     sections: [/^## What to do about it$/m, /^## Evidence$/m, /^## Reading the numbers$/m, /^## Reproducing$/m],
   },
   {
+    doc: "reference/supabase-auth-users-locks",
+    mustContain: [
+      // AL01a/AL01b: the mode and the conflict that makes it an outage. The
+      // lock name and the refusal text together are the claim; either alone
+      // turns into "a migration was slow".
+      "`ShareRowExclusiveLock` (with `AccessShareLock` and `RowShareLock`)",
+      "55P03 canceling statement due to lock timeout",
+      // AL01c: the customer-visible symptom, which is a hang rather than an
+      // error, and the 15 s is the probe's client, not the platform's.
+      "hung until the probe's 15 s HTTP client timeout",
+      "The 15 s is the probe's own client timeout, not a platform timeout",
+      // AL02b: the reason the two-statement path works. Softening this to
+      // "takes a weaker lock" loses the mode that does not conflict.
+      "`AccessShareLock, RowShareLock`",
+      // AL03a/AL03b: the reverse direction, and the control that proves the
+      // reader was the cause.
+      "`55P03 canceling statement due to lock timeout`",
+      "succeeded once the reader committed",
+    ],
+    mustNotContain: [
+      // The FK was never added to auth.users: the platform restricts DDL on
+      // the auth schema, and the doc must not read as though it were.
+      "ADD CONSTRAINT to auth.users itself",
+    ],
+    sections: [
+      /^## Which form do I pick$/m,
+      /^## What to do about it$/m,
+      /^## Reading the numbers$/m,
+      /^## Reproducing$/m,
+      /^## Evidence$/m,
+      /^## Related docs$/m,
+    ],
+  },
+  {
     doc: "reference/supabase-data-surface-lockdown",
     mustContain: [
       // S21 (2026-09-03): the anon-only revoke left every RPC callable; the
@@ -1633,6 +1667,7 @@ const practicePages: Array<[doc: string, heading: RegExp]> = [
   ["reference/rls-without-supabase-auth", PRACTICES_HEADING],
   ["reference/stripe-sync-engine", PRACTICES_HEADING],
   ["reference/supabase-auth-end-to-end", PRACTICES_HEADING],
+  ["reference/supabase-auth-users-locks", PRACTICES_HEADING],
   ["reference/supabase-aws-privatelink", PRACTICES_HEADING],
   ["reference/supabase-branching-two-projects-one-repo", PRACTICES_HEADING],
   ["reference/supabase-compute-disk", /^## Ops playbook$/m],
