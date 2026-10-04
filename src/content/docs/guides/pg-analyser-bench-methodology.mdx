@@ -1,0 +1,325 @@
+---
+title: Measure a Postgres change with pg-analyser bench
+description: The pgbench workflow with methodology guardrails - preflight client-saturation checks, an unmeasured warmup, repeated measured runs with exact p50/p95/p99 parsed from the per-transaction log, a pg_settings snapshot per run, and a SQLite run history whose --compare puts the config delta next to the performance delta.
+author: "Erfi Anugrah"
+category: supabase
+group: operations
+---
+
+`pgbench` prints a mean and a standard deviation and nothing else, so the two
+numbers most likely to decide a config change - the tail latency and the
+config difference between the two runs - are the two it does not give you. It
+also runs happily on a client machine that is busy compiling something, and a
+busy client benchmarks itself.
+
+`pg-analyser bench` wraps pgbench and enforces the mechanizable half of a
+defensible benchmark: it refuses to start on a saturated client, runs an
+unmeasured warmup, repeats the measured run, parses the per-transaction log for
+real percentiles, snapshots `pg_settings` before and after, and stores the run
+in SQLite so the next one can be compared against it.
+
+You will produce, for one change:
+
+1. A baseline run stored with its `pgbench` version, `scale`, client count,
+   protocol and the full `pg_settings` map.
+2. The same workload after the change.
+3. A `--compare` table with the TPS and p50/p95/p99 deltas and the exact GUCs
+   that moved between the two runs.
+
+Prerequisites: `pgbench` from the PostgreSQL client tools, a connection string
+for the database you are testing, and - for the store and the wrapper - the
+`pg-analyser` binary or Bun ([github.com/erfianugrah/pg-analyser](https://github.com/erfianugrah/pg-analyser)).[^pga-repo]
+The tool is the one whose threshold catalogue the
+[Supabase Grafana monitoring guide](/guides/supabase-grafana-monitoring/) is
+built on; bench is the half that proves a fix rather than detecting a finding.
+Because pgbench speaks the wire protocol, bench is always no-PAT: it needs a
+connection string and never touches the Management API planes.
+
+## Constants
+
+The fixed facts every later claim depends on. These are the defaults as the code
+ships them.[^pga-bench-design]
+
+| Setting | Default | Effect |
+|---|---|---|
+| Script | `-b tpcb-like` | built-in suite, ignored when any `-f` is given |
+| `--scale` | 1 | `pgbench -i` scale, and the scale reported with the run |
+| `--clients` | 4 | `-c` |
+| `--threads` | `min(cores, clients)` | `-j`, clamped to `--clients` |
+| `--time` | 60 | measured seconds per repetition |
+| `--warmup` | 10 | unmeasured seconds before the first measured run |
+| `--runs` | 3 | measured repetitions; the median of each statistic is reported |
+| `--protocol` | extended | one of `simple`, `extended`, `prepared` |
+| `--rate` | off | `-R`, a target TPS instead of max speed |
+| `--init` | off | runs `pgbench -i` first; needs `--yes` |
+| `--reset-stats` | off | `pg_stat_statements_reset()` before measuring; needs superuser |
+
+Thresholds the guardrails act on:
+
+| Constant | Value | Used for |
+|---|---|---|
+| Client-load abort | load1 greater than 0.5 x cores | refuses to start unless `--yes` |
+| Tainted run | peak load1 greater than cores | the run is stored flagged `tainted` |
+| Load sampling interval | every 2 s during a run | the peak the tainted flag is computed from |
+| Short-run warning | `--time` under 30 s | warns that warmup dominates |
+| Single-run warning | `--runs` under 2 | warns that instability cannot be detected |
+| Instability threshold | TPS spread over 15% | the run set is stored flagged `unstable` |
+| Percentiles | nearest rank, from the `-l` log | p50, p95, p99, plus max, mean and stddev |
+
+## How a run is put together
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  preflight [label="preflight\npgbench present,\nclient not saturated"];
+  init [label="optional init\npgbench -i"];
+  guc1 [label="pg_settings\nsnapshot"];
+  warm [label="warmup\nunmeasured"];
+  runs [label="N measured runs\n-l per-transaction log"];
+  guc2 [label="pg_settings\nsnapshot"];
+  store [label="bench_runs\nin history.db"];
+  preflight -> init -> guc1 -> warm -> runs -> guc2 -> store;
+}
+```
+
+Text fallback, in order:
+
+1. Preflight: find the `pgbench` binary, parse its version, read `os.loadavg()`
+   and `os.cpus()`, and check the thread, duration and run-count sanity rules.
+2. Optional `pgbench -i` at `--scale`, which drops and recreates `pgbench_*`.
+3. Capture `pg_settings` as a name-to-`current_setting` map.
+4. Run the unmeasured warmup.
+5. Run N measured repetitions, each with `-l` writing one log file per worker
+   thread into a temporary directory.
+6. Capture `pg_settings` again.
+7. Parse the logs, aggregate the median of each statistic, compute the TPS
+   spread, and insert one row into `bench_runs`.
+
+Component versions: `pgbench`'s own version is parsed from `pgbench --version`
+and stored, and the server version is read once with `SHOW server_version` and
+stored for provenance. The binary is found via `PG_ANALYSER_PGBENCH` if that is
+set, otherwise on `PATH`.
+
+## Part 1: point it at a database
+
+`--db-url` resolves through the same chain as the analysis sweeps - the flag,
+then an environment variable, then `pg-analyser.databases.json`, then a profile.
+For a benchmark, prefer an explicit flag, because the target of a benchmark is
+the one thing you want visible in the command that produced the number:
+
+```bash
+pg-analyser bench --db-url "$TARGET_DB_URL" -f myquery.sql --name baseline
+```
+
+The URL is not stored. The store keeps a `ref` derived from the connection
+string, so a history row can be attributed to a database without the credential
+being written to disk.
+
+## Part 2: let the preflight stop you
+
+The preflight is the part that runs before any timing exists, and it is the part
+worth not overriding:
+
+- **Client saturation.** If load1 is above half the core count, the run aborts
+  with the machine's numbers in the message. A client that is busy measuring
+  itself produces a smaller number that has nothing to do with the database.
+  `--yes` proceeds anyway, and the resulting row keeps the client's core count
+  and peak load so the caveat travels with it.
+- **Thread sanity.** `--threads` is clamped to `--clients`, because pgbench
+  rejects more threads than clients.
+- **Duration floor.** `--time` under 30 s warns; `--runs 1` warns.
+- **Init confirmation.** `--init` prints that it drops and recreates `pgbench_*`
+  in the target database and refuses without `--yes`. This is the same warning
+  to keep the benchmark off a project you care about - use a throwaway project
+  or a branch.
+- **Reset-stats tier.** `--reset-stats` runs `SELECT
+  pg_stat_statements_reset()`,[^pg-stat-statements] which needs superuser and the extension. A
+  refusal there is downgraded to a warning and the run continues without the
+  reset, rather than failing the benchmark.
+
+During each measured run, load1 is sampled every 2 s. If the peak exceeds the
+core count, the row is stored `tainted`, the text output prints a warning naming
+the peak and the core count, and `--compare` refuses to let you forget it.
+
+## Part 3: establish a baseline
+
+Create the standard tables once, on a throwaway database:
+
+```bash
+pg-analyser bench --db-url "$TARGET_DB_URL" -b tpcb-like --init --yes --name baseline
+```
+
+Then decide what you are actually measuring. The built-in `tpcb-like` script is
+an infra comparison - same software on different hardware, or two software
+versions on the same hardware.[^pga-pgbench] It is not your workload, and no conclusion about
+your application follows from its TPS. For a config or index change, write a
+custom script against your own schema shape:
+
+```bash
+pg-analyser bench --db-url "$TARGET_DB_URL" -f myquery.sql --name work_mem-4MB
+```
+
+Custom scripts are passed with `-n`, which skips the standard-table vacuum, and
+several are allowed with weights written as `file@N`. Their text is hashed into
+a `script_hash` (the first 12 hex characters of the SHA-256, or
+`builtin:<name>`), and the hash - not the file path - is what the history is
+keyed on.
+
+## Part 4: read the run correctly
+
+Each measured run writes a per-transaction log,[^pg-pgbench] whose third field is the
+transaction's elapsed time in microseconds; entries for transactions that did
+not complete read `skipped`, `failed`, `serialization` or `deadlock` and are
+counted rather than timed. Percentiles are computed from those latencies by
+nearest rank, so p95 and p99 are real tail figures rather than an inference from
+the mean and standard deviation.
+
+Across `--runs N`, the median of each statistic is reported, and the TPS spread
+is `(max - min) / median`. A spread above 15% stores the set as `unstable` and
+the output tells you to repeat before trusting it. The output shape, from the
+tool's design note:
+
+```
+run 1: tps <value>  p50 <value>  p95 <value>  p99 <value>  failed <n>
+median: tps <value>  p50 <value>  p95 <value>  p99 <value>  (spread <pct>% - stable)
+stored as run #<id> (ref <ref>, script <hash>, 3 runs)
+```
+
+The figures in that note are the design note's illustration of the format, not a
+measurement taken for this page.
+
+## Part 5: change one variable, then measure again
+
+```bash
+pg-analyser bench --db-url "$TARGET_DB_URL" -f myquery.sql --name work_mem-64MB
+```
+
+One change per run, otherwise the next step has two candidates and no way to
+separate them. The GUCs that were in force during the run are captured either
+way, so the comparison below attributes the movement rather than inferring it.
+
+Note what bench does not do: it never sets a GUC, installs an extension, or
+resets statistics unless you asked with `--reset-stats`. Changing `work_mem` is
+your job, through whichever interface the database exposes; bench records what
+was true while it measured.
+
+## Part 6: compare the stored runs
+
+History lives in the same SQLite file as the analysis snapshots, in its own
+table keyed by `ref`, `script_hash` and timestamp:
+
+```bash
+pg-analyser bench --list            # every stored run, with tainted/unstable flags
+pg-analyser bench --show 7          # one run: config, load, versions, per-run stats
+pg-analyser bench --compare 1 2     # deltas plus the pg_settings diff
+```
+
+`--compare` prints the two runs' labels, the TPS delta, the p50, p95 and p99
+deltas as percentages, the failed-transaction counts, and then the GUC
+differences between the two `pg_settings` maps in the form
+`work_mem: 4MB -> 64MB`. Unchanged GUCs are summarised as `none recorded`, so
+"the config did not change" and "the config was not captured" stay
+distinguishable. Two warnings ride along: a `script_hash` mismatch means the
+workload changed between the runs and the comparison is not like-for-like, and a
+`tainted` flag on either run means a saturated client may have produced one of
+the numbers.
+
+Reading it: the TPS line says whether throughput moved, the percentile lines say
+whether the tail moved with it, and the GUC block says what changed. A TPS gain
+with a p99 regression is a real outcome and worth reporting as one.
+
+## Part 7: bracket the window in `pg_stat_statements`
+
+pgbench TPS shows the system moved; it does not show which query moved. Bracket
+the run with the analysis store for that:
+
+1. `pg-analyser snapshot --ref <ref>` - baseline.
+2. Run the workload.
+3. Apply the fix.
+4. Run the same workload again.
+5. `pg-analyser snapshot --ref <ref>`, then `pg-analyser diff --ref <ref>` -
+   per-query regressions matched by `queryid` (1.5x or more on mean execution
+   time is a regression).
+
+If you pass `--reset-stats` and have superuser, the reset happens immediately
+before the first measured run, so the `pg_stat_statements` window contains the
+benchmark and little else. Bench deliberately does not bracket the snapshots
+itself; that stays a manual step, and the design note records automatic
+bracketing as a possible later flag rather than shipped behaviour.[^pga-bench-src]
+
+## Verification
+
+| Check | How | Expected |
+|---|---|---|
+| The run was not client-bound | `--show <id>` | `tainted` flag absent, peak load under the core count |
+| The run set is stable | the median line in the run output | spread at or under 15%, or the run is flagged `unstable` |
+| The tail was measured, not inferred | p95 and p99 are non-zero in the run output | values come from the `-l` log |
+| The config is recorded | `--show <id>` | a non-zero `pg_settings captured` count |
+| The comparison is like-for-like | `--compare` output | no `script differs` warning |
+| The change is attributable | the GUC block of `--compare` | the one GUC you changed, and nothing else |
+
+## Gotchas and lessons learned
+
+- **`pgbench -i` writes to `public` and drops `pgbench_*`.** Run it on a
+  throwaway project or a Supabase branch. Bench's `--init` refuses without
+  `--yes` for exactly this reason.
+- **The client machine is part of the benchmark.** Bench catches the obvious
+  case, a client already loaded at start, and flags the case where it became
+  loaded mid-run. It cannot move the benchmark closer to the database, so run it
+  in the same region as the target.
+- **On shared compute your numbers include your neighbours.** A high `-c` on
+  small compute degrades co-tenants and their load taints your run. Pick a quiet
+  window and expect more spread than on dedicated hardware.
+- **A script change silently invalidates the comparison.** `--compare` keys on
+  the script hash and warns when the two hashes differ; editing the workload
+  between the two runs is the one mistake that makes the deltas meaningless.
+- **`--reset-stats` degrades quietly when it cannot run.** Without superuser or
+  without the extension, the reset is skipped with a warning and the run still
+  stores - so check the run output if the `pg_stat_statements` window matters.
+- **Custom scripts need their own data.** `-n` skips the standard-table vacuum
+  and no fixture is created for you; point the script at tables that exist at a
+  scale you can describe.
+- **`--rate` changes what the run is.** A rate-limited run measures latency at a
+  target load, not the maximum the database will take. Do not compare a
+  rate-limited run against a max-speed one and call it a config effect.
+
+## What bench does not tell you
+
+These are the tool's stated non-goals, so they are not gaps to work around:
+
+- **Nothing about your workload from the built-in suite.** `tpcb-like` is a
+  hardware and version comparison only.
+- **No infra leaderboard.** There is no TPC-C or hammerdb-style harness; that is
+  a different tool class from a config-tuning loop.
+- **No automatic snapshot bracketing.** The `snapshot` and `diff` steps around a
+  run stay manual.
+- **No CI regression gate on `--compare`.** A `--fail-if-slower-pct` style exit
+  is recorded as a possible later phase, not shipped.
+- **No client-region assertion.** Bench does not check whether the client and the
+  database are in the same region.
+- **No server-side changes.** It sets nothing, installs nothing and resets
+  nothing unless asked.
+
+## File reference
+
+| Path | What it is |
+|---|---|
+| `src/bench.ts` | orchestration and guardrails; the log parser, percentile, spread and GUC-diff helpers are pure and unit-tested |
+| `src/store.ts` | the `bench_runs` table and its record/list/get methods |
+| `src/index.ts` | the `bench` subcommand and its flags |
+| `test/bench.test.ts` | parser, percentile, spread and GUC-diff units against fixture logs; store round-trip; preflight logic with injected system info |
+| `docs/bench-design.md` | the design note this page follows: command surface, guardrails in order, store schema, output shape, non-goals |
+| `docs/pgbench.md` | the companion pgbench guide: the manual flags, what pgbench can and cannot tell you, and the tuning workflow bench sits in |
+| `~/.pg-analyser/history.db` | the run history, shared with analysis snapshots |
+
+## References
+
+[^pga-repo]: pg-analyser, "Postgres performance analysis," GitHub, commit `538a7a2`. https://github.com/erfianugrah/pg-analyser
+[^pga-bench-design]: pg-analyser, "pg-analyser bench - design note," GitHub, commit `538a7a2`. https://github.com/erfianugrah/pg-analyser/blob/538a7a2/docs/bench-design.md
+[^pga-pgbench]: pg-analyser, "pgbench tutorial," GitHub, commit `538a7a2`. https://github.com/erfianugrah/pg-analyser/blob/538a7a2/docs/pgbench.md
+[^pga-bench-src]: pg-analyser, "src/bench.ts," GitHub, commit `538a7a2`. https://github.com/erfianugrah/pg-analyser/blob/538a7a2/src/bench.ts
+[^pg-pgbench]: PostgreSQL Global Development Group, "pgbench," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/current/pgbench.html
+[^pg-stat-statements]: PostgreSQL Global Development Group, "The pg_stat_statements module," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/current/pgstatstatements.html
