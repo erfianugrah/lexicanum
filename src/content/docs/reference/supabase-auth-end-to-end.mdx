@@ -12,7 +12,7 @@ import { Aside } from "@astrojs/starlight/components";
 
 Authentication on Supabase is one Postgres schema (`auth`), one issuer (GoTrue) writing to it, and several verifiers (PostgREST, GoTrue itself, Storage, Realtime, Edge Functions) reading a key set. Everything else in this reference - refresh races, third-party issuers, identity moves, lockdown levers, running your own GoTrue - is a consequence of that shape.
 
-Every row marked measured was run against a real project by the [supabase-lab](https://github.com/erfianugrah/supabase-lab) harness between 2026-07-09 and 2026-09-02, and in the session-carry runs at 02:55 and 02:56 UTC on 2026-09-25 (one project pair, plus a third project for S01x). Each project was created and destroyed for the experiment; the experiment and module id is named per row and the run records are public. Where two runs disagree the later one is stated and the earlier one is noted. Documented rows cite the vendor page and were not run.
+Every row marked measured was run against a real project by the [supabase-lab](https://github.com/erfianugrah/supabase-lab) harness between 2026-07-09 and 2026-09-02, in the Auth rate-limit battery on 2026-09-08, and in the session-carry runs at 02:55 and 02:56 UTC on 2026-09-25 (one project pair, plus a third project for S01x). Each project was created and destroyed for the experiment; the experiment and module id is named per row and the run records are public. Where two runs disagree the later one is stated and the earlier one is noted. Documented rows cite the vendor page and were not run.
 
 **TL;DR:**
 
@@ -22,6 +22,7 @@ Every row marked measured was run against a real project by the [supabase-lab](h
 - **A consumer caches a third-party key set and did not re-resolve within the windows measured.** No re-resolution across 37 minutes in one run and 20 minutes in another, so a hub key rotation strands every spoke for at least that long and revocation does not revoke at a consumer.
 - **RLS reads a GUC.** `auth.uid()` reads `request.jwt.claims`; set it over the wire and per-user RLS works with no PostgREST and no GoTrue. The transaction pooler leaks a bare `SET` across clients; use `set_config(..., true)` inside a transaction.
 - **A session moves between projects only by SQL.** Five `auth.*` tables copied in FK order move a tenant with its existing refresh token and its MFA factor; an aal2 session stays aal2 at the new project only if `auth.mfa_amr_claims` is copied as well. The admin API can mint a user with a bcrypt hash but cannot carry a session.
+- **A sign-up burst is capped by CPU and by the Auth connection pool before it reaches any rate limit.** Against the documented 30-request bucket, a fresh bucket on the anonymous sign-in path answers `429` at request 31, and the built-in email provider refuses the 3rd send inside the hour; but admin-create latency itself rose from a p50 of 102/105/110ms sequential to 411/368/366ms at concurrency 8, and GoTrue's pool is 10 sessions against the project's `max_connections` of 60.
 - **A GoTrue you run yourself works against a managed project** as the `postgres` role with `search_path=auth`, shares users and refresh tokens with the managed one, and is trusted by PostgREST as long as the legacy HS256 signing key stays `previously_used`. Revoking that signing key kills its tokens in 3-6 s (3 s, 6 s and 4 s on three projects), and the legacy anon and service_role API keys with them. Give it its own ES256 key, publish the public half from an Edge Function on the project and register that URL as third-party auth, and its tokens are accepted by PostgREST 4 s after the registration and survive that revoke.
 
 ---
@@ -236,6 +237,45 @@ SH06 ran on a fourth project. The self-hosted GoTrue was started with a generate
 
 `GET /storage/v1/bucket` answered 200 to the own-key token, to a managed token and to the anon key alike, so that probe does not show whether Storage verifies a third-party token, and Realtime was not probed. Pooler behaviour under load was not measured. An image ahead of the platform's migration set (which would try to write `auth.schema_migrations` as `postgres` and fail) could not be tested: no public `supabase/gotrue` tag newer than v2.196.0 existed on 2026-09-02. SMTP, hooks and OAuth providers on the self-hosted side were not run.
 
+## Rate limits and sign-up throughput
+
+Auth rate-limits per IP with a token bucket whose capacity is 30 for most endpoints, and per project for email and SMS.[^sb-rate-limits] The numbers below put the boundary where it lands rather than where the table says it is, and separate what caps a sign-up burst from what only looks like it does.
+
+Measured 2026-09-08 on one throwaway project in each of a Free, a Pro and a Team organization, all in `ap-southeast-1` (AR01-AR04, 8 pass / 0 fail per tier). Every row below was identical across the three plans, which is why the plan is not a column.
+
+| Boundary | Documented | Measured 2026-09-08 | Module |
+|---|---|---|---|
+| Anonymous sign-in, per IP, first cut | bucket capacity equal to the configured limit | 60 x `422` when the burst fired immediately after anonymous sign-ins were switched on. Polling `/auth/v1/settings` for `external.anonymous_users` first, the burst trips `429` as documented | AR01a |
+| Anonymous sign-in, per IP, counted | capacity 30 | `429` at request **31** of 60 on a fresh bucket | AR02a |
+| Email sends, built-in provider, per project | 2 per hour | the 3rd signup inside the hour refused `429 over_email_send_rate_limit "email rate limit exceeded"` | AR01b |
+| Config defaults behind those buckets | not stated as absolute values | anonymous 30, email 2, otp 30, verify 30, token_refresh 150, sms 30 | AR01c |
+
+The switch case is worth keeping: a `422` from the signup path is not a rate limit and not a bad request, it is a setting that has not propagated yet. Poll the settings endpoint for the feature you enabled before reading a burst as a failure.
+
+### Sb-Forwarded-For moves the bucket
+
+With IP forwarding **off** the header is ignored: anonymous sign-ins carrying 60 distinct `Sb-Forwarded-For` values drew their `429` from the caller's own bucket at request 31 (AR02a). With `security_sb_forwarded_for_enabled` on and a secret key, the same 60 requests over distinct forwarded addresses drew no `429` at all (AR02b). The differential is the claim; neither half alone shows it.
+
+The docs add a credential condition that the run satisfied rather than tested: forwarding needs a secret API key, and publishable or legacy `anon` and `service_role` keys are not accepted for it.[^sb-rate-limits] A server-side client that forwards an end-user IP while holding the wrong key is not rebucketed, and keeps spending the server's own bucket.
+
+### What actually caps a burst
+
+Sign-up throughput on a small instance is CPU-bound and then pool-bound, well before the IP bucket is in play. Admin-create hashes the password and sends no email (AR03, measured, p50 in ms, Pro/Team/Free):
+
+| Path | Sequential | Concurrency 8 |
+|---|---|---|
+| Pro | 102 | 411 |
+| Team | 105 | 368 |
+| Free | 110 | 366 |
+
+GoTrue's share of the database connection pool is 10 sessions (`db_max_pool_size=10`) against `max_connections=60` on all three plans (AR04, read-only), so 10 concurrent hashing sign-ups is the other ceiling beside core count. Rate limits bound abuse; they do not bound a launch, and an application-level throttle of your own will fire after the pool already has.
+
+### What this did not settle
+
+- The sign-in/sign-up and token-endpoint buckets were counted only on the anonymous sign-in path (AR02a). The bucket shape is shared; the boundary number is one endpoint's.
+- `rate_limit_token_refresh` read 150 on every plan while the public page quoted 1800 per hour at the time (AR01c, 2026-09-08). If the config value is per hour those disagree by 12x; if it is per five minutes then 150 per five minutes is 1800 per hour and they agree. The run does not settle which unit the field carries, and the page has since been rewritten in terms of `auth.rate_limits.*` keys with no numeric default for this one, so the comparison cannot be repeated against the live page.[^sb-rate-limits]
+- SMS caps, the per-minute MFA challenge limit, the web3 endpoints, the per-user OTP, signup-confirmation and password-reset windows, the email cap under custom SMTP or the Send Email hook, and the same burst behind a shared NAT address were not run.
+
 ## Dropping the HTTP tier instead
 
 The other in-house option keeps managed Auth and removes PostgREST. Wedge the managed Data API (`PATCH /v1/projects/{ref}/postgrest {"db_schema": ""}` -> `503 PGRST002` within about 4 s; Auth, Storage, Realtime and Edge Functions unaffected) and run `postgrest/postgrest` against the session pooler as a dedicated NOSUPERUSER role that is a member of `anon` and `authenticated`, never `postgres` and never `service_role` (security-lockdown S04, S06). Point `PGRST_JWKS_URI` at the project's JWKS to keep verifying GoTrue tokens. The `db-pre-request` IP filter that never fired on hosted (L09) fires on your own PostgREST and refuses a spoofed `x-forwarded-for` with `403 PT403`. Storage and Realtime stay managed and never traverse PostgREST, so this owns the REST layer and nothing else.[^lex-own-pgrst]
@@ -254,6 +294,8 @@ Dropping GoTrue as well means owning signup, OAuth, magic links, token minting, 
 | first `POST /auth/v1/admin/users` on a fresh project answers 500 (`unexpected_failure` or `"Database error checking email"`) | `ACTIVE_HEALTHY` is not readiness; the second call about 10 s later succeeds | `unexpected_failure` on five projects; `"Database error checking email"` on two |
 | Auth 521 for about 75 s, Storage 500 for about 78 s, REST untouched, during a compute restart | the paths do not move together | platform-downtime |
 | `over_email_send_rate_limit` on scripted signups | the shared SMTP allows 2 emails per hour; use the admin create plus password grant path | `rate_limit_email_sent` read as 2 from `GET /v1/projects/{ref}/config/auth` ([S03](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/security-lockdown/tests/s03-auth-hardening.ts), [S14](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/security-lockdown/tests/s14-auth-switch-on.ts)). [W03](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/edge-resilience/tests/w03-jwt-exp.ts) and [S11](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/security-lockdown/tests/s11-auth-efficacy.ts) route around the limit rather than measuring it |
+| `422` on a signup burst in the seconds after a switch was turned on | the setting has not propagated, and it is not a rate limit: anonymous sign-ins answered 60 x `422` until the run polled `/auth/v1/settings` for `external.anonymous_users` | measured [AR01a](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar01-endpoint-limits.ts), 2026-09-08 |
+| `429` on a signup burst | the caller's bucket empties at request 31 of 60 on the anonymous path, and the built-in email provider refuses the 3rd send inside the hour; forwarding a distinct `Sb-Forwarded-For` with a secret key moves the bucket onto that address | measured [AR01b](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar01-endpoint-limits.ts), [AR02a](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar02-forwarded-for.ts), [AR02b](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar02-forwarded-for.ts) |
 
 ## What to do about it
 
@@ -320,6 +362,7 @@ Dropping GoTrue as well means owning signup, OAuth, magic links, token minting, 
 | PostgREST and GoTrue verify the same key set | PostgREST rejects an HS256 token carrying any `kid`; the managed GoTrue accepts it. For an ES256 token the managed GoTrue selects by `kid` and refused key material it held only under another kid (S01g) | undocumented |
 | a private key you already have can be imported, and the `kid` header of the tokens you sign must be the same value you give when importing | a kid another project already holds is refused `409` "Signing key with kid ... already exists": on a second project in the same organization (S01b) and on a project in a different organization with different key material (S01x), while the first project held the kid `in_use`; both organizations were under one account, cross-account not run. | docs silent on kid uniqueness across projects |
 | `security_refresh_token_reuse_interval` is configurable | PATCH accepted and read back; the running service kept 10 s | propagation or clamp unknown |
+| the token-endpoint limit is 1800 per hour | `rate_limit_token_refresh` read 150 on Free, Pro and Team alike (2026-09-08), and the two figures agree only if the field is per five minutes rather than per hour | unit of the config field was not settled by the run, and the page has since dropped the numeric default |
 
 None of these has been filed with Supabase as of 2026-09-25.
 
@@ -336,6 +379,10 @@ Measured claims map to module ids in the named supabase-lab experiments; every R
 
 | Claim | Status | How it was checked |
 |---|---|---|
+| The IP bucket trips at request 31 of 60, the built-in email cap refuses the 3rd send inside the hour, and both are identical on Free, Pro and Team | measured | [AR01a](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar01-endpoint-limits.ts), [AR01b](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar01-endpoint-limits.ts), [AR02a](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar02-forwarded-for.ts), one throwaway project per plan, `ap-southeast-1`, 2026-09-08 |
+| `Sb-Forwarded-For` rebuckets the limit onto the forwarded address, and only with a secret key and forwarding enabled | measured | [AR02a](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar02-forwarded-for.ts) (forwarding off, 429 at 31 of 60), [AR02b](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar02-forwarded-for.ts) (on, 60 distinct addresses, no `429`) |
+| Sign-up latency is bcrypt-bound: p50 102/105/110ms sequential against 411/368/366ms at concurrency 8 | measured | [AR03](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar03-signup-hashing.ts), `POST /auth/v1/admin/users`, one run per plan |
+| GoTrue's connection share is 10 of the project's 60 | measured, read-only | [AR04](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar04-connection-share.ts), `config/auth` against `pg_settings.max_connections`; recorded rather than asserted, since the run does not establish which plans change the pool figure |
 | ES256 `in_use` plus HS256 `previously_used` on a fresh project; `jwt_secret` readable and mints accepted tokens | measured | edge-resilience [W01](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/edge-resilience/tests/w01-jwt-skew.ts), [W07](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/edge-resilience/tests/w07-breakglass-mint.ts); self-hosted-auth [SH01c](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/self-hosted-auth/tests/sh01-privilege-map.ts) |
 | PostgREST skew tolerance exactly 30 s; expired and unknown-key codes | measured | edge-resilience [W01](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/edge-resilience/tests/w01-jwt-skew.ts), two runs |
 | PostgREST refuses an HS256 token with any `kid`; GoTrue accepts it | measured | self-hosted-auth [SH04](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/self-hosted-auth/tests/sh04-verify-managed-key.ts), three projects (arbitrary kid, platform kid, no kid) |
@@ -371,6 +418,13 @@ Measured claims map to module ids in the named supabase-lab experiments; every R
 
 | Module | Experiment | Test | Artifact |
 |---|---|---|---|
+| AR01a | auth-rate-limits | [`ar01-endpoint-limits.ts`](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar01-endpoint-limits.ts) | none published |
+| AR01b | auth-rate-limits | [`ar01-endpoint-limits.ts`](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar01-endpoint-limits.ts) | none published |
+| AR01c | auth-rate-limits | [`ar01-endpoint-limits.ts`](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar01-endpoint-limits.ts) | none published |
+| AR02a | auth-rate-limits | [`ar02-forwarded-for.ts`](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar02-forwarded-for.ts) | none published |
+| AR02b | auth-rate-limits | [`ar02-forwarded-for.ts`](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar02-forwarded-for.ts) | none published |
+| AR03 | auth-rate-limits | [`ar03-signup-hashing.ts`](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar03-signup-hashing.ts) | none published |
+| AR04 | auth-rate-limits | [`ar04-connection-share.ts`](https://github.com/erfianugrah/supabase-lab/blob/677c101/experiments/auth-rate-limits/tests/ar04-connection-share.ts) | none published |
 | C01 | rls-wire-claims | [`c01-wire-claims.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/rls-wire-claims/tests/c01-wire-claims.ts) | none published |
 | C02 | rls-wire-claims | [`c02-gotrue-claims.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/rls-wire-claims/tests/c02-gotrue-claims.ts) | none published |
 | C02 | tenant-consolidation | [`c02-email-collision.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/tenant-consolidation/tests/c02-email-collision.ts) | none published |
@@ -446,6 +500,7 @@ Measured claims map to module ids in the named supabase-lab experiments; every R
 - [Put an IAP over the Data API](/guides/supabase-iap-data-api/), [Running many tenants on one project](/guides/supabase-shared-tenancy/), [Promoting a tenant](/guides/supabase-tenant-promotion/), [Consolidating tenants](/guides/supabase-tenant-consolidation/), [Run your own PostgREST](/guides/supabase-own-postgrest/), [Trusted-device MFA and impersonation audit](/guides/supabase-auth-mfa-trusted-device-and-impersonation-audit/) - the guides each section points at.
 
 [^sb-signing-keys]: Supabase, "JWT Signing Keys," Supabase Docs. https://supabase.com/docs/guides/auth/signing-keys
+[^sb-rate-limits]: Supabase, "Rate limits," Supabase Docs. https://supabase.com/docs/guides/auth/rate-limits
 [^gotrue-readme]: Supabase, "supabase/auth README," GitHub. https://github.com/supabase/auth/blob/master/README.md
 [^sb-compose]: Supabase, "docker/docker-compose.yml," supabase/supabase on GitHub. https://github.com/supabase/supabase/blob/master/docker/docker-compose.yml
 [^gotrue-conf]: Supabase, "internal/conf/configuration.go and jwk.go," supabase/auth on GitHub. https://github.com/supabase/auth/tree/master/internal/conf
