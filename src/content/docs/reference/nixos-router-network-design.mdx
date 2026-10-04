@@ -1,0 +1,513 @@
+---
+title: "NixOS edge router network design"
+description: "The network architecture of the fleet's NixOS edge router: tagged VLAN trunking, default-drop nftables zones with Docker bridge traversal, Kea DHCP isolation, hairpin routing without DNS lies, loopback service-plane addresses, and an 18-check post-deploy doctor gate."
+author: Erfi Anugrah
+category: networking
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+The edge router in this homelab runs NixOS on an x86_64 appliance, terminating public WAN traffic and providing inter-VLAN routing, stateful firewalling, DHCP, and edge proxying for the fleet. This reference documents the router's network architecture: tagged 802.1Q trunking, default-drop nftables zones with container bridge forwarding, Kea DHCP socket isolation, hairpin access without split-horizon DNS lies, loopback service-plane addressing, and the 18 post-deployment runtime health checks enforced by `eaves doctor`.
+
+The router operates alongside the NAS and home-automation appliances described in [Three NixOS hosts, one deploy interface](/reference/nixos-fleet/), isolates smart-home peripherals as detailed in [Isolating a smart-home fleet on an IoT VLAN](/reference/home-iot-network/), advertises internal routes to the tailnet in [A Tailscale tailnet across a dual-site homelab](/reference/tailscale-homelab/), and aligns with the interface tuning covered in [Tuning a 10GbE link end to end](/guides/10gbe-link-tuning/).
+
+<Aside type="note" title="Provenance">
+  Architecture, firewall rulesets, and diagnostic checks reflect the live NixOS edge router configuration and the `eaves` diagnostic suite. The hardware platform is a Minisforum MS-01 equipped with an Intel X710-DA2 dual SFP+ card for LAN trunking and Intel i226-V 2.5GbE copper ports for WAN connectivity.
+</Aside>
+
+## TL;DR
+
+- **Tagged trunk parent carries no address**: The primary LAN trunk interface carries 802.1Q tagged child interfaces exclusively. The parent link runs with `LinkLocalAddressing = "no"` and no IP address, eliminating raw-socket packet cross-capture in the DHCP daemon.
+- **Admin segment is tagged VLAN 69**: The management and workstation segment was migrated from an untagged native network to tagged VLAN 69 (`10.0.69.0/24`) to eliminate switch port drift and prevent Kea from cross-allocating addresses across segments.
+- **Scoped nftables table flushes**: NixOS manages firewall rules with `flushRuleset = false` and opens with scoped `flush table inet filter` and `flush table inet nat` commands. This allows idempotent rule reloads without destroying Docker's separate `ip nat` chains.
+- **Docker bridge forward traversal**: Linux kernel `br_netfilter` directs bridged container traffic through the host's default-drop forward chain. Explicit intra-bridge and DNAT-conntrack rules permit container communication and testcontainer dialing while blocking lateral container-to-host hops.
+- **Kea carrier re-detection**: Kea is configured with `re-detect = true` so its interface manager re-binds raw sockets as switch ports complete their two-minute boot cycle, avoiding deaf DHCP listeners at startup.
+- **Loopback service-plane addressing**: Internal services and DNS listeners bind dedicated `/32` loopback aliases on `lo` (including Knotea on `10.0.10.5`), bypassing Linux macvlan parent-child communication barriers.
+- **Hairpin without split-horizon DNS**: Public hostnames resolve to public IPs or loopback aliases across all networks; LAN packets hitting the router's WAN IP terminate directly at the local reverse proxy, preserving authentic client source IPs in logs without NAT hairpins.
+- **18-check doctor gate**: Every deployment and automated run asserts 18 runtime conditions via `eaves doctor`, testing kernel parameters, descriptor rings, default-drop firewall policies, orphan VLAN interfaces, and port ownership.
+
+## Architecture
+
+The edge router bridges external WAN traffic, local VLANs, and Tailscale overlay routing through a unified nftables ruleset and host-networked edge services.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  wan [label="Internet / WAN\nDHCP on i226-V\nPublic services :80/:443/:2222"];
+  tailnet [label="Tailscale overlay\ntailscale0\n100.64.0.0/10"];
+
+  subgraph cluster_router {
+    label="MS-01 edge router (NixOS)"; style=rounded; fontsize=12; margin=12;
+    lo [label="Loopback (lo)\nService-plane address\nKnotea DNS (10.0.10.5)"];
+    nft [label="nftables engine\ninet filter (policy drop)\ninet nat (masquerade + redirect)"];
+    kea [label="Kea DHCPv4 daemon\ninterfaces-config.re-detect\nTagged VLAN children only"];
+    docker [label="Docker daemon\ninet bridges: docker0, forgejo0\nScoped iptables-nft tables"];
+  }
+
+  subgraph cluster_switch {
+    label="Managed switch (10GbE SFP+ DAC)"; style=rounded; fontsize=12; margin=12;
+    trunk [label="802.1Q Trunk\nX710-DA2 (4096 rings)"];
+    vlan_admin [label="VLAN 69 (admin)\n10.0.69.0/24"];
+    vlan_wifi [label="VLAN 100 (wireless)\n10.0.72.0/24"];
+    vlan_servers [label="VLAN 200 (servers)\n10.0.71.0/24"];
+    vlan_turing [label="VLAN 300 (turing)\n10.0.74.0/24"];
+    vlan_iot [label="VLAN 400 (iot)\nIsolated smart home"];
+    vlan_guest [label="VLAN 500 (guest)\nInternet only"];
+  }
+
+  wan -> nft [label="ingress"];
+  tailnet -> nft [label="subnet ingress"];
+  nft -> lo [label="input chain"];
+  nft -> trunk [label="forward chain"];
+  kea -> trunk [label="DHCP offers"];
+  docker -> nft [label="br_netfilter"];
+  trunk -> vlan_admin;
+  trunk -> vlan_wifi;
+  trunk -> vlan_servers;
+  trunk -> vlan_turing;
+  trunk -> vlan_iot;
+  trunk -> vlan_guest;
+}
+```
+
+The diagram outlines the router's packet paths:
+
+1. External traffic enters through the WAN interface or the Tailscale subnet router (`tailscale0`).
+2. The packet traverses the `inet filter` input chain for host services or the forward chain for inter-segment and egress routing.
+3. Local management services and DNS queries terminate on loopback aliases (`lo`), while DHCP is served by Kea directly to tagged VLAN children.
+4. Filtered packets cross the physical SFP+ trunk link into the managed switch, which routes them to their destination VLANs based on 802.1Q tags.
+
+---
+
+## VLAN segmentation and trunk architecture
+
+The physical link between the edge router and the core managed switch is a 10GbE direct-attach copper (DAC) cable on an Intel X710-DA2 controller. A secondary Intel i226-V 2.5GbE interface handles the WAN connection to the optical network terminal.
+
+### The bare trunk parent doctrine
+
+The physical trunk interface does not hold an IPv4 address. Under `systemd-networkd`, the interface configuration explicitly drops link-local addressing and disables online requirements:
+
+```ini
+# 15-trunk.network
+[Match]
+Name=enp2s0f0np0
+
+[Network]
+LinkLocalAddressing=no
+ConfigureWithoutCarrier=yes
+VLAN=admin
+VLAN=wireless
+VLAN=servers
+VLAN=turing
+VLAN=iot
+VLAN=guest
+
+[Link]
+RequiredForOnline=no
+MTUBytes=1500
+```
+
+Every routable subnet is bound to an explicit netdev of type `vlan`. In systemd-networkd, omitting `MTUBytes` causes the daemon to leave whatever value was previously set on the interface. The MTU is declared explicitly as 1500 across the trunk and all child interfaces to ensure consistent packet sizing across rebuilds.
+
+### Why admin moved to tagged VLAN 69
+
+In the early router architecture, the administrative network operated as an untagged native network on the trunk parent link. This was abandoned for two operational reasons:
+
+1. **Switch configuration drift**: Port membership for untagged VLAN 1 on managed switches is frequently maintained as an implicit default table. Routine administrative edits to other ports caused switch firmware to silently alter untagged port memberships.
+2. **Kea raw-socket cross-capture**: Kea binds raw `AF_PACKET` sockets to interfaces to process DHCP broadcast frames from unconfigured clients.[^kea-arm] When Kea listened on a bare parent interface alongside tagged VLAN interfaces, its raw socket captured tagged broadcast frames from child VLANs before the kernel stripped the 802.1Q headers. Kea logged `DHCPSRV_MULTIPLE_RAW_SOCKETS_PER_IFACE` and issued wrong-subnet lease offers to newly connected clients on the untagged network, preventing devices from acquiring valid IP addresses.
+
+Switching Kea to standard UDP sockets would resolve the cross-capture issue but would break initial DHCP discovery, as cold clients without an assigned IP address communicate via raw L2 broadcast. Moving the administrative network to tagged VLAN 69 solved this permanently. The kernel strips 802.1Q tags before passing packets to the VLAN netdevs, allowing Kea to bind cleanly to distinct virtual interfaces without cross-capturing frames. Switch access ports for workstations and out-of-band management assign PVID 69, keeping client configurations untagged.
+
+### Segment layout
+
+Each VLAN serves a distinct trust tier and administrative role:
+
+| VLAN Name | 802.1Q Tag | Subnet / Range | Primary Purpose | DHCP Mode |
+|---|---|---|---|---|
+| `admin` | 69 | `10.0.69.0/24` | Workstation (`erfi1`), PiKVM, home hub (`erfipie` / `10.0.69.7`), switch management | Dynamic pool (`.100 - .200`) + reservations |
+| `wireless` | 100 | `10.0.72.0/24` | Wi-Fi clients and access point management on GL.iNet Flint 2 | Dynamic pool (`.100 - .200`) + reservations |
+| `servers` | 200 | `10.0.71.0/24` | Storage and compute host (`servarr`), Docker macvlan containers (`servarr_lan`) | Reservations-only (no dynamic pool) |
+| `turing` | 300 | `10.0.74.0/24` | Turing Pi 2 cluster: BMC controller and RK1 compute nodes | Reservations-only (no dynamic pool) |
+| `iot` | 400 | The IoT VLAN | Home automation plugs, sensors, and relays on dedicated SSID | Dynamic pool (`.100 - .200`) + reservations |
+| `guest` | 500 | The guest VLAN | Guest Wi-Fi devices with direct internet egress only | Dynamic pool (`.100 - .200`) |
+
+The `servers` segment operates without a dynamic pool. IP addresses on `10.0.71.0/24` outside the router's gateway are hand-allocated to Docker macvlan containers (such as the Kanban application at `10.0.71.66`) and server infrastructure. The `turing` segment operates identically: the BMC controller holds a static reservation, cluster nodes assign static addresses, and a reserved block is assigned to the MetalLB load-balancer pool.
+
+### Trunk link buffer tuning
+
+At 9.4 Gbps link saturation on MTU 1500, a 10GbE network processes roughly 810,000 packets per second. The default ring buffer depth in the Intel `i40e` driver is 512 descriptors.[^intel-i40e] Under CPU scheduling jitter or RSS core interrupts, a 512-descriptor buffer fills in less than a millisecond, causing the network controller to drop frames that have already arrived cleanly over the wire (tracked in the kernel counter `rx_missed_errors`).
+
+Tuning the trunk link requires two mechanisms:
+
+1. **MAC-matched systemd.link file**: Descriptor rings must be set to 4096 via a `.link` file. Matching must be performed against `matchConfig.MACAddress`, not `matchConfig.Name`. Udev evaluates `.link` files when the network interface first appears, at which point the kernel name is still `eth0`. Matching against predictable interface names fails during boot, causing the system to fall back to default ring sizes.
+2. **Activation oneshot unit**: Because udev does not re-evaluate `.link` files during `nixos-rebuild switch`, an idempotent systemd oneshot unit executes `ethtool -G <trunk> rx 4096 tx 4096` during activation if the current descriptor depth is below 4096.
+
+On the WAN interface, `ethtool -K <wan> rx-udp-gro-forwarding on` is applied via a oneshot unit. Generic Receive Offload (GRO) forwarding prevents Tailscale WireGuard packets from being fragmented and re-segmented when routed through the edge.[^tailscale-gro]
+
+---
+
+## The service-plane address
+
+Internal services and local DNS resolvers on the router do not attach to a physical VLAN interface. Instead, they bind to `/32` loopback aliases configured on `lo`:
+
+```ini
+# 05-lo.network
+[Match]
+Name=lo
+
+[Network]
+Address=10.0.10.5/32
+```
+
+Loopback aliases are used for three reasons:
+
+- **Macvlan interface isolation**: Linux macvlan sub-interfaces in bridge mode cannot communicate directly with the parent host interface. If the DNS resolver ran as a container on a macvlan network on the router, it would be unable to reach the host router as its recursive gateway. Binding services to `lo` on the host network avoids this architectural limitation.
+- **Decoupled network identities**: Services bound to loopback addresses hold stable identities that are independent of physical interface numbering. If a core service moves to a different physical machine, the router can route the `/32` address to the new host without reconfiguring DHCP option 6 or modifying firewall rules across the fleet.
+- **Universal local routing**: Loopback addresses are inherently routable from every internal VLAN through the router's local routing table, subject only to nftables input filtering.
+
+The Knotea resolver binds directly to `10.0.10.5:53`, providing recursive and authoritative DNS resolution across the homelab as detailed in [knotea: one binary that is both your recursive resolver and your authoritative DNS](/reference/knotea-self-hosted-dns/). The edge reverse proxy binds to the service-plane loopback address for internal HTTP and SSH forwarding, documented in [Edge Caddy as a native NixOS service](/reference/edge-caddy-on-nixos/).
+
+---
+
+## nftables zone model and policies
+
+The router disables the default NixOS firewall module (`networking.firewall.enable = false`) and manages rules directly through `networking.nftables`.
+
+### Scoped table flushing
+
+NixOS defaults to flushing the entire firewall ruleset upon activation. This causes severe regressions when running Docker on the host: Docker manages its own NAT and bridge isolation rules in the `ip nat` and `ip filter` tables using `iptables-nft` compatibility layers. A global ruleset flush deletes Docker's masquerade rules, severing container network connectivity until `dockerd` is restarted.
+
+Setting `flushRuleset = false` prevents NixOS from clearing Docker's tables. However, a rebuild with `flushRuleset = false` only appends new rules, leaving obsolete chains active in memory. To achieve idempotent rebuilds without disturbing Docker, the configuration ruleset executes scoped table flushes:
+
+```nft
+table inet filter
+flush table inet filter
+table inet nat
+flush table inet nat
+```
+
+NixOS places all router-managed filtering in `table inet filter` and all router-managed NAT in `table inet nat`. Docker's rules reside in `table ip nat` and `table ip filter`, allowing both systems to reload independently without collision.[^nft-wiki]
+
+### Input chain policies
+
+The `input` chain drops all incoming traffic by default (`policy drop`). Conntrack accepts established and related packets while dropping invalid states. Inbound traffic is accepted based on source interface and service role:
+
+```nft
+table inet filter {
+  chain input {
+    type filter hook input priority 0; policy drop;
+    iifname "lo" accept
+    ct state vmap { established : accept, related : accept, invalid : drop }
+
+    # Universal LAN services
+    iifname { "admin", "wireless", "servers", "turing", "iot", "guest" } icmp type echo-request accept
+    iifname { "admin", "wireless", "servers", "turing", "iot", "guest" } udp dport { 67, 68 } accept
+
+    # Core LAN services (IoT excluded)
+    iifname { "admin", "wireless", "servers", "turing", "guest" } udp dport 53 accept
+    iifname { "admin", "wireless", "servers", "turing", "guest" } tcp dport 53 accept
+    iifname { "admin", "wireless", "servers", "turing" } udp dport 5353 accept
+    iifname { "admin", "wireless", "servers", "turing" } tcp dport { 80, 443, 2222, 2223 } accept
+    iifname { "admin", "wireless", "servers", "turing" } udp dport 443 accept
+
+    # Administrative plane
+    iifname "admin" tcp dport { 22, 8080 } accept
+    iifname "tailscale0" tcp dport { 22, 8080 } accept
+    iifname "tailscale0" icmp type echo-request accept
+
+    # Pinned ingress rules
+    iifname "servers" ip saddr 10.0.71.66 tcp dport 8080 accept
+    iifname "admin" ip saddr <switch-ip> udp dport 514 accept
+
+    # Docker bridge input to local services
+    iifname { "docker0", "forgejo0" } udp dport 53 accept
+    iifname { "docker0", "forgejo0" } tcp dport 53 accept
+    iifname { "docker0", "forgejo0" } ip daddr <service-plane-ip> tcp dport { 443, 2222 } accept
+
+    # WAN ingress
+    iifname "enp1s0" tcp dport { 80, 443, 2222, 2223 } accept
+    iifname "enp1s0" udp dport 443 accept
+    iifname "enp1s0" icmp type echo-request limit rate 5/second accept
+
+    # IoT audit logging
+    iifname "iot" ip daddr != 224.0.0.0/4 limit rate 10/minute log prefix "iot-in-drop: "
+  }
+}
+```
+
+The input chain enforces key isolation boundaries:
+
+- **DNS isolation**: The Knotea resolver on `10.0.10.5:53` is accessible to all LAN segments except the IoT VLAN. IoT devices communicate with the Home Assistant hub exclusively by IP address, removing DNS lookups as an exfiltration channel.
+- **Administrative control**: SSH (port 22) and the Composer management API (port 8080) are reachable only from the administrative interface (`admin`) and the Tailscale interface (`tailscale0`). The Kanban dashboard container on the servers VLAN is granted a single pinned exception to communicate with port 8080.
+- **IoT surveillance**: Any unpermitted packet from the IoT VLAN destined for the router is rate-limited to 10 logs per minute and recorded in the system journal with the prefix `iot-in-drop: `.
+
+### Forward chain policies
+
+The `forward` chain enforces strict default-drop inter-VLAN routing:
+
+```nft
+chain forward {
+  type filter hook forward priority 0; policy drop;
+  ct state vmap { established : accept, related : accept, invalid : drop }
+
+  # Tailscale subnet routing: local VLANs only, no WAN exit
+  iifname "tailscale0" ip saddr 100.64.0.0/10 ip daddr 10.0.0.0/8 accept
+
+  # Workstation full lateral reach
+  iifname "admin" ip saddr 10.0.69.3 accept
+
+  # Hub to IoT management plane
+  iifname "admin" ip saddr 10.0.69.7 oifname "iot" accept
+
+  # IoT to Hub: NTP only
+  iifname "iot" ip daddr 10.0.69.7 udp dport 123 oifname "admin" accept
+  iifname "iot" limit rate 10/minute log prefix "iot-fwd-drop: "
+
+  # Monitoring: Prometheus to Hub metrics
+  iifname "servers" ip daddr 10.0.69.7 tcp dport 8123 oifname "admin" accept
+
+  # Internet egress (IoT excluded)
+  iifname { "admin", "wireless", "servers", "turing", "guest" } ip daddr != 10.0.0.0/8 oifname "enp1s0" accept
+
+  # Docker bridge forwarding
+  iifname "docker0" oifname "docker0" accept
+  iifname "forgejo0" oifname "forgejo0" accept
+  iifname { "docker0", "forgejo0" } oifname { "docker0", "forgejo0" } ct status dnat accept
+  iifname { "docker0", "forgejo0" } ip daddr != 10.0.0.0/8 oifname "enp1s0" accept
+}
+```
+
+The forward chain contains five critical routing controls:
+
+- **Tailscale subnet boundary**: Inbound traffic from `tailscale0` is restricted to RFC1918 internal space (`10.0.0.0/8`). The router does not forward tailnet traffic to the WAN interface, preventing the machine from operating as an unintentional exit node.
+- **Administrative workstation**: The primary workstation (`erfi1` at `10.0.69.3`) is granted unrestricted lateral forwarding to manage infrastructure across all segments.
+- **Smart-home confinement**: The home automation hub (`erfipie` at `10.0.69.7`) can initiate connections into the IoT VLAN for Home Assistant native API polling (port 6053), ESPHome over-the-air updates (port 3232), and web configuration (port 80). The IoT VLAN cannot initiate connections back into the network, with a single pinhole for NTP time synchronisation (UDP port 123) to Chrony on the hub.
+- **Internet egress**: All segments except the IoT VLAN may forward traffic out the WAN interface to non-internal addresses (`ip daddr != 10.0.0.0/8`). The IoT VLAN has no egress rule; unpermitted forwarding attempts are logged at 10 per minute with `iot-fwd-drop: ` before being dropped.
+
+### Docker bridge forward traversal
+
+When Docker creates bridge networks on a Linux host, the kernel's `br_netfilter` module passes bridged Ethernet frames through the host's iptables and nftables forward chains.[^br-netfilter] In a default-drop firewall architecture, this causes container-initiated traffic to fail:
+
+1. **Same-bridge communication**: Packets between two containers on `docker0` traverse the forward chain. Without explicit rules, container-initiated communication (such as an application container reaching a database container) is dropped by the default policy. The router addresses this with explicit intra-bridge acceptance: `iifname <b> oifname <b> accept`.
+2. **Cross-bridge testcontainer access**: In continuous-integration workflows on the router's Forgejo instance, a runner container on `forgejo0` executes integration tests that spin up ephemeral testcontainers publishing ports on other Docker bridges. The runner dials the container via the host gateway port. Docker DNATs this traffic in `PREROUTING`. Because the destination IP is transformed to a container IP on another bridge, the packet enters the forward chain across two distinct interfaces.
+3. **The DNAT conntrack pinhole**: Directly accepting all traffic between bridges would break container isolation. The forward chain inspects conntrack status: `iifname { "docker0", "forgejo0" } oifname { "docker0", "forgejo0" } ct status dnat accept`. This restricts cross-bridge routing strictly to packets that underwent legitimate Docker port-publishing DNAT, while dropping attempts to route directly to raw container IPs.
+
+### NAT rules
+
+NAT configuration resides in `table inet nat`. The router handles masquerading and selective DNS steering:
+
+```nft
+table inet nat {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    # Media device DNS steering: redirect hardcoded queries to local Knotea resolver
+    iifname "wireless" ip saddr <media-device-ip> ip daddr != 10.0.0.0/8 udp dport 53 dnat to 10.0.10.5
+    iifname "wireless" ip saddr <media-device-ip> ip daddr != 10.0.0.0/8 tcp dport 53 dnat to 10.0.10.5
+  }
+  chain postrouting {
+    type nat hook postrouting priority 100; policy accept;
+    ip saddr 10.0.0.0/8 oifname "enp1s0" masquerade
+  }
+}
+```
+
+The prerouting chain intercepts DNS queries from devices with hardcoded upstream servers (such as smart TVs directing queries to public resolvers) and redirects them to the local Knotea resolver at `10.0.10.5:53`. The postrouting chain masquerades all internal RFC1918 traffic exiting the WAN interface.
+
+---
+
+## DHCP architecture with Kea
+
+The router runs ISC Kea DHCPv4 (`kea-dhcp4-server.service`) to manage IP leases across all local segments.
+
+### Switch boot race and socket recovery
+
+In an edge router deployment, the host boots in seconds while managed switches require up to two minutes to load firmware, initialise ASIC matrices, and raise link carrier. When the router activates Kea at boot, the physical trunk interface and its 802.1Q child VLANs exist as netdevs in the kernel but lack carrier flags (`LOWER_UP`).
+
+By default, Kea attempts to bind raw sockets to configured interfaces at startup. If an interface is not operational, socket allocation fails, Kea reports `DHCPSRV_NO_SOCKETS_OPEN`, and the daemon halts. If systemd attempts restarts while the switch is still booting, Kea trips systemd's restart rate limits and enters a permanent failed state.
+
+The configuration hardens Kea against this race through three options:
+
+```nix
+systemd.services.kea-dhcp4-server = {
+  after = [ "sys-subsystem-net-devices-trunk.device" ]
+    ++ map (i: "sys-subsystem-net-devices-${i}.device") vlanIfaces;
+  unitConfig.StartLimitIntervalSec = lib.mkForce 0;
+  serviceConfig = {
+    Restart = lib.mkForce "always";
+    RestartSec = 5;
+  };
+};
+
+services.kea.dhcp4.settings = {
+  interfaces-config = {
+    interfaces = lanIfaces;
+    re-detect = true;
+  };
+  lease-database = {
+    type = "memfile";
+    persist = true;
+    name = "/var/lib/kea/leases4.csv";
+  };
+  valid-lifetime = 300;
+};
+```
+
+Setting `interfaces-config.re-detect = true` instructs Kea's interface manager (`IfaceMgr`) to poll the kernel link state periodically and re-bind raw sockets as interfaces gain carrier. Disabling systemd's restart rate limits ensures Kea continues retrying until the switch completes its boot sequence.
+
+### Allocation and reservation policy
+
+Kea generates a `subnet4` declaration for each configured VLAN. Address pools are differentiated by trust tier:
+
+- **Dynamic pools (`.100 - .200`)**: Configured on `admin`, `wireless`, `iot`, and `guest`. Standard clients receive temporary leases with a 300-second valid lifetime, allowing rapid DHCP configuration changes to propagate across the fleet.
+- **Reservations-only**: Configured on `servers` and `turing`. The `subnet4` blocks declare `pool = []`, disabling dynamic lease offers entirely. Devices on these segments must hold explicit MAC-to-IP reservations in Kea or configure static IP addresses. This prevents unknown hardware from leasing addresses on sensitive infrastructure segments.
+
+Across all scopes, Kea distributes the Knotea loopback resolver address (`10.0.10.5`) as the primary DNS server.
+
+---
+
+## Hairpin routing without DNS lies
+
+Split-horizon DNS - answering with private IP addresses for internal clients and public IP addresses for external clients - creates subtle operational failure modes. Modern web browsers and operating systems increasingly utilise DNS-over-HTTPS (DoH) or DNS-over-TLS (DoT) by default, bypassing local LAN resolvers and receiving public IP addresses. When split DNS is used, off-site laptops returning to the office cache public records, while on-site devices fail when accessing services via alternative resolvers.
+
+The fleet eliminates split-horizon DNS lies for public hostnames. A single set of authoritative DNS records exists on public nameservers, pointing all service hostnames to the edge router's public WAN IP.
+
+### Local edge termination
+
+Because the public IP address terminates directly on the router's WAN interface, hairpinned traffic requires no NAT translation:
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  client [label="LAN client\n10.0.69.3"];
+  dns [label="Knotea / Public DNS\nreturns public WAN IP"];
+  router_wan [label="Router WAN address\n(terminates on router)"];
+  caddy [label="Edge Caddy (host net)\nTerminates TLS, proxies to backend"];
+
+  client -> dns [label="1. Resolve host"];
+  dns -> client [label="2. Public IP"];
+  client -> router_wan [label="3. Syn to public IP:443"];
+  router_wan -> caddy [label="4. Local input chain accept"];
+}
+```
+
+1. A LAN client (e.g. `10.0.69.3`) resolves a public service hostname. The resolver returns the router's public WAN IP address.
+2. The client transmits packets destined for the public IP. Because the router is the client's default gateway, the packet arrives on the router's VLAN interface.
+3. The Linux routing engine inspects the destination IP, recognises it as an address assigned to a local interface, and directs the packet to the `input` firewall chain.
+4. The input rule `iifname { ... } tcp dport { 80, 443 } accept` permits the connection. Caddy accepts the TCP connection directly on the host network.
+
+Because the packet terminates locally on the router, no source NAT (masquerade) is required. Conntrack tracks the connection state, and return packets travel directly from the router back to the client's LAN IP. Caddy's access logs record the authentic client IP (`10.0.69.3`) rather than a masqueraded router gateway address.
+
+---
+
+## Post-deploy verification: the eaves doctor gate
+
+To ensure that changes to NixOS configurations do not introduce silent network regressions, the edge router deploys through a post-switch verification gate: `eaves doctor`.
+
+The doctor is a standalone Go diagnostic binary that executes 18 automated runtime checks against the running system. It is invoked immediately following `nixos-rebuild switch` and runs periodically on an hourly timer. Any failure exits non-zero and triggers alerting.
+
+### The 18 checks
+
+The 18 checks are implemented in `internal/show/doctor.go` within the `eaves` toolchain:
+
+| # | Check Name | Target / Source | Assertion | Regression / Failure Mode Guarded |
+|---|---|---|---|---|
+| 1 | `kernel-cmdline-i226` | `/proc/cmdline` | Contains `pcie_port_pm=off` and `igc.eee_enable=0` | Intel i226-V PCIe power management and Energy Efficient Ethernet cause link flapping |
+| 2 | `ip-forwarding` | `/proc/sys/net/ipv4/ip_forward`, `.../ipv6/conf/all/forwarding` | Both values equal `1` | Kernel forwarding disabled, causing the router to stop routing packets |
+| 3 | `wan-link` | Kernel routing table & interfaces | Default route exists on an interface holding a scope-global IP | WAN interface loss, upstream DHCP failure, or missing default gateway |
+| 4 | `nft-default-policies` | `inet filter` ruleset | `input` policy is `drop` and `forward` policy is `drop` | Inadvertent rebuild regression reverting firewall policies to open `accept` |
+| 5 | `nft-conntrack-accept` | `inet filter forward` chain | Rule with `ct state established accept` exists | Missing conntrack state rule, dropping all established return traffic |
+| 6 | `nat-masquerade` | `inet nat postrouting` chain | Rule with `masquerade` action exists | Missing outbound NAT, cutting off LAN client internet access |
+| 7 | `kea-running` | Systemd unit state | `kea-dhcp4-server.service` is `active` | DHCP daemon crash or systemd start-limit failure |
+| 8 | `kea-topology` | Kea config vs kernel links | Every Kea-served interface exists, is `UP`, has `kind vlan`, and holds an IP | Kea listening on bare trunk parent instead of tagged VLAN child |
+| 9 | `vlan-no-orphans` | Kernel network interfaces | Every live 802.1Q VLAN link on the system has an IPv4 address | Leaked netdevs from rolled-back NixOS generations (networkd never deletes netdevs) |
+| 10 | `kea-no-raw-socket-warn` | Systemd journal (Kea) | No `MULTIPLE_RAW_SOCKETS_PER_IFACE` in last 300 log entries | Raw socket packet cross-capture on bare parent interfaces |
+| 11 | `conntrack-headroom` | `/proc/sys/net/netfilter/` | Active conntrack count is below 60% (warn) and 80% (fail) of max | State table exhaustion under network load or SYN flooding |
+| 12 | `resolved-running` | Systemd unit state | `systemd-resolved.service` is `active` | Local host name resolution failure on the router itself |
+| 13 | `docker-nat-intact` | `ip nat` ruleset | If Docker is active, table `ip nat` contains chain `DOCKER` | Global `nft flush ruleset` wiped Docker's `iptables-nft` rules |
+| 14 | `nixos-checkout` | `/etc/nixos` git repository | Working tree is clean (`--porcelain`) and HEAD matches `origin/main` | Uncommitted on-box edits or detached HEAD diverging from git repository |
+| 15 | `trunk-link` | Sysfs net speed/duplex | SFP+ trunk parent link is `UP`, has carrier, and operates at 10000/full | Silent link degradation or auto-negotiation downshift to 1GbE |
+| 16 | `trunk-errors` | Sysfs statistics | 13 kernel error counters (missed, crc, fifo, frame) are zero | Physical cable, DAC, or switch port interface errors |
+| 17 | `trunk-rings` | `ethtool -g` runtime status | Current RX and TX descriptor ring depths equal declared 4096 | MAC `.link` file failed to apply at boot, reverting buffers to driver default 512 |
+| 18 | `edge-services` | Systemd units & `ss -tlnp` | Caddy, edgectl, and composer active; :8080 owned by composerd, :8082 by edgectl | Port collision between edge control plane and container management plane |
+
+### Three structural defects caught by the doctor
+
+The doctor suite was written to catch specific historical failures:
+
+1. **Orphan VLAN interface leakage (`vlan-no-orphans`)**: Systemd-networkd creates netdevs it is instructed to manage, but it never deletes virtual interfaces that are removed from subsequent configurations. Activating an older generation for testing permanently leaves its VLAN interfaces active in the kernel. In August 2026, an old generation was tested for twenty seconds and left four unmanaged links behind. These orphaned interfaces inherited the trunk's MTU and sat active on tags that the current configuration no longer recognised. The `vlan-no-orphans` check asserts that every 802.1Q child interface possesses a valid gateway IP address, flagging any unmanaged netdev leakage.
+2. **Descriptor ring regression (`trunk-rings`)**: In September 2026, a power outage rebooted the router. The trunk `.link` file had been written matching on `Name=enp2s0f0np0`. Because udev evaluates link files when the device is still named `eth0`, the rule failed to match, and the driver initialised the rings at the default depth of 512. Within four hours, scheduling latency on the RSS core caused 239,000 dropped packets (`rx_missed_errors`). The `trunk-rings` check asserts the applied ring depth directly with `ethtool -g`, ensuring buffer regressions fail the deployment gate immediately.
+3. **Edge management port collisions (`edge-services`)**: When Caddy was migrated to run natively on the host network, `edgectl` and the Docker container for `composer` both attempted to bind host port 8080. Depending on which service started first, `composer` failed to start or `composer.erfi.io` routed traffic into the `edgectl` metrics dashboard. The `edge-services` check parses `ss -tlnp` output to verify that port 8080 is owned exclusively by `composerd` and port 8082 is owned by `edgectl`.
+
+---
+
+## Decision guide
+
+Use this guide when adding new network interfaces, container bridges, or routing rules to the edge router.
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.35; ranksep=0.55;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  start [label="New network resource needed", shape=diamond];
+  q_type [label="What type of resource?", shape=diamond];
+  
+  vlan [label="New LAN VLAN\n1. Define in vlans attr in configuration.nix\n2. Set explicit MTUBytes=1500\n3. Add to Kea subnet4 and interfaces\n4. Configure PVID on managed switch"];
+  svc [label="New edge service\n1. Bind to lo loopback alias (10.0.10.x/32)\n2. Add input chain allow rule\n3. Do NOT bind to macvlan"];
+  bridge [label="New Docker bridge\n1. Set com.docker.network.bridge.name in compose\n2. Add bridge name to dockerBridges in configuration.nix\n3. Rebuild router to update nftables forward rules"];
+  pinhole [label="New inter-VLAN pinhole\n1. Scope rule by iifname, ip saddr, and tcp/udp dport\n2. Target exact destination host\n3. Do not grant lateral subnet-wide reach"];
+
+  start -> q_type;
+  q_type -> vlan [label="Subnet for physical/Wi-Fi devices"];
+  q_type -> svc [label="Host-level edge daemon"];
+  q_type -> bridge [label="Compose application stack on router"];
+  q_type -> pinhole [label="Cross-VLAN device access"];
+}
+```
+
+The decision sequence operates as follows:
+
+1. **New LAN VLAN**: Define the subnet under `vlans` in `configuration.nix`. Ensure the trunk parent interface remains unnumbered, declare `MTUBytes = 1500` explicitly on the child netdev, assign a Kea subnet pool, and configure switch ports with the appropriate 802.1Q PVID.
+2. **New edge service**: Assign a `/32` loopback alias on `lo`. Do not use a container macvlan interface. Add explicit input chain acceptance rules in nftables for authorised LAN segments.
+3. **New Docker bridge**: Assign an explicit bridge interface name using `com.docker.network.bridge.name` in the application's Compose file. Add the bridge name to `dockerBridges` in `configuration.nix` so nftables generates intra-bridge and DNAT forwarding rules.
+4. **Inter-VLAN pinhole**: Add a targeted rule to the `forward` chain. Scope the rule strictly to the sending interface, the source IP, the destination IP, and the required destination port. Never grant broad inter-subnet forwarding.
+
+---
+
+## Operational practices
+
+| Practice | Mechanism / Command | Operational Rationale |
+|---|---|---|
+| Verify post-deploy runtime health | `eaves doctor` | Asserts all 18 runtime conditions; verifies rulesets, descriptor rings, and socket bindings |
+| Inspect dropped IoT traffic | `journalctl -k \| grep iot-in-drop` | Audits unpermitted connection attempts from isolated smart-home peripherals |
+| Inspect dropped forwarding attempts | `journalctl -k \| grep iot-fwd-drop` | Verifies that isolated devices are not attempting lateral movement across segments |
+| Check trunk interface descriptor rings | `ethtool -g <trunk-interface>` | Confirms RX and TX descriptor ring depths remain set to 4096 |
+| Check physical interface link errors | `ethtool -S <trunk-interface> \| grep -E 'missed\|errors'` | Detects physical link degradation, DAC cable faults, or buffer overruns |
+| Verify Kea socket bindings | `journalctl -u kea-dhcp4-server \| grep -i socket` | Ensures Kea bound raw sockets to all tagged child VLANs without cross-capture |
+
+---
+
+## Related docs
+
+- [Three NixOS hosts, one deploy interface](/reference/nixos-fleet/) - The fleet deployment workflow, git force-reset mechanics, and the role of `eaves doctor` in deployment automation.
+- [Edge Caddy as a native NixOS service](/reference/edge-caddy-on-nixos/) - Native reverse proxy architecture, custom Nix derivations, and port allocations on the edge router.
+- [knotea: one binary that is both your recursive resolver and your authoritative DNS](/reference/knotea-self-hosted-dns/) - The recursive and authoritative DNS server bound to loopback address `10.0.10.5:53`.
+- [Isolating a smart-home fleet on an IoT VLAN](/reference/home-iot-network/) - Smart home isolation, Home Assistant integration, and NTP time distribution from the hub.
+- [A Tailscale tailnet across a dual-site homelab](/reference/tailscale-homelab/) - Subnet router configuration and WireGuard routing over `tailscale0`.
+- [Tuning a 10GbE link end to end](/guides/10gbe-link-tuning/) - Buffer ring tuning, interrupt mitigation, and MTU configuration on 10GbE hardware.
+
+[^kea-arm]: Internet Systems Consortium, "DHCPv4 Server Configuration: Interface Selection," Kea Administrator Reference Manual. https://kea.readthedocs.io/en/latest/arm/dhcp4-srv.html#interface-selection
+[^intel-i40e]: The Linux Kernel documentation, "Intel(R) Ethernet Controller X710/XL710 Family Linux Driver," kernel.org. https://docs.kernel.org/networking/device_drivers/ethernet/intel/i40e.html
+[^tailscale-gro]: Tailscale, "ethtool configuration for UDP GRO forwarding," Tailscale Documentation. https://tailscale.com/kb/1320/performance-best-practices#ethtool-configuration
+[^nft-wiki]: Netfilter Project, "nftables HOWTO documentation," Netfilter. https://wiki.nftables.org/wiki-nftables/index.php/Main_Page
+[^br-netfilter]: The Linux Kernel documentation, "Bridge Netfilter," kernel.org. https://docs.kernel.org/networking/netfilter-sysctl.html
