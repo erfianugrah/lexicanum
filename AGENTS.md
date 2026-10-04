@@ -32,6 +32,12 @@ the build/test gate only, no deploy.
   `guides/magic-wan-interop` does, for MTU/MSS arithmetic. The marker name is
   historical: it outlived the `prose-dollar.sh` that read it, and renaming it across
   the corpus would be churn for nothing.
+- The social card (`og:image`, `dist/thumbnail.jpg`) is rendered at build time
+  by `src/lib/og-card.mjs` (satori + sharp), called from the `ogCard`
+  integration in `astro.config.mjs` on `astro:build:done`; doc counts on it
+  are measured from `src/content/docs`, so adding docs needs no card edit.
+  `public/thumbnail.jpg` is not committed; there is nothing to regenerate by
+  hand. Not run in dev.
 - A custom rehype pass (`rehypeFootnoteLabelToReferences`) renames the GFM
   "Footnotes" heading to a visible **References** section. Do not rename it back.
 - `src/styles/custom.css` styles `.footnotes` dense (small type, tight leading).
