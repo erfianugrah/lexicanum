@@ -1,0 +1,407 @@
+---
+title: "Edge Caddy as a native NixOS service"
+description: "How the fleet's edge reverse proxy runs natively on the NixOS router with custom plugins, reproducible Go module packaging, transitive dependency overrides, and edgectl sidecar management."
+author: Erfi Anugrah
+category: networking
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+The edge reverse proxy on the MS-01 edge router runs Caddy as a native NixOS systemd service, terminating public TLS, enforcing L4/L7 traffic tiers, and routing requests to internal homelab workloads. The binary is built with custom Go plugins via a custom Nix derivation that replaces Go module dependencies from local flake inputs rather than relying on public proxies. This reference documents the plugin packaging mechanics, the dependency override discipline, the September 2026 WAF simplification, the `edgectl` management control plane, and durable traffic routing patterns.
+
+The router deployment transitioned from Docker Compose to native NixOS services on 2026-09-19. The containerized stack remains maintained in `deploy/edge/` as an inactive deployment alternative, sharing the same Go plugin architecture and configuration concepts.
+
+## TL;DR
+
+- Caddy runs as a native systemd service (`caddy.service`) on the NixOS router, listening directly on host ports 80, 443, 2222, and 2223 with `CAP_NET_BIND_SERVICE` and `CAP_NET_ADMIN`.
+- The binary is packaged by `pkgs/caddy-edge.nix` without `pkgs.caddy.withPlugins` because the standard helper cannot resolve private local plugins. Instead, a custom derivation uses Go module directory replacement against flake inputs.[^caddy-extending]
+- Public plugins (`rfc2136`, `cloudflare`, `caddy-l4`, `caddy-dynamicdns`, `cache-handler`, `storages/nuts/caddy`) are pinned to exact versions; private plugins (`caddy-policy-engine`, `caddy-body-matcher`, `caddy-ddos-mitigator`) are replaced from local checkouts.[^caddy-standard]
+- Transitive dependencies are strictly overridden via `-replace` directives in `go.mod`: `grpc` is pinned to `v1.84.0` and `golang.org/x/crypto` to `v0.57.0` for security advisories, while `cel-go` is deliberately held at `v0.28.1` because Caddy 2.11.4 is incompatible with CEL-Go 0.29+.[^cel-compat][^cel-advisory][^grpc-release]
+- On 2026-09-26, the OWASP Core Rule Set (CRS), Coraza SecRules, and challenge interstitial layers were removed after traffic auditing confirmed zero blocking value and severe operational overhead. The in-house policy engine was preserved for targeted, hand-written rules.
+- The `edgectl` control plane runs alongside Caddy as a native service on port 8082, managing dynamic IPsum blocklists, GeoIP lookups, and unified access log parsing backed by PostgreSQL 18 and Valkey.
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  wan [label="Internet / WAN clients"];
+  lan [label="LAN / Tailnet clients"];
+
+  subgraph cluster_router {
+    label="MS-01 edge router (NixOS)"; style=rounded; fontsize=12; margin=12;
+    caddy [label="caddy.service (caddy-edge)\n:80, :443, :2222, :2223\nPlugins: policy-engine, ddos, body-matcher"];
+    edgectl [label="edgectl.service (sidecar)\n:8082 API + static dashboard\n/var/lib/edgectl"];
+    pg [label="PostgreSQL 18 (socket)\npostgres:///edgectl", shape=cylinder];
+    valkey [label="Valkey (socket)\nIP jail mirror", shape=cylinder];
+    log [label="/var/log/caddy/combined-access.log", shape=note];
+    rules [label="/var/lib/caddy/waf/policy-rules.json\n(hot-reloaded every 5s)", shape=note];
+    jail [label="/var/lib/caddy/waf/jail.json\n(mtime polled)", shape=note];
+  }
+
+  backend [label="Homelab services\n(LAN macvlan, containers, storage NAS)"];
+
+  wan -> caddy [label="HTTPS / SSH"];
+  lan -> caddy [label="HTTPS / SSH"];
+  caddy -> backend [label="reverse_proxy / l4"];
+  caddy -> log [label="structured JSON + log_append"];
+  edgectl -> log [label="incremental offset tailing"];
+  edgectl -> rules [label="sync policy rules"];
+  edgectl -> jail [label="sync IPsum / jail"];
+  edgectl -> pg [label="peer auth"];
+  edgectl -> valkey [label="unix socket"];
+  rules -> caddy [label="evaluated in request path"];
+  jail -> caddy [label="evaluated by ddos-mitigator"];
+}
+```
+
+The request and control flow operates across five discrete steps:
+
+1. Inbound traffic on ports 80, 443, 2222, and 2223 terminates on Caddy running with ambient capabilities on the host network.
+2. The custom `caddy-ddos-mitigator` and `caddy-policy-engine` HTTP handlers evaluate requests against active jail and rule files hot-reloaded from `/var/lib/caddy/waf/`.
+3. Allowed requests pass through to internal backends across local subnets, macvlan bridges, or L4 TCP streams.
+4. Caddy emits structured JSON logs with security metadata injected via `log_append` to `/var/log/caddy/combined-access.log`.
+5. The `edgectl` sidecar tails access logs, updates security event analytics in PostgreSQL, downloads daily IPsum feeds, and rewrites the rules and jail files read by Caddy.
+
+## Plugin build architecture
+
+In standard NixOS environments, custom Caddy binaries are built with `pkgs.caddy.withPlugins`. That helper accepts module names and versions, invoking `xcaddy` to download and compile modules from the public Go proxy (`proxy.golang.org`).
+
+This mechanism fails when packaging custom in-house plugins that live in private repositories or local flake inputs. `pkgs.caddy.withPlugins` cannot access private authentication tokens during the build phase and cannot accept arbitrary filesystem paths for module code.
+
+To resolve this, `pkgs/caddy-edge.nix` replaces the standard helper with a custom build derivation:
+
+```nix
+{ lib, buildGoModule, fetchFromGitHub, runCommand, flakeInputs }:
+
+let
+  caddyVersion = "2.11.4";
+  caddySrc = fetchFromGitHub {
+    owner = "caddyserver";
+    repo = "caddy";
+    rev = "v${caddyVersion}";
+    hash = "sha256-J0v9v0n68pS8+0F2r4bFhGz3x8jWwR4k1l2m3n4o5p6=";
+  };
+
+  policyEngine = flakeInputs.caddy-policy-engine;
+  bodyMatcher = flakeInputs.caddy-body-matcher;
+  ddosMitigator = flakeInputs.caddy-ddos-mitigator;
+  souinFork = flakeInputs.souin;
+in
+buildGoModule {
+  pname = "caddy-edge";
+  version = caddyVersion;
+  src = caddySrc;
+
+  # Network required during buildPhase to resolve public plugin modules
+  __noChroot = true;
+  # ...
+}
+```
+
+### Build mechanics and entrypoint isolation
+
+The derivation addresses several Go module packaging constraints:
+
+1. **Subdirectory entrypoint:** The build creates a `plugged/main.go` file inside a subdirectory rather than at the root of the source tree. Because the root of `caddyserver/caddy` declares `package caddy` as a library, placing a `package main` entrypoint at the root breaks Go module parsing. The entrypoint imports `github.com/caddyserver/caddy/v2/cmd` to run the standard CLI interface.
+2. **Explicit standard modules:** The entrypoint must import `_ "github.com/caddyserver/caddy/v2/modules/standard"`.[^caddy-standard] Without this explicit blank import, Caddy registers only approximately 45 base modules out of roughly 197 standard modules. Basic directives such as `file_server`, `reverse_proxy`, `encode`, and standard log encoders fail during Caddyfile adaptation.
+3. **Flake input directory replacement:** Private plugins are injected using Go module replacement directives pointing to the Nix store paths of the flake inputs:
+   ```bash
+   go mod edit \
+     -replace github.com/erfianugrah/caddy-policy-engine=$policyEngine \
+     -replace github.com/erfianugrah/caddy-body-matcher=$bodyMatcher \
+     -replace github.com/erfianugrah/caddy-ddos-mitigator=$ddosMitigator \
+     -replace github.com/darkweak/souin=$souinFork
+   ```
+4. **Relaxed sandboxing:** Public plugins are resolved via `go get` during `buildPhase`. This requires network access, enabled by setting `__noChroot = true;` in the derivation and configuring `nix.settings.sandbox = "relaxed"` on the router build host.
+
+### Module inventory
+
+The resulting binary packages six public plugins and three private plugins:
+
+| Plugin | Source / Pin | Purpose |
+|---|---|---|
+| `caddy-policy-engine` | Private flake input | L7 rule evaluation, header filtering, honeypots |
+| `caddy-body-matcher` | Private flake input | HTTP request body matching and variable extraction |
+| `caddy-ddos-mitigator` | Private flake input | Adaptive behavioral rate limiting and kernel jail management |
+| `souin` | Private fork | RFC-compliant HTTP cache handler |
+| `caddy-dns/rfc2136` | `v1.0.0` | RFC 2136 DNS-01 dynamic updates to local Knot DNS[^rfc2136] |
+| `caddy-dns/cloudflare` | `v0.2.4` | Cloudflare DNS-01 fallback for public hostnames |
+| `mholt/caddy-l4` | `v0.1.2` | Layer 4 TCP proxying (SSH passthrough) |
+| `mholt/caddy-dynamicdns` | `a5890c9` | Dynamic DNS record synchronization |
+| `caddyserver/cache-handler` | `v0.16.0` | Standard HTTP cache directive integration |
+| `storages/nuts/caddy` | `v0.0.19` | NutsDB storage backend for cache handlers |
+
+## Dependency overrides and the CEL-Go hold
+
+Transitive Go dependencies pulled in by plugins can introduce build breakage or security vulnerabilities. The Nix packaging enforces explicit version overrides to maintain reproducible builds and security compliance.
+
+### The 2026-09-29 security replacements
+
+On 2026-09-29, fleet vulnerability audits identified open Dependabot alerts across transitive dependencies in `caddy-policy-engine` and `caddy-ddos-mitigator`. The derivation applies explicit `-replace` directives during module preparation:
+
+```bash
+go mod edit \
+  -replace google.golang.org/grpc=google.golang.org/grpc@v1.84.0 \
+  -replace golang.org/x/crypto=golang.org/x/crypto@v0.57.0 \
+  -replace golang.org/x/text=golang.org/x/text@v0.39.0
+```
+
+- **gRPC `v1.84.0`:** Replaced `v1.82.1` to clear high-severity gRPC transport vulnerabilities resolved in upstream releases 1.82.2 and 1.83.1.[^grpc-release]
+- **x/crypto `v0.57.0`:** Bumped to satisfy security scanner requirements regarding SSH channel denial-of-service vulnerabilities.
+- **x/text `v0.39.0`:** Bumped for parity across the Go networking toolchain.
+
+### The CEL-Go v0.28.1 hold
+
+The Common Expression Language (`cel-go`) dependency in `caddy-policy-engine` is deliberately held at version `v0.28.1`. Upgrading `cel-go` to `v0.29.0` or later breaks compilation of Caddy 2.11.4:
+
+```
+# github.com/caddyserver/caddy/v2/modules/caddyhttp
+cannot use fn (value of type func(interpreter.InterpretableV2) interpreter.InterpretableV2)
+as interpreter.InterpretableDecorator in argument to interpreter.NewCall
+```
+
+In `cel-go` 0.29, the internal `interpreter.NewCall` signature was refactored to require `InterpretableV2`, a breaking API change that Caddy core has not yet adopted.[^cel-compat]
+
+Security scanners report advisory `GO-2026-6094` against `cel-go` `v0.28.1`.[^cel-advisory] Analysis of the vulnerability confirms it is non-actionable for this proxy: `GO-2026-6094` describes a panic condition when evaluating expressions involving `NativeTypes`. Caddy's HTTP expression matchers evaluate standard string, path, and header attributes, and never enable or execute `NativeTypes` evaluation. Holding at `v0.28.1` preserves stable builds without exposing the runtime to vulnerability triggers.
+
+## What was removed in the September 2026 redesign
+
+Between 2026-09-23 and 2026-09-26, the edge proxy underwent an audit and architectural simplification. The preceding stack incorporated the OWASP Core Rule Set (CRS v4) via Coraza rules, an automated SecRule translation pipeline, and proof-of-work browser challenges.
+
+### Preflight audit findings
+
+A 30-day preflight traffic audit (`docs/nuke-snapshot-2026-09-23/`) across seven production sites revealed a severe disproportion between complexity and defensive value:
+
+- **84,373 total policy events** were logged across 1,013 unique client IP addresses.
+- **0 actual requests were blocked.** The entire CRS rule corpus was operating in detection-only mode because enforcing it caused false positives on legitimate client APIs.
+- **342 imported CRS rules** generated thousands of notice-level events (such as rule `9100034` request body inspection and rule `930130` scanner user-agent matches), drowning genuine operational signals in noise.
+- **One custom rule did all useful work:** A single exclusion rule skipping false positives for the Atuin shell history sync client accounted for the only critical policy configuration.
+- **Maintenance overhead:** Maintaining the `tools/crs-converter` translation pipeline and its 4,566-test regression suite required ongoing debugging, with 93 standing CRS conversion regressions remaining unresolved.
+
+### Architectural pruning
+
+On 2026-09-26, the stack was simplified to eliminate unneeded components:
+
+| Component | Status | Rationale |
+|---|---|---|
+| OWASP Core Rule Set (CRS) | Removed | 342 generic rules produced noise; 0 blocks across 84k events |
+| Coraza SecRule engine | Retired | Replaced by native Go `caddy-policy-engine` handler |
+| `coraza-caddy` fork | Archived | Fork retired 2026-09-29; archived on Forgejo |
+| `tools/crs-converter` | Removed | Eliminated 4,566-test converter test suite and standing regressions |
+| Challenge interstitial | Removed | SHA-256 hashcash PoW and service worker tracking removed from edge path |
+| WAF UI settings pages | Pruned | Removed 9 complex configuration views from the dashboard |
+
+An initial cleanup attempt on 2026-09-26 removed the entire WAF subsystem. This was immediately corrected: the removal target was CRS and Coraza rule translation, not the underlying policy engine. The in-house `caddy-policy-engine` was restored to evaluate lightweight, hand-written rules (such as honeypots, path deny-lists, and Atuin exceptions) without the operational burden of third-party signature sets.
+
+## The edgectl control plane
+
+`edgectl` (renamed from `wafctl` on 2026-09-27) is the companion management daemon running alongside Caddy on the router. It operates as a native systemd service (`edgectl.service`) listening on `127.0.0.1:8082` (leaving host port 8080 dedicated to Composer).
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_caddy {
+    label="Caddy runtime"; style=rounded; fontsize=12; margin=12;
+    caddy_proc [label="caddy.service\n(user: caddy)"];
+    access_log [label="/var/log/caddy/combined-access.log", shape=note];
+    policy_file [label="/var/lib/caddy/waf/policy-rules.json", shape=note];
+    jail_file [label="/var/lib/caddy/waf/jail.json", shape=note];
+  }
+
+  subgraph cluster_edgectl {
+    label="edgectl control plane"; style=rounded; fontsize=12; margin=12;
+    edgectl_proc [label="edgectl.service\n(user: edgectl, group: caddy)\n:8082 REST API"];
+    ui [label="Static Astro/React UI\n/var/lib/edgectl/ui", shape=folder];
+  }
+
+  subgraph cluster_storage {
+    label="Storage tier (local sockets)"; style=rounded; fontsize=12; margin=12;
+    pg [label="PostgreSQL 18\npeer auth", shape=cylinder];
+    valkey [label="Valkey socket\nIP jail cache", shape=cylinder];
+    geoip [label="country.mmdb\nMaxMind GeoIP", shape=note];
+  }
+
+  caddy_proc -> access_log [label="writes requests"];
+  edgectl_proc -> access_log [label="tails offset"];
+  edgectl_proc -> policy_file [label="writes rules"];
+  edgectl_proc -> jail_file [label="writes jail"];
+  policy_file -> caddy_proc [label="reloads 5s"];
+  jail_file -> caddy_proc [label="mtime poll"];
+  edgectl_proc -> pg [label="events & config"];
+  edgectl_proc -> valkey [label="jail mirror"];
+  edgectl_proc -> geoip [label="pure-Go lookup"];
+  edgectl_proc -> ui [label="serves the dashboard host"];
+}
+```
+
+The control plane interaction handles data persistence and service boundaries:
+
+1. **Permission isolation:** `edgectl` runs under its own system user (`edgectl`) but belongs to supplementary group `caddy`. The directory `/var/lib/caddy/waf` is set to mode `2775` (setgid `caddy`), allowing `edgectl` to write configuration files that `caddy` reads.
+2. **Storage transition:** On 2026-09-30, `edgectl` cut over from flat JSON files to PostgreSQL 18 (`postgres:///edgectl?host=/run/postgresql`) via Unix socket peer authentication. PostgreSQL stores rule definitions, managed lists, and security events. A dedicated local Valkey instance (`/run/edgectl-valkey/valkey.sock`) mirrors active jail entries.
+3. **Decoupled file sync:** Caddy does not communicate with PostgreSQL or Valkey directly. `edgectl` exports compiled rule sets to `/var/lib/caddy/waf/policy-rules.json` and active IP jail entries to `/var/lib/caddy/waf/jail.json`. Caddy hot-reloads these files asynchronously. If `edgectl` or the database stops, Caddy continues serving traffic using the last written state on disk.
+4. **Dashboard interface:** The static frontend (built with Astro 7 and React 19) is located at `/var/lib/edgectl/ui`. When accessed via its LAN-only dashboard hostname, Caddy reverse proxies the API and serves static assets directly.
+
+## Durable runtime mechanics
+
+The native NixOS deployment carries forward core traffic management, threat intelligence, and logging patterns established in the edge architecture.
+
+### Traffic tiers in Caddyfile
+
+Site definitions in the router's `edge/Caddyfile` compose modular snippets to enforce traffic tiers:
+
+```caddyfile
+(ddos) {
+    ddos_mitigator {
+        jail_file       /var/lib/caddy/waf/jail.json
+        threshold       0.65
+        base_penalty    60s
+        max_penalty     24h
+        warmup_requests 1000
+    }
+}
+
+(waf) {
+    import ddos
+    policy_engine {
+        rules_file     /var/lib/caddy/waf/policy-rules.json
+        reload_interval 5s
+    }
+    handle_errors 400 403 429 {
+        import error_pages
+    }
+}
+
+(lan_only) {
+    @denied not remote_ip 10.0.0.0/8 100.64.0.0/10 172.16.0.0/12 192.168.0.0/16
+    respond @denied 401
+}
+
+(research_auth) {
+    @denied {
+        not remote_ip 10.0.0.0/8 100.64.0.0/10 172.16.0.0/12 192.168.0.0/16
+        not header Authorization "Bearer {$RESEARCH_TOKEN}"
+    }
+    respond @denied 401
+}
+```
+
+The snippets partition services into four access tiers:
+
+- **Public services with WAF (`import waf`):** Evaluates `caddy-ddos-mitigator` anomaly scoring and `caddy-policy-engine` rules on internet-facing endpoints such as the Forgejo host and the resolver's DoH endpoint.
+- **LAN and Tailnet restricted (`import lan_only`):** Enforces CIDR filtering allowing only RFC 1918 private subnets and Tailscale CGNAT addresses (`100.64.0.0/10`). Applied to internal administrative consoles such as the edgectl dashboard and the traffic-analysis UI.
+- **Token authenticated (`import research_auth`):** Bypasses authentication for LAN and tailnet clients, but requires a pre-shared bearer token (`{$RESEARCH_TOKEN}`) for external requests. Applied to compute services such as the search and crawler endpoints of the research stack.
+- **Layer 4 SSH passthrough:** Caddy uses `caddy-l4` to proxy raw TCP traffic for port 2222 (forwarded to the documentation SSH daemon on port 2222) and port 2223 (forwarded to Forgejo's container SSH server on port 2222).
+
+### IPsum blocklist lifecycle
+
+Malicious IP defense relies on the stamparm/ipsum threat intelligence feed, aggregate data compiled from over 30 public threat lists:[^ipsum-feed]
+
+1. **Daily retrieval:** `edgectl` downloads `ipsum.txt` daily at 06:00 UTC (configured by `EDGE_BLOCKLIST_REFRESH_HOUR=6`). Operators can also trigger a refresh on demand from the dashboard.
+2. **Score grouping:** IPs are parsed and categorized across all eight threat score levels (1 through 8). IPs with a score of 1 or higher are ingested into eight managed lists (`ipsum_level_1` through `ipsum_level_8`).
+3. **Rule synchronization:** `edgectl` compiles these lists into policy engine block rules named `IPsum Block (Level N)`.
+4. **Execution:** The rules are written to `policy-rules.json`. When a matching IP connects, Caddy's policy engine blocks the request with a 403 Forbidden before backend evaluation occurs.
+
+### Three-tier GeoIP resolution
+
+For security analytics and geographic rule matching, `edgectl` resolves client IPs through a priority chain:
+
+```
+Priority 1: Cf-Ipcountry header (0 ms latency, injected by Cloudflare CDN)
+Priority 2: Local MMDB lookup   (<1 µs, pure-Go reader against /var/lib/edgectl/geoip/country.mmdb)
+Priority 3: Online API fallback (cached in memory with an LRU cache, 24h TTL)
+```
+
+The local MMDB lookup uses a pure-Go MaxMind reader requiring no CGO dependencies or external shared libraries. If the Cloudflare header is absent and the local database does not match, the query falls back to a rate-limited online lookup.
+
+### Unified access log parsing
+
+Instead of maintaining separate web server and security audit logs, Caddy writes a single unified access stream to `/var/log/caddy/combined-access.log`. Security metadata is injected using `log_append` directives in the `(site_log)` snippet:
+
+```caddyfile
+(site_log) {
+    log_append request_id {http.request.uuid}
+    log_append ddos_action {http.vars.ddos_mitigator.action}
+    log_append ddos_fingerprint {http.vars.ddos_mitigator.fingerprint}
+    log_append ddos_z_score {http.vars.ddos_mitigator.z_score}
+    log_append ddos_spike_mode {http.vars.ddos_mitigator.spike_mode}
+    log_append policy_action {http.vars.policy_engine.action}
+    log_append policy_rule {http.vars.policy_engine.rule_name}
+    log_append policy_ja4 {http.vars.policy_engine.ja4}
+    log_append policy_score {http.vars.policy_engine.anomaly_score}
+    log_append policy_detect_rules {http.vars.policy_engine.detect_rules}
+    log_append policy_detect_matches {http.vars.policy_engine.detect_matches}
+    log combined {
+        level INFO
+        output file /var/log/caddy/combined-access.log {
+            roll_size 100MiB
+            roll_keep 10
+        }
+        format json { time_format wall }
+    }
+}
+```
+
+`edgectl`'s `AccessLogStore` tails `/var/log/caddy/combined-access.log` using byte offset tracking saved to `/var/lib/edgectl/.access-log-offset`. When log rotation occurs, the file size drops below the saved offset; `edgectl` detects the truncation, resets the offset to zero, and resumes streaming without missing events or re-parsing rolled logs.
+
+## Decision guide: native service vs containerized stack
+
+Both deployment models are maintained in the repository workspace. Selecting between native NixOS and Docker Compose depends on host role and network architecture:
+
+| Property | Native NixOS (`caddy-edge.nix`) | Containerized Compose (`deploy/edge/`) |
+|---|---|---|
+| **Host role** | Primary edge router (MS-01) | Standalone Docker host or secondary node |
+| **Network topology** | Direct host binding (`CAP_NET_BIND_SERVICE`) | Docker bridge, host network, or macvlan |
+| **Binary delivery** | Nix derivation with flake input replace | Multi-stage Dockerfile built via `xcaddy` |
+| **Service manager** | Systemd units managed by NixOS | Docker Compose daemon |
+| **Storage layer** | Local PostgreSQL 18 and Valkey unix sockets | Docker volume bind mounts or containerized DB |
+| **Operational state** | Active production deployment | Inactive deployment alternative |
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  start [label="Choosing an edge deployment architecture", shape=ellipse];
+  q1 [label="Is the target host the NixOS edge router?", shape=diamond];
+  q2 [label="Does the environment require Docker-only orchestration?", shape=diamond];
+  native [label="Native NixOS Service\n(caddy.service + edgectl.service)\nDirect host networking, nix flake build"];
+  compose [label="Containerized Compose\n(deploy/edge/compose.yaml)\nIsolated containers, xcaddy Docker build"];
+
+  start -> q1;
+  q1 -> native [label="Yes (MS-01)"];
+  q1 -> q2 [label="No"];
+  q2 -> compose [label="Yes"];
+  q2 -> native [label="No (NixOS fleet host)"];
+}
+```
+
+The decision flow follows three criteria:
+
+1. Deploy as a native NixOS service on the MS-01 edge router to avoid container bridge overhead, bind host ports cleanly with systemd capabilities, and manage dependencies through the flake lockfile.
+2. Deploy via Docker Compose on standard Linux distributions or container worker nodes where Nix package management is unavailable.
+3. Keep the Compose configuration updated in `deploy/edge/` as a verified operational fallback if router services need isolation during host maintenance.
+
+## Related docs
+
+- [Self-hosted Forgejo on the router](/reference/self-hosted-forgejo-router/) - How Forgejo runs on the same edge router, receiving SSH and HTTPS traffic forwarded through Caddy.
+- [Tailscale homelab network topology](/reference/tailscale-homelab/) - Subnet routing and CGNAT IP address space referenced by Caddy's `(lan_only)` filter snippet.
+- [Legacy containerized Caddy WAF guide](/guides/caddy-compose-waf/) - Historical reference for the 2026-02 Docker Compose and Coraza implementation.
+
+[^caddy-extending]: Caddyserver, "Extending Caddy," Caddy Docs. https://caddyserver.com/docs/extending-caddy
+[^caddy-standard]: Caddyserver, "Standard Modules," Caddy Docs. https://caddyserver.com/docs/modules/
+[^cel-compat]: Common Expression Language, "CEL-Go Releases," GitHub. https://github.com/google/cel-go/releases
+[^cel-advisory]: Go Security Team, "GO-2026-6094: Panics when evaluating expressions involving NativeTypes in github.com/google/cel-go," Go Vulnerability Database. https://pkg.go.dev/vuln/GO-2026-6094
+[^grpc-release]: gRPC Project, "gRPC-Go Releases," GitHub. https://github.com/grpc/grpc-go/releases
+[^ipsum-feed]: Stamparm, "IPsum: Threat Intelligence Feed," GitHub. https://github.com/stamparm/ipsum
+[^rfc2136]: P. Vixie et al., "Dynamic Updates in the Domain Name System (DNS UPDATE)," RFC 2136, IETF. https://www.rfc-editor.org/rfc/rfc2136
