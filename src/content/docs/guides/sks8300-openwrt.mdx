@@ -1,0 +1,356 @@
+---
+title: "A XikeStor SKS8300 switch on OpenWrt: flash, config as code, and the way back to stock"
+description: Running a 16-port managed switch (12x 2.5G-T, 2x 10G-T, 2x SFP+, Realtek RTL9302C) on OpenWrt instead of its stock firmware - the stock defects that forced the move (a permanent admin/admin login, a silent lockout that rejected correct credentials mid-incident), the upstream support state that still requires a small fork, the U-Boot and TFTP initramfs flash with an exact partition-level rollback to stock, and the day-2 loop where the running config is diffed against git and a 17-check script proves every port after each flash.
+author: Erfi Anugrah
+category: networking
+featured: true
+blurb: "Flashing a XikeStor SKS8300 switch to OpenWrt, and running it as config in git."
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+The XikeStor SKS8300-12E2T2X is a capable cheap managed switch with a rough stock OS: a web UI and CLI over a proprietary config blob, with a login that cannot be changed. This guide replaces that OS with OpenWrt, built from a small fork because the board is upstream but not in any stable release, and keeps the switch equal to a git repo afterwards. It ends with the stock firmware restorable partition-for-partition, so the whole move is reversible.
+
+Prerequisites: a USB-to-RJ45 serial cable (FTDI, Cisco rollover pinout), a host that can serve TFTP on the switch's admin segment, SSH access to the router the switch trunks to, and a maintenance window - the switch carries the house trunk, so every reboot takes the LAN down for a minute or two. Everything marked measured was done on the rig below: the flash window ran 2026-09-24 22:42 to 2026-09-25 00:45, with two reflashes on 2026-09-25 and 2026-09-28.
+
+## Constants (read this first)
+
+### The rig (measured example)
+
+| Piece | Detail |
+|---|---|
+| Switch | XikeStor SKS8300-12E2T2X: Realtek RTL9302C (MIPS 34Kc 800 MHz), 512 MB DDR3, 32 MB SPI-NOR, 12x 2.5G-T (RTL8224), 2x 10G-T (RTL8261N), 2x 10G SFP+, RJ45 console at 115200 8N1 |
+| Stock firmware at flash time | V1.04.B09 Release, built 2026-04-28 |
+| Bootloader | U-Boot 2011.12 (vendor build of 2025-01-06); `Press A to stop autoboot` |
+| OpenWrt | SNAPSHOT from a fork branch rebased on upstream main, kernel 6.18; live revision `r36641+32-a5c93cd334` (flashed 2026-09-28) |
+| Router | NixOS mini PC: kea, nftables, the VLAN trunk terminates here |
+| TFTP host | the hub Pi, access port on the admin segment (10.10.0.7); in the event TFTP was actually served from the router - see the gotcha |
+| Serial | FTDI USB-to-RJ45 on the Windows workstation, COM3, driven by a small PowerShell bridge script |
+
+### Ports and segments
+
+The port map every later section refers to. Stock labels are the vendor's `eth0/x/y` names; OpenWrt labels come from the upstream device tree. Link speeds are measured on the flashed box.
+
+| OpenWrt port | Stock label | Role | Segment | Measured link |
+|---|---|---|---|---|
+| lan16 (SFP+ DAC) | eth0/1/4 | trunk to the router | every segment, tagged | 10000 |
+| lan13 (10G-T) | eth0/1/1 | NAS | LAN segment, access | 10000 |
+| lan14 (10G-T) | eth0/1/2 | workstation (2.5G NIC) | admin segment, access | 2500 |
+| lan1 | eth0/0/1 | access point uplink | home segment (VLAN 30), access | 2500 |
+| lan2 | eth0/0/2 | access point uplink | iot segment (VLAN 40), access | 2500 |
+| lan3 | eth0/0/3 | KVM Pi | admin segment, access | 1000 |
+| lan4 | eth0/0/4 | hub Pi (the planned TFTP host) | admin segment, access | 1000 |
+| lan5 | eth0/0/5 | server BMC | admin segment, access | down, no device |
+| lan6 | eth0/0/6 | lab cluster node | lab segment, access | 1000 |
+| lan8 | eth0/0/8 | access point, guest SSID | guest segment, access | 1000 |
+| lan15 (SFP+) | eth0/1/3 | unused | - | down, no module |
+
+Ports that read "down" had powered-off devices behind them at flash time and came up at their expected speeds once the devices were on - a dark port is not a PHY fault when its chip siblings are up.
+
+### Addresses that matter during a flash
+
+| Moment | Address | Note |
+|---|---|---|
+| Stock management | admin segment, static | the address xikectl talks to |
+| U-Boot `ipaddr` default | 192.168.168.1 | placeholder; give the loader a fresh address on the admin segment before `tftpboot` |
+| U-Boot `ethaddr` default | 00:E0:4C:00:00:00 | placeholder; set the label MAC or TFTP may not work at all |
+| TFTP `serverip` | 10.10.0.7 planned; the router's trunk interface in the event | whichever host serves the initramfs |
+| OpenWrt management | 10.10.0.4 on the admin segment | baked into the image; static, no DHCP |
+| Syslog target | the router, 10.10.0.1:514 | same source address as stock, so existing firewall pins keep working |
+
+## Why leave the stock firmware
+
+Every defect below was hit for real, most of them during or around an incident response on 2026-08-08:
+
+- **Permanent `admin/admin`.** The password cannot be changed and users cannot be added. The only compensations are network-side: the management VLAN and a login ACL.
+- **A silent credential lockout.** A run of failed logins (`failMax`/`silentTime`, 2 to 1440 minutes, buried in an ASP page) makes the box reject even correct credentials, with no indication anywhere. It fired mid-incident on 2026-08-08 and blocked CLI access during the response; it fired again on 2026-09-05 when a read-only probe ran without credentials exported. That second firing was the trigger for this project.
+- **Save-to-flash from the CLI is a silent no-op.** Only the web UI's Save actually persists. A config "saved" from the CLI survives until the next reboot and no further.
+- **The config is a proprietary blob.** No config-in-git, no diff; the web UI's config export does not produce a restorable file, so the only real backup is a CLI scrape.
+- **A 15-session CLI limit with silent rejects**, a nonstandard syslog dialect (uptime stamp, `%MODULE-SEV-MNEMONIC`) that needed a custom parser on the router, and no optical DDM on this hardware build.
+
+What OpenWrt gives, concretely:
+
+- DSA-native Linux networking: `ip link`, `bridge vlan` - the same mental model and tooling as the router.[^owrt-dsa]
+- `ethtool -S` per-port error counters (FCS, symbol, carrier) - exactly the data an earlier trunk-discard investigation had to do without on the switch side.
+- Standard syslog to the router's collector, real SSH (dropbear) with key-only auth, no lockout, no telnet.
+- The whole config as text files in git, with a diff that exits 1 on drift.
+
+The scraper CLI written for the stock OS (xikectl) does not die with the flash: it becomes the rollback kit. Its config backups are what a rollback restores, and its `verify` suite is how a rolled-back box is checked.
+
+## Hardware support state
+
+Board support is merged upstream - the device tree, image recipe and flash instructions landed in one commit in early 2026.[^owrt-commit][^owrt-pr] What upstream does not have is a stable release carrying the board: the current stable line builds an older kernel and has no device tree for it, so a release image cannot be downloaded for this switch. That gap is the only reason a fork exists. The fork is upstream main plus a device overlay (the baked config), CI that builds the image pair, and tooling scripts - about thirty commits, rebased onto upstream main every few weeks when a weekly drift check flags realtek-touching commits.
+
+The 10G-T ports are the part that needed care. The RTL8261N PHY broke on the kernel 6.18 merge upstream (10G-T dead, 2.5G regressed); the fix history runs through an interim USXGMII patch and then a new driver.[^owrt-23025][^owrt-8261n] On the flashed box, measured 2026-09-25 and re-verified 2026-09-28: lan13 and lan16 at 10000, the 2.5G ports at 2500. A sibling board (the 8-port SKS8300-8T, same loader family) had a separate problem where U-Boot's autoboot left ports dead under OpenWrt;[^owrt-8t] it did not appear here, but it is why the runbook tests reboots explicitly rather than assuming them.
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  fork [label="OpenWrt fork (private)\nfiles/ overlay = the whole config\nCI: initramfs + sysupgrade per push"];
+  sw [label="SKS8300 (OpenWrt)\nbr-lan, 10.10.0.4 on admin segment\nlan1-14 access, lan16 trunk"];
+  rt [label="router\nkea + nftables + syslog collector"];
+  hosts [label="access ports\nNAS, workstation, APs, Pis"];
+  serial [label="workstation\nserial bridge on COM3"];
+
+  fork -> sw [label="deploy script over ssh\n(config); sysupgrade (image)"];
+  sw -> rt [label="lan16 trunk, all segments tagged"];
+  sw -> hosts [label="lan1-14"];
+  serial -> sw [label="console, rescue only"];
+}
+```
+
+Text version: the fork's CI builds the image with the config baked in; a deploy script pushes config changes to the running box over SSH so a config edit never needs a rebuild; the switch trunks every segment to the router on one SFP+ DAC and serves access ports; the serial console is attached but used only for flashes and rescue.
+
+## Part 1: the fork and the image
+
+The config must be baked into the image, not pushed after first boot. A stock OpenWrt first boot would put its default network onto the trunk and take the house down, with serial as the only way back. So the fork carries a `files/` overlay that becomes the box's `/etc` on every image:
+
+| Overlay file | Purpose |
+|---|---|
+| `etc/config/network` | DSA bridge-VLAN matrix, management address 10.10.0.4 on the admin segment, pinned bridge MAC (the label MAC) |
+| `etc/config/firewall` | a management zone accepting ssh/snmp/icmp from the admin segment only |
+| `etc/config/system` | hostname, timezone, remote syslog to the router, the `timeserver` section |
+| `etc/config/snmpd` | read-only community, admin segment only |
+| `etc/config/dropbear` + `etc/dropbear/authorized_keys` | key-only SSH on the management interface; exactly one dedicated key |
+| `etc/fw_env.config` | `/dev/mtd1 0x0 0x10000 0x10000` so `fw_printenv`/`fw_setenv` work (upstream has no entry for this board) |
+
+Three of these exist because of first-boot traps found by reading the target defaults before flashing: the realtek target ships firewall4, whose default input policy rejects everything - without the management zone the first boot answers only on serial; `config_generate` skips a pre-seeded `/etc/config/system`, so the overlay has to carry its own `timeserver` section or there is no NTP; and the realtek board script derives per-port MACs from the label MAC, leaving the bridge with a derived address that any MAC-keyed DHCP reservation or check would miss - so the overlay pins the bridge to the label MAC.
+
+Packages are the other fork-only lever. A pinned snapshot build has no package feed, so nothing can be installed after the flash: anything wanted on the box (ip-full, ip-bridge, tcpdump-mini, ethtool, snmpd, the RTL8261N firmware) goes into the CI config and the image is rebuilt. One trap: `snmpd` is a virtual package name that the device recipe selects into nothing - the CI workflow has to select the real package (`snmpd-nossl`) and fail the build if it drops out. One CI run that would have shipped without snmpd was cancelled for exactly this.
+
+Builds: CI on every push that touches the target or the overlay produces the initramfs + sysupgrade pair with checksums (~25 min cold, ~11 min warm on the self-hosted runner); a local build of the same config takes minutes on a warm tree for iteration. The image that gets flashed is a CI build of a pushed commit, so every image on the switch traces to a tag. One local-build gotcha: on WSL, Windows PATH entries make `find -execdir` refuse to run and the build dies at `package/install` - scrub `/mnt/c` entries from PATH first.
+
+## Part 2: before the window
+
+All of this happens days ahead, from a desk; only the two backups touch the switch, and both are read-only.
+
+1. **Serial cable in hand and proven.** Plugged into the workstation, a console client at 115200 8N1, and typed characters echoing back from the stock CLI's login prompt - TX and RX proven against the real UART before the window depends on them. Log everything to a file; the U-Boot `printenv` output is the backup of the original environment.
+2. **Stock config backups.** With the stock credentials exported (an unexported variable means an empty-credential login, and every failed login re-arms the lockout - probe nothing twice): the running config scrape and the saved config, into a gitignored directory, plus a green drift check against the live box.
+3. **The vendor firmware download.** The exact rollback comes from the partition dump during the initramfs boot (step 3 of the runbook), because the running build could not be matched to any vendor download - the vendor image has no readable version header. The vendor file is the fallback of unknown version; the dump is mandatory.
+4. **TFTP host on an access port.** A small TFTP server on the admin segment, serving the CI initramfs, proven from another host (`curl tftp://... | sha256sum` against the CI checksum).
+5. **Router ready.** The syslog collector accepting the OpenWrt logd dialect (it had only parsed the stock dialect), the tree clean, and - right before the window - the neighbor entry for the switch's address flushed, so a stale ARP entry cannot answer pings for a dead box.
+6. **Keys.** A dedicated ed25519 keypair for the box, the public half matching the overlay's `authorized_keys` exactly. Losing this key after the flash means serial only.
+
+Window logistics: the flash takes the trunk down, so the workstation doing the flashing loses the LAN and the household WiFi (the access points hang off lan1/lan2). The router stays reachable over the tailnet from a phone hotspot. Budget an hour.
+
+## Part 3: flash day
+
+The U-Boot sequence comes from the upstream board-support commit.[^owrt-commit] The whole window was driven from the workstation: a small script on the serial port that sends `A` when `stop autoboot` appears, plus a reboot issued through the stock CLI - nobody had to stand at the switch.
+
+### 0. Interrupt the boot and record
+
+Power-cycle (or reboot from the stock CLI). `Press A to stop autoboot: 3` gives a three-second window; a capital `A` stops it and lands in a vendor menu, and a capital `Q` there drops to the `RTL9300#` U-Boot prompt. No login at either level. `printenv` now - the whole original environment goes into the serial log. Expected: `bootcmd=boota`, the placeholder MAC, `ipaddr=192.168.168.1`.
+
+Missed the window? Let stock finish booting and power-cycle again; it is harmless.
+
+### 1. Enable the fabric and boot the initramfs from RAM
+
+```
+setenv bootcmd 'rtk network on; boota'
+saveenv
+rtk network on
+setenv ipaddr 10.10.0.244
+setenv serverip 10.10.0.7
+setenv ethaddr <label-mac>
+tftpboot 0x82000000 openwrt-realtek-rtl930x-xikestor_sks8300-12e2t2x-initramfs-kernel.bin
+bootm 0x82000000
+```
+
+`rtk network on` turns the switching fabric on and merges every port into one untagged network - OpenWrt needs it in the bootcmd permanently or the fabric stays off. This is the one flash write before the sysupgrade: `saveenv` updates the U-Boot environment partition. Stock still boots with the new bootcmd (`boota` still runs), so a reboot at any point before step 4 returns to stock untouched.
+
+<Aside type="caution" title="Type at the loader, never paste">
+At 115200 with no flow control, a pasted line can drop characters, and a mangled `setenv bootcmd` followed by `saveenv` is the one typo that persists. Type the env commands, or paste one line at a time and read the echo before Enter.
+</Aside>
+
+<Aside type="caution" title="TFTP failed from the access port; the fix was four changes at once">
+Measured 2026-09-24: from the hub Pi on lan4, block 1 of the initramfs arrived and then timeouts - the loader could not even ping the TFTP host. The working combination, applied together: serve TFTP from the router over the trunk instead (a temporary /32 on the trunk interface, a firewall accept, a TFTP server from nixpkgs), give the loader a fresh unused address, set the label MAC in place of the placeholder, and turn the access point off. With `rtk network on` merging every port into one untagged network, the placeholder MAC and the AP's traffic are the likely causes, but which one mattered is unproven. Next time, all four before the first `tftpboot`. The temporary TFTP setup on the router was removed and verified gone after the window.
+</Aside>
+
+### 2. Validate in RAM
+
+From the serial console first (`root`, no password), then from the workstation once the trunk is up:
+
+- `logread | grep -iE 'error|fail'` shows nothing about netifd, fw4, dropbear, snmpd, ntpd.
+- `ip -br link`: every cabled port UP; `ethtool lan16` and `ethtool lan13` at 10000Mb/s, `ethtool lan1`, `lan2`, `lan14` at 2500Mb/s.
+- `bridge vlan show`: the full matrix, lan16 tagged in every segment.
+- The management interface has 10.10.0.4 and the pinned label MAC.
+- `nft list ruleset` shows the management zone (fw4 loaded it).
+- SSH with the dedicated key works; any other key is refused. SNMP answers from an admin-segment host.
+- On the router: the neighbor table shows the pinned MAC for 10.10.0.4, and kea's log shows leases renewing for clients on every segment - that is the trunk carrying all tags.
+- A link flap (`ip link set lan5 down; up`) arrives at the syslog collector in the OpenWrt dialect.
+- `date` is the current year (if it is 1970, the box has a resolver it cannot use - see the gotchas).
+
+If anything fails, `reboot` returns to stock and the day ends with notes, not a flash.
+
+### 3. Back up stock from the initramfs - the only exact rollback
+
+```
+cat /proc/mtd    # map names to mtdN
+for p in u-boot u-boot-env sysinfo factory sysdata jffs2_filesystem firmware; do
+  n=$(grep "\"$p\"" /proc/mtd | cut -d: -f1)
+  dd if=/dev/${n}ro of=/tmp/stock-$p.bin
+done
+```
+
+Pull all seven files over SSH (33 MB total; the RAM disk has room), `sha256sum` on both sides. The `firmware` partition is the exact stock image. Keep this dump forever.
+
+### 4. Sysupgrade
+
+```
+cat openwrt-*-sysupgrade.bin | ssh -i ~/.ssh/id_sks8300 root@10.10.0.4 'cat > /tmp/sysupgrade.bin'
+ssh -i ~/.ssh/id_sks8300 root@10.10.0.4 'sha256sum /tmp/sysupgrade.bin'   # compare with the CI checksum
+ssh -i ~/.ssh/id_sks8300 root@10.10.0.4 'sysupgrade -n /tmp/sysupgrade.bin'
+```
+
+`-n` because the overlay is the config - nothing from the RAM session needs preserving. Two notes: `scp` does not work (the box has no SFTP server and modern `scp` defaults to SFTP), so upload by cat-pipe; and run `sysupgrade` in the SSH foreground - busybox has no `nohup`, and the session dropping with a ubus "Connection failed" tail is expected, the flash proceeds. The trunk blips for one to two minutes.
+
+### 5. Prove the flash, then prove reboot durability
+
+Liveness, strongest signal first: the serial console shows the boot; the router's neighbor table shows the pinned MAC for 10.10.0.4; syslog frames arrive; SSH answers. A ping reply is none of these things on its own - the 2026-09-04 AP flash lost forty minutes to a carrier gateway answering pings at a first-boot address.
+
+Then `reboot` twice. After each: all ports back at speed, the VLAN matrix unchanged, leases renewing, syslog flowing. The sibling board's dead-ports-after-autoboot problem is exactly what this test exists to catch, and the AP's vendor firmware once failed exactly this test - do not skip it. Measured across three flashes: every cabled port back at its expected speed after each of two autoboots, SSH back in about a minute.
+
+The brick floor is low: U-Boot lives in its own partition that sysupgrade never writes, so a botched flash still leaves serial plus `rtk network on` plus `tftpboot` as the recovery path. There is a single firmware partition - no dual-image marker games.
+
+<Aside type="caution" title="Do not press the front reset button on a box you cannot see">
+The device tree wires the reset button as KEY_RESTART: on a running OpenWrt box, holding it is a factory reset and reboot. Serial is the reset path.
+</Aside>
+
+## Part 4: day 2 - config as code and the check loop
+
+A config change is: edit the overlay, commit, run the deploy script. The script prints the live-vs-repo diff first, pushes the changed files over SSH, reloads the affected services, and proves SSH still answers afterwards. Then the drift check must be clean:
+
+```
+eaves switch diff sks8300      # live uci export vs the overlay, exit 1 on drift
+eaves switch status sks8300    # release, uptime, load
+```
+
+`eaves switch deploy sks8300` prints the exact push command for the host and `eaves switch recover sks8300` prints the rescue paths (serial, U-Boot, the stock rollback) without touching the box - both read from the same inventory file the diff uses. A rebuild plus sysupgrade is only needed for packages or kernel.
+
+Two service-reload traps, both hit for real:
+
+- **Reload dropbear, never restart it.** The deploy script's own SSH session lives in dropbear's procd cgroup, so restarting dropbear kills the session and the daemon with it - twice this left the box with no SSH at all, recovered from the serial console with `/etc/init.d/dropbear start`.
+- **`sysupgrade -n` regenerates the dropbear host key.** The next SSH in refuses the changed key; verify the new fingerprint over serial (`dropbearkey -y -f /etc/dropbear/dropbear_ed25519_host_key`), then fix `known_hosts`. A check script that retries SSH forever on a host-key failure will hang the whole verification - fail fast instead.
+
+After any flash, a 17-check script proves the box: firmware revision, snmpd answering (and a wrong community getting nothing), the bootcmd, DNS, clock, every port's speed against the baseline, and the full VLAN matrix - then again after a deliberate reboot. It needs no internet, so it can run while a switch reboot has the house offline.
+
+Counters and logs: `ethtool -S lan16 | grep -vw 0` for the trunk's error picture (the router's NIC counters are the other side of the same wire), `logread` on the box, and the remote copy in the log store via the router's collector.
+
+## VLAN and trunk setup
+
+DSA makes this the same `bridge vlan` model as any Linux box:[^owrt-dsa] one bridge, one `bridge-vlan` stanza per segment, access ports untagged with a PVID, the trunk tagged in everything. The shape of it:
+
+```
+# /etc/config/network (excerpt)
+config device
+	option name 'br-lan'
+	option type 'bridge'
+	option macaddr '<label-mac>'
+	list ports 'lan1'
+	list ports 'lan2'
+	...
+	list ports 'lan16'
+
+config bridge-vlan
+	option device 'br-lan'
+	option vlan '30'
+	list ports 'lan1'
+	list ports 'lan16:t'
+
+config bridge-vlan
+	option device 'br-lan'
+	option vlan '40'
+	list ports 'lan2'
+	list ports 'lan16:t'
+
+config interface 'mgmt'
+	option device 'br-lan.<admin-vlan>'
+	option proto 'static'
+	option ipaddr '10.10.0.4'
+	option netmask '255.255.255.0'
+	option gateway '10.10.0.1'
+	list dns '10.10.0.5'
+```
+
+The details that are easy to get wrong:
+
+- **The management interface lives on the admin segment's VLAN** (a tagged subinterface of the bridge), not untagged - the trunk port carries it like every other segment. The DNS entry matters: the overlay originally pointed at an address where nothing answered, and the box sat at 1970 until it was fixed - syslog frames stamped with the build epoch are the symptom.
+- **The box routes nothing and serves nothing.** The realtek target ships `DEVICE_TYPE basic`: no dnsmasq, no DHCP, no PPP. Kea on the router owns every segment. Do not add DHCP config here.
+- **The firewall only governs traffic to the switch CPU.** Bridged traffic is forwarded by the ASIC and never touches fw4. The management zone is there to keep ssh/snmp/icmp to the admin segment:
+
+```
+# /etc/config/firewall (excerpt)
+config zone
+	option name 'mgmt'
+	option input 'REJECT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+	list network 'mgmt'
+
+config rule
+	option name 'allow-admin-ssh-snmp-icmp'
+	option src 'mgmt'
+	option src_ip '10.10.0.0/24'
+	option proto 'tcp udp icmp'
+	option dest_port '22 161'
+	option target 'ACCEPT'
+```
+
+- **MTU is permissive, not validated.** The bridge runs at 9014 because the ASIC takes it; every segment on the router is 1500, so nothing end-to-end uses jumbo. A `ping -M do -s 8972` from the router fails at the router's own 1500, not at the switch - do not read it as a switch fault.
+- **Keep the port map in one place.** The header of the overlay's network file carries the port/role/segment table, and it is kept in step with the access point's network notes. The near-miss: the guest segment was added to the stock config four days after the overlay was derived from it, and the overlay nearly flashed a switch without it. Re-derive (or at least re-diff) the overlay against the live config right before the window.
+
+## Rollback
+
+Three levels, cheapest first:
+
+- **Config only**: `git revert` in the fork, run the deploy script.
+- **Previous OpenWrt image**: `sysupgrade` with the prior image pair, kept per flash with its checksums.
+- **Back to stock**: from OpenWrt, `fw_setenv bootcmd 'boota'` (this is what the baked `fw_env.config` is for), then `sysupgrade -F` with the stock image - the `firmware` partition dump from runbook step 3 is the exact one; the vendor download is a fallback of unconfirmed version. Then restore the config: `xikectl restore <backup>` (it validates the file against the CLI grammar and uploads it as the boot config, taking effect on the next reboot) or paste through the web UI. Without the config backup, this step is a manual rebuild of the whole VLAN matrix. Once stock is back, the scraper's `verify` suite checks the box against its fixture.
+
+## Verification
+
+| Check | How | Expected |
+|---|---|---|
+| Ports at speed | `ethtool lan1 lan2 lan13 lan14 lan16` | 2500 / 2500 / 10000 / 2500 / 10000 |
+| VLAN matrix | `bridge vlan show` | every access port in its segment, lan16 tagged in all |
+| Management identity | `ip -br addr` on the mgmt interface; `ip link show br-lan` | 10.10.0.4 on the admin segment; the label MAC |
+| Box equals repo | `eaves switch diff sks8300` | exit 0 |
+| Boot durability | `reboot` twice, re-run the port and VLAN checks after each | identical both times |
+| SSH policy | the dedicated key logs in; any other key refused | both |
+| SNMP policy | `snmpwalk` from the admin segment answers; a wrong community gets nothing | both |
+| U-Boot env readable | `fw_printenv bootcmd` | `rtk network on; boota` |
+| Clock | `date` against the router | within a minute |
+| Syslog | a link flap shows up at the collector | OpenWrt dialect, parsed |
+| Rollback kit | the seven partition dumps' checksums match the copies | verified at flash time |
+
+## Gotchas and lessons learned
+
+- **TFTP from an access port failed; from the router it worked.** Fresh loader address, label MAC in `ethaddr`, AP off, TFTP on the trunk - apply all four before the first `tftpboot`; which one was decisive is unproven.
+- **Reload dropbear, never restart it.** A restart kills the session that asked for it and leaves no SSH; serial recovers it.
+- **Every `sysupgrade -n` is a new host key.** Verify the fingerprint over serial, then fix `known_hosts`; make check scripts fail fast on a changed key rather than retry.
+- **`scp` fails; cat-pipe the image.** No SFTP server on the box.
+- **A ping reply is not the box.** Static address, no lease to watch: liveness is serial output, the router's neighbor table entry for the pinned MAC, syslog frames, then SSH.
+- **fw4 rejects unzoned input.** A management interface in no firewall zone means first boot answers only on serial.
+- **The fork exists because stable releases lag.** Board support is upstream; the fork is overlay + CI + a weekly drift check that files an issue when upstream touches the realtek target. When a stable release carries the board, the fork's reason to exist shrinks to the overlay.
+- **The serial bridge is rescue tooling, not daily tooling.** Day-to-day is SSH, the deploy script, and sysupgrade over SSH. One serial-console note: Ctrl-C does not clear a half-typed line on the OpenWrt serial shell - never leave raw text unsubmitted at a prompt.
+- **Each reboot drops the whole house for 60-90 seconds.** The switch carries the trunk; schedule accordingly and warn the household.
+
+## Related docs
+
+- [A bridged access point on mainline OpenWrt](/guides/openwrt-bridged-ap/) is the same pattern on the access point that hangs off lan1 and lan2 - flash, u-boot recovery, config as code with the same diff loop.
+- [Home IoT: an ESPHome fleet on a Flint-bridged VLAN](/reference/home-iot-network/) is the segment design behind the iot access port; the router-side policy is there.
+- [Tuning a 10GbE link end to end](/guides/10gbe-link-tuning/) covers the trunk's MTU and ring-buffer side from the router and workstation ends; this switch is the wire between them.
+- [NixOS fleet](/reference/nixos-fleet/) describes the router the trunk terminates on and the deploy-time doctor gate.
+
+[^owrt-commit]: OpenWrt, "realtek: add support for XikeStor SKS8300-12E2T2X," openwrt/openwrt commit 6da2890c03. https://github.com/openwrt/openwrt/commit/6da2890c03
+[^owrt-pr]: OpenWrt, "realtek: add support for XikeStor SKS8300-12E2T2X," openwrt/openwrt pull request 21773. https://github.com/openwrt/openwrt/pull/21773
+[^owrt-dsa]: OpenWrt, "DSA mini-tutorial," OpenWrt Wiki. https://openwrt.org/docs/guide-user/network/dsa/dsa-mini-tutorial
+[^owrt-23025]: OpenWrt, "realtek: RTL8261N 10G-T broken on kernel 6.18," openwrt/openwrt issue 23025. https://github.com/openwrt/openwrt/issues/23025
+[^owrt-8261n]: OpenWrt, "realtek: phy: add RTL8261N driver," openwrt/openwrt pull request 23427. https://github.com/openwrt/openwrt/pull/23427
+[^owrt-8t]: OpenWrt, "realtek: add support for XikeStor SKS8300-8T," openwrt/openwrt pull request 19994. https://github.com/openwrt/openwrt/pull/19994
