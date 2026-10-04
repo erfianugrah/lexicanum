@@ -86,6 +86,20 @@ for concepts rather than explaining them inline.
 Test: "how does X work / which do I pick?" -> reference. "how do I do X, step by
 step?" -> guide.
 
+**When the system a doc describes is retired or replaced** (convention set
+2026-10-04): keep the doc, do not delete or move it - its URL is linked from
+elsewhere and its lessons usually still hold. Add a `<Aside type="caution"
+title="Historical since YYYY-MM-DD">` (or "Superseded on ..." / "Out of date
+since ..." when the system still exists in another form) directly after the
+frontmatter, stating what replaced it, which parts still hold, and a link to
+the replacement doc once one exists. Remove `featured`/`blurb` so the homepage
+does not lead with it. A renamed tool (sbshift -> pgmig) is renamed in prose,
+with a one-time "named X until DATE" gloss; a heading whose slug changes
+keeps its old slug as an explicit `<a id="old-slug"></a>` under the new
+heading, pinned in `tests/pins.test.ts` `anchors`. A dated measurement table
+is not rewritten when the numbers move on: add a dated re-check row or a
+note beside it.
+
 Pair across types. Task and concept are intertwingled for the reader even
 though the folders split them: a guide that rests on a reference doc links it
 from the lede, and the reference doc links back. Name the relationship
