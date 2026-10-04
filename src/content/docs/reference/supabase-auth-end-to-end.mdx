@@ -172,6 +172,96 @@ Through the admin API, `POST /auth/v1/admin/users` accepts a bcrypt `password_ha
 
 Managed-to-managed logical replication does not carry `auth.*` or `storage.*` at any tested size (edge-resilience W09, W14): initial sync stalls, `received_lsn` stays null, while public and custom schemas replicate in about 4 s. A warm standby's auth posture is third-party auth for existing sessions plus a SQL backfill or forced re-login for fresh ones, and per-project auth config (SMTP, `SITE_URL`, `jwt_exp`, rate limits) does not follow a cutover (W17).
 
+## When a provider subject changes
+
+An identity is the pair (provider, subject), and the lookup that decides "known
+user" is on that pair: `provider_id` and `identity_data.sub` carry the same
+value, and a new subject is a stranger until something else says otherwise
+(IT01a). A provider that reissues subjects for the same person - a vendor
+migration, a team transfer, a re-created app registration - therefore arrives
+as a new user unless one of three things happens, and which one it is decides
+whether the person keeps their `auth.users.id`.
+
+| What arrives | What Auth does |
+|---|---|
+| new subject, **verified** email matching exactly one non-SSO user | links to the existing user: same user id in the token, a second row in `auth.identities` (IT01b) |
+| new subject, a different email | a new user, none of the old rows (IT01c) |
+| new subject, email matching but `email_verified = false` | no session: `error=access_denied`, `error_code=provider_email_needs_verification`; the old user keeps 1 identity row (IT01e) |
+
+The first row is the linked-by-email rule the docs describe as automatic on
+the same address.[^sb-identity-linking] The other two are what a migration has
+to handle. Both come back to the same row, because the match is read from it,
+and a rewrite there is what a migration controls:
+
+```sql
+update auth.identities
+   set provider_id = '<new subject>'
+ where provider_id = '<old subject>' and user_id = '<user>';
+```
+
+The column is what the lookup reads. A later run rewrote only `provider_id`
+and left `identity_data.sub` at the old subject; the new subject, signing in
+with a different email, still landed on the old user with one identity row
+(ITL1b), so updating the JSON copy as well is tidiness rather than the
+mechanism. `auth.users.id` is untouched, so RLS ownership and every foreign
+key from `public` survive the rewrite.
+
+Everything else repairs itself on the next sign-in except the primary email.
+`raw_user_meta_data.sub`, `.provider_id` and `.email`, and `identity_data.sub`
+and `.email`, were all the new values after that sign-in from the old ones
+immediately before it, while `auth.users.email` and the `email` claim in the
+issued token stayed at the old address (ITL1c); the 2026-09-07 managed run
+saw the same split (IT01d). A migration that stops at the identity row leaves
+the project mailing a dead relay address until `auth.users.email` is updated
+too.
+
+Two other levers are narrower than they look:
+
+- **A custom claim does not steer the lookup.** `DetermineAccountLinking`
+  opens on the identity pair, so a claim naming the old subject is stored and
+  never read. A `transfer_sub`-shaped claim was written to both the identity
+  and the user (`identity_data.custom_claims` and
+  `raw_user_meta_data.custom_claims`, ITL2a), and a sign-in whose claim held
+  the old identity's exact subject, with an email matching nothing, produced a
+  new user (ITL2b). The copies are not durable either: one sign-in without the
+  claim and both were gone, because `identity_data` is replaced wholesale and
+  the top-level `custom_claims` map is overwritten (ITL2c). Harvest transfer
+  identifiers from the provider's own endpoint during its window; do not plan
+  to read them back out of the database later.
+- **The Before User Created hook fires on the create decision only.** A
+  sign-in carrying a claim the hook refuses got a session down the link path
+  (ITL3b) and down the existing-user path (ITL3c), while a stranger carrying
+  the same claim was refused with `error=access_denied`, no `error_code`, and
+  the hook's own digest of its payload in the message - `user_metadata` keys
+  including `custom_claims`, with `transfer_sub` matching what the issuer sent
+  (ITL3d; the same shape with a claim the hook accepts was created, ITL3e). No
+  `auth.users` row was left for the refused address. A hook can therefore
+  alarm on exactly the post-migration users a remap missed, but it will not
+  catch the remap of a user who already exists.
+
+One trace on the refusal path matters before a cleanup: the
+unverified-email refusal still wrote 1 identity row for the new subject and 1
+user row for it, with `auth.users.email` NULL and unconfirmed (IT01e), so a
+sweep keyed on `auth.users.email` does not see it.
+
+IT01 ran on 2026-09-07 against a managed micro project in `ap-southeast-1`.
+ITL1-ITL3 ran on 2026-09-11 against a self-hosted `supabase/auth:v2.197.0`
+with a throwaway Postgres on a local rig, chosen because the four files the
+cases turn on (`internal/models/linking.go`, `internal/api/hooks.go`,
+`internal/api/provider/keycloak.go`, `internal/api/provider/oidc.go`) were
+byte-identical between that tag and `master` as fetched that day. GoTrue
+imports what the provider reports and the account-resolution code runs after
+every provider, Apple included, so a lab provider slot stands in for the
+vendor path.
+
+What is not measured: Apple was never minted, so nothing vendor-specific is
+settled - neither Apple's own user-migration exchange nor the audience rule
+across a Services ID and a bundle ID. The managed platform's hook
+configuration (`hook_before_user_created_*` is a field group in the
+Management API document) was not probed: ITL2 and ITL3 answered those
+questions on the local rig, and the managed-vantage modules for them have
+never run.
+
 ## Levers, and what each one gates
 
 | Lever | Gates | Does not gate | Measured |
@@ -291,6 +381,14 @@ Dropping GoTrue as well means owning signup, OAuth, magic links, token minting, 
 - Do not plan a move between projects on a shared signing key: a kid cannot be imported into a second project while another project holds it `in_use` (other key states not run), and the same material under a new kid is refused (session-carry S01b, S01x, S01f, S01g). Expect the access token held at cutover to fail at the target (`403 bad_jwt` at Auth, `401 PGRST301` at PostgREST; S02a, S02b) until the client refreshes there (S02c, S02e).
 - For PBKDF2 sources, import passwordless and verify locally on first login (pbkdf2 reference).
 
+**Provider subject changes**
+
+- Treat an identity as the pair (provider, subject): a new subject is a stranger until a verified email or a rewrite links it (IT01a, IT01b).
+- On a provider migration, rewrite `provider_id` on the identity row and update `auth.users.email`; the JSON copies and the user metadata repair themselves on the next sign-in, the primary email does not (ITL1b, ITL1c, IT01d).
+- Use a Before User Created hook to refuse unexpected new accounts, not to catch a migrated user: it does not run down the link path or the existing-user path (ITL3b, ITL3c, ITL3d).
+- Harvest a transfer identifier from the provider's endpoint while it is valid; a stored copy disappears on the first sign-in without it (ITL2b, ITL2c).
+- Clean up by subject, not by email: a refused unverified-email sign-in leaves an identity row and a user row with `auth.users.email` NULL (IT01e).
+
 **Levers**
 
 - `verify_jwt` on an Edge Function checks key possession only; authorise inside the function or with RLS (L07).
@@ -329,13 +427,29 @@ None of these has been filed with Supabase as of 2026-09-25.
 - Third-party acceptance latency has two measured values: about 1.1 s (X02, 2026-08-03, another Supabase project as issuer) and about 30 s cold (W01 and W05, 2026-08-15, a lab ES256 issuer in W01 and a Supabase project in W05). Neither run reproduced the other's conditions, and the runs do not reconcile the two.
 - All self-hosted GoTrue rows are one image version against one managed version on the same day, as `postgres` through the session pooler. The kid rule was reproduced on three projects; the revoke timing is 3 s, 6 s and 4 s across them.
 - Each negative claim ("not portable", "cannot") comes from a complete probe set or a cited source.
+- The provider-subject section spans two load-bearing vantages and they are
+not interchangeable: IT01 is the managed platform (2026-09-07, one micro
+project), ITL1-ITL3 are a self-hosted GoTrue on a local rig (2026-09-11, one
+run of 14 cases), and the reason the local rig stands in - four source files
+identical between `v2.197.0` and `master` on that day - is an argument about
+the code, not a measurement on the platform. The IT01 module was edited after
+its 2026-09-07 run, so that artifact carries neither the metadata measurements
+nor evidence that the refactor was behaviour-neutral; ITL1c measured the same
+question locally. Two labels in the ITL artifact are harness defaults rather
+than facts: the region reads `ap-southeast-1` and the rig has none, and the
+lab-commit stamp resolves to nothing after a history rewrite.
 
 ## Evidence
 
-Measured claims map to module ids in the named supabase-lab experiments; every RUNLOG is public under [experiments/](https://github.com/erfianugrah/supabase-lab/tree/7691a91/experiments), and the self-hosted GoTrue runs have redacted artifacts with measurement tables under [self-hosted-auth/out/2026-09-02/](https://github.com/erfianugrah/supabase-lab/tree/7691a91/experiments/self-hosted-auth/out/2026-09-02); session-carry's RUNLOG is pinned at [31b9102](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/RUNLOG.md).
+Measured claims map to module ids in the named supabase-lab experiments; every RUNLOG is public under [experiments/](https://github.com/erfianugrah/supabase-lab/tree/7691a91/experiments), and the self-hosted GoTrue runs have redacted artifacts with measurement tables under [self-hosted-auth/out/2026-09-02/](https://github.com/erfianugrah/supabase-lab/tree/7691a91/experiments/self-hosted-auth/out/2026-09-02); session-carry's RUNLOG is pinned at [31b9102](https://github.com/erfianugrah/supabase-lab/blob/31b9102/experiments/session-carry/RUNLOG.md). The provider-subject section comes from [identity-transfer](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/RUNLOG.md): IT01 on the managed platform (2026-09-07, [`out/2026-09-07`](https://github.com/erfianugrah/supabase-lab/tree/4578c50/experiments/identity-transfer/out/2026-09-07)) and ITL1-ITL3 on a local self-hosted GoTrue (2026-09-11, [`out/2026-09-11`](https://github.com/erfianugrah/supabase-lab/tree/4578c50/experiments/identity-transfer/out/2026-09-11)).
 
 | Claim | Status | How it was checked |
 |---|---|---|
+| A new subject with a verified email matching one non-SSO user links to that user; a different email makes a new user | measured | identity-transfer [IT01b, IT01c](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/it01-identity-transfer.ts) (2026-09-07, managed micro project, `ap-southeast-1`) |
+| Rewriting `provider_id` alone remaps the subject; `identity_data.sub` is not read | measured | identity-transfer [ITL1b](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/itl1-remap-stored-copies.ts), [ITL1c](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/itl1-remap-stored-copies.ts) (2026-09-11, self-hosted `supabase/auth:v2.197.0`); [IT01d](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/it01-identity-transfer.ts) on managed rewrote both |
+| A stored `transfer_sub` claim is never read and does not survive a sign-in without it | measured | identity-transfer [ITL2a-ITL2c](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/itl2-custom-claim-local.ts) (2026-09-11) |
+| The Before User Created hook runs on create only, and its payload carries the provider's custom claims | measured | identity-transfer [ITL3a-ITL3e](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/itl3-hook-local.ts) (2026-09-11); managed hook config not probed |
+| An unverified matching email is refused `provider_email_needs_verification` and leaves an identity row and a NULL-email user row | measured | identity-transfer [IT01e](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/it01-identity-transfer.ts) (2026-09-07) |
 | ES256 `in_use` plus HS256 `previously_used` on a fresh project; `jwt_secret` readable and mints accepted tokens | measured | edge-resilience [W01](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/edge-resilience/tests/w01-jwt-skew.ts), [W07](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/edge-resilience/tests/w07-breakglass-mint.ts); self-hosted-auth [SH01c](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/self-hosted-auth/tests/sh01-privilege-map.ts) |
 | PostgREST skew tolerance exactly 30 s; expired and unknown-key codes | measured | edge-resilience [W01](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/edge-resilience/tests/w01-jwt-skew.ts), two runs |
 | PostgREST refuses an HS256 token with any `kid`; GoTrue accepts it | measured | self-hosted-auth [SH04](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/self-hosted-auth/tests/sh04-verify-managed-key.ts), three projects (arbitrary kid, platform kid, no kid) |
@@ -435,6 +549,20 @@ Measured claims map to module ids in the named supabase-lab experiments; every R
 | X01 | cross-project-auth | [`x01-tpa-shapes.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/cross-project-auth/tests/x01-tpa-shapes.ts) | none published |
 | X02 | cross-project-auth | [`x02-token-portability.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/cross-project-auth/tests/x02-token-portability.ts) | none published |
 | X03 | cross-project-auth | [`x03-refresh-to-issuer.ts`](https://github.com/erfianugrah/supabase-lab/blob/713c28f/experiments/cross-project-auth/tests/x03-refresh-to-issuer.ts) | none published |
+| IT01a | identity-transfer | [`it01-identity-transfer.ts`](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/it01-identity-transfer.ts) | [`out/2026-09-07`](https://github.com/erfianugrah/supabase-lab/tree/4578c50/experiments/identity-transfer/out/2026-09-07) |
+| IT01b | identity-transfer | [`it01-identity-transfer.ts`](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/it01-identity-transfer.ts) | [`out/2026-09-07`](https://github.com/erfianugrah/supabase-lab/tree/4578c50/experiments/identity-transfer/out/2026-09-07) |
+| IT01c | identity-transfer | [`it01-identity-transfer.ts`](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/it01-identity-transfer.ts) | [`out/2026-09-07`](https://github.com/erfianugrah/supabase-lab/tree/4578c50/experiments/identity-transfer/out/2026-09-07) |
+| IT01d | identity-transfer | [`it01-identity-transfer.ts`](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/it01-identity-transfer.ts) | [`out/2026-09-07`](https://github.com/erfianugrah/supabase-lab/tree/4578c50/experiments/identity-transfer/out/2026-09-07) |
+| IT01e | identity-transfer | [`it01-identity-transfer.ts`](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/it01-identity-transfer.ts) | [`out/2026-09-07`](https://github.com/erfianugrah/supabase-lab/tree/4578c50/experiments/identity-transfer/out/2026-09-07) |
+| ITL1b | identity-transfer | [`itl1-remap-stored-copies.ts`](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/itl1-remap-stored-copies.ts) | [`out/2026-09-11`](https://github.com/erfianugrah/supabase-lab/tree/4578c50/experiments/identity-transfer/out/2026-09-11) |
+| ITL1c | identity-transfer | [`itl1-remap-stored-copies.ts`](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/itl1-remap-stored-copies.ts) | [`out/2026-09-11`](https://github.com/erfianugrah/supabase-lab/tree/4578c50/experiments/identity-transfer/out/2026-09-11) |
+| ITL2a | identity-transfer | [`itl2-custom-claim-local.ts`](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/itl2-custom-claim-local.ts) | [`out/2026-09-11`](https://github.com/erfianugrah/supabase-lab/tree/4578c50/experiments/identity-transfer/out/2026-09-11) |
+| ITL2b | identity-transfer | [`itl2-custom-claim-local.ts`](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/itl2-custom-claim-local.ts) | [`out/2026-09-11`](https://github.com/erfianugrah/supabase-lab/tree/4578c50/experiments/identity-transfer/out/2026-09-11) |
+| ITL2c | identity-transfer | [`itl2-custom-claim-local.ts`](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/itl2-custom-claim-local.ts) | [`out/2026-09-11`](https://github.com/erfianugrah/supabase-lab/tree/4578c50/experiments/identity-transfer/out/2026-09-11) |
+| ITL3b | identity-transfer | [`itl3-hook-local.ts`](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/itl3-hook-local.ts) | [`out/2026-09-11`](https://github.com/erfianugrah/supabase-lab/tree/4578c50/experiments/identity-transfer/out/2026-09-11) |
+| ITL3c | identity-transfer | [`itl3-hook-local.ts`](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/itl3-hook-local.ts) | [`out/2026-09-11`](https://github.com/erfianugrah/supabase-lab/tree/4578c50/experiments/identity-transfer/out/2026-09-11) |
+| ITL3d | identity-transfer | [`itl3-hook-local.ts`](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/itl3-hook-local.ts) | [`out/2026-09-11`](https://github.com/erfianugrah/supabase-lab/tree/4578c50/experiments/identity-transfer/out/2026-09-11) |
+| ITL3e | identity-transfer | [`itl3-hook-local.ts`](https://github.com/erfianugrah/supabase-lab/blob/4578c50/experiments/identity-transfer/tests/itl3-hook-local.ts) | [`out/2026-09-11`](https://github.com/erfianugrah/supabase-lab/tree/4578c50/experiments/identity-transfer/out/2026-09-11) |
 
 ## Related docs
 
@@ -446,6 +574,7 @@ Measured claims map to module ids in the named supabase-lab experiments; every R
 - [Put an IAP over the Data API](/guides/supabase-iap-data-api/), [Running many tenants on one project](/guides/supabase-shared-tenancy/), [Promoting a tenant](/guides/supabase-tenant-promotion/), [Consolidating tenants](/guides/supabase-tenant-consolidation/), [Run your own PostgREST](/guides/supabase-own-postgrest/), [Trusted-device MFA and impersonation audit](/guides/supabase-auth-mfa-trusted-device-and-impersonation-audit/) - the guides each section points at.
 
 [^sb-signing-keys]: Supabase, "JWT Signing Keys," Supabase Docs. https://supabase.com/docs/guides/auth/signing-keys
+[^sb-identity-linking]: Supabase, "Identity linking," Supabase Docs. https://supabase.com/docs/guides/auth/auth-identity-linking
 [^gotrue-readme]: Supabase, "supabase/auth README," GitHub. https://github.com/supabase/auth/blob/master/README.md
 [^sb-compose]: Supabase, "docker/docker-compose.yml," supabase/supabase on GitHub. https://github.com/supabase/supabase/blob/master/docker/docker-compose.yml
 [^gotrue-conf]: Supabase, "internal/conf/configuration.go and jwk.go," supabase/auth on GitHub. https://github.com/supabase/auth/tree/master/internal/conf
