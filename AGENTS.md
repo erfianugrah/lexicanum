@@ -19,6 +19,12 @@ the build/test gate only, no deploy.
 
 ## Pipeline facts (load-bearing)
 
+- `package.json` `overrides` pins `better-sqlite3` to 13.0.3 (2026-10-06). The
+  graphviz render cache (`@beoe/sqlitecache`) asks for `^11.9.1`; on a Node
+  v26.10.0 Mac its install script exited 1 and `node-gyp rebuild` failed, so
+  no binding existed and `astro build` died loading the config. 13.x ships prebuilds for
+  darwin/linux/win32 in the package and supports Node >=22 (CI runs 22). Drop
+  the override once `@beoe/sqlitecache` depends on 13 itself.
 - `gfm: true` in `astro.config.mjs` -> GFM footnotes render. The citation system
   is built on them.
 - `remark-math` + `rehype-katex` are ON. A literal `$` in **prose** is parsed as math.
