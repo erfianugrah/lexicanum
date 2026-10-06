@@ -1,5 +1,7 @@
 # Entity Graphs Reference Public Cleanup Implementation Plan
 
+> **Status: SUPERSEDED - absorbed by later corpus passes** (stocktake 2026-10-06). Boxes were never ticked, but f9715fa (identifier removal), ba52bbb (prose rewrite) and 12c14b3 rewrote the page. Checked against the live `reference/postgres-entity-graphs.mdx` with this plan's own Task-5 greps: every required value is retained (1521, 10016, 14233, ap-southeast-1, 2504695, 14034445, 270 chars, 88%, not measured, not discoverable, ...); no internal paths, session state or teardown prose; demo URL phrased as disposable; person/org extraction described as noisy candidate generation. The remaining leakage-grep hits (G05-G12, RUNLOG) are IEEE citation links into the public supabase-lab repo - the house citation style, not leakage.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Clean up the public-facing entity-graphs reference so it retains every measured detail and caveat while removing internal lab-status prose, private paths, operational teardown notes and audience-confusing implementation chatter.
