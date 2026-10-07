@@ -598,7 +598,7 @@ const pins: Pin[] = [
       "15s",
       "30s",
       // The single-source-address rule IS the access model here.
-      "ip saddr 10.0.0.59",
+      "ip saddr 192.168.22.59",
     ],
     sections: [/^## Verification$/m, /^## Gotchas and lessons learned$/m, /^## File reference$/m],
     linksTo: ["reference/self-hosted-monitoring-topology"],
