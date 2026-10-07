@@ -805,7 +805,7 @@ const pins: Pin[] = [
       // prose, so pin the constants-table phrasing instead).
       "never `>=500` alone",
       // File reference links out to the public repo.
-      "github.com/erfianugrah/supabase-lab/blob/0769afb/experiments/edge-resilience/worker/worker.ts",
+      "github.com/erfianugrah/supabase-lab/blob/a07de3d/experiments/edge-resilience/worker/worker.ts",
     ],
     linksTo: ["reference/supabase-incident-resilience"],
   },
