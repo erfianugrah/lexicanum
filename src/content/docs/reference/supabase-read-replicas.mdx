@@ -1,0 +1,317 @@
+---
+title: "Supabase read replicas: how requests reach them and what they cost"
+description: Which Supabase requests a read replica can serve - Data API GETs through the load balancer or the replica's own endpoint, read-only functions called with get true - and which always land on the primary (writes, POST RPC, Auth, Storage, Realtime, a custom domain). What a replica bills (compute at the primary's size, 1.25x disk, mirrored IOPS, throughput and IPv4, outside compute credits and the spend cap), its prerequisites, what it blocks, and how to read its share of traffic from the dashboard and the API logs.
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+A Supabase read replica is a second database billed at the primary's compute size, and it only earns that bill if requests reach it. This page maps which requests can, which never do, what the replica costs line by line, and how to measure its share yourself.
+
+Almost everything here is documented rather than measured: the Supabase docs were read on 2026-10-08 and every such claim carries a footnote. Two things were measured in the supabase-lab, both about creating a replica and neither about routing: the prerequisite chain on a Pro org (sfp-platforms S07/S07e, 2026-08-25) and a same-region replica on a Medium primary in ap-southeast-2 (medium-serverless MS06, 2026-09-30). No lab module has measured how the load balancer splits traffic, and the page says so where it matters.
+
+**TL;DR**
+
+- Over HTTP, only Data API `GET` requests can be served by a replica, and only when they go to the API load balancer endpoint or to the replica's own API endpoint; SQL over the replica's own pooler or connection string also reaches it. Non-`GET` requests through the load balancer go to the primary.[^sb-rr]
+- A Postgres function called over `POST /rest/v1/rpc/...` is a non-`GET` request. In supabase-js, `rpc(fn, args, { get: true })` sends it as a `GET`, which the docs name as the way to run a read-only function on a replica.[^sb-rr][^postgrest-js-rpc]
+- Auth always runs on the primary, even through the load balancer; Storage and Realtime cannot use a replica either.[^sb-rr] A custom domain bypasses the load balancer.[^sb-rr]
+- A replica bills compute at the primary's size by the hour, a disk 1.25x the primary's billed from the first byte, and copies of any provisioned IOPS, throughput and IPv4.[^sb-rr-usage][^sb-disk-usage] Compute credits do not apply to it, and the spend cap does not cover it.[^sb-rr-usage][^sb-compute-usage]
+- Read the replica's share from the API logs field `metadata.load_balancer_redirect_identifier`, from API Reports, or from Database Reports with the Source toggle set to the replica.[^sb-rr][^sb-log-fields]
+
+## Where each request lands
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  client  [label="Client\n(supabase-js, HTTP)"];
+  lb      [label="API load balancer\nendpoint"];
+  proj    [label="Primary API endpoint\n(project URL)"];
+  cd      [label="Custom domain"];
+  rrapi   [label="Replica API\nendpoint"];
+  pool    [label="Replica pooler /\ndatabase string"];
+  primary [label="Primary", shape=cylinder];
+  replica [label="Read replica", shape=cylinder];
+
+  client -> lb;
+  client -> proj;
+  client -> cd;
+  client -> rrapi;
+  client -> pool [label="SQL"];
+  lb -> replica [label="Data API GET,\nclosest database"];
+  lb -> primary [label="GET if closest;\nnon-GET; Auth"];
+  proj -> primary;
+  cd -> primary [label="no load balancer"];
+  rrapi -> replica [label="GET only"];
+  pool -> replica [label="reads"];
+  primary -> replica [label="WAL: streaming +\narchived files", style=dashed];
+}
+```
+
+The same map as a table. "Documented" means the docs say it; "inferred" means it follows from the docs' wording and was not measured.
+
+| Request | Where it goes | Status |
+| --- | --- | --- |
+| Data API `GET` to the load balancer endpoint | the closest database, primary included | documented[^sb-rr] |
+| Data API `POST` / `PATCH` / `DELETE` to the load balancer endpoint, including `POST /rest/v1/rpc/...` | primary | documented[^sb-rr] |
+| `rpc(fn, args, { get: true })` to the load balancer endpoint | sent as `GET`, so eligible for a replica | documented[^sb-rr]; method choice read in the client source[^postgrest-js-rpc] |
+| Auth through the load balancer endpoint | primary, always | documented[^sb-rr] |
+| Storage, Realtime | not a replica | documented[^sb-rr] |
+| Data API `GET` to a replica's own API endpoint | that replica; the endpoint supports `GET` only | documented[^sb-rr] |
+| Any request to a custom domain | not routed through the load balancer, so the primary unless you call a replica endpoint | first half documented,[^sb-rr] landing on the primary inferred |
+| Any request to the primary's project URL | primary | inferred: the API settings page lists the load balancer as a separate endpoint[^sb-rr] |
+| SQL over the replica's pooler or database connection string | that replica, read-only | documented[^sb-rr] |
+
+## The load balancer
+
+Each replica has its own database and API endpoints, and a project with replicas also gets an API load balancer endpoint, listed on the API settings page.[^sb-rr] The docs on routing, quoted:
+
+> The load balancer enables geo-routing for Data API requests to automatically route `GET` requests to the database closest to your user ensuring the lowest latency. You can also send Non-`GET` requests through this endpoint, and they are routed to the Primary database automatically.[^sb-rr]
+
+> Due to the requirements of the Auth service, all Auth requests are handled by the Primary, even when sent over the load balancer endpoint.[^sb-rr]
+
+The routing rule changed on 2025-04-04, from round-robin "among all databases (all read replicas + primary) of your project, regardless of location" to geo-routing that "directs requests to the closest available database (all read replicas + primary)".[^sb-rr] The primary is in that pool. Under geo-routing as documented, a replica takes a `GET` when it is the closest database to the caller (inferred: a replica farther than the primary takes none). The docs do not say how the load balancer chooses between a primary and a replica in the same region, and no lab module measured it. The platform does accept a same-region replica: MS06 (2026-09-30) created one and it answered a read over its own pooler string 219 s after setup.
+
+The load balancer exists only while a replica does. "If you remove all Read Replicas from your project, the load balancer and its endpoint are removed as well."[^sb-rr] A client still pointed at the load balancer endpoint when the last replica goes has nowhere to send requests, so repoint it first.
+
+<Aside type="caution" title="A custom domain bypasses the load balancer">
+"If you use a custom domain, requests will not be routed through the load balancer. You should instead use the dedicated endpoints provided in the dashboard."[^sb-rr] A project that serves its Data API through a custom domain therefore sends no Data API reads to a replica unless the client calls the replica's own endpoint for them.
+</Aside>
+
+## Reads that arrive as POST
+
+PostgREST runs `GET` and `HEAD` in a `READ ONLY` transaction: "Modifying the database inside READ ONLY transactions is not possible. PostgREST uses this fact to enforce HTTP semantics in GET and HEAD requests."[^postgrest-tx] A function call over `POST` runs read-write when the function is `VOLATILE` and read-only when it is `STABLE` or `IMMUTABLE`, but either way it is a non-`GET` request and the load balancer sends it to the primary.[^postgrest-tx][^sb-rr] The docs' fix is the client option:
+
+> To call a read-only Postgres function on Read Replicas through the REST API, use the `get: true` option.[^sb-rr]
+
+```ts
+// POST /rest/v1/rpc/top_products - always the primary
+const a = await supabase.rpc("top_products", { lim: 20 });
+
+// GET /rest/v1/rpc/top_products?lim=20 - eligible for a replica
+const b = await supabase.rpc("top_products", { lim: 20 }, { get: true });
+```
+
+The supabase-js reference shows the option as "Call a read-only Postgres function" and the client's own doc comment says that with `get: true` "the function will be called with read-only access mode".[^sb-js-rpc][^postgrest-js-rpc] In the postgrest-js source, `get: true` sets the method to `GET` and moves each argument into the query string: arrays become `{a,b}` literals and any other value goes through JavaScript string conversion, so an object argument would arrive as `[object Object]` (source read at commit `84e2c5d`, not run).[^postgrest-js-rpc] Two consequences:
+
+- The function must not write. A function that writes (inserts, updates, or calls `nextval()`) fails under `GET`, because `GET` runs READ ONLY; the PostgREST docs' example, a view calling `nextval()`, answers HTTP 405 with SQLSTATE `25006`, "cannot execute nextval() in a read-only transaction".[^postgrest-tx]
+- Keep `get: true` for scalar and array arguments. PostgREST matches `GET` parameters to function parameters by name, `?a=1&b=2`.[^postgrest-fn]
+
+The Securing your API page states the same split from the rate-limiting side: "`GET` and `HEAD` requests run in read-only mode. They can be served by Read Replicas, which don't support writing to the database."[^sb-securing-api]
+
+## What a replica costs
+
+The usage docs describe a replica as "a dedicated database" whose resources are "mirrored from the primary database".[^sb-rr-usage]
+
+| Resource | What the replica gets | Billing |
+| --- | --- | --- |
+| Compute | "the same Compute size as the primary database"[^sb-rr-usage] | by the hour; a partial hour bills as a full one[^sb-rr-usage] |
+| Disk size | "1.25x the size of the primary disk to account for WAL archives"[^sb-rr-usage] | from the first byte; the plan's included disk does not cover it[^sb-disk-usage][^sb-rr-usage] |
+| Provisioned disk IOPS | inherits any additional IOPS[^sb-rr-usage] | as for the primary |
+| Provisioned disk throughput | inherits any additional throughput[^sb-rr-usage] | as for the primary |
+| IPv4 add-on | one per replica if the primary has one[^sb-rr-usage][^sb-ipv4] | "Each replica adds to the total IPv4 cost."[^sb-ipv4] |
+
+On the invoice, replica compute is its own line, "Replica Compute Hours"; "Disk Size, Disk IOPS, Disk Throughput and IPv4 are not shown separately for Read Replicas and are rolled up into the project."[^sb-rr-usage] Searching the invoice for the replica's disk will not find it.
+
+Two exclusions apply: no credits offset it, and no spend cap limits it. "No, Compute Credits do not apply to Read Replica Compute."[^sb-rr-usage] Paid plans include \$10 a month in compute credits, "enough to cover one Micro instance",[^sb-pricing] and they "apply only to Compute and do not cover other line items, including Read Replica Compute and Branching Compute".[^sb-compute-usage] And "Read Replicas are **not** covered by the Spend Cap": Read Replica Compute sits on the cost-control page's list of usage the cap excludes.[^sb-rr-usage][^sb-cost-control]
+
+Compute per replica, at the monthly prices on the public pricing page (doc-read 2026-10-08). Projects below XL can have up to two replicas, XL and above up to five.[^sb-rr-start]
+
+| Primary compute | Replica compute per month | Replicas allowed |
+| --- | --- | --- |
+| Small | \$15 | up to 2 |
+| Medium | \$60 | up to 2 |
+| Large | \$110 | up to 2 |
+| XL | \$210 | up to 5 |
+| 2XL | \$410 | up to 5 |
+| 4XL | \$960 | up to 5 |
+| 8XL | \$1,870 | up to 5 |
+| 12XL | \$2,800 | up to 5 |
+| 16XL | \$3,730 | up to 5 |
+
+Monthly prices from the pricing page;[^sb-pricing] the usage docs' own examples quote Large at \$111 for 730 hours.[^sb-rr-usage] Micro and Nano are absent because a replica needs Small or larger.[^sb-rr-start]
+
+The docs' smallest worked example, quoted line for line: a Pro project on Small with one replica and no add-ons bills Pro Plan \$25, primary compute \$15, primary disk 8 GB \$0, replica compute \$15, replica disk 10 GB \$1.25, subtotal \$56.25, Compute Credits -\$10: \$46.25 a month.[^sb-rr-usage] The credits cannot apply to the replica's compute, so the replica is \$16.25 of that, none of it offset. The same page's second example, two Large replicas with IPv4 and provisioned IOPS and throughput, totals \$427.06.[^sb-rr-usage]
+
+A resize moves the replicas with the primary. When the primary's compute changes, the primary restarts first while the replicas stay available, then "all the Read Replicas are restarted (and resized, if needed) concurrently".[^sb-rr-start] The compute cost of an upsize therefore multiplies by one plus the replica count.
+
+## Prerequisites
+
+The docs list four requirements on top of a Pro, Team or Enterprise plan: the project runs on AWS, on "at least a Small compute add-on", on Postgres 15 or later, and not on legacy logical backups.[^sb-rr-start] General regions (the Americas, Europe and APAC groupings) "aren't yet supported for read replicas"; a project needs a specific region.[^sb-regions]
+
+The lab hit the compute floor and the backup requirement in order on a fresh Pro project (sfp-platforms S07/S07e, 2026-08-25):
+
+| Step | Response from `POST /v1/projects/{ref}/read-replicas/setup` |
+| --- | --- |
+| Fresh project on the default Micro | `400 "Read replicas require a minimum size of small"` |
+| After a `ci_small` upgrade | `406 "Failed to check for latest completed physical backup"` |
+| After enabling the `pitr_7` add-on (physical backups) | `204` accepted |
+
+MS06 (2026-09-30) skipped the chain on a Medium primary in ap-southeast-2, with the replica in the primary's own region: it added `pitr_7` first (HTTP 200), then setup answered `204` on the first attempt; the replica's `READ_REPLICA` entry appeared in the pooler config after 216 s, and a connection through the replica's Supavisor string answered `pg_is_in_recovery() = true` after 219 s. Removal answered `204` and the entry was gone on the first poll. The docs say replicas deploy "across multiple regions"[^sb-rr] and do not mention the same-region case.
+
+PITR was the lab's way to get a completed physical backup on a fresh project; the backups docs say projects on Postgres `15.8.1.079` and newer use physical backups already.[^sb-backups] Whether the `406` clears on its own once the backup that follows a compute change completes was not run; on 2026-09-03 a fresh project already listed a completed physical backup. PITR is its own add-on priced by retention period, so it belongs in the replica's price when the project needs it.[^sb-backups]
+
+## What a replica does not do
+
+- Writes. The replica accepts `select` only.[^sb-rr]
+- Auth, Storage and Realtime. "Requests to other Supabase products, such as Auth, Storage, and Realtime, aren't able to use a Read Replica or its API endpoint."[^sb-rr]
+- Failover. The read replica docs describe no way to promote a replica or fail over to one (doc-read 2026-10-08); the production checklist recommends replicas "if you require availability resilience to a disk failure event".[^sb-going-prod] For a region outage, the warm standby in [the DR tiers reference](/reference/supabase-dr-tiers/) is the tier that runs somewhere else.
+- Survive an upgrade or a restore. "Projects with read-replicas can't be upgraded. You need to delete the replicas and re-create them after upgrade completes."[^sb-upgrading] The getting-started page puts data restorations under the same rule: all replicas come down first, and you re-deploy them once the operation completes.[^sb-rr-start] The [major upgrade guide](/guides/supabase-postgres-major-upgrade-e2e/) carries this as a pre-window checklist item; reads go to the primary only once clients are repointed at the primary's URL (the load balancer endpoint is removed with the last replica), so repoint first and size the primary to carry them.
+- Fresh data on demand. Replication is asynchronous,[^sb-rr] and "High replication lag can result in stale data returned for queries executed against the affected read replicas."[^sb-rr-start]
+
+## Checking whether the replica serves reads
+
+The dashboard and the logs both answer it, from the docs (none of these was exercised by a lab module):
+
+1. Database Reports, with the Source toggle on the replica, shows its resource use.[^sb-rr] A replica at idle CPU while the primary is busy is the first sign (inferred).
+2. API Reports covers "API requests going through either a Read Replica or Load Balancer API endpoint".[^sb-rr]
+3. In the API logs, a request through the load balancer records the database that served it: "The upstream database or the one that eventually handles the request can be found under the `Redirect Identifier` field. This is equivalent to `metadata.load_balancer_redirect_identifier` when querying the underlying logs."[^sb-rr] The log field reference lists it on `edge_logs` as `log_attributes['load_balancer_redirect_identifier']`.[^sb-log-fields]
+4. Replication lag sits under Replica Information on Database Reports.[^sb-rr-start] For a metrics pipeline, the docs name `physical_replication_lag_physical_replica_lag_seconds`; the Grafana guide's alert uses `physical_replication_lag_physical_replication_lag_seconds` (not reconciled). The [Grafana monitoring guide](/guides/supabase-grafana-monitoring/) covers ingesting that endpoint.
+
+The query below counts Data API requests per serving database and method. It is built from the documented field names and the documented query syntax[^sb-log-fields][^sb-log-sql] and was not run here:
+
+```sql
+-- Data API requests by serving database and method, over the Explorer's time range
+select
+  log_attributes['load_balancer_redirect_identifier'] as served_by,
+  log_attributes['request.method'] as method,
+  count() as requests
+from logs
+where source = 'edge_logs'
+  and log_attributes['request.path'] like '/rest/v1/%'
+group by served_by, method
+order by requests desc
+limit 50;
+```
+
+Rows with an empty `served_by` are requests the field did not describe; the docs define the field only "for API Load Balancer traffic",[^sb-log-fields] so a large empty bucket reads as traffic that never went through the load balancer (inferred). `POST` rows against `/rest/v1/rpc/` are function calls the replica cannot take until they use `get: true`.
+
+## Which do I pick
+
+| Situation | Choice | Why |
+| --- | --- | --- |
+| Primary CPU high, workload under roughly 80% reads | Larger compute | "Read Replicas only serve reads and won't help writes."[^sb-rr] |
+| Read-heavy, users far from the primary's region | Replica near the users, clients on the load balancer endpoint | geo-routing sends each `GET` to the closest database[^sb-rr] |
+| Analytical queries competing with the app | Replica, the analytics job on the replica's connection string | the replica has its own pooler and database endpoint[^sb-rr] |
+| Region outage cover | Warm standby, not a replica | no promotion path is documented; see [the DR tiers](/reference/supabase-dr-tiers/) |
+| Data must stay in one jurisdiction | Replica only in an acceptable region | a replica is a full copy in its own region; see [data residency](/reference/supabase-data-residency/) |
+| Replica exists, its share of reads is near zero | Fix the client path, or delete it | every hour bills at the primary's compute size, outside credits and the spend cap[^sb-rr-usage] |
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="Logs or API report show\nGETs served by the replica?"];
+  q2 [label="Clients on the load balancer\nor replica endpoint?"];
+  q3 [label="Reads sent as POST rpc?"];
+  q4 [label="Behind a custom domain?"];
+  q5 [label="Replica in the primary's region,\nor users closer to the primary?"];
+  ok [label="It is serving reads:\nkeep it, watch lag"];
+  a2 [label="Point Data API reads at\nthe load balancer endpoint"];
+  a3 [label="Call read-only functions\nwith get: true"];
+  a4 [label="Send reads to the\nreplica's own endpoint"];
+  a5 [label="Move the replica toward\nthe users, or delete it"];
+  a6 [label="Check the load balancer's split\nin the logs; not measured here"];
+
+  q1 -> ok [label="yes"];
+  q1 -> q2 [label="no"];
+  q2 -> a2 [label="no"];
+  q2 -> q3 [label="yes"];
+  q3 -> a3 [label="yes"];
+  q3 -> q4 [label="no"];
+  q4 -> a4 [label="yes"];
+  q4 -> q5 [label="no"];
+  q5 -> a5 [label="yes"];
+  q5 -> a6 [label="no"];
+}
+```
+
+The same check as a list:
+
+1. Do the API logs or API Reports show `GET` requests served by the replica? If yes, it is serving reads; keep it and watch replication lag.
+2. If not, are the clients on the load balancer endpoint or the replica's endpoint? If not, point Data API reads at the load balancer endpoint.
+3. Are the reads function calls sent as `POST`? If yes, call read-only functions with `get: true`.
+4. Is the Data API behind a custom domain? If yes, send reads to the replica's own endpoint.
+5. Is the replica in the primary's region, or are the users closer to the primary? If yes, move the replica toward the users or delete it.
+6. If not, check the load balancer's split in the logs; not measured here.
+
+## What to do about it
+
+Most rows rest on the docs, read 2026-10-08, because no lab module measured routing; the Module column says so. MS06 and S07 resolve in the [medium-serverless RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/1de7be3/experiments/medium-serverless/RUNLOG.md) and the [sfp-platforms RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/sfp-platforms/RUNLOG.md).
+
+| Practice | Evidence | Module |
+| --- | --- | --- |
+| Count the replica's share in the API logs before paying for another month. | `metadata.load_balancer_redirect_identifier` names the database that served a load-balanced request; the query above groups by it. | documented; query not run |
+| Point Data API reads at the load balancer endpoint or a replica endpoint. | Only those two endpoints reach a replica; the load balancer is a separate endpoint on the API settings page. | documented; not measured |
+| Call read-only functions with `rpc(fn, args, { get: true })`. | Non-`GET` requests go to the primary; `get: true` sends a `GET` with arguments in the query string. A function that writes fails under `GET` with `25006`. | documented; client source read |
+| Keep `get: true` to functions whose arguments are scalars or arrays. | The client converts each argument to a string for the query string; an object argument becomes `[object Object]`. | source read at `84e2c5d`; not run |
+| Send reads to a replica endpoint when the project uses a custom domain. | Custom-domain requests are not routed through the load balancer. | documented; not measured |
+| Place a replica closer to the users than the primary is. | Geo-routing picks the closest database, primary included; the same-region tie-break is not documented. | MS06 shows a same-region replica serves SQL; LB split not measured |
+| Price each replica as a second database at the primary's compute size. | Compute, 1.25x disk from the first byte, IOPS, throughput and IPv4 are mirrored; credits and the spend cap do not apply. | documented |
+| Budget the replicas into every primary upsize. | Replicas are resized with the primary, after it, concurrently. | documented; not measured |
+| Wait for, or force, a completed physical backup after the resize to Small. | Setup answered `406 "Failed to check for latest completed physical backup"` on Small; `204` after `pitr_7`. MS06 served 219 s after setup. | S07/S07e (2026-08-25), MS06 (2026-09-30) |
+| Delete replicas before an upgrade or restore; repoint clients and size the primary. | Upgrades and data restorations require all replicas down first; recreate after. | documented |
+| Repoint clients off the load balancer endpoint before removing the last replica. | The load balancer and its endpoint are removed with the last replica. | documented |
+| Plan region failover on a standby, not a replica. | The docs describe no promotion path; Auth stays on the primary. | documented (absence) |
+
+Not measured anywhere in the lab, and stated as such above: how the load balancer splits `GET`s between a primary and a same-region replica; whether a custom-domain request lands on the primary; that a `get: true` call reaches a replica; the contents of `load_balancer_redirect_identifier` on a real request; replica lines on a real invoice; replication lag on a replica; whether the `406` clears on its own once the backup that follows the resize to Small completes.
+
+## Evidence
+
+| Claim | Status | How it was checked |
+| --- | --- | --- |
+| Replica setup gate: `400` below Small, `406` awaiting a physical backup after the resize to Small, `204` after `pitr_7` | measured | sfp-platforms [S07/S07e](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/sfp-platforms/tests/s07-read-replicas.ts), 2026-08-25, Pro org; responses recorded in the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/sfp-platforms/RUNLOG.md) |
+| Same-region replica accepted, in the pooler config after 216 s, `pg_is_in_recovery() = true` after 219 s, removal `204`, entry gone from the pooler config on the first poll (0 s) | measured | medium-serverless [MS06](https://github.com/erfianugrah/supabase-lab/blob/1de7be3/experiments/medium-serverless/tests/ms06-same-region-replica.ts), 2026-09-30, Medium primary in ap-southeast-2; [facts](https://github.com/erfianugrah/supabase-lab/blob/1de7be3/experiments/medium-serverless/out/2026-09-30/run-2026-09-30T06-12-54-369Z.facts.md) |
+| `get: true` sends `GET` with arguments in the query string | source read | postgrest-js `rpc()` at supabase-js commit `84e2c5d`; not run |
+| Load balancer routing, Auth on the primary, custom-domain bypass, GET-only replica endpoints, the 2025-04-04 geo-routing change | documented | read replicas docs, doc-read 2026-10-08 |
+| Mirrored resources, 1.25x disk, Replica Compute Hours line, credits and spend cap exclusions, the \$46.25 and \$427.06 examples | documented | read replica usage, compute usage, disk size and cost-control docs, doc-read 2026-10-08 |
+| Per-size monthly compute prices | documented | public pricing page, doc-read 2026-10-08 |
+| Plans, AWS, Small, Postgres 15+, replica counts, general-region exclusion, upgrade and restore rule | documented | getting-started, regions and upgrading docs, doc-read 2026-10-08 |
+| `load_balancer_redirect_identifier`, the Source toggles, the lag metric | documented | read replicas docs and the log field reference, doc-read 2026-10-08 |
+
+No docs-vs-runtime disagreement was found, so nothing on this page has been filed upstream. Two gaps sit between them: the same-region case MS06 measured, which the docs do not describe either way, and the setup gate after a compute change (`406` on the Pro org), which the getting-started prerequisites do not list (doc-read 2026-10-08).
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| MS06 | medium-serverless | [`ms06-same-region-replica.ts`](https://github.com/erfianugrah/supabase-lab/blob/1de7be3/experiments/medium-serverless/tests/ms06-same-region-replica.ts) | [`out/2026-09-30`](https://github.com/erfianugrah/supabase-lab/blob/1de7be3/experiments/medium-serverless/out/2026-09-30/run-2026-09-30T06-12-54-369Z.facts.md) |
+| S07 | sfp-platforms | [`s07-read-replicas.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/sfp-platforms/tests/s07-read-replicas.ts) | none published |
+| S07e | sfp-platforms | [`s07-read-replicas.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/sfp-platforms/tests/s07-read-replicas.ts) | none published |
+
+## Related docs
+
+- [Supabase DR tiers](/reference/supabase-dr-tiers/) - where a replica sits against daily backups, PITR and a warm standby.
+- [Compute and disk](/reference/supabase-compute-disk/) - the compute sizes a replica mirrors and the spend-cap exclusions.
+- [Postgres major upgrade, end to end](/guides/supabase-postgres-major-upgrade-e2e/) - the delete-and-recreate step in the upgrade window.
+- [Incident resilience](/reference/supabase-incident-resilience/) - what keeps serving in an outage, and what does not.
+- [Data residency](/reference/supabase-data-residency/) - a replica as a copy of the data in another region.
+- [Cloudflare Workers + Supabase](/reference/cloudflare-supabase-architecture/) - a replica near the edge to cut read latency.
+
+[^sb-rr]: Supabase, "Read Replicas," Supabase Docs. https://supabase.com/docs/guides/platform/read-replicas
+[^sb-rr-start]: Supabase, "Getting started with Read Replicas," Supabase Docs. https://supabase.com/docs/guides/platform/read-replicas/getting-started
+[^sb-rr-usage]: Supabase, "Manage Read Replica usage," Supabase Docs. https://supabase.com/docs/guides/platform/manage-your-usage/read-replicas
+[^sb-compute-usage]: Supabase, "Manage Compute usage," Supabase Docs. https://supabase.com/docs/guides/platform/manage-your-usage/compute
+[^sb-disk-usage]: Supabase, "Manage Disk Size usage," Supabase Docs. https://supabase.com/docs/guides/platform/manage-your-usage/disk-size
+[^sb-cost-control]: Supabase, "Control your costs," Supabase Docs. https://supabase.com/docs/guides/platform/cost-control
+[^sb-ipv4]: Supabase, "Dedicated IPv4 Address for Ingress," Supabase Docs. https://supabase.com/docs/guides/platform/ipv4-address
+[^sb-pricing]: Supabase, "Pricing," Supabase. https://supabase.com/pricing
+[^sb-regions]: Supabase, "Available regions," Supabase Docs. https://supabase.com/docs/guides/platform/regions
+[^sb-backups]: Supabase, "Database Backups," Supabase Docs. https://supabase.com/docs/guides/platform/backups
+[^sb-upgrading]: Supabase, "Upgrading," Supabase Docs. https://supabase.com/docs/guides/platform/upgrading
+[^sb-going-prod]: Supabase, "Production Checklist," Supabase Docs. https://supabase.com/docs/guides/deployment/going-into-prod
+[^sb-securing-api]: Supabase, "Securing your API," Supabase Docs. https://supabase.com/docs/guides/api/securing-your-api
+[^sb-js-rpc]: Supabase, "JavaScript: rpc()," Supabase Docs. https://supabase.com/docs/reference/javascript/rpc
+[^sb-log-fields]: Supabase, "Log sources and fields," Supabase Docs. https://supabase.com/docs/guides/observability/log-field-reference
+[^sb-log-sql]: Supabase, "Query logs with SQL," Supabase Docs. https://supabase.com/docs/guides/observability/advanced-log-filtering
+[^postgrest-tx]: PostgREST, "Transactions," PostgREST Docs. https://docs.postgrest.org/en/stable/references/transactions.html
+[^postgrest-fn]: PostgREST, "Functions," PostgREST Docs. https://docs.postgrest.org/en/stable/references/api/functions.html
+[^postgrest-js-rpc]: Supabase, "postgrest-js PostgrestClient.ts, rpc()," GitHub, commit 84e2c5d. https://github.com/supabase/supabase-js/blob/84e2c5d/packages/core/postgrest-js/src/PostgrestClient.ts

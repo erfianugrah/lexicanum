@@ -1744,6 +1744,7 @@ const practicePages: Array<[doc: string, heading: RegExp]> = [
   ["guides/supabase-auth-mfa-trusted-device-and-impersonation-audit", PRACTICES_HEADING],
   ["guides/supabase-aws-privatelink-tofu", PRACTICES_HEADING],
   ["guides/supabase-branch-detach-git-link", PRACTICES_HEADING],
+  ["guides/supabase-edge-function-bff-fanout", PRACTICES_HEADING],
   ["guides/supabase-grafana-monitoring", PRACTICES_HEADING],
   ["guides/supabase-iap-data-api", PRACTICES_HEADING],
   ["guides/supabase-management-api-logs-endpoint", /^## Traps, each measured$/m],
@@ -1761,6 +1762,7 @@ const practicePages: Array<[doc: string, heading: RegExp]> = [
   ["reference/cloudflare-supabase-architecture", PRACTICES_HEADING],
   ["reference/pbkdf2-supabase-auth-migration", PRACTICES_HEADING],
   ["reference/postgres-entity-graphs", PRACTICES_HEADING],
+  ["reference/postgres-redundant-writes", PRACTICES_HEADING],
   ["reference/rls-without-supabase-auth", PRACTICES_HEADING],
   ["reference/stripe-sync-engine", PRACTICES_HEADING],
   ["reference/supabase-auth-end-to-end", PRACTICES_HEADING],
@@ -1776,6 +1778,7 @@ const practicePages: Array<[doc: string, heading: RegExp]> = [
   ["reference/supabase-incident-resilience", PRACTICES_HEADING],
   ["reference/supabase-multi-tenant-placement", PRACTICES_HEADING],
   ["reference/supabase-platform-operation-cost", PRACTICES_HEADING],
+  ["reference/supabase-read-replicas", PRACTICES_HEADING],
   ["reference/supabase-rls-policy-cost", PRACTICES_HEADING],
   ["reference/supabase-wrapper-delete-scope", PRACTICES_HEADING],
 ];

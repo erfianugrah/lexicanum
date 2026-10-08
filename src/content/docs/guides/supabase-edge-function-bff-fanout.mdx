@@ -1,0 +1,390 @@
+---
+title: "A backend-for-frontend fan-out on Supabase Edge Functions"
+description: One Edge Function that serves an app screen from four upstream APIs - JWT-verified, parallel calls with a per-call AbortController timeout, partial results and an all-failed 502, a Server-Timing header, and a per-user cache in a private Postgres table that only service_role writes. Code, SQL, the eight checks, and local vs hosted timings from 2026-10-08, including a first-call 502 after deploy.
+author: Erfi Anugrah
+category: supabase
+group: architecture
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+You'll build one Edge Function for an app screen that needs data from several upstream APIs. The app makes one request; the function verifies the caller's JWT, calls four upstream endpoints in parallel with a timeout on each call, and returns whatever answered, with a per-upstream report and a `partial` flag. Responses the upstream marks cacheable are kept per user in a Postgres table the user can read through an RPC but cannot write. The runtime ceilings this sits under (CPU, idle timeout, wall clock) are measured in [Edge Function limits, one ceiling at a time](/reference/supabase-edge-function-limits/), and what `verify_jwt` does and does not gate is in [Locking down Supabase](/reference/supabase-data-surface-lockdown/).
+
+Prerequisites: a Supabase project, the Supabase CLI, and Docker for the local stack.
+
+Everything marked measured comes from the [supabase-lab](https://github.com/erfianugrah/supabase-lab) experiment [`governed-starter-kit`](https://github.com/erfianugrah/supabase-lab/tree/16077ed/experiments/governed-starter-kit), run on 2026-10-08: first on a local Docker stack (client on the same host as the stack), then later the same day against the kit's `kit-ready` project (Micro, `ap-southeast-1`, Team-plan organization; the kit's second project was not used), driven from the operator's machine, so hosted wall times include the client's round trip to the region. Both runs used Supabase CLI 2.120.0. The upstreams were a mock deployed as a second Edge Function on the same project. The run record is the experiment's [RUNLOG.md](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/RUNLOG.md); no redacted artifact is published for it, the raw evidence is gitignored. The code was re-run on 2026-10-09 and passed the same eight checks locally and on two hosted K05 runs, recorded in the same RUNLOG. Anything not marked measured is cited to the Supabase docs or is a design choice, and says so.
+
+## Constants
+
+| Fact | Value | Where it is set |
+|---|---|---|
+| Upstream endpoints | `profile`, `feed`, `inbox`, `stats` | `ENDPOINTS` in `fanout.ts` |
+| Per-call timeout | 800 ms default, clamped to 50-10,000 ms | `FANOUT_UPSTREAM_TIMEOUT_MS` function secret |
+| Mock delays | profile 250 ms, feed 180 ms, inbox 120 ms, stats 60 ms | `DEFAULT_LATENCY_MS` in `upstream-mock/index.ts` |
+| Mock `Cache-Control` | profile `private, max-age=300`; feed `private, max-age=60`; inbox and stats `no-store` | `CACHE_CONTROL` in `upstream-mock/index.ts` |
+| `?slow=` delay | 3000 ms, past the 800 ms timeout | `DEFAULT_SLOW_MS` in `upstream-mock/index.ts` |
+| Cache TTL cap | 3600 s, in the function and again in SQL | `MAX_TTL_S`; `least(..., 3600)` in `fanout_cache_put` |
+| Requests per timed check | 5, median reported | `REPS` in `k05-fanout-api.ts`; `BFF_REPS` (default 5) in `scripts/bff-local.ts` |
+
+## Component versions
+
+| Component | Version | Note |
+|---|---|---|
+| Supabase CLI | 2.120.0 | local stack and deploys |
+| `@supabase/server` | 1.9.0 | `withSupabase({ auth: "user" })` |
+| `@supabase/supabase-js` | 2.117.2 | the RPC calls |
+| Deploy path | `supabase functions deploy --use-api` | server-side bundling |
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  app [label="app screen\n(user JWT)"];
+  gw [label="functions gateway\nverify_jwt on"];
+  bff [label="fanout-api\nwithSupabase auth: user"];
+  up [label="upstream-mock\n/profile /feed /inbox /stats\nx-api-key checked"];
+  rest [label="PostgREST"];
+  cache [label="private.fanout_cache\nRLS: own rows"];
+
+  app -> gw -> bff;
+  bff -> up [label="4 calls in parallel\n800 ms timeout each"];
+  bff -> rest [label="fanout_cache_get (as user)\nfanout_cache_put (service_role)"];
+  rest -> cache;
+}
+```
+
+The app calls `fanout-api` through the functions gateway. The function calls the four upstream endpoints in parallel, reads and writes the cache through two RPCs on PostgREST, and never touches the table directly.
+
+## Step 1: the cache table and its two RPCs
+
+The table lives in a schema the Data API does not expose. The lab's baseline creates it with `create schema if not exists private;`, `revoke all on schema private from public;` and `grant usage on schema private to authenticated;`. Then, from [`sql/50-fanout.sql`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/sql/50-fanout.sql):
+
+```sql
+create table if not exists private.fanout_cache (
+  user_id    uuid not null references auth.users (id) on delete cascade,
+  endpoint   text not null check (endpoint in ('profile', 'feed', 'inbox', 'stats')),
+  body       jsonb not null,
+  fetched_at timestamptz not null default now(),
+  expires_at timestamptz not null,
+  primary key (user_id, endpoint)
+);
+alter table private.fanout_cache enable row level security;
+
+revoke all on private.fanout_cache from public, anon, authenticated, service_role;
+grant select on private.fanout_cache to authenticated;
+grant usage on schema private to service_role;
+grant select, insert, update on private.fanout_cache to service_role;
+
+drop policy if exists "fanout_cache: own rows" on private.fanout_cache;
+create policy "fanout_cache: own rows" on private.fanout_cache
+  for select to authenticated
+  using (user_id = (select auth.uid()));
+
+-- Read path: SECURITY INVOKER, so the policy above decides what comes back.
+create or replace function public.fanout_cache_get(p_endpoints text[])
+returns table (endpoint text, body jsonb, age_s int)
+language sql stable security invoker set search_path = '' as $$
+  select c.endpoint, c.body, floor(extract(epoch from (now() - c.fetched_at)))::int
+    from private.fanout_cache c
+   where c.endpoint = any (p_endpoints)
+     and c.expires_at > now()
+$$;
+revoke execute on function public.fanout_cache_get(text[]) from public, anon;
+grant execute on function public.fanout_cache_get(text[]) to authenticated;
+
+-- Write path: service_role only. TTL capped at an hour.
+create or replace function public.fanout_cache_put(p_user uuid, p_entries jsonb)
+returns int
+language sql security invoker set search_path = '' as $$
+  with w as (
+    insert into private.fanout_cache as c (user_id, endpoint, body, fetched_at, expires_at)
+    select p_user, e ->> 'endpoint', e -> 'body', now(),
+           now() + make_interval(secs => least(greatest((e ->> 'ttl_s')::int, 0), 3600))
+      from jsonb_array_elements(p_entries) e
+    on conflict (user_id, endpoint) do update
+      set body = excluded.body, fetched_at = excluded.fetched_at, expires_at = excluded.expires_at
+    returning 1
+  )
+  select count(*)::int from w
+$$;
+revoke execute on function public.fanout_cache_put(uuid, jsonb) from public, anon, authenticated;
+grant execute on function public.fanout_cache_put(uuid, jsonb) to service_role;
+```
+
+Both RPCs are SECURITY INVOKER. The read runs as the calling user, so RLS returns that user's rows only; the write runs as `service_role`, the only role granted execute, so a user cannot plant a row in the cache, including in their own. One row per user and endpoint, overwritten on refresh, keeps the table at users times four rows with no purge job; an expired row is ignored by the read until the next write replaces it.
+
+The cache is a table because a map inside the function would live in one worker. The docs define the wall clock as how long an Edge Function worker stays active, 150 s on Free and 400 s on paid plans, during which a worker can serve several requests;[^sb-limits] a hosted function runs on more than one worker over time, so a second request can land on a worker whose map is empty, and no map outlives its worker. The `profile` TTL of 300 s is already most of a paid worker's life. A row is shared by every worker and survives a cold start, at the price of one PostgREST round trip per screen request for the read and one more on a miss for the write. That reasoning is the design; the run did not count workers or measure an in-memory cache's hit rate.
+
+## Step 2: the fan-out
+
+[`fanout.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/supabase/functions/fanout-api/fanout.ts) has no Supabase or network dependency of its own: fetch, the clock and the cache are passed in, so its 11 Deno unit tests run offline. Each upstream call gets its own `AbortController`, and the body read sits inside the same deadline:
+
+```ts
+async function callOne(o: FanOutOptions, endpoint: Endpoint): Promise<Outcome> {
+  const f = o.fetch ?? fetch;
+  const now = o.now ?? Date.now;
+  const url = new URL(`${o.baseUrl.replace(/\/+$/, "")}/${endpoint}`);
+  // ... demo knobs: ?mode=fail / ?mode=slow on the upstream URL
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), o.timeoutMs);
+  const t0 = now();
+  try {
+    const r = await f(url, {
+      headers: { "x-api-key": o.apiKey, "x-user-id": o.userId, accept: "application/json" },
+      signal: ac.signal,
+    });
+    // The body read is inside the same deadline: a slow body is a slow upstream.
+    const text = await r.text();
+    const ms = now() - t0;
+    if (!r.ok) {
+      return { endpoint, body: null, report: { status: "error", source: "upstream", ms, http: r.status, error: `upstream http ${r.status}` } };
+    }
+    // ... JSON.parse(text); a non-JSON body is also status "error"
+    const ttl = cacheTtl(r.headers.get("cache-control"));
+    return { endpoint, body, report: { status: "ok", source: "upstream", ms, http: r.status, ttl_s: ttl } };
+  } catch (e) {
+    const ms = now() - t0;
+    if (ac.signal.aborted) {
+      return { endpoint, body: null, report: { status: "timeout", source: "upstream", ms, error: `no answer within ${o.timeoutMs} ms` } };
+    }
+    return { endpoint, body: null, report: { status: "error", source: "upstream", ms, error: String((e as Error)?.message ?? e).slice(0, 200) } };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+```
+
+`callOne` never rejects, so `Promise.all` over the cache misses waits for every call to answer or hit its own deadline, and one slow upstream cannot fail the rest:
+
+```ts
+const misses = ENDPOINTS.filter((e) => !hits.has(e));
+const outcomes = await Promise.all(misses.map((e) => callOne(o, e)));
+```
+
+What gets cached is the upstream's decision: `cacheTtl` reads `max-age=N` from the response's `Cache-Control`, returns 0 for `no-store` or `no-cache`, and caps N at 3600 s. A failed or timed-out call is never cached. A cache read that throws marks `cache.read: "error"` and the function carries on to the upstreams, so a broken cache costs latency rather than the response. There are no retries: inside a fixed per-call budget a retry only moves the timeout, and the app can re-request the screen.
+
+## Step 3: the handler
+
+From [`fanout-api/index.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/supabase/functions/fanout-api/index.ts), trimmed. `verify_jwt` stays on (the platform default) and `withSupabase({ auth: "user" })` verifies the token again; the user id sent upstream comes from the verified claims, never from the request.
+
+```ts
+import { withSupabase } from "npm:@supabase/server@1.9.0";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2.117.2";
+
+function pgCache(user: SupabaseClient, admin: SupabaseClient, userId: string): Cache {
+  return {
+    async get(endpoints) {
+      const { data, error } = await user.rpc("fanout_cache_get", { p_endpoints: endpoints });
+      if (error) throw new Error(`cache read: ${error.message}`);
+      return (data ?? []) as CacheEntry[];
+    },
+    async put(entries) {
+      const { error } = await admin.rpc("fanout_cache_put", { p_user: userId, p_entries: entries });
+      if (error) throw new Error(`cache write: ${error.message}`);
+    },
+  };
+}
+
+export default {
+  fetch: withSupabase({ auth: "user" }, async (req, ctx) => {
+    // ... 405 unless GET; 503 upstream_not_configured if either upstream secret is unset
+    const userId = ctx.userClaims?.id;
+    if (!userId) return Response.json({ error: "no user in the verified token" }, { status: 401 });
+
+    const agg = await fanOut({
+      baseUrl, apiKey, userId,
+      timeoutMs: timeoutMs(),
+      controls: parseControls(new URL(req.url).searchParams),
+      cache: pgCache(ctx.supabase as unknown as SupabaseClient, ctx.supabaseAdmin as unknown as SupabaseClient, userId),
+    });
+    const timing = [
+      `total;dur=${agg.total_ms}`,
+      `cache;dur=${agg.cache.read_ms + agg.cache.write_ms}`,
+      ...Object.entries(agg.upstreams).map(([e, u]) => `${e};dur=${u.ms};desc="${u.source} ${u.status}"`),
+    ].join(", ");
+    // 200 while anything useful came back; 502 only when every upstream failed.
+    const anyOk = Object.values(agg.upstreams).some((u) => u.status === "ok");
+    return Response.json(
+      { screen: "main", user_id: userId, ...agg },
+      { status: anyOk ? 200 : 502, headers: { "Server-Timing": timing, "Cache-Control": "private, no-store" } },
+    );
+  }),
+};
+```
+
+The body carries `partial`, `total_ms`, `timeout_ms`, the cache outcome, `data` (a failed upstream is `null`) and `upstreams` (status, source, ms, and the error for a failed one). An all-failed 502 has the same shape, so a client can tell the function's own 502 from a gateway error by the body. `Server-Timing` repeats the per-upstream figures for a browser's network panel; the local manual pass with curl on 2026-10-08 showed the header carrying the same per-upstream figures as the body.
+
+`?slow=` and `?fail=` steer the mock in a demo; `?refresh=1` skips the cache read in `fanout-api`. Remove `slow` and `fail` in front of a real upstream: a client should not be able to steer upstream calls.
+
+## Step 4: the upstream and its shared secret
+
+The upstream is called by the function, not by a user, so the mock is deployed with `--no-verify-jwt` and checks a shared key instead. It fails closed when the secret is unset and compares in constant time, from [`upstream-mock/index.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/supabase/functions/upstream-mock/index.ts):
+
+```ts
+const expected = Deno.env.get("UPSTREAM_API_KEY");
+if (!expected) return json(503, { error: "upstream not configured (UPSTREAM_API_KEY unset)" });
+if (!(await sameSecret(req.headers.get("x-api-key") ?? "", expected))) return json(401, { error: "bad or missing x-api-key" });
+```
+
+`sameSecret` hashes both values with SHA-256 and XORs the digests. A real upstream behind its own gateway would do the same check. An IP allowlist on the upstream is not an option: Supabase documents that Edge Functions "do not originate from a single static IP address or a small, stable range of IPs", and for a destination you control it recommends a shared secret in a custom header, with an outbound proxy on a static IP for one you do not.[^sb-egress]
+
+The mock also stops waiting when the caller aborts (`req.signal`), so a timed-out call does not hold the mock's worker for the full 3000 ms slow delay. That an abort in `fanout-api` reaches the mock's `req.signal` through the hosted gateway was not measured.
+
+## Step 5: deploy
+
+The lab's `make bff-deploy` does this against the project (`$REF`):
+
+```bash
+# 1. the SQL from step 1, then both functions
+supabase functions deploy upstream-mock --project-ref "$REF" --use-api --no-verify-jwt
+supabase functions deploy fanout-api    --project-ref "$REF" --use-api
+
+# 2. the shared key and the upstream URL as function secrets, never in code
+k=$(openssl rand -hex 32)
+printf 'UPSTREAM_API_KEY=%s\nUPSTREAM_BASE_URL=https://%s.supabase.co/functions/v1/upstream-mock\n' "$k" "$REF" \
+  | supabase secrets set --env-file /dev/stdin --project-ref "$REF"
+```
+
+Then list the secrets (`GET /v1/projects/{ref}/secrets`) and confirm both names are present; the Makefile fails if they are not. The Makefile makes no warm-up call: make one call to `fanout-api` yourself before anything you measure or show (see the cold-start result below).
+
+## Verification
+
+The lab runs the same eight checks locally (`make bff-local`, a throwaway Docker stack with two seeded users) and against the deployed project (module K05), from [`lib/bff-checks.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/lib/bff-checks.ts). The local runner labels them L01 to L08 and K05 labels them K05.01 to K05.08; the L ids are local to this experiment.
+
+| # | Check | Expected |
+|---|---|---|
+| 1 | no token, and a token with a tampered signature | 401 for both |
+| 2 | all four upstreams, cache read skipped (`refresh=1`) | 200, `partial: false`, all four from upstream, `user_id` and `profile.user_id` are the caller's |
+| 3 | the next call | `cache.read: "hit"`; profile and feed from cache, inbox and stats live |
+| 4 | `slow=stats` | 200, `partial: true`, stats `timeout` at or past `timeout_ms`, `data.stats` null, `total_ms` under `timeout_ms` + 500 |
+| 5 | `fail=feed` | 200, `partial: true`, feed `error` with `http: 503`, the other three ok |
+| 6 | all four forced to fail | 502, `partial: true`, every `data` entry null (the per-upstream report is printed, not asserted) |
+| 7 | a second user's call | `user_id` and `profile.user_id` are the second user's |
+| 8 | the cache from the Data API as a user | `fanout_cache_put` refused with `42501`; `private.fanout_cache` refused; `fanout_cache_get` returns only the caller's rows |
+
+Results, all measured on 2026-10-08:
+
+- Unit tests (`make bff-test`, offline, a fake fetch that honours the AbortSignal and an in-memory cache): 11 of 11 pass, 295 ms.
+- Local stack: 8 of 8 pass. No token and a tampered signature both 401 at the gateway. Check 8: `fanout_cache_put` as a user 403 `42501`; the `private` schema through the Data API 406 `PGRST106`; `fanout_cache_get` returned the caller's 2 rows (feed, profile).
+- Hosted, three K05 runs: 8 pass, 0 fail, 0 skip each time. All-failed 502 with the per-upstream report; a second user never received the first user's cached rows; `fanout_cache_put` as a user 403 `42501`; `private` schema 406 `PGRST106`. The hosted record does not say whether the two 401s came from the gateway or from the function.
+- Negative control, local only, from a scratch script that is not committed: with the cache policy changed to `using (true)` and insert, update and execute granted to `authenticated`, checks 7 and 8 failed (the second user's profile came from the cache carrying another user's id; the user's own `fanout_cache_put` returned 200 and `fanout_cache_get` returned 8 rows), and the other six still passed. Reapplying `sql/50-fanout.sql` restored it. So checks 7 and 8 do detect the two failures they are written for.
+
+## Measured timings, local and hosted
+
+Medians over 5 requests per check, in ms. Wall is the client's time; server is the function's own `total_ms`. Local: client on the same host as the stack. Hosted: the operator's machine to `ap-southeast-1`; the RUNLOG records medians for hosted runs 1 and 2.
+
+| Check | Local wall, median (min-max) | Local server | Hosted run 1 wall / server | Hosted run 2 wall / server |
+|---|---|---|---|---|
+| All four upstreams, cache read skipped (`refresh=1`) | 273 (270-276) | 266 | 705 / 469 | 662 / 459 |
+| Next call, profile and feed from cache | 143 (136-158) | 136 | 525 / 311 | 489 / 277 |
+| `slow=stats`, past the 800 ms timeout | 815 (813-817) | 807 | 1120 / 903 | 1071 / 870 |
+| `fail=feed` (503) | 199 (194-204) | 192 | 659 / 406 | 581 / 355 |
+
+| Detail | Local | Hosted |
+|---|---|---|
+| Cache read, median | 4 ms | 89 ms (run 1), 66 ms (run 2), through PostgREST |
+| Where stats was cut on `slow=stats` | `timeout` at 804 ms (last request) | 801-802 ms (runs 1 and 2; the RUNLOG does not say whether per request or per median) |
+| Per-upstream times on `refresh=1` | not recorded per upstream | 182-381 ms (runs 1 and 2; the RUNLOG does not say whether per request or per median) against configured mock delays of 60-250 ms |
+| First `fanout-api` call | 2246 ms (the RUNLOG attributes it to "isolate boot plus the npm imports") | http 502 after a deploy, twice (below) |
+
+Reading the numbers:
+
+- Locally the fan-out costs about the slowest upstream: 266 ms server time against the 250 ms `profile` delay. Hosted, each upstream call took 182-381 ms (runs 1 and 2; the RUNLOG does not say whether per request or per median) against 60-250 ms of configured delay. The RUNLOG reads that as each hop from `fanout-api` to `upstream-mock` through the public functions URL adding roughly 100-130 ms, inferred from the difference and not measured separately. An upstream that is not an Edge Function on the same project takes a different path, and none was run.
+- Hosted wall minus server is 201-253 ms across the eight hosted medians above (derived, median minus median): the client's round trip to the region, the gateway, and the function's work outside `total_ms` (JWT verification in `withSupabase`, building the response), from one vantage.
+- The cache saved 158 ms (run 1) and 182 ms (run 2) of server time hosted, and 130 ms locally (derived from the first two rows); the first row includes a cache write, so this overstates the read-path saving by that write. A hit removes the two slowest upstreams, so the screen is then bounded by `inbox` plus the cache read, which costs 66-89 ms hosted against 4 ms locally.
+- The timeout held: stats was cut at 801-802 ms hosted (runs 1 and 2; the RUNLOG does not say whether per request or per median) against an 800 ms setting, and the whole slow request finished in 870-903 ms of server time.
+- Every timed figure is one client sending requests one at a time, in one region, from one vantage, against a mock whose delay is a `setTimeout`. The finding is the shape (hosted costs one network hop per upstream plus a PostgREST round trip per cache operation); the milliseconds hold for this vantage and mock only.
+
+## The first call after a deploy answered 502
+
+<Aside type="caution" title="Cold start, reproduced twice; cause inferred">
+On the hosted project the first `fanout-api` call after a deploy (K05's pre-check probe, `refresh=1`, logged rather than scored) answered http 502 in 3314 ms before run 1, and again in 4203 ms after a redeploy (before run 3, by elimination; the RUNLOG does not number it); every later call passed. Hosted run 2, with no redeploy before it, had a first call of http 200 in 639 ms.
+</Aside>
+
+The RUNLOG's likely cause, inferred and not confirmed from the 502 body or the function logs: the four parallel calls each hit a cold `upstream-mock` worker and all four exceeded the 800 ms per-call timeout, which is the function's own all-failed path. The other reading is a 502 from the platform rather than from the function. The body would separate them (the function's 502 carries the per-upstream report), and it was not kept. Either way the cost lands on the first user after a deploy. The cold-start figure this site measured on a single function is about 1.4 s on the first call after deploy and idle ([incident resilience, class 10](/reference/supabase-incident-resilience/#class-10-edge-function-limits)), which on its own would exceed an 800 ms per-call budget.
+
+## What the Edge Function limits mean for a fan-out
+
+The ceilings themselves are measured in [Edge Function limits, one ceiling at a time](/reference/supabase-edge-function-limits/); this is how they apply to this shape.
+
+- CPU time. The docs cap CPU at 2 s per request and define it as "actual time spent on the CPU per request - does not include async I/O".[^sb-limits] A fan-out spends almost all its time waiting on four fetches and two RPCs, so the time it waits on upstreams does not count against the 2 s. CPU used per request was not measured.
+- Request idle timeout. 150 s without a response, then 504.[^sb-limits] The per-call timeout is clamped to 10,000 ms in code, so the function always answers well inside it.
+- Wall clock. 150 s on Free and 400 s on paid plans, counted per worker, which can serve several requests in that time.[^sb-limits] A request of about one second is a small slice, but a request that arrives late in a worker's life is cut sooner; the shared-worker case was not run here or on the limits page. The same lifetime is why the cache is a table (step 1).
+- Function-to-function calls. When the upstreams are Edge Functions on the same project, every upstream call is a nested call. The recursive-calls page, read on 2026-10-08, gives each trace "a budget of 30 requests within a 60-second window", counts fan-out patterns, and exempts calls to external APIs.[^sb-recursive] One screen request here is 4 nested calls. The limits page on this site tested the figure documented before this change (about 5000 per minute) on 2026-09-02; the docs changed it on 2026-09-23 (supabase/supabase commit 4998a13) to 30 requests per trace within a 60-second window.[^sb-recursive-change] This run did not probe the per-trace budget. Apart from the first call after each deploy (502, below), every check passed in the three hosted runs; checks 2 to 5 require the unforced upstreams to answer ok.
+- Outbound IPs. No static egress IP, so the upstream authenticates the function by header (step 4).[^sb-egress]
+
+## What to do about it
+
+Module ids are this experiment's K05 checks; a row that is a design choice rather than a result says so.
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Take the user id from verified claims; keep `verify_jwt` on and verify again in code. | No token and a tampered signature both 401, locally (at the gateway) and hosted. Sourcing the id from claims is a design choice. | K05.01 |
+| Give each upstream call its own `AbortController`; read the body inside the same deadline. | Stats cut at 801-802 ms hosted (runs 1 and 2; the RUNLOG does not say whether per request or per median) and 804 ms locally against 800 ms; the other three returned. | K05.04 |
+| Answer 200 with `partial: true` while any upstream answered; 502 only when none did. | `fail=feed` 200 with feed `error` 503; all four failing 502 with the per-upstream report. | K05.05, K05.06 |
+| Cache per user in a `private` table; write only through a service_role RPC. | `fanout_cache_put` as a user 403 `42501`; `private` 406 `PGRST106`; the negative control failed checks 7 and 8. | K05.07, K05.08 |
+| Read the cache through a SECURITY INVOKER RPC so RLS scopes it. | The read RPC returned the caller's 2 rows, never the second user's. | K05.08 |
+| Let the upstream's `Cache-Control` set the TTL, and cap it. | Design choice. The cap is 3600 s in `cacheTtl` and again in `fanout_cache_put`. | none |
+| Do not keep the cache in an in-worker map. | Design choice, reasoned from the per-worker wall clock in the docs; hit rate not measured. | none |
+| Make one warm-up call after every deploy before real traffic. | First call after a deploy answered 502 twice (3314 ms, 4203 ms); later calls passed. | K05 (pre-check probe) |
+| Set the per-call timeout from hosted per-upstream times, not local ones. | Hosted calls took 182-381 ms (runs 1 and 2; the RUNLOG does not say whether per request or per median) against 60-250 ms of mock delay; local server time tracked the slowest delay. | K05.02 |
+| Authenticate the function to the upstream with a shared-secret header. | Edge Functions have no static egress IP (docs); the mock fails closed and compares in constant time. | none |
+| Remove the `slow` and `fail` query parameters in front of a real upstream. | Design choice: they let a client steer upstream calls. | none |
+| Keep the fan-out inside the 30-per-trace budget when upstreams are functions. | Docs figure, read 2026-10-08; 4 nested calls per request here; the budget was not probed. | none |
+
+## Not measured
+
+- Load. Every timed check sent 5 requests one after another from one client; no concurrency, no throughput figure, no behaviour of the cache table under contention.
+- Other vantages. Hosted wall times are from the operator's machine to `ap-southeast-1` only; no other region, no client near the region.
+- Upstreams that are not Edge Functions. All four upstreams were one mock function on the same project, so the hop cost and the nested-call budget are specific to function-to-function calls, and the cold-start 502 may be (cause inferred, not confirmed).
+- The cause of the cold-start 502. The 502 body and the function logs were not read.
+- An anon-key call. `verify_jwt` admits any valid project JWT including the anon key ([Locking down Supabase](/reference/supabase-data-surface-lockdown/)); the code answers 401 when the verified claims carry no user id, but no check sent the anon key.
+- CPU time per request, and the shared-worker wall clock.
+- Hosted run 3's timings; the RUNLOG records 8 of 8 passing but medians for runs 1 and 2 only.
+
+## Gotchas and lessons learned
+
+- The cold-start 502 is the function's all-failed path behaving as designed if the inferred cause holds: four cold upstream workers each missed 800 ms. A deploy followed by a demo without a warm-up call shows the 502 to the first user.
+- `refresh=1` skips the cache read but still writes, so the first row of the timings table includes a cache write. The RUNLOG does not break that write out.
+- Forced `fail` and `slow` endpoints bypass the cache read on purpose, so a demo knob is never hidden by a cache hit. A real client has no such knob.
+- The mock is deployed with `--no-verify-jwt` because its caller holds no user JWT. That makes it reachable by anyone with the URL, and the shared key is the only gate; a `verify_jwt = false` function is one of the surfaces reachable with no credential at all ([Locking down Supabase](/reference/supabase-data-surface-lockdown/)).
+- The BFF response sets `Cache-Control: private, no-store`, so nothing between the app and the function caches one user's screen.
+
+## File reference
+
+The reproducible form is [`experiments/governed-starter-kit`](https://github.com/erfianugrah/supabase-lab/tree/16077ed/experiments/governed-starter-kit) in supabase-lab:
+
+| File | What it is |
+|---|---|
+| [`supabase/functions/fanout-api/index.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/supabase/functions/fanout-api/index.ts) | the handler: auth, secrets, status, `Server-Timing` |
+| [`supabase/functions/fanout-api/fanout.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/supabase/functions/fanout-api/fanout.ts) | the fan-out, timeouts, cache policy |
+| [`supabase/functions/fanout-api/fanout.test.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/supabase/functions/fanout-api/fanout.test.ts) | the 11 offline unit tests (`make bff-test`) |
+| [`supabase/functions/upstream-mock/index.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/supabase/functions/upstream-mock/index.ts) | the mock upstream |
+| [`sql/50-fanout.sql`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/sql/50-fanout.sql) | the cache table and both RPCs |
+| [`lib/bff-checks.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/lib/bff-checks.ts) | the eight checks, shared by local and hosted |
+| [`scripts/bff-local.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/scripts/bff-local.ts) | the local Docker run (`make bff-local`) |
+| [`tests/k05-fanout-api.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/tests/k05-fanout-api.ts) | the hosted module K05 |
+| [`RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/RUNLOG.md) | the 2026-10-08 entries |
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| K05 | governed-starter-kit | [`k05-fanout-api.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/tests/k05-fanout-api.ts) | none published |
+
+## Related docs
+
+- [Edge Function limits, one ceiling at a time](/reference/supabase-edge-function-limits/) - each runtime ceiling this function sits under, measured at its boundary.
+- [Locking down Supabase](/reference/supabase-data-surface-lockdown/) - what `verify_jwt` checks, and why the cache table sits outside the exposed schemas.
+- [Supabase incident resilience](/reference/supabase-incident-resilience/) - the single-function cold-start measurement the 502 above is compared with.
+
+[^sb-limits]: Supabase, "Limits," Supabase Docs. https://supabase.com/docs/guides/functions/limits
+[^sb-recursive]: Supabase, "Recursive / Nested Function Calls," Supabase Docs. https://supabase.com/docs/guides/functions/recursive-functions
+[^sb-recursive-change]: Supabase, "docs: correct function-to-function call rate limit for Edge Functions (#50806)," supabase/supabase commit 4998a13, 2026-09-23. https://github.com/supabase/supabase/commit/4998a137ecea9d0062edbecca10565cecffb5315
+[^sb-egress]: Supabase, "Why Supabase Edge Functions cannot provide static egress IPs for allow listing," Supabase Docs. https://supabase.com/docs/guides/troubleshooting/why-supabase-edge-functions-cannot-provide-static-egress-ips-for-whitelisting-3d78b0

@@ -1,0 +1,480 @@
+---
+title: "Redundant writes in Postgres: what an unchanged upsert costs"
+description: "What an upsert or UPDATE of rows that did not change writes in Postgres - row versions, WAL, full-page images, dead tuples, VACUUM - how much each guard removes, and how far reltuples and n_live_tup stand in for count(*). Measured locally on PG 15, PG 17 and the Supabase Postgres image."
+author: Erfi Anugrah
+category: supabase
+group: architecture
+---
+
+An upsert or UPDATE that re-sends unchanged rows writes them again unless it
+is guarded. This page measures what an unchanged upsert or UPDATE writes,
+which guard removes how much of it, and how far the cheap row-count sources
+can replace `count(*)`.
+
+Everything here was measured on 2026-10-08 on a local Docker rig (the
+[`redundant-writes`](https://github.com/erfianugrah/supabase-lab/tree/16077ed/experiments/redundant-writes)
+experiment in supabase-lab): `postgres:15-alpine` (15.19),
+`postgres:17-alpine` (17.11) and `public.ecr.aws/supabase/postgres:17.11.0.004`
+(17.11, the Postgres image supabase CLI 2.120.0 starts for a major_version 17
+project), each with its image's own configuration. Fixture:
+`t (id bigint primary key, a int, b text)` at 10,000, 100,000 and 1,000,000
+rows, a batch table with the same ids (identical, or 1% changed), three reps
+per cell on a fresh fixture, medians quoted. Row versions, locks and dead
+tuples were identical across reps; WAL bytes were too in every cell except the
+RW05 plain upsert at 1,000,000 rows on the two Alpine images (pg17
+315365912-317161685, pg15 312633950-316851134). WAL bytes are the statement's
+own figure from `EXPLAIN (ANALYZE, WAL)`; the `pg_current_wal_insert_lsn()`
+diff across the transaction (commit record and background WAL included) is in
+the artifact as `wal_bytes_lsn`. Nothing ran on a hosted project: the disk IO
+budget section quotes the Supabase docs and does not claim a measured hosted
+effect. Figures are PG
+17.11 (`postgres:17-alpine`) at 1,000,000 rows unless a row says otherwise.
+
+**TL;DR**
+
+- A plain `INSERT ... ON CONFLICT (id) DO UPDATE` of 1,000,000 unchanged rows
+  wrote 1,000,000 new row versions, left 1,000,000 dead tuples, grew the heap
+  from 76562432 to 153124864 bytes and wrote 400162756 bytes of WAL with a
+  checkpoint right before it. A plain UPDATE of the same rows wrote
+  344004728 bytes.
+- `WHERE (t.a, t.b) IS DISTINCT FROM (excluded.a, excluded.b)` on the
+  `DO UPDATE` stopped the new versions and the dead tuples but still locked
+  every row, as the INSERT docs say it will[^pg-insert]: 0 versions,
+  1,000,000 rows locked, 130271034 bytes of WAL (54000000 bytes with the pages
+  already logged this checkpoint cycle, 54 bytes per row).
+- `suppress_redundant_updates_trigger()` behaved the same on UPDATE and on the
+  upsert path: 0 versions, 1,000,000 rows locked, 130271034 bytes.
+- Filtering the batch before the write removed all of it on an identical
+  batch: an anti-join before `ON CONFLICT`, a guarded `MERGE`, or a `WHERE`
+  guard on UPDATE wrote 0 bytes of WAL and locked 0 rows.
+- When some rows do change, WAL follows pages touched as much as rows changed:
+  the anti-join upsert of 10,000 changed rows spread over every page wrote
+  99462572 bytes with a checkpoint right before the statement and 2994760
+  bytes with the pages already logged this checkpoint cycle.
+- `pg_class.reltuples` read in 0.33 ms (client round trip) against 12.82 ms
+  for `count(*)` (warm, server execution time from EXPLAIN ANALYZE) and kept its last VACUUM/ANALYZE value through a stats reset and a crash.
+  `n_live_tup` read 0 after `pg_stat_reset()` and after a SIGKILL, and double
+  the true count after a quick insert and a VACUUM (ANALYZE) on one
+  connection.
+
+## Which guard to pick
+
+WAL is for 1,000,000 identical rows on PG 17.11, first with a checkpoint
+right before the statement (every page's first touch writes a full-page
+image) and then with the pages already logged this checkpoint cycle.
+
+| Pattern | New versions | Rows locked, not updated (visible rows with xmax = statement xid) | WAL bytes (checkpoint right before / pages already logged) | Pick it when |
+| --- | --- | --- | --- | --- |
+| Plain `ON CONFLICT ... DO UPDATE` | 1,000,000 | 1,000,000 | 400162756 / 315515118 | Never for a batch that re-sends unchanged rows |
+| `DO UPDATE ... WHERE (...) IS DISTINCT FROM (...)` | 0 | 1,000,000 | 130271034 / 54000000 | The one-line edit to an existing upsert, or most batch rows really change |
+| Anti-join the batch first, guard kept | 0 | 0 | 0 / 0 | Most of the batch is unchanged and you can read the target in the same statement |
+| Guarded `MERGE` | 0 | 0 | 0 / 0 | PG 15 or later and no concurrent insert of the same keys (see below) |
+| `UPDATE ... WHERE (...) IS DISTINCT FROM (...)` | 0 | 0 | 0 / 0 | Any bulk UPDATE whose new values may equal the old |
+| `suppress_redundant_updates_trigger()` | 0 | 1,000,000 | 130271034 / 54000000 | You cannot change the SQL the writer sends |
+
+## What a plain upsert of unchanged rows writes
+
+Postgres does not compare old and new values before an UPDATE. The docs for
+the suppress trigger call it "the normal behavior which always performs a
+physical row update regardless of whether or not the data has
+changed"[^pg-trigger-fns], and an UPDATE leaves the old version behind for
+VACUUM: "an UPDATE or DELETE of a row does not immediately remove the old
+version of the row"[^pg-vacuum]. `ON CONFLICT DO UPDATE` takes the same path for
+every conflicting row. Measured, PG 17.11, identical batch, checkpoint right
+before the statement:
+
+| Rows | New versions | Dead tuples | WAL bytes | Full-page images | VACUUM after, WAL bytes | Statement ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| 10,000 | 10000 | 10000 | 4008081 | 124 | 115769 | 61.42 |
+| 100,000 | 100000 | 100000 | 40021870 | 1211 | 1115070 | 536.19 |
+| 1,000,000 | 1000000 | 1000000 | 400162756 | 12091 | 11109000 | 5598.37 |
+
+The heap doubled at every size (76562432 -> 153124864 bytes at 1,000,000).
+No update was HOT (`n_tup_hot_upd` 0 in every cell). A heap-only update needs
+"sufficient free space on the page containing the old row"[^pg-hot], and the
+fixture's pages were full, so each new version went to another page and,
+without HOT, needed a new primary-key index entry as well. PG 15.19 and the
+Supabase image wrote the same WAL to within 0.1% (400079799 and 400162807
+bytes at 1,000,000 rows).
+
+## The DO UPDATE guard still locks every row
+
+The INSERT reference: "Only rows for which this expression
+returns true will be updated, although all rows will be locked when the ON
+CONFLICT DO UPDATE action is taken."[^pg-insert]
+
+```sql
+insert into t as t (id, a, b)
+  select id, a, b from src
+  on conflict (id) do update set a = excluded.a, b = excluded.b
+  where (t.a, t.b) is distinct from (excluded.a, excluded.b);
+```
+
+On the identical batch: 0 new versions, 0 dead tuples, and the VACUUM
+afterwards removed 0 tuples and wrote 0 bytes. Every row still carried the
+statement's transaction id as a lock in `xmax` (1,000,000 of 1,000,000), which
+is a WAL record per row and a modified page per heap page: 130271034 bytes and
+9346 full-page images, one per heap page (76562432 bytes / 8192). With the
+pages already logged this checkpoint cycle the same statement wrote 54000000
+bytes, 54 per locked
+row. `IS DISTINCT FROM` is used over `<>` because "if both inputs are null it
+returns false"[^pg-comparison]: a NULL that stays NULL counts as unchanged.
+
+The guard cut execution time by less than it cut WAL: 4243.61 ms against
+5598.37 ms for the plain upsert on PG 17.11, and 723.83 ms against 1870.69 ms on the Supabase image
+(see Reading the numbers: the cause of the gap between the images was not
+isolated).
+
+## Filtering before the write
+
+The lock goes away only when unchanged rows never reach the write. Three
+shapes did that, each with 0 bytes of WAL and 0 rows locked on the identical
+batch at every size:
+
+```sql
+-- anti-join the batch against the table, keep the guard for rows a
+-- concurrent writer changes in between
+insert into t as t (id, a, b)
+  select s.id, s.a, s.b
+    from src s
+    left join t cur on cur.id = s.id
+   where cur.id is null or (cur.a, cur.b) is distinct from (s.a, s.b)
+  on conflict (id) do update set a = excluded.a, b = excluded.b
+  where (t.a, t.b) is distinct from (excluded.a, excluded.b);
+
+-- MERGE (PG 15+): the WHEN MATCHED condition filters before any lock
+merge into t as t
+  using src as s on t.id = s.id
+  when matched and (t.a, t.b) is distinct from (s.a, s.b) then
+    update set a = s.a, b = s.b
+  when not matched then
+    insert (id, a, b) values (s.id, s.a, s.b);
+
+-- plain UPDATE
+update t set a = s.a, b = s.b
+  from src s
+ where t.id = s.id and (t.a, t.b) is distinct from (s.a, s.b);
+```
+
+A `MERGE` `WHEN MATCHED` clause "is executed if the condition is absent or it
+evaluates to true"[^pg-merge]; on the identical batch it ran for no row. The
+MERGE reference also points concurrent writers at the other statement: "You
+may also wish to consider using INSERT ... ON CONFLICT as an alternative
+statement which offers the ability to run an UPDATE if a concurrent INSERT
+occurs."[^pg-merge] That is why the anti-join form keeps `ON CONFLICT` and its
+guard.
+
+The filter costs a read of the target. At 1,000,000 rows the anti-join upsert
+ran in 241.04 ms, MERGE in 364.03 ms and the guarded UPDATE in 286.61 ms,
+against 4243.61 ms for the guard-only upsert. With 1% of rows changed, each
+pattern wrote new versions of exactly the 10,000 changed rows. The anti-join
+upsert's 10,000 new versions also carried its xid in `xmax` (the
+`ON CONFLICT` path locks a row before it updates it); MERGE's new versions did
+not. Both locked the 10,000 rows they replaced.
+
+Not measured: what the anti-join does when another transaction changes a row
+between the statement's snapshot and its write. The filtered and unfiltered
+statements can leave different final values in that case; which one is right
+depends on the application.
+
+## UPDATE and suppress_redundant_updates_trigger
+
+The built-in trigger "will prevent any update that does not actually change
+the data in the row from taking place"[^pg-trigger-fns]. It did prevent the
+new version, and it did not prevent the lock:
+
+| PG 17.11, 1,000,000 identical rows | New versions | Rows locked, not updated (visible rows with xmax = statement xid) | WAL bytes | Dead tuples | ms |
+| --- | --- | --- | --- | --- | --- |
+| `UPDATE ... FROM src` | 1000000 | 0 | 344004728 | 1000000 | 1861.55 |
+| same, `WHERE (...) IS DISTINCT FROM (...)` | 0 | 0 | 0 | 0 | 286.61 |
+| same, trigger installed | 0 | 1000000 | 130271034 | 0 | 630.17 |
+| plain upsert, trigger installed | 0 | 1000000 | 130271034 | 0 | 4720.58 |
+
+A plain UPDATE reads 0 here because the xmax it sets is on the old, now
+invisible versions; the plain upsert reads 1,000,000 because `ON CONFLICT`
+carries its lock onto the new version.
+
+The docs ask for the trigger to fire last ("you would therefore choose a
+trigger name that comes after the name of any other trigger you might have on
+the table") and warn that it "takes a small but non-trivial time for each
+record"[^pg-trigger-fns]. It fits the writer you cannot change: an ORM or a
+sync tool.
+
+```sql
+create trigger zzz_suppress_redundant_updates
+  before update on t
+  for each row execute function suppress_redundant_updates_trigger();
+```
+
+The function existed on all three servers (checked with `to_regproc`).
+
+## Full-page images: why WAL follows pages
+
+With `full_page_writes` on (all three servers here), "the PostgreSQL server
+writes the entire content of each disk page to WAL during the first
+modification of that page after a checkpoint"[^pg-wal-config]. A statement's
+WAL therefore depends on where it lands in the checkpoint cycle. The rig
+measured both ends:
+
+| PG 17.11, 1,000,000 rows | WAL bytes, checkpoint right before | Full-page images | WAL bytes, pages already logged | Full-page images |
+| --- | --- | --- | --- | --- |
+| Plain upsert, identical | 400162756 | 12091 | 315515118 | 1489 |
+| Guarded upsert, identical | 130271034 | 9346 | 54000000 | 0 |
+| Plain UPDATE, identical | 344004728 | 12091 | 247483968 | 0 |
+| Anti-join upsert, 1% changed | 99462572 | 12080 | 2994760 | 0 |
+| Guarded MERGE, 1% changed | 98922572 | 12080 | 2454760 | 0 |
+
+The 1% cases are the worst shape for full-page images: every 100th id
+changed and about 107 rows sit on a page (1,000,000 rows over 9346 pages), so
+every heap page held a changed row and 10,000 row changes cost a full-page
+image of every page. Changes clustered on fewer pages would write fewer
+images; that was not measured. The 1489 images left in the plain upsert's
+second column (pg17; pg15 read 1296) most likely came from a checkpoint
+starting during the statement on the two Alpine images (not instrumented);
+the Supabase image read 0 there and 303650416 bytes.
+
+## Dead tuples, autovacuum and VACUUM
+
+Autovacuum vacuums a table once its dead tuples pass "vacuum base threshold +
+vacuum scale factor * number of tuples"[^pg-vacuum], 50 + 0.2 x `reltuples`
+on all three servers here. Every plain case crossed it (1,000,000 dead
+against 200,050); no guarded, filtered, MERGE or trigger case did, including
+the 1% ones (10,000 dead). The VACUUM that cleans up after a plain upsert of
+1,000,000 rows wrote 11109000 bytes of WAL and ran 280.5 ms here; after the
+guarded upsert of the same batch it removed nothing and wrote 0 bytes.
+Autovacuum was disabled on the test tables so the counts are what each
+statement left behind.
+
+## Count estimates and exact counts
+
+`count(*)` reads the table. `pg_class.reltuples` is "only an estimate used by
+the planner. It is updated by VACUUM, ANALYZE, and a few DDL commands such as
+CREATE INDEX."[^pg-class] `pg_stat_user_tables.n_live_tup` is an "Estimated
+number of live rows" from the cumulative statistics system[^pg-stats], which
+has three properties that matter here: each process flushes its counters to
+shared memory "just before going idle, but not more frequently than once per
+PGSTAT_MIN_INTERVAL milliseconds (1 second unless altered while building the
+server)"; a clean shutdown keeps them; and after "an unclean shutdown (e.g.,
+after an immediate shutdown, a server crash, starting from a base backup, and
+point-in-time recovery), all statistics counters are reset."[^pg-stats]
+
+Measured at 1,000,000 rows, identical on all three servers:
+
+| Event | `reltuples` | `n_live_tup` | `count(*)` |
+| --- | --- | --- | --- |
+| After load, VACUUM, ANALYZE | 1000000 | 1000000 | 1000000 |
+| After a clean restart | not read | 1000000 | not read |
+| After `pg_stat_reset()` | 1000000 | 0 | 1000000 |
+| +100,000 rows after the reset, no ANALYZE | 1000000 | 100000 | 1100000 |
+| After ANALYZE | 1100000 | 1100000 | not read |
+| After SIGKILL and restart | 1100000 | 0 | 1100000 |
+
+After the 100,000-row insert the planner's own row estimate for a full scan
+was 1100043 while raw `reltuples` still read 1000000: the planner "fetches the
+actual current number of pages in the table" and scales `reltuples` when the
+page count differs[^pg-row-est]. `EXPLAIN select * from t` gives that estimate
+when raw `reltuples` is stale.
+
+`n_live_tup` also over-counted. A table loaded and then vacuumed with VACUUM
+(ANALYZE) on the same connection read exactly double its row count in 35 of 36
+reps across the three servers and four sizes (1,000 to 1,000,000 rows); the
+same load with the VACUUM on a second connection read the true count every
+time. The one same-connection rep that read true was the only one whose insert
+took over a second (1013.1 ms). The reading that fits the one-second flush
+rule: the insert's counters were still pending when VACUUM wrote its absolute
+count, and the later flush added them on top. The flush itself was not
+instrumented. RW04's fixture is also a same-connection load, but it inserts
+two 1,000,000-row tables before its VACUUM and read the true count.
+
+Timing, PG 17.11, 1,000,000 rows: `count(*)` 12.82 ms warm and 12.98 ms after
+a container restart and a dropped page cache in the Docker VM (server
+execution time from EXPLAIN ANALYZE), reading all 9346 heap pages; the
+`reltuples` lookup 0.33 ms warm and 2.08 ms on the first connection after the
+restart (client round trip). The cold figure is not a disk read: the macOS
+page cache under the VM was not dropped. Where those 9346 pages are not
+cached, each exact count reads them from disk, and a large sequential scan
+reuses a 256KB ring of buffers rather than filling shared
+buffers[^pg-buffer-ring], so repeated counts do not get cheaper by caching in
+Postgres.
+
+## How this relates to the Supabase disk IO budget
+
+The Supabase docs define disk IO as "throughput in Megabytes per second (MB/s)
+and IOPS which are Input/Output Operations per Second"[^sb-disk-io], and the
+budget as burst capacity above a per-size baseline: "Compute sizes up to 2XL
+can burst above their baseline for short periods of time, drawing on a disk IO
+budget. Once the budget is exhausted, performance returns to
+baseline."[^sb-compute] The dashboard metric is `Disk IO % consumed`: "If the
+`Disk IO % consumed` stat is more than 1%, it indicates that your workload has
+exceeded the baseline IO throughput during the day."[^sb-compute] Running out
+can show up as slower responses, CPU spent in IO wait, and disrupted daily
+backups and autovacuum[^sb-disk-io].
+
+What this page measured is the Postgres side: WAL bytes, full-page images,
+dead tuples and VACUUM work per statement. All of it is data Postgres writes
+to disk (WAL at commit, dirty pages at checkpoint, VACUUM's own pages), so a
+pre-write filter that removes 400162756 bytes of WAL and 1,000,000 dead tuples
+per 1,000,000-row identical batch with a checkpoint right before it (315515118
+bytes with the pages already logged) removes write volume from whatever disk
+the database sits on (reasoned from where Postgres writes, not measured as
+disk IO). How much of a
+hosted project's budget that is, on which compute size, gp3 or io2, was not
+measured; nothing here was run against a hosted project. The
+[compute and disk reference](/reference/supabase-compute-disk/) has the
+per-size baselines and the documented `Disk IO % consumed` metric, and
+the [Grafana monitoring guide](/guides/supabase-grafana-monitoring/) has the
+EBS burst-balance alerts that warn before the budget runs out.
+
+## What to do about it
+
+Every row rests on a module in this page's experiment
+([`redundant-writes`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/redundant-writes/RUNLOG.md), run 2026-10-08) unless it says otherwise.
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Filter unchanged rows out of the batch before `INSERT ... ON CONFLICT`. | Anti-join upsert of 1,000,000 identical rows: 0 bytes of WAL, 0 rows locked, 241.04 ms; plain upsert 400162756 bytes. | RW02 |
+| Keep the `IS DISTINCT FROM` guard on `DO UPDATE` behind the filter. | Design choice: it covers rows another writer changes between the read and the write; on the identical batch the filtered statement wrote 0 bytes with it in place. | RW02 |
+| Do not count on the `DO UPDATE` guard alone to stop disk writes. | 0 new versions but 1,000,000 rows locked and 130271034 bytes of WAL (54000000 with the pages already logged). | RW02, RW05 |
+| Add `WHERE (cols) IS DISTINCT FROM (new values)` to bulk UPDATEs. | 0 bytes and 286.61 ms against 344004728 bytes and 1861.55 ms. | RW03 |
+| Use `suppress_redundant_updates_trigger()` only for writers you cannot change. | Same lock cost as the `DO UPDATE` guard (130271034 bytes, 1,000,000 rows locked); name it to fire last. | RW03 |
+| Read `reltuples` (or the planner's estimate) for a row count. | 0.33 ms (client round trip) against 12.82 ms for `count(*)` (server execution time); survived `pg_stat_reset()` and a SIGKILL. | RW04 |
+| Run ANALYZE after a bulk load before trusting `reltuples`. | Read 1000000 after a 100,000-row insert until ANALYZE; the planner estimate read 1100043. | RW04 |
+| Do not use `n_live_tup` as a row count. | 0 after `pg_stat_reset()` and after a crash; double the true count in 35 of 36 same-connection reps. | RW04, RW06 |
+| Measure WAL with `EXPLAIN (ANALYZE, WAL)` or `pg_current_wal_insert_lsn()`. | `pg_current_wal_lsn()` is the write position; a diff of it read 0 bytes for VACUUMs after 10,000-dead-tuple statements on pg17 and supabase (superseded run, recorded in RUNLOG only, artifact not published). | RUNLOG |
+| Compare `Disk IO % consumed` before and after deploying a guard. | Documented metric[^sb-compute]; the hosted effect of a guard was not measured. | none |
+
+## Reading the numbers
+
+What generalises: the row-level behaviour (a new version per updated row, a
+lock per row the `DO UPDATE` guard or the trigger skips, nothing for a row
+filtered out first) and the WAL per row for this row shape (54 bytes per
+lock, about 247 bytes per plain UPDATE and 304 per plain upsert (Supabase
+image, the only server whose RW05 plain-upsert cell had 0 full-page images:
+303650416 / 1,000,000), derived from the 1,000,000-row cells. The 54 and 247
+figures were the same on PG 15.19, PG 17.11 and the Supabase image to within
+0.1%.
+
+What does not: execution time. Every 1,000,000-row `ON CONFLICT` case that
+reached the conflict path for all rows took 4236.6 to 5638.89 ms on the two
+Alpine images and 723.83 to 1870.69 ms on the Supabase image, with the same
+WAL; plain UPDATE, MERGE and the anti-join were within 25% across the three.
+The Alpine images are musl builds and the Supabase image a glibc build; that
+was not tested as the cause, and JIT was ruled out by a manual check (one run
+per image, not a module; RUNLOG). Full-page-image volume depends on checkpoint
+timing, so a real batch lands between the two WAL columns of the
+full-page-image table. The table is narrow (three columns, primary key only, full
+pages): wider rows, more indexes, TOAST or a lower fillfactor change the
+bytes per row and whether updates are HOT, and none of those were measured.
+
+## Decision guide
+
+```dot
+digraph {
+    rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+    fontname="Helvetica,Arial,sans-serif";
+    node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+    edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+    start [label="Batch re-sends rows\nthe table may already hold"];
+    sql [label="Can you change\nthe writer's SQL?"];
+    kind [label="Upsert or UPDATE?"];
+    filter [label="Anti-join the batch first,\nkeep the IS DISTINCT FROM guard"];
+    upd [label="UPDATE ... WHERE (cols)\nIS DISTINCT FROM (new)"];
+    trig [label="suppress_redundant_updates_trigger\n(versions stop, locks remain)"];
+    count [label="Need a row count?\nreltuples after ANALYZE,\nnot n_live_tup"];
+
+    start -> sql;
+    sql -> kind [label="yes"];
+    sql -> trig [label="no"];
+    kind -> filter [label="upsert"];
+    kind -> upd [label="UPDATE"];
+    filter -> count;
+    upd -> count;
+    trig -> count;
+}
+```
+
+1. If you can change the SQL and it is an upsert: anti-join the batch against
+   the table first and keep the `IS DISTINCT FROM` guard on `DO UPDATE`.
+2. If you can change the SQL and it is an UPDATE: add
+   `WHERE (cols) IS DISTINCT FROM (new values)`.
+3. If you cannot change the SQL: install `suppress_redundant_updates_trigger()`
+   and expect the row locks to remain.
+4. For a row count: `reltuples` refreshed by ANALYZE, or the planner's
+   estimate; not `n_live_tup`.
+
+## Evidence
+
+| Claim | How it was checked |
+| --- | --- |
+| Plain upsert / UPDATE rewrites every unchanged row | Measured: rows with xmin = the statement's xid counted inside its transaction, `n_dead_tup` after a forced stats flush (RW02, RW03) |
+| `DO UPDATE` guard and the trigger lock every row | Measured: rows with xmax = the statement's xid (RW02, RW03); the lock behaviour of the guard is also documented[^pg-insert] |
+| Anti-join, guarded MERGE and guarded UPDATE write nothing on an identical batch | Measured: EXPLAIN (ANALYZE, WAL), 0 records (RW02, RW03) |
+| WAL with a checkpoint right before the statement and with the pages already logged this checkpoint cycle | Measured: CHECKPOINT before the statement (RW02, RW03) vs before the fixture (RW05) |
+| VACUUM cost after each case | Measured: VACUUM (VERBOSE) "WAL usage" line (RW02, RW03) |
+| `reltuples` vs `n_live_tup` vs `count(*)` across reset, insert, ANALYZE, restart, crash | Measured (RW04) |
+| `n_live_tup` doubling after a same-connection load and VACUUM | Measured (RW06); the flush-timing mechanism is inferred, not instrumented |
+| Cold `count(*)` timing | Measured through the macOS page cache, so not a disk read (RW04) |
+| Disk IO budget definition and `Disk IO % consumed` | Documented[^sb-disk-io][^sb-compute], not tested here |
+| Effect of any of this on a hosted project's disk IO | Not measured |
+
+## Reproducing
+
+The rig, the SQL for every case (`lib/cases.ts`) and the published artifacts
+are in
+[`experiments/redundant-writes`](https://github.com/erfianugrah/supabase-lab/tree/16077ed/experiments/redundant-writes).
+`make all` starts the three containers, runs RW01 to RW06, publishes the
+redacted run artifact (this page cites two: RW01-RW05 and a separate RW06 run)
+to `out/` under the run date and removes the containers; it needs Docker, bun,
+openssl and the lab repo's harness, no Supabase account. `RW_SIZES`, `RW_REPS` and
+`RW_TARGETS` narrow the matrix. RW04 restarts and kills the rig's containers
+and drops the Docker VM's page cache, which affects every container on that VM.
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| RW01 | redundant-writes | [`rw01-environment.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/redundant-writes/tests/rw01-environment.ts) | [`run-2026-10-08T13-10-22-155Z`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/redundant-writes/out/2026-10-08/run-2026-10-08T13-10-22-155Z.facts.md) |
+| RW02 | redundant-writes | [`rw02-upsert.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/redundant-writes/tests/rw02-upsert.ts) | [`run-2026-10-08T13-10-22-155Z`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/redundant-writes/out/2026-10-08/run-2026-10-08T13-10-22-155Z.facts.md) |
+| RW03 | redundant-writes | [`rw03-update.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/redundant-writes/tests/rw03-update.ts) | [`run-2026-10-08T13-10-22-155Z`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/redundant-writes/out/2026-10-08/run-2026-10-08T13-10-22-155Z.facts.md) |
+| RW04 | redundant-writes | [`rw04-count-estimate.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/redundant-writes/tests/rw04-count-estimate.ts) | [`run-2026-10-08T13-10-22-155Z`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/redundant-writes/out/2026-10-08/run-2026-10-08T13-10-22-155Z.facts.md) |
+| RW05 | redundant-writes | [`rw05-no-fpi.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/redundant-writes/tests/rw05-no-fpi.ts) | [`run-2026-10-08T13-10-22-155Z`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/redundant-writes/out/2026-10-08/run-2026-10-08T13-10-22-155Z.facts.md) |
+| RW06 | redundant-writes | [`rw06-live-tup-race.ts`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/redundant-writes/tests/rw06-live-tup-race.ts) | [`run-2026-10-08T13-35-31-791Z`](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/redundant-writes/out/2026-10-08/run-2026-10-08T13-35-31-791Z.facts.md) |
+
+## Related docs
+
+- [Supabase compute and disk sizing](/reference/supabase-compute-disk/) - the
+  per-size IO baselines and the `Disk IO % consumed` metric (how this page's
+  write volume shows up there was not measured).
+- [Monitor Supabase with Grafana](/guides/supabase-grafana-monitoring/) - the
+  EBS burst-balance alerts that warn before the IO budget runs out.
+- [Stripe Sync Engine](/reference/stripe-sync-engine/) - another place
+  `n_live_tup` read a different number from `count(*)` after a backfill.
+- [What a Supabase platform operation costs a client](/reference/supabase-platform-operation-cost/) -
+  what is and is not known about statistics surviving a platform restart.
+
+[^pg-insert]: PostgreSQL, "INSERT," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/17/sql-insert.html
+
+[^pg-trigger-fns]: PostgreSQL, "Trigger Functions," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/17/functions-trigger.html
+
+[^pg-vacuum]: PostgreSQL, "Routine Vacuuming," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/17/routine-vacuuming.html
+
+[^pg-hot]: PostgreSQL, "Heap-Only Tuples (HOT)," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/17/storage-hot.html
+
+[^pg-comparison]: PostgreSQL, "Comparison Functions and Operators," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/17/functions-comparison.html
+
+[^pg-merge]: PostgreSQL, "MERGE," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/17/sql-merge.html
+
+[^pg-wal-config]: PostgreSQL, "Write Ahead Log," PostgreSQL 17 Documentation (server configuration). https://www.postgresql.org/docs/17/runtime-config-wal.html
+
+[^pg-class]: PostgreSQL, "pg_class," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/17/catalog-pg-class.html
+
+[^pg-stats]: PostgreSQL, "The Cumulative Statistics System," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/17/monitoring-stats.html
+
+[^pg-row-est]: PostgreSQL, "Row Estimation Examples," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/17/row-estimation-examples.html
+
+[^pg-buffer-ring]: PostgreSQL source, "Buffer Ring Replacement Strategy," src/backend/storage/buffer/README (REL_17_STABLE). https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/storage/buffer/README
+
+[^sb-disk-io]: Supabase, "High Disk I/O," Supabase Docs. https://supabase.com/docs/guides/troubleshooting/exhaust-disk-io
+
+[^sb-compute]: Supabase, "Compute and Disk," Supabase Docs. https://supabase.com/docs/guides/platform/compute-and-disk

@@ -78,6 +78,21 @@ Auth also has levers a customer switches *on*. Each hardens Auth alone and gates
 
 S14 read the switch-on fields on a micro project (2026-08-31) and S19 drove them to their refusals (2026-09-03). In S19 the rate-limit count was exact, with no burst above the configured value in that window. In the seconds before the hook was active, signups returned a 400 without the hook's message (observed while writing the probe, not recorded in the artifact), so a verifier waits for the hook's own text.
 
+## What each platform control covers
+
+The controls a security review asks about outside the HTTP tier each have a documented scope. The right-hand column is what stays reachable, readable or uncovered with the control on.
+
+| Control | Covers | Does not cover |
+|---|---|---|
+| Network Restrictions | Postgres and the database pooler[^sb-netrestrict] | the HTTPS APIs (the docs name PostgREST, Storage and Auth) and supabase-js. Edge Functions lose direct database access while restrictions are on, and the docs point them at supabase-js instead;[^sb-netrestrict] measured as a `CONNECT_TIMEOUT` under [Option 2](#option-2-lock-the-database-socket) |
+| SSL enforcement | connections to Postgres, Supavisor and PgBouncer[^sb-ssl] | the HTTP APIs, which enforce SSL on every connection regardless.[^sb-ssl] (Side effect: applying or updating it triggers a fast database reboot.[^sb-ssl]) |
+| PrivateLink | Postgres and PgBouncer connections from an AWS VPC in the project's region; Team and Enterprise; Beta[^sb-privatelink-feature] | the Supabase API, Storage, Auth and Realtime, which stay on public endpoints;[^sb-privatelink-feature] and the uptime SLA, which does not cover Beta products.[^sb-sla] Measured in [AWS PrivateLink to Supabase](/reference/supabase-aws-privatelink/) |
+| Read-only organization role (Team and Enterprise) | Dashboard access without writes; its SQL runs as `supabase_read_only_user`, a member of `pg_read_all_data`[^sb-access-control] | secrets: the access-control table footnotes that the Read-only role "is able to access secrets".[^sb-access-control] Nor row visibility: `pg_read_all_data` alone does not bypass RLS,[^pg-predefined] but the lab read BYPASSRLS on `supabase_read_only_user` (governed-starter-kit [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/RUNLOG.md) and [ACCESS-CONTROL.md](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/docs/ACCESS-CONTROL.md), 2026-10-07), so a Read-only member's SQL reads every row. A Read-only member's own session was not exercised |
+| MCP server `read_only=true` | writes: it executes SQL "as a read-only Postgres user"[^sb-mcp] | row visibility, as far as the docs say: they name no role and do not mention RLS. The server sends `read_only: true` to the Management API's `/v1/projects/{ref}/database/query`,[^mcp-src] and the API documents its sibling `/database/query/read-only` as running as `supabase_read_only_user`.[^sb-mgmt-query] If the flag lands on that role, a read-only MCP session reads every row as the Read-only role does. Which role the MCP path runs as was not measured |
+| Enterprise uptime SLA | 99.9% of each calendar month, per product, for generally available products[^sb-sla] | Beta and Alpha products, and the listed exclusions, among them third-party vendors and cloud providers, integration partners, force majeure and ISP outages, customer misconfiguration or resource limits, and account suspension.[^sb-sla] Below Enterprise there is no uptime SLA; the remedy and plan split are in [what the SLA does and does not cover](/reference/supabase-dr-tiers/#what-the-sla-does-and-does-not-cover) |
+
+A Read-only seat should be treated as a whole-database read (BYPASSRLS read on `supabase_read_only_user`, 2026-10-07; no member session exercised), and a read-only MCP session as one until a probe shows otherwise. Network Restrictions, SSL enforcement and PrivateLink act on Postgres connections only, so the HTTP tier stays as the lever table under [Why there is no perimeter to harden](#why-there-is-no-perimeter-to-harden) measured it.
+
 ## Which option fits the goal
 
 Before picking an option, read the Management API security advisor. In security-lockdown S01 it caught every seeded exposure - `rls_disabled_in_public`, `rls_enabled_no_policy`, `security_definer_view`, `anon_/authenticated_security_definer_function_executable`, `function_search_path_mutable` - so for the database half it answers "are we locked down?" before any lever is pulled, and again after each one.
@@ -94,6 +109,20 @@ Before picking an option, read the Management API security advisor. In security-
 The boundary is the row, so the control belongs on the row, set through grants, RLS, and the token.
 
 ### Grants
+
+#### The default is changing
+
+On existing projects a table created in `public` receives `SELECT`, `INSERT`, `UPDATE` and `DELETE` for `anon`, `authenticated` and `service_role` by default, and Supabase is changing the platform default to revoke those automatic grants.[^sb-securing] The rollout was announced on 2026-04-28:[^sb-grants-change]
+
+| Date | What changes |
+|---|---|
+| 2026-04-28 | opt-in at project creation: leave the "Automatically expose new tables" checkbox unchecked |
+| 2026-05-30 | the new behaviour becomes the default for new projects |
+| 2026-10-30 | enforced on existing projects: a new table in `public` without an explicit `grant` stops being reachable through the Data API |
+
+The change is to default privileges, so it governs tables created afterwards. The announcement's opt-in SQL changes the defaults for future tables and sequences the `postgres` role creates in `public`, and existing objects keep their current grants.[^sb-grants-change]
+
+A project the lab created with OpenTofu on 2026-08-28, after the new-project date, still had the old default. In iap-lockdown L08 a table created with no `GRANT` was readable by anon through the Data API. The first L08 run on that project made that observation before any lab statement had altered a default privilege. Its attempt to alter them was refused (42501), and its teardown then granted `SELECT` on new tables to anon and authenticated. Revoking `postgres`'s default privileges closed the next new table in the second run, after that teardown, so the default ACL as the source is inferred, not shown on the untouched project ([RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/iap-lockdown/RUNLOG.md), [L08](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/iap-lockdown/tests/l08-grant-lockdown.ts)). The cause was not established. The announcement describes the setting on the project creation screen and does not say what a project created through the Management API or a Terraform provider receives. `select defaclrole::regrole, defaclnamespace::regnamespace, defaclobjtype, defaclacl from pg_default_acl where defaclobjtype = 'r'` shows what a given project will grant on new tables: an `anon=` entry for `postgres` in `public` means new tables arrive exposed. Whatever it shows, grant each table explicitly and enable RLS on it;[^sb-securing] a migration written that way behaves the same before and after 2026-10-30.
 
 #### One table
 
@@ -394,6 +423,8 @@ Each row names the module id it rests on (security-lockdown unless prefixed); a 
 | Restrict EXECUTE on schema `net` to the roles that need it, or leave `pg_net` disabled. | `net.http_get('https://...')` returned 200 from SQL. | [S08](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/security-lockdown/tests/s08-pg-net-egress.ts) |
 | Inventory Edge Functions that open a direct database connection before Option 2. | Under restrict-all the `pg` connect over `SUPABASE_DB_URL` fails with `CONNECT_TIMEOUT db.<ref>.supabase.co:5432` while the `/rest` fallback with the service key still serves, so they move to the Data API path or break. Whether pg_cron jobs or database webhooks are affected was not measured. | iap-lockdown [L22](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/iap-lockdown/tests/l22-ef-under-restrictions.ts) |
 | Verify the socket lock through the pooler from an excluded address. | Expect `FATAL (EADDRNOTALLOWED) address not in tenant` on the shared pooler; on direct 5432 and the dedicated pooler expect a connect timeout instead (medium-serverless MS03). | [S10](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/security-lockdown/tests/s10-socket-lock.ts) |
+| Grant each new table explicitly and enable RLS on it, whatever the platform default. | The documented default on existing projects gives new `public` tables all four privileges for `anon`, `authenticated` and `service_role`; from 2026-10-30 new tables get none, and existing tables keep their grants; a project created with OpenTofu on 2026-08-28 still exposed a table created with no `GRANT` to anon. | iap-lockdown [L08](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/iap-lockdown/tests/l08-grant-lockdown.ts) |
+| Do not give a Read-only seat or read-only MCP to anyone barred from some rows. | `supabase_read_only_user` carries BYPASSRLS (read 2026-10-07) and the Read-only role can access secrets per the access-control docs; which role the MCP read-only path uses was not measured. | governed-starter-kit [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/RUNLOG.md), a RUNLOG record with no module |
 | Create views over RLS tables `with (security_invoker = true)`. | A plain view returned every row to anon, the invoker-security view 0. | iap-lockdown [L08](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/iap-lockdown/tests/l08-grant-lockdown.ts) |
 | Set `password_min_length` to 12 or more and keep MFA TOTP verify on. | Both are set through `PATCH /v1/projects/{ref}/config/auth`. A 4-character password was refused with 422 on the update path; `password_hibp_enabled` is off by default and, once on, does not fire on `PUT /auth/v1/user`. The value 12 is a design choice; the 422 on a 4-character password is the measurement. | [S03](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/security-lockdown/tests/s03-auth-hardening.ts), [S11](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/security-lockdown/tests/s11-auth-efficacy.ts) |
 | Treat key revocation in the proxy-only variant as three separate acts. | Disabling legacy keys refuses the legacy anon JWT after about 45s, the `sb_publishable_` generation is independent and keeps reading, and the control plane re-mints a key at will (201), so any PAT holder reopens the path. | iap-lockdown [L05](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/iap-lockdown/tests/l05-key-revocation.ts), [L11](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/iap-lockdown/tests/l11-worker-access-proxy.ts) |
@@ -435,6 +466,9 @@ Every measured claim comes out of four disposable supabase-lab experiments, plus
 | `verify_jwt` passes any project JWT | tested | anon-key call to a `verify_jwt=true` function returns 200 |
 | Legacy-key disable leaves publishable keys working | tested | `PUT /api-keys/legacy?enabled=false`, publishable key still reads |
 | Grants close a table; default privileges reopen new ones | tested | `REVOKE` + `CREATE TABLE` + `ALTER DEFAULT PRIVILEGES`, probed via `/rest/v1` |
+| An OpenTofu-created project on 2026-08-28 still granted anon on new tables, after the 2026-05-30 new-project default | tested; cause not established | a table created with no `GRANT` read by anon in the project's first L08 run, before any lab statement altered a default privilege ([L08](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/iap-lockdown/tests/l08-grant-lockdown.ts)); dates from the [announcement](https://github.com/orgs/supabase/discussions/45329) |
+| `supabase_read_only_user` has BYPASSRLS | tested | role attribute read on the governed-starter-kit project, 2026-10-07 ([RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/16077ed/experiments/governed-starter-kit/RUNLOG.md)); a Read-only member's session not exercised |
+| Scope of Network Restrictions, SSL enforcement, PrivateLink, the Read-only role, MCP read-only mode and the SLA | documented | the pages cited in [What each platform control covers](#what-each-platform-control-covers); the MCP role inferred from the server source and the API spec, not measured |
 | `db-pre-request` does not fire on hosted | tested | GUC set + `NOTIFY`, no pre-request within 120s ([L09](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/iap-lockdown/tests/l09-prerequest-and-api-enum.ts)) or 61s ([S16](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/security-lockdown/tests/s16-prerequest-restart.ts)); none within 182s after `POST /restart` ([S16](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/security-lockdown/tests/s16-prerequest-restart.ts)); fires on own PostgREST ([S04](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/security-lockdown/tests/s04-self-hosted-postgrest.ts)) |
 | The hosted edge appends to `x-forwarded-for` and passes `cf-connecting-ip` | tested | RPC returning `request.headers`: 1 address without a client header, 2 with, client value first ([S16](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/security-lockdown/tests/s16-prerequest-restart.ts)) |
 | A client-supplied `cf-connecting-ip` never reaches SQL | tested | same RPC carrying `cf-connecting-ip: 203.0.113.9` -> `403` at the edge; without a client header the key is present and equals the sole `x-forwarded-for` element ([S22a](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/security-lockdown/tests/s22-header-keyed-checks.ts)) |
@@ -537,3 +571,21 @@ Every measured claim comes out of four disposable supabase-lab experiments, plus
 [^sb-captcha]: Supabase, "Enable CAPTCHA Protection," Supabase Docs. https://supabase.com/docs/guides/auth/auth-captcha
 
 [^sb-authratelimit]: Supabase, "Rate Limits," Supabase Docs. https://supabase.com/docs/guides/auth/rate-limits
+
+[^sb-grants-change]: Supabase, "Breaking Change: Tables not exposed to Data and GraphQL API automatically," supabase GitHub Discussions #45329, 2026-04-28. https://github.com/orgs/supabase/discussions/45329
+
+[^sb-ssl]: Supabase, "Postgres SSL Enforcement," Supabase Docs. https://supabase.com/docs/guides/platform/ssl-enforcement
+
+[^sb-privatelink-feature]: Supabase, "PrivateLink," Supabase Features. https://supabase.com/features/privatelink
+
+[^sb-sla]: Supabase, "Service Level Agreement." https://supabase.com/sla
+
+[^sb-access-control]: Supabase, "Access Control," Supabase Docs. https://supabase.com/docs/guides/platform/access-control
+
+[^pg-predefined]: PostgreSQL, "Predefined Roles," PostgreSQL Documentation. https://www.postgresql.org/docs/current/predefined-roles.html
+
+[^sb-mcp]: Supabase, "Supabase MCP Server," Supabase Docs. https://supabase.com/docs/guides/getting-started/mcp
+
+[^mcp-src]: Supabase, "api-platform.ts," supabase/mcp, commit 8a26508. https://github.com/supabase/mcp/blob/8a2650891e2fa6e5e895075663ba4f35867083d6/packages/mcp-server-supabase/src/platform/api-platform.ts
+
+[^sb-mgmt-query]: Supabase, "Management API OpenAPI document," api.supabase.com, as served on 2026-10-08. https://api.supabase.com/api/v1-json
