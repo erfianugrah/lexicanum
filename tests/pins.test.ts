@@ -1646,6 +1646,26 @@ const pins: Pin[] = [
       "14859 ms",
     ],
   },
+  {
+    doc: "reference/glanceable-dashboards-environmental-telemetry",
+    mustContain: [
+      // The sections-grid correction: the legacy key is tripled on load, which
+      // is what makes a legacy 12 wrap inside a two-column-wide section.
+      "GRID_COLUMN_MULTIPLIER",
+      "layout_options.grid_columns",
+      "grid_options.columns",
+      // last_reported is a state property, not an attribute - the trap that
+      // makes state_attr() return none.
+      "states.<entity_id>.last_reported",
+      // Staleness is the failure mode the page exists to make visible.
+      "keeps an entity's last value indefinitely",
+      // Both surfaces name the same published scale; a local gradient would
+      // let the two boards disagree about the same air.
+      "The US EPA AQI categories as published by AirNow",
+    ],
+    sections: [/^## Checklist$/m, /^## What was checked here$/m],
+    linksTo: ["reference/openaq-pm25-home-assistant"],
+  },
 ];
 
 describe.each(pins.map((p) => [p.doc, p] as const))("%s", (_name, pin) => {
