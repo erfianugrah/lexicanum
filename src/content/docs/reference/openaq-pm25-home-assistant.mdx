@@ -1,0 +1,307 @@
+---
+title: "OpenAQ community PM2.5 in Home Assistant"
+description: What data sources exist for outdoor PM2.5 in Singapore, how the OpenAQ v3 API routes work for polling integrations, and what we learnt wiring 14 community stations into Home Assistant - entity-id slugification, nearest-station projections, verifying through Prometheus, and the per-location sensor-ID mapping that the API itself does not surface.
+author: Erfi Anugrah
+category: homelab
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+What the outdoor PM2.5 source landscape looks like in Singapore, how the OpenAQ v3 API routes data (and does not), and the Home Assistant integration patterns that survived real use: station-roster polling, entity-id naming, nearest-station projections with freshness cutoffs, and end-to-end verification through Prometheus rather than the HA API.
+
+Everything here was verified on a personal homelab, 2026-10-08: Home Assistant 2025.x on an NixOS Raspberry Pi, Prometheus scraping HA's `/api/prometheus` endpoint, and a Grafana 13 instance with a datasource-proxy query path. The OpenAQ v3 API shape is from its public docs; the API key, rate-limit, and endpoint behaviour was confirmed with live `curl` probes against the free tier.
+
+The indoor half of this setup is covered in [AirGradient ONE on ESPHome, fully local](/guides/airgradient-one-esphome-local/), and the NEA's official regional feed in [Singapore weather alerts and live maps with Home Assistant and Grafana](/guides/singapore-weather-ha-grafana/). The network this runs on is the one in [Home IoT: an ESPHome fleet on a Flint-bridged VLAN](/reference/home-iot-network/).
+
+**TL;DR:**
+
+- **NEA's data.gov.sg feed** is reference-grade but spatially coarse: five regions for the whole island. Good as a sanity-check baseline, not as a neighbourhood reading.
+- **IQAir's map** looks denser because it mixes government reference stations with crowd low-cost sensors (AirVisual Pro, PurpleAir feeds) and modelled values - and it displays US AQI, not concentration. The data-source label on each marker is buried in a station detail panel.[^iqair-source]
+- **OpenAQ** aggregates only openly-licensed feeds. For Singapore that is ~14 currently-active locations within 25 km, mostly AirGradient's outdoor network plus one Clarity NASA calibration node and HabitatMap AirBeams. It reports physical concentrations (ug/m3), not indices.[^openaq-about]
+- **The v3 API routes sensor data per location, not per parameter.** `/v3/locations/{id}/latest` returns all of a location's sensors keyed only by `sensorsId` - you must map PM2.5's `sensorsId` from the locations response and filter results on it. The roster of active stations decays; probe `datetimeLast`, filter fresh, re-probe periodically.
+- **HA derives entity_id from `name`, not `unique_id`.** "OpenAQ PM2.5 Midwood" becomes `sensor.openaq_pm2_5_midwood`. Any template iterating entity ids must mirror that slugification - keying on `unique_id` makes every derived template sensor silently `unavailable`. Verify against `/var/lib/hass/.storage/core.entity_registry` on the live host.
+- **Verify through the pipeline, not the config.** The HA Prometheus exporter + a Grafana datasource-proxy query confirms values end-to-end without an HA API token. Config looks correct and still fails silently in the template layer.
+- **Low-cost station caveat:** OpenAQ does not verify placement - a sensor placed indoors still appears. Sanity-check divergent readings against the NEA regional feed.
+
+---
+
+## Source landscape
+
+Three public outdoor PM2.5 sources for a Singapore address, and what each one actually gives you.
+
+| Source | Station count (SG) | Reports | License | Best use |
+|---|---|---|---|---|
+| NEA (data.gov.sg) | 5 regions | ug/m3, 1 hr, keyless | Open | Sanity-check baseline; the authoritative reference |
+| IQAir map | ~30+ markers | US AQI, real-time | Proprietary | Quick visual check; dense spots are often crowd sensors or modelled |
+| OpenAQ v3 | ~14 active within 25 km | ug/m3, per-station, per-parameter | Open (varies by feed) | Nearest-neighbour projection; physical concentration for automations |
+
+NEA's feed covers the island in five coarse regions and is the reference-grade option - but it cannot tell you whether the air at your window matches the regional average.[^dgs-pm25] IQAir's map shows far more dots, which makes it look more precise than it is: many markers are AirVisual Pro or PurpleAir low-cost sensors that the platform ingests, and some are modelled values where no physical station exists. The data-source label is shown in the station detail panel, not on the map pin.[^iqair-source] The map also displays US AQI (a piecewise-linear index), not the underlying PM2.5 concentration - converting back to ug/m3 from a rounded AQI value loses precision.
+
+OpenAQ sits between them: it aggregates only feeds whose license permits republication, reports physical concentrations, and exposes a REST API with geospatial queries. The trade-off is that its station roster is thinner than IQAir's full map and its active count decays as sensors go offline - it is a polling integrator, not a live dashboard.
+
+<Aside type="note">
+The NEA regional feed and OpenAQ community stations measure the same pollutant at different spatial resolutions. They are complementary: the NEA reading is your "is the sensor network plausible" check; the OpenAQ nearest reading is your "what am I actually breathing" proxy.
+</Aside>
+
+---
+
+## OpenAQ v3 API shape
+
+The parts that matter for a polling integration. Full endpoint reference at the OpenAQ docs.[^openaq-api]
+
+### Auth and rate limits
+
+API key in the `X-API-Key` header. Free tier: 60 requests per minute, 2,000 per hour.[^openaq-rate-limits] With a 15-minute poll interval across 14 stations, 14 requests every 900 seconds sits comfortably under both limits (under 1 req/min).
+
+### Geospatial location query
+
+`GET /v3/locations?parameters_id=2&radius=25000&coordinates=1.3521,103.8198&limit=100`
+
+- `parameters_id=2` filters to locations with a PM2.5 sensor.
+- `radius` max is 25,000 m.
+- Returns per-location metadata: `id`, `name`, `coordinates` (lat/lon), `sensors` array with each sensor's `id` and `parametersId`, and `datetimeLast` (the last measurement time for the location).
+
+The `sensors` array is the critical extract: a location may have multiple parameters, and you need the `id` where `parametersId === 2` (PM2.5) for the per-location latest query below. A location with no PM2.5 sensor is filtered by `parameters_id=2` at the query level, so every returned location has at least one.
+
+### Per-location latest
+
+`GET /v3/locations/{id}/latest`
+
+Returns ALL of a location's sensors in one call, keyed by `sensorsId`. There is no `parameters_id` filter on this endpoint - you get every parameter the location measures and must filter the response to the PM2.5 `sensorsId` from the locations query.
+
+The response shape:
+
+```json
+{
+  "results": [
+    {
+      "sensorsId": 12345,
+      "parameter": { "id": 2, "name": "pm2.5", "units": "ug/m3" },
+      "value": 18.4,
+      "datetime": { "utc": "2026-10-08T06:00:00Z", "local": "..." }
+    },
+    {
+      "sensorsId": 12346,
+      "parameter": { "id": 7, "name": "pm10", "units": "ug/m3" },
+      ...
+    }
+  ]
+}
+```
+
+### What the API does not do
+
+- `/v3/parameters/{id}/latest` has no geospatial filter - it is global only, useless for a local projection.
+- No per-parameter filter on `/v3/locations/{id}/latest`. You must map `sensorsId` yourself.
+- No combined "give me the latest PM2.5 for every station in this radius" endpoint. You iterate locations.
+
+### Station roster decay
+
+Stations go offline. A location's `datetimeLast` tells you when its last measurement arrived. Filter locations whose `datetimeLast` is older than your polling interval; a station that has been silent for two poll cycles is effectively gone until it returns. Re-run the locations query periodically (daily is enough) to pick up new stations and drop ones that OpenAQ has delisted.
+
+---
+
+## Home Assistant integration patterns
+
+The non-obvious lessons from wiring 14 REST sensors, a roster template, and two nearest-station projections (home + phone).
+
+### Per-station REST sensors
+
+One `rest` resource per station exposes two sensors: a value sensor and a reading-time twin. One HTTP call serves both.
+
+```yaml
+rest:
+  - resource: https://api.openaq.org/v3/locations/12345/latest
+    scan_interval: 900
+    headers:
+      X-API-Key: !secret openaq_api_key
+    sensor:
+      - name: OpenAQ PM2.5 Midwood
+        unique_id: openaq_pm25_midwood
+        value_template: >-
+          {% set pm = results | selectattr('sensorsId', 'eq', 67890) | list %}
+          {{ pm[0].value if pm else none }}
+        json_attributes_path: "$"
+        json_attributes: ["results"]
+      - name: OpenAQ PM2.5 Midwood Reading Time
+        unique_id: openaq_pm25_midwood_reading_time
+        value_template: >-
+          {% set pm = results | selectattr('sensorsId', 'eq', 67890) | list %}
+          {{ pm[0].datetime.utc if pm else none }}
+        device_class: timestamp
+```
+
+The `sensorsId` value (`67890` above) comes from the locations query. The `json_attributes` expose the full results array so the template sensor below can iterate all stations from one place, though in practice each station gets its own REST resource.
+
+<Aside type="caution">
+**HA derives entity_id from `name`, not `unique_id`.** "OpenAQ PM2.5 Midwood" slugifies to `sensor.openaq_pm2_5_midwood`. Any template sensor that iterates entity IDs must mirror that slugification. Keying on `unique_id` (e.g. looking for `sensor.openaq_pm25_midwood`) produces a template that renders correctly in the UI preview but resolves to `unavailable` at runtime because the entity does not exist under that ID. Verify with `cat /var/lib/hass/.storage/core.entity_registry | grep openaq` on the live host.
+</Aside>
+
+### Secrets on NixOS
+
+On NixOS, the `home-assistant` module unquotes strings with a leading bang, so `!secret openaq_api_key` works directly in the config attrset. The `secrets.yaml` itself stays host-local, outside the repo - it is referenced by the HA config directory path, not by a Nix path.
+
+### Nearest-station template sensors
+
+A template sensor that picks the nearest station from the roster, with a freshness cutoff and (for the phone variant) a max-distance cutoff.
+
+```yaml
+template:
+  - sensor:
+      - name: OpenAQ PM2.5 Home
+        unique_id: openaq_pm25_home
+        state: >-
+          {% set hlat = state_attr('zone.home', 'latitude') %}
+          {% set hlon = state_attr('zone.home', 'longitude') %}
+          {% set stations = [
+            {'id': 'openaq_pm2_5_midwood', 'lat': 1.30, 'lon': 103.75},
+            {'id': 'openaq_pm2_5_joo_chiat_place', 'lat': 1.31, 'lon': 103.90},
+            ...
+          ] %}
+          {% set ns = namespace(best=none, best_d=9999) %}
+          {% for s in stations %}
+            {% set v = states('sensor.' ~ s.id) | float(none) %}
+            {% set ts = states('sensor.' ~ s.id ~ '_reading_time') | as_datetime | as_local %}
+            {% if v is not none and ts is not none
+               and (now() - ts).total_seconds() < 5400 %}
+              {% set d = ((hlat - s.lat)**2 + (hlon - s.lon)**2)**0.5 %}
+              {% if d < ns.best_d %}
+                {% set ns.best = v %}
+                {% set ns.best_d = d %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.best }}
+        unit_of_measurement: ug/m3
+        device_class: pm25
+```
+
+The main choices in this template:
+
+- **Equirectangular distance** is adequate at Singapore's latitude (cos ~1.0) and for the small distances involved. No haversine needed.
+- **Freshness cutoff** (5,400 s = 1.5x the 900 s poll interval) discards stations whose last reading is stale. Without this, a station that went offline three days ago still contributes its last value.
+- **Phone variant** adds a max-distance cutoff (`{% if d > 1.5 %}{% set v = none %}`) so an overseas phone reports `unavailable` instead of picking a home-city station 13,000 km away.
+
+### US EPA AQI conversion in Jinja
+
+OpenAQ reports concentration only. The US EPA AQI is a piecewise-linear function of PM2.5 concentration; it fits in a Jinja template without an external library.
+
+Breakpoint table (ug/m3 to AQI):
+
+| Clow | Chigh | Ilow | Ihigh |
+|---|---|---|---|
+| 0.0 | 12.0 | 0 | 50 |
+| 12.1 | 35.4 | 51 | 100 |
+| 35.5 | 55.4 | 101 | 150 |
+| 55.5 | 150.4 | 151 | 200 |
+| 150.5 | 250.4 | 201 | 300 |
+| 250.5 | 350.4 | 301 | 400 |
+| 350.5 | 500.4 | 401 | 500 |
+
+Jinja implementation:
+
+```jinja
+{% set c = states('sensor.openaq_pm2_5_home') | float(none) %}
+{% if c is none %}{{ none }}
+{% elif c <= 12.0 %}{{ ((50 - 0) / (12.0 - 0) * (c - 0) + 0) | round(0) }}
+{% elif c <= 35.4 %}{{ ((100 - 51) / (35.4 - 12.1) * (c - 12.1) + 51) | round(0) }}
+{% elif c <= 55.4 %}{{ ((150 - 101) / (55.4 - 35.5) * (c - 35.5) + 101) | round(0) }}
+{% elif c <= 150.4 %}{{ ((200 - 151) / (150.4 - 55.5) * (c - 55.5) + 151) | round(0) }}
+{% elif c <= 250.4 %}{{ ((300 - 201) / (250.4 - 150.5) * (c - 150.5) + 201) | round(0) }}
+{% elif c <= 350.4 %}{{ ((400 - 301) / (350.4 - 250.5) * (c - 250.5) + 301) | round(0) }}
+{% elif c <= 500.4 %}{{ ((500 - 401) / (500.4 - 350.5) * (c - 350.5) + 401) | round(0) }}
+{% else %}{{ none }}{% endif %}
+```
+
+<Aside type="note">
+The breakpoints come from the EPA's AQI Technical Assistance Document. The IQAir map uses the same formula but rounds its output for display; the concentration-to-AQI direction is exact, AQI-to-concentration is not.
+</Aside>
+
+### End-to-end verification
+
+Do not verify through the HA config. The configuration can parse correctly and still produce `unavailable` sensors because a template references a non-existent entity_id or a Jinja filter resolves to `none` silently.
+
+Verify through the pipeline:
+
+1. **Prometheus exporter**: confirm the entity appears and has a value.
+   ```
+   curl -s 'http://hearth:8123/api/prometheus' | grep 'openaq_pm2_5_home'
+   ```
+   A missing line means the entity is `unavailable` or not registered.
+
+2. **Grafana datasource-proxy query**: confirm the value is recent and plausible.
+   ```
+   GET /api/datasources/proxy/1/api/v1/query?query=openaq_pm2_5_home
+   ```
+   This path needs no HA API token - it goes through Grafana's configured Prometheus datasource.
+
+3. **Sanity-check against NEA**: the nearest OpenAQ station should track the NEA regional reading within a plausible offset. A community station reading 150 ug/m3 while NEA reports 20 ug/m3 island-wide means the sensor is indoors, faulty, or placed next to a source.
+
+---
+
+## Refreshing the station roster
+
+A runbook for the `curl` + `jq` probe that builds the per-location sensor-ID map. Run when stations appear stale or the active count drops.
+
+### 1. Fetch the location roster
+
+```bash
+curl -s -H "X-API-Key: $OPENAQ_API_KEY" \
+  "https://api.openaq.org/v3/locations?parameters_id=2&radius=25000&coordinates=1.3521,103.8198&limit=100" \
+  | jq '[.results[] | select(.datetimeLast.utc > "'$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)'")]'
+```
+
+Change the coordinates to your home location. The `datetimeLast` filter drops stations that have not reported in the last two hours - adjust the window to match your polling cadence.
+
+### 2. Extract per-location PM2.5 sensor IDs
+
+```bash
+curl -s -H "X-API-Key: $OPENAQ_API_KEY" \
+  "https://api.openaq.org/v3/locations?parameters_id=2&radius=25000&coordinates=1.3521,103.8198&limit=100" \
+  | jq '[.results[] | {
+      id, name, lat: .coordinates.latitude, lon: .coordinates.longitude,
+      pm25_sensor: [.sensors[] | select(.parametersId == 2)][0].id,
+      last: .datetimeLast.utc
+    }]'
+```
+
+The output maps each location to its PM2.5 `sensorsId` - feed those into the REST sensor `value_template` selectattr filter.
+
+### 3. Spot-check one station
+
+```bash
+curl -s -H "X-API-Key: $OPENAQ_API_KEY" \
+  "https://api.openaq.org/v3/locations/<LOCATION_ID>/latest" \
+  | jq '.results[] | select(.sensorsId == <SENSOR_ID>)'
+```
+
+Confirm the sensor ID resolves, the value is in ug/m3, and the timestamp is recent.
+
+---
+
+## What generalises
+
+- **Sensor-ID mapping is a general polling-integrator problem.** Any API that returns multi-parameter results per station and lacks a per-parameter filter on the latest-values endpoint will need the same two-step probe: list resources to get IDs, then poll each resource filtering on the ID. The OpenAQ `locations` to `locations/{id}/latest` pattern is the specific instance.
+- **HA's name-to-entity_id slugification is deterministic but not obvious.** The rule is: lowercase, strip non-alphanumeric, replace whitespace and dashes with underscores, collapse runs. Test with one sensor and check `/var/lib/hass/.storage/core.entity_registry` before wiring a template that iterates the roster.
+- **Prometheus as the verification surface.** The HA API needs an auth token and returns nested JSON; the Prometheus exporter is a single `curl` with no auth and a flat `metric{label="value"}` format. If you already run Prometheus, use it for health checks.
+- **Community-station networks decay.** OpenAQ's active count is a moving window. A station that was reliable for months can disappear when its owner unplugs it. The daily roster refresh is not optional.
+
+---
+
+## Related docs
+
+- [AirGradient ONE on ESPHome, fully local](/guides/airgradient-one-esphome-local/) - the indoor sensor this setup compares against
+- [Singapore weather alerts and live maps with Home Assistant and Grafana](/guides/singapore-weather-ha-grafana/) - the NEA regional PM2.5 feed integrated the same way
+- [Home IoT: an ESPHome fleet on a Flint-bridged VLAN](/reference/home-iot-network/) - the network design this runs on
+
+## References
+
+[^iqair-source]: IQAir, "How can I check the data source of a station?," IQAir Knowledge Base. https://www.iqair.com/support/knowledge-base/how-can-i-check-the-data-source-of-a-station
+
+[^openaq-about]: OpenAQ, "About OpenAQ," OpenAQ Docs. https://docs.openaq.org/about/about/
+
+[^openaq-api]: OpenAQ, "Quick Start," OpenAQ Docs. https://docs.openaq.org/using-the-api/quick-start/
+
+[^openaq-rate-limits]: OpenAQ, "Rate Limits," OpenAQ Docs. https://docs.openaq.org/using-the-api/rate-limits/
+
+[^dgs-pm25]: Singapore NEA, "PM2.5," data.gov.sg. https://api-open.data.gov.sg/v2/real-time/api/pm25
