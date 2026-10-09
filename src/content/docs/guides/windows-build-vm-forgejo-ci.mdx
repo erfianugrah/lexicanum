@@ -1,0 +1,284 @@
+---
+title: Building Windows releases on a Linux-only Forgejo runner
+description: "Running a Windows 11 VM in a container on the router (dockurr/windows under KVM) so a Linux-only Forgejo Actions runner can build and publish a Flutter Windows app: unattended install and idempotent provisioning, key-only OpenSSH into the guest, a release workflow that ships the source by git archive and pulls artifacts back as one tar, and starting and stopping the VM per build through the Composer container API so it holds no RAM between releases."
+author: Erfi Anugrah
+category: forge
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+The Forgejo runner on the router only runs Linux job containers, and `flutter build windows` refuses to run anywhere but Windows. This guide adds a Windows 11 VM as a Composer-managed container on the same host, provisions it as a headless build box, and drives it over ssh from an ordinary `ubuntu-latest` job. The VM is started at the beginning of each release run and stopped at the end, so its 8 GB of guest RAM is only held while a build is in progress.
+
+The first consumer was a fork of the Fladder Jellyfin client, kept so a Windows deadlock fix could ship without waiting for upstream. The pattern does not depend on Flutter: anything that needs MSVC, a Windows SDK or an installer compiler on Windows fits the same shape. Prerequisites: a Linux host with `/dev/kvm`, the runner from [the Forgejo Actions runner reference](/reference/forgejo-actions-runner/), and Composer from [the Composer GitOps reference](/reference/composer-gitops-compose-manager/). Every timing below was measured on 2026-10-09.
+
+## Constants (read this first)
+
+| Fact | Value | Why it matters |
+|---|---|---|
+| Flutter Windows target | Windows host only: `"build windows" only supported on Windows hosts.` ([flutter#110585](https://github.com/flutter/flutter/issues/110585)) | No cross-compile path from the Linux runner. |
+| Windows toolchain | Visual Studio "Desktop development with C++" workload ([Flutter Windows setup](https://docs.flutter.dev/platform-integration/windows/setup)) | Installed by the provisioning script as Build Tools, no IDE. |
+| Host | MS-01 router, 32 GB RAM, KVM available | The VM gets 8 GB / 6 vCPU, container limit 10 GB / 6 CPU. |
+| Image | `dockurr/windows:6.06` | Windows under QEMU/KVM inside one container ([dockur/windows](https://github.com/dockur/windows)). |
+| VM address | a static address (written `VM_IP` below) on the forge network `forgejo_forgejo`, below the network's dynamic `.128/25` range | Runner job containers already join that network, so no firewall change. |
+| Cold boot to ssh | 10-16 s | Cheap enough to boot per build. |
+| Stop | about 10 s, an ACPI shutdown | The container turns SIGTERM into a guest shutdown. |
+| Build | 5m54s (runs 11 and 12) | Clean source tree each run. |
+| Release run with start and stop | 7m02s (run 14) | Start, ssh wait, build, stop. |
+| Artifacts | installer 64,535,441 bytes, portable zip 88,696,199 bytes | Plus `SHA256SUMS.txt`. |
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  tag [label="git tag v0.11.1-erfi.N\npushed to Forgejo"];
+  runner [label="forgejo-runner\n(router)"];
+  job [label="ubuntu-latest job container\non forgejo_forgejo"];
+  composer [label="Composer API\ncontainers/winbuild/start|stop"];
+  vm [label="winbuild container\nstatic IP on forgejo_forgejo\nQEMU/KVM Windows 11"];
+  release [label="Forgejo release\nzip + Setup.exe + SHA256SUMS"];
+
+  tag -> runner -> job;
+  job -> composer [label="1. start / 6. stop"];
+  composer -> vm [label="docker start/stop"];
+  job -> vm [label="2. ssh wait\n3. scp src.tar\n4. build-windows.ps1\n5. scp out.tar"];
+  job -> release [label="7. create + upload"];
+}
+```
+
+In order: the tag push starts the job; the job asks Composer to start the `winbuild` container; it polls ssh until the guest answers; it copies a `git archive` of the tagged commit to the guest and runs the build script there; it copies the artifacts back as one tar; it stops the container; it creates the Forgejo release and uploads the files.
+
+The container NATs the guest and DNATs every port it does not use itself (8006 for the web viewer, 5900 for VNC) to Windows, so `ssh build@VM_IP` reaches the guest's OpenSSH server directly. That forwarding is the image's default behaviour, set up in [qemus/qemu `src/network.sh`](https://github.com/qemus/qemu/blob/master/src/network.sh).
+
+## Part 1: the stack
+
+One service, joined to the forge's network as an external network rather than given one of its own:
+
+```yaml
+services:
+  winbuild:
+    image: dockurr/windows:6.06
+    restart: unless-stopped
+    stop_grace_period: 2m
+    environment:
+      VERSION: "11"
+      USERNAME: ${WIN_USERNAME:?required}
+      PASSWORD: ${WIN_PASSWORD:?required}
+      RAM_SIZE: 8G
+      CPU_CORES: "6"
+      DISK_SIZE: 128G
+      MAC: "02:57:42:00:06:14"
+    devices: [/dev/kvm, /dev/net/tun, /dev/vhost-net]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - /var/lib/winbuild/storage:/storage
+      - /var/lib/composer/stacks/winbuild/oem:/oem:ro
+    deploy:
+      resources:
+        limits: { cpus: "6", memory: 10G }
+    networks:
+      forgejo:
+        ipv4_address: VM_IP   # a free static below the dynamic range
+
+networks:
+  forgejo:
+    name: forgejo_forgejo
+    external: true
+```
+
+- The static address sits below `.128` because the forge network's `ip_range` hands out `.128/25` dynamically.
+- A fixed `MAC` keeps the guest's network adapter identity across container recreates.
+- `stop_grace_period: 2m` gives the guest time to finish an ACPI shutdown before Docker kills it.
+- `WIN_PASSWORD` is SOPS-encrypted in the stack's `.env`. It is only needed for the web console; ssh is key-only.
+- In Composer, the stack is a git stack on the router host with `depends-on: forgejo`, so the network exists before the VM is started.
+
+The first `up` downloads the Windows 11 image, installs it unattended and logs in as `USERNAME`. The image copies the `/oem` folder to `C:\OEM` and runs `install.bat` from it "during the final step of the automatic installation" ([dockur/windows README](https://github.com/dockur/windows#how-do-i-run-a-script-after-installation)). It does this once only, so later edits to `oem/` never reach a running guest.
+
+## Part 2: provisioning the guest
+
+`install.bat` only calls PowerShell, so the real work lives in a script that can be rerun later:
+
+```bat
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\OEM\provision.ps1" > "C:\OEM\provision.log" 2>&1
+```
+
+`provision.ps1` checks before it installs each piece, so rerunning it after a version bump only installs what changed. Versions are pinned in a sibling `versions.ps1`. In order:
+
+1. Disable sleep, hibernation and automatic Windows Update reboots. Enable long paths and Developer Mode, which Flutter needs to create plugin symlinks. Turn off Defender real-time scanning, which slows MSVC and cargo builds.
+2. Install OpenSSH Server from the Win32-OpenSSH MSI, key-only. The account is an Administrator, so its keys go in `C:\ProgramData\ssh\administrators_authorized_keys`, readable only by Administrators and SYSTEM ([Microsoft Learn](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_keymanagement#administrative-user)). Windows PowerShell becomes the default shell.
+3. Install Git, with `core.longpaths` set.
+4. Install VS 2022 Build Tools with `VCTools`, `VC.Tools.x86.x64`, `VC.CMake.Project` and `VC.ATL` ([component IDs](https://learn.microsoft.com/en-us/visualstudio/install/workload-component-id-vs-build-tools)). If Build Tools are already installed without a listed component, the script runs `setup.exe modify` to add it.
+5. Install Rust via rustup, MSVC host. Fladder's media-controls plugin compiles a Rust crate through cargokit during the Flutter build.
+6. Install Flutter at the version in the repo's `.fvmrc` (3.35.7), then `precache --windows`.
+7. Install Inno Setup 6.
+
+Every installer goes through one wrapper that fails on a bad exit code. The same wrapper retries exit 1618 (`ERROR_INSTALL_ALREADY_RUNNING`, [MSI error codes](https://learn.microsoft.com/en-us/windows/win32/msi/error-codes)) every 30 s, because at first logon Windows is still running its own installers. A full provisioning run took 9 minutes; VS Build Tools is most of that.
+
+To rerun it after changing `versions.ps1`, copy the files in and run the script over ssh:
+
+```bash
+scp -J router -i ~/.ssh/id_winbuild oem/versions.ps1 oem/provision.ps1 build@VM_IP:C:/OEM/
+ssh -J router -i ~/.ssh/id_winbuild build@VM_IP \
+  'powershell -ExecutionPolicy Bypass -File C:\OEM\provision.ps1'
+```
+
+## Part 3: credentials for CI
+
+The release repo needs three things:
+
+| Name | Kind | Contents |
+|---|---|---|
+| `WINBUILD_SSH_KEY` | secret | private half of an ed25519 key whose public half is in `oem/authorized_keys` |
+| `WINBUILD_HOST_KEY` | variable | the guest's `ssh-ed25519 AAAA...` host key line, so the job runs with `StrictHostKeyChecking yes` |
+| `COMPOSER_WINBUILD_KEY` | secret | a Composer API key, role `operator`, minted for this one consumer |
+
+Mint the Composer key with `POST /api/v1/keys` and pipe the response straight into the Forgejo secret, so the plaintext key is never printed:
+
+```bash
+curl -sf -X POST -H "X-API-Key: $COMPOSER_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"forgejo-ci-winbuild","role":"operator"}' \
+  https://composer.erfi.io/api/v1/keys \
+  | jq -r .plaintext_key | fjctl secret set COMPOSER_WINBUILD_KEY -R erfi/fladder
+```
+
+The `operator` role can start and stop containers without being able to change users, keys or stacks. Give each consumer repo its own key so one can be revoked without breaking the others.
+
+## Part 4: the release workflow
+
+Key parts of `.forgejo/workflows/release.yml`, in order:
+
+```yaml
+on:
+  push:
+    tags: ["v*-erfi.*"]
+  workflow_dispatch: {}
+
+concurrency:
+  group: winbuild
+  cancel-in-progress: false
+```
+
+- `v0.11.1-erfi.1` means the upstream version from `pubspec.yaml`, then a fork counter. The workflow refuses a tag whose base does not match `pubspec.yaml`.
+- A manual dispatch builds the artifacts without publishing a release.
+- The concurrency group is shared by every repo that builds on this VM. That keeps one run's stop step from shutting the VM down under another run's build.
+
+Upload the source as a `git archive` tar rather than cloning on the guest, so the VM never needs git credentials. Every build starts from a fresh tree:
+
+```bash
+git archive --format=tar -o /tmp/src.tar HEAD
+scp -q /tmp/src.tar "$WINBUILD:C:/build/src.tar"
+ssh "$WINBUILD" 'if (Test-Path C:\build\fladder) { Remove-Item -Recurse -Force C:\build\fladder };
+  New-Item -ItemType Directory C:\build\fladder | Out-Null;
+  tar -xf C:\build\src.tar -C C:\build\fladder; if ($LASTEXITCODE) { exit $LASTEXITCODE }'
+```
+
+The build script on the guest runs `flutter pub get`, `flutter build windows --release --build-number=N`, then `ISCC.exe /DFLADDER_VERSION=...` on the repo's Inno Setup script. It zips `build\windows\x64\runner\Release` and writes `SHA256SUMS.txt`. The script also reloads `PATH` from the machine environment first, because an ssh session that predates provisioning has a stale one.
+
+Pack the artifacts into a tar on the guest and copy that back. Do not scp a Windows wildcard path:
+
+```bash
+ssh "$WINBUILD" 'tar -cf C:\build\out.tar -C C:\build\out .; if ($LASTEXITCODE) { exit $LASTEXITCODE }'
+scp -q "$WINBUILD:C:/build/out.tar" /tmp/out.tar && tar -xf /tmp/out.tar -C out
+```
+
+The release is created with the run's own `${{ github.token }}` against `${{ forgejo.server_url }}/api/v1`, as in [lane 2 of the releases reference](/reference/forgejo-releases-and-registry/#lane-2-binary-clis-get-a-forgejo-release). The notes list the fork's commits on top of the upstream merge-base, excluding fork-only CI files, and paste the checksums.
+
+## Part 5: start and stop per build
+
+The VM is normally stopped. The job's first step starts it:
+
+```bash
+curl -sf -X POST -H "X-API-Key: $COMPOSER_KEY" "$COMPOSER_API/containers/winbuild/start"
+```
+
+Starting a container that is already running also returns 204, so this step does not need to check state first. The ssh setup step then polls for up to 5 minutes:
+
+```bash
+for i in $(seq 1 60); do
+  ssh -o ConnectTimeout=5 -o BatchMode=yes "$WINBUILD" hostname 2>/dev/null && exit 0
+  sleep 5
+done
+exit 1
+```
+
+The last step runs whether the build passed or failed:
+
+```yaml
+- name: Stop winbuild VM
+  if: always()
+  run: |
+    curl -sf -X POST -H "X-API-Key: $COMPOSER_KEY" "$COMPOSER_API/containers/winbuild/stop" \
+      && echo "winbuild stopped" || echo "::warning::winbuild stop failed - VM left running"
+```
+
+The stop call sends SIGTERM to the container. The image turns that into an ACPI shutdown and waits for it, logging `Received SIGTERM signal, sending ACPI shutdown signal...`, a few `Waiting for Windows to shut down...` lines, then `Shutdown completed!`. The whole call took 12 s. A failed stop only produces a warning: the build has already succeeded, and a VM left running costs RAM, not correctness.
+
+Use the per-container endpoint, not the stack lifecycle endpoints. On this Composer version those act on the whole stack and silently ignore a `services` filter.
+
+<Aside type="caution" title="An exited container is the idle state">
+Composer shows the stack as stopped between builds, which is intended. `restart: unless-stopped` does not bring an explicitly stopped container back after a host reboot, so the VM stays down until the next build. A Composer `up` on the stack starts the VM, and it then stays up until the next build's stop step or a manual stop. For interactive work, start it by hand first.
+</Aside>
+
+## Part 6: keeping the fork on upstream
+
+Two scheduled pieces keep the fork current, and fork-only files stay under `.forgejo/` so rebases do not conflict:
+
+- `upstream-drift.yml` runs daily. It fetches upstream `develop` and reports how many commits behind the fork is. It runs `git cherry` to list which fork patches upstream has already merged, lists files changed on both sides, and does a test rebase in a throwaway worktree. While the fork is behind, it keeps one tracking issue open, comments only when upstream's head moves (it reads back a `<!-- upstream-head: SHA -->` marker), and closes the issue on the first clean run.
+- `sync-upstream.sh --push` rebases the `patched` branch onto upstream `develop` and pushes with `--force-with-lease`. A fork patch that upstream has merged drops out of the rebase.
+
+A checks workflow (`flutter analyze`, `flutter test`) runs on every push to `patched` in the `ghcr.io/cirruslabs/flutter` image matching `.fvmrc`. That image has no node, so `actions/checkout` cannot run inside it and the job fetches the commit with plain git.
+
+## Verification
+
+| Check | How | Result (2026-10-09) |
+|---|---|---|
+| Job network reaches the guest | `docker run --rm --network forgejo_forgejo alpine:3 sh -c "nc -z -w5 VM_IP 22"` | open |
+| Key-only ssh | `ssh -J router -i ~/.ssh/id_winbuild build@VM_IP hostname` | `winbuild` |
+| Toolchain | `flutter doctor -v` on the guest | Windows and Visual Studio sections green |
+| Cold start | stop, then the start call, then poll ssh | ssh up after 10-16 s |
+| Clean stop | container log after the stop call | `Shutdown completed!` |
+| Release | push `v0.11.1-erfi.1` | run 12 green, release with 3 assets |
+| Start/stop round trip | dispatch with the VM stopped | run 14 green in 7m02s, container `Exited` afterwards |
+| Artifacts | `sha256sum -c SHA256SUMS.txt` on the downloads | both OK |
+| Fix in the build | 5 cold launches of the installed app, 20 s each | 0 seconds "Not Responding" |
+| Drift issue | dispatch on a branch 5 commits behind, twice, then on `patched` | issue opened, second run skipped the comment, clean run closed it |
+
+## Gotchas and lessons learned
+
+- **The first-logon installer race skips OpenSSH silently.** On the first run, the OpenSSH MSI returned immediately with 1618 because Windows was still installing its own packages. There was no error, so the next step failed with `Cannot find any service with service name 'sshd'`. Check every installer's exit code, and retry 1618.
+- **`Write-Output` inside a PowerShell helper becomes part of its return value.** A `Log` function using `Write-Output`, called inside a download helper, turned the helper's returned path into an array: `Cannot convert 'System.Object[]' to the type 'System.String' required by parameter 'FilePath'`. Log with `Write-Host`.
+- **Plugins can need more of Visual Studio than Flutter's docs list.** `flutter_local_notifications_windows` includes `atlbase.h`, so the first build failed with C1083 until `VC.ATL` was added. Checking the components on an existing install with `vswhere -requires` lets the script repair that install instead of reinstalling.
+- **ssh refuses a config file the job wrote with default permissions.** `chmod 600` the config and `known_hosts` after writing them in a heredoc.
+- **The guest has no console you can read from CI.** For debugging an install, tunnel VNC from the host (`ssh -L 15900:VM_IP:5900 router`) and grab frames with `uvx --from vncdotool vncdo -s 127.0.0.1::15900 capture shot.png`. The same tool can type into a PowerShell window.
+- **Upstream's template test fails on its own.** Fladder's `test/widget_test.dart` is the stock "Counter increments" smoke test and throws `No ProviderScope found`. Upstream CI never runs `flutter test`. The fork's checks skip that one file and run the rest.
+- **A tags-only workflow fired on a tag at an already-built commit.** On 2026-09-18 a tag pushed to a commit that already had a push run fired nothing, three times over, including a delete and re-push. Here the tag's commit had a push run of a different workflow (`checks.yml`), and the tags-only `release.yml` still fired. The deduplication, if that is what it is, looks per-workflow.
+- **The image's `HOST` variable equals the container name.** A secret scanner that hashes every container environment value will then mask the container's name everywhere. Exclude the image's sizing and naming variables from it.
+- **Windows stays unactivated.** It shows a watermark and locks personalisation, which does not matter on a headless build host.
+
+## File reference
+
+| File | Repo | Purpose |
+|---|---|---|
+| `compose.yaml` | winbuild | The VM container, network join, resource limits |
+| `oem/install.bat` | winbuild | First-logon hook, calls `provision.ps1` |
+| `oem/provision.ps1` | winbuild | Idempotent toolchain install |
+| `oem/versions.ps1` | winbuild | Version pins (Flutter, OpenSSH, Git, Inno Setup) |
+| `oem/authorized_keys` | winbuild | CI key and admin key |
+| `.env` | winbuild | SOPS-encrypted Windows account |
+| `.forgejo/workflows/release.yml` | fladder | Start VM, build, publish, stop VM |
+| `.forgejo/scripts/build-windows.ps1` | fladder | Build, installer, zip, checksums on the guest |
+| `.forgejo/workflows/checks.yml` | fladder | analyze + test on push |
+| `.forgejo/workflows/upstream-drift.yml` | fladder | Daily drift report and tracking issue |
+| `.forgejo/scripts/upstream-drift.sh` | fladder | The drift report; exit 0 clean, 1 drift |
+| `.forgejo/scripts/sync-upstream.sh` | fladder | Rebase onto upstream and push |
+
+## Related docs
+
+- [The Forgejo Actions runner: build and lifecycle](/reference/forgejo-actions-runner/) - the Linux runner this guide works around, including the `forgejo_forgejo` network pin that lets a job reach the VM.
+- [Forgejo releases and the registry](/reference/forgejo-releases-and-registry/) - the release-upload lane this workflow reuses; the Windows artifacts are a fourth shape next to its three.
+- [Composer GitOps compose manager](/reference/composer-gitops-compose-manager/) - the API the job uses to start and stop the VM, and the role model behind the `operator` key.
+- [Porting a GitHub Actions workflow to Forgejo Actions](/guides/porting-github-actions-to-forgejo/) - the general differences between the two runners; GitHub's hosted `windows-latest` runner has no equivalent here, which is why this VM exists.
