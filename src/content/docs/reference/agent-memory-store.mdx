@@ -76,7 +76,8 @@ digraph {
     pg [label="Postgres 18\n+ pgvector"];
     rest [label="PostgREST"];
     emb [label="embedding worker\n+ search API"];
-    rest -> pg; emb -> pg;
+    ssum [label="session summariser\n(LLM, every 15 min)"];
+    rest -> pg; emb -> pg; ssum -> pg;
   }
 
   agents [label="agent clients\n(native tools / Model Context Protocol (MCP))"];
@@ -93,15 +94,23 @@ digraph {
 | Source | Shape | Checkpoint | Why it is here |
 |---|---|---|---|
 | Agent session logs | jsonl, one line per message, append-only | byte offset | The bulk of the corpus and the only copy past local retention |
+| Subagent transcripts | jsonl per subagent, one directory below its parent session, plus a small metadata file | byte offset | A delegated agent's tool calls exist only here; the parent log holds the prompt and the returned report. Stored as their own sessions, linked to the parent |
 | Prompt history file | jsonl, one line per prompt | line count | A client that logs prompts but not full sessions still has recoverable intent |
 | Account export | zip or json, one array of conversations | one-shot import, idempotent | Web-client history that has no local log at all |
-| Work ledger | sqlite, one row per session summary | max id | The "what did I do on project X" question, already summarised. Raw shutdown transcripts land as `summary_pending` rows; a separate 15-minute LLM batch job (`memledger summarise`) turns them into summaries, writing back to both stores |
-| Agent memories | one json file | whole-file | Small, changes rarely, cheap to re-read |
+| Work ledger | sqlite, one row per session summary | max id | The "what did I do on project X" question, already summarised. Raw shutdown transcripts land as `summary_pending` rows; a separate 15-minute LLM batch job (`memledger summarise`) turns them into summaries, writing back to both stores. A client with no ledger of its own gets the same summaries from a server-side job that reads its stored messages once a session has been idle for 30 minutes, skipping headless runs and subagent transcripts |
+| Agent memories | one json file, or one markdown file per memory | whole-file, per file | Small, changes rarely, cheap to re-read. The store is the only off-disk copy, so a memory file deleted from its directory is deleted from the store, but a missing directory deletes nothing |
 
 The unifying key is `session_key = <source>:<host>:<external_id>`, and messages
 are keyed `(session_key, ordinal)` where ordinal is the line index. That key
 makes incremental ingest idempotent: re-reading a file from an earlier
 offset re-derives the same keys, and the upsert merges rather than duplicating.
+
+Coverage has to be checked against the files on disk. Subagent transcripts sat
+one directory deeper than the ingester's glob, and nothing errored: the sync
+log only reports the files it read. The first sweep after widening the glob
+added 82 sessions on one machine and 212 on the other. The same pass found the
+memory source had no delete path, so a memory removed as wrong kept answering
+searches.
 
 ## Incremental ingest
 
@@ -139,9 +148,16 @@ a pgvector column with an HNSW index.[^pgvector]
 
 Query syntax differs per mode. Postgres `websearch_to_tsquery` accepts
 quoted phrases, `OR`, and `-negation`, but not the FTS5-style `AND`/`NOT` an
-agent might have learned from a different tool; multi-word queries are joined
-with `OR` before they reach it so a two-word search does not silently require
-both.[^pg-fts]
+agent might have learned from a different tool, and it requires every word in
+the same message.[^pg-fts] The tools send the query as written and retry it
+`OR`-broadened only when it matches nothing, saying so in the result. Quotes
+and inner hyphens must not block that retry: a broadening rule that bailed on
+any `"` or `-` left `read-only` and every dead phrase without one. The default
+parser also indexes a path as a single token, so `fjctl` does not match inside
+`~/infra/fjctl`; search the plain words around a path. Memory search is a
+plain substring match, so it splits the query into words and requires each one
+somewhere in the memory, rather than the whole query as one contiguous
+string.
 
 Vector search needs the query embedded with the same model as the corpus, so it
 belongs behind a small service rather than in each client. That service also
@@ -375,9 +391,10 @@ adapter such as MCP suits clients that expect it,[^mcp] and it sits on the same
 endpoints. It costs a process spawn per session, a handshake before the first
 tool call, and one more place for a credential to live.
 
-The MCP adapter exists and serves six tools over HTTP at the store's `/mcp`
+The MCP adapter exists and serves seven tools over HTTP at the store's `/mcp`
 endpoint: message search, session-topic search, session list, semantic search,
-ledger search, and memory search. Auth is a static bearer, accepted as either
+ledger search, memory search, and memory read (one memory in full by id,
+name or file path; it used to take four calls to read one). Auth is a static bearer, accepted as either
 `Authorization: Bearer` or an `X-Memledger-Token` header; the 401 carries an
 RFC 9728 `resource_metadata` challenge so spec-following clients can discover
 that shape, with the metadata document served statically at the edge. One
@@ -396,7 +413,8 @@ small enough to wire twice:
 | Message search | PostgREST function over the FTS index |
 | Semantic search | Embedding service, cosine similarity over HNSW |
 | Ledger search | PostgREST function over summaries |
-| Memory search | PostgREST table filter |
+| Memory search | PostgREST table filter, every word as a substring |
+| Memory read | PostgREST table filter on the memory id |
 | Session list | PostgREST table filter, ordered by start time |
 
 ## The store echoes the question back
@@ -424,8 +442,10 @@ key (`source:hostname:uuid`), so results drop rows from that session; when the
 exact query then matches nothing, it retries the same query at a deeper limit,
 then retries OR-broadened. The result text states which strategy fired, because
 "here are some rows" and "here are rows I had to loosen the query to find" are
-different answers. Interfaces that cannot know their own identity - raw curl,
-the web UI - keep both behaviours off and need short queries instead.
+different answers. Interfaces that cannot know their own identity cannot drop
+their own rows: the MCP endpoint and the tool server for another client still
+retry a dead query `OR`-broadened and flag those rows, while raw curl and the
+web UI do neither and need short queries instead.
 
 "The search only returns the current session's messages" looks exactly like an
 ingest gap and, in the one incident investigated, was query shape instead.
@@ -493,6 +513,10 @@ digraph {
 | Uncommitted worker transaction blocks all DDL | `pg_blocking_pids` traced a stalled `REINDEX` to a 22-minute `idle in transaction` connection with 20+ queries queued behind it; after committing on the empty path the worker's connections idle with no open transaction | Measured |
 | `idle_in_transaction_session_timeout` does not catch it | Setting was 5 min for the whole 22-minute transaction; it measures continuous idle, not transaction age | Measured |
 | Self-reference + AND granularity hides the sources from a session searching its own prior context | Seven-term query returned only the querying session's own messages while the source sessions were fully ingested; 2-3 term queries on the same corpus returned the sources immediately | Measured |
+| Subagent transcripts were outside the ingest glob | Live sessions with a parent link counted against `agent-*.jsonl` files on disk after the fix (2026-10-09): 82 sessions for 83 files on one machine, the extra file an agent copied into both halves of a forked session | Measured |
+| A path is one full-text token | Within one ingested message holding `~/infra/fjctl`: `creatordate tag` matched, `creatordate fjctl` and `creatordate infra` did not (2026-10-09) | Measured |
+| Whole-query substring misses multi-word memory searches | Same three words against the memories table: 0 rows as one contiguous `ILIKE` pattern, 3 with each word required separately (2026-10-09) | Measured |
+| Headlines are built only for returned rows | `EXPLAIN (ANALYZE)` of an `OR` query matching 12,702 messages: `ts_headline` evaluated above the top-10 sort, 453 ms total (2026-10-09) | Measured |
 | Vector search quality vs FTS | No side-by-side relevance evaluation was run | Not tested |
 
 [^pgrst-upsert]: PostgREST, "Tables and Views," PostgREST Documentation. https://docs.postgrest.org/en/latest/references/api/tables_views.html
