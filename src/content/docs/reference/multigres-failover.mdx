@@ -1,0 +1,238 @@
+---
+title: "Multigres OSS failover: what a client sees"
+description: What a client observes when the primary of an open-source Multigres cluster is killed, hung or left behind - 17 failovers under 8 closed-loop writers on a local 3-cell container, 2,216,532 acknowledged writes checked against a client-side commit log with 0 lost, and the ack-free stall per fault from 1.1 s to 56.2 s, plus the errors clients get and the pooler feature matrix through the gateway.
+author: Erfi Anugrah
+category: supabase
+group: architecture
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+What a Postgres client sees when the primary of an open-source Multigres cluster dies, freezes or has a lagging standby: how long writes stall, which errors come back, and whether any acknowledged write is lost. For anyone weighing Multigres against the [warm standby tier](/reference/supabase-dr-tiers/) of a managed project.
+
+The numbers are from one local rig on 2026-10-10: a Docker Desktop VM (Linux kernel 7.0.14-linuxkit, Docker server 29.8.2, 10 CPUs, about 8 GB) on an arm64 Mac. The tests, the load generators and the fault injector (`docker exec kill`) ran on the macOS host and reached the gateway through a published port. No cloud resources and no Supabase project were involved. The Multigres blog and the v0.1.0 release page are documented sources and were not tested.[^sb-multigres-alpha][^mg-release-v010]
+
+Scope first. This is the upstream repository's all-in-one image (`Dockerfile.cluster`), built from a pinned `main` commit of 2026-10-09 because the `v0.1.0` tag has no such Dockerfile (the GitHub contents API answered 404 at that ref). It is not the Kubernetes operator path[^sb-multigres-alpha] and not the invite-only private alpha, and neither was measured.
+
+**TL;DR:**
+
+- 17 failovers, 2,216,532 acknowledged writes checked against a client-side commit log, 0 acknowledged-but-lost. That includes a standby left 22.3 to 23.3 MB behind by `SIGSTOP`, followed by killing the primary and the other standby: the lagging standby was never promoted (MG08).
+- The longest ack-free gap depends on the fault. Postgres `SIGKILL`: 1.1 to 4.2 s with 8 writers, 1.9 to 6.7 s with one 10 writes/s client. Whole-cell kill: 14.7 to 15.1 s. Hung primary: 20.0 and 25.1 s in the main run, 20.0 to 56.2 s over six runs in three artifacts.
+- Clients are not shielded. In-flight statements fail (one per worker), new connections get `no writable primary is currently available` or `database is temporarily unavailable; please retry`, and 2 to 5 connects per postgres-kill run were refused with `password authentication failed` using the correct password.
+- Nothing restarted a killed cell in this container: the cluster stayed at 2 nodes for 45 s.
+- The gateway passed 9 of 9 session-feature probes on two cells, with one uncontended client. Pool contention, network partitions and other durability policies were not measured.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  client [label="Client\n8 writers", style=rounded];
+
+  subgraph cluster_ctr {
+    label="One container (child processes)"; style=rounded; fontsize=12; margin=12;
+    etcd [label="etcd"];
+    admin [label="multiadmin"];
+    subgraph cluster_z1 {
+      label="cell zone1"; style=rounded; fontsize=11; margin=8;
+      gw1 [label="multigateway"];
+      pl1 [label="multipooler"];
+      pg1 [label="postgres + pgctld", shape=cylinder];
+      or1 [label="multiorch"];
+    }
+    zN [label="cells zone2, zone3\nsame five processes"];
+  }
+
+  client -> gw1 [label="published port"];
+  gw1 -> pl1;
+  pl1 -> pg1;
+  or1 -> etcd;
+  or1 -> pl1 [label="promote"];
+  pg1 -> zN [label="ANY 1 of 3 sync"];
+}
+```
+
+1. The client connects to the zone1 multigateway through one published port.
+2. The gateway routes to the multipooler, which holds the backends on that cell's postgres.
+3. Each cell runs its own postgres, pgctld, multipooler, multiorch and multigateway; etcd and multiadmin are shared.
+4. Commits are acknowledged under `synchronous_commit=on` with `synchronous_standby_names` of the form `ANY 1 (<3 ids>)`, so one standby must flush before the client sees an acknowledgement.
+
+What was run, as measured in MG01 and the run configuration:
+
+| Item | Value |
+|---|---|
+| Image | upstream `main` at commit `e3cbdbbb0b94453ca2ec43c9c40c05c98ed7bb73` (2026-10-09), built from `Dockerfile.cluster` |
+| Server banner | `Multigres 0.1.0-SNAPSHOT (unknown revision) built with go1.26.9` (image built without the commit stamp) |
+| Cells | 3 (zone1 to zone3); a single cell never becomes ready |
+| Durability | `synchronous_commit=on`, `ANY 1` of 3 poolers, 2 walsenders visible from the primary, `max_connections=110` |
+| Multiorch timers | `recovery-cycle-interval` and `pooler-health-check-interval` 500 ms |
+| Bootstrap | `allow-unsafe-initial-cohort: true` written into every multiorch block by the entrypoint |
+| Load | 8 workers, one connection each, autocommit `INSERT (w, n)` through the zone1 gateway, closed loop, 5,398 to 6,046 acknowledged writes per second before the fault |
+
+The 500 ms timers and the unsafe-initial-cohort flag are the local provisioner's values; the operator's were not read or run, and whether they change the results against a default deployment was not measured.
+
+---
+
+## What each fault costs the client
+
+Each run is one failover; n = 3 per fault unless stated. An INSERT that returns is acknowledged. One that errors is in doubt and is checked against the final table. Acknowledged-but-lost means an acknowledged `(w, n)` missing from the table read back after recovery. The stall is the longest interval with no acknowledgement from any worker that ends after the fault.
+
+| Module and fault | n | Acknowledged writes checked | Acknowledged-but-lost | Ack stall per run (ms) |
+|---|---|---|---|---|
+| MG02 `SIGKILL` the primary's postgres (pgctld and multipooler left up) | 3 | 442,944 | 0 | 2,238 / 1,100 / 4,233 |
+| MG03 `SIGKILL` postgres, multipooler and pgctld of the primary's cell | 3 | 263,121 | 0 | 14,702 / 15,136 / 14,735 |
+| MG04 `SIGSTOP` the primary's cell for 45 s, then `SIGCONT` | 2 | 395,924 | 0 | 20,016 / 25,122 |
+| MG08 one standby `SIGSTOP`ped 20 s (22.3 to 23.3 MB behind), then primary and current standby `SIGKILL`ed | 3 | 759,319 | 0 | 6,852 / 6,431 / 8,161 |
+| MG09 as MG02 with one writer at 10 writes/s | 3 | 720 | 0 | 6,657 / 1,900 / 6,589 |
+| MG05 pgbench relaunch loop and two single runs | 3 | 354,504 logged | 0 | n/a / n/a / 2,283 |
+
+Over the 17 runs, 2,216,532 acknowledged writes were checked and none was missing from the final table. Every run ended with the same row count on every surviving node and on a read through the gateway. The fault clock starts just before the `docker exec kill`, whose latency is inside every window (largest 154 ms in the printed evidence).
+
+### Postgres crash (MG02, MG09)
+
+After the postgres `SIGKILL`, the promote step took 327 to 374 ms in MG02, 343 to 364 ms in MG09 and 345 to 2,181 ms in MG08. The rest of the stall is the time before multiorch starts its leader appointment: the first `starting leader appointment` line came 570 to 3,786 ms after the kill in MG02, 1,411 to 6,082 ms in MG09 and 5,765 to 6,288 ms in MG08.
+
+The spread is wide, from about 1 s to about 6.7 s, with most runs near 1 to 2 s or near 6 to 7 s, and the cause is unexplained. The one-writer MG09 runs gave (6.7 / 1.9 / 6.6 s) and the 8-writer MG02 runs (2.2 / 1.1 / 4.2 s), but two earlier full runs of the same fault code gave (6.3 / 1.8 / 1.0 s) and (1.4 / 1.7 / 1.3 s). At n = 3 per cell the claim that traffic speeds up detection is not supported and is not made.
+
+### Whole-cell loss (MG03)
+
+Killing postgres, multipooler and pgctld together gave multiorch the reason `LeaderUnreachableByCohort`. Its first `starting leader appointment` line came (14.2 to 14.6 s) after the kill in all three runs, and the promote step took 360 to 364 ms. Nothing restarted the killed cell: after a 45 s wait the cluster still had 2 nodes in all three runs, so each MG03 run starts from a freshly created container.
+
+### Hung primary (MG04)
+
+A frozen cell keeps its sockets open. Multiorch's reason was `LeaderQuorumWritesStalled`. In the two main-run measurements:
+
+| Event | Run a | Run b |
+|---|---|---|
+| First `executing appoint leader action` check | +18.6 s | +18.7 s |
+| `starting leader appointment` | +19.4 s | +20.1 s |
+| New primary promoted at the pooler | +19.9 s | +20.6 s |
+| Multiorch logs the promotion as a success | +39.7 s | +40.3 s |
+| Client ack stall | 20,016 ms | 25,122 ms |
+
+Multiorch's success line lags the pooler-level promote by about 20 s because the recruit RPC to the frozen cell had to time out first (`recruit_ms` about 20,250). In run a the 20,016 ms stall coincides with the client's own 20 s statement timeout: all 8 workers ended with `Query read timeout` at +20 s, so the client could not see recovery earlier. In run b the reconnects after that timeout hit the client's 5 s connect timeout once (8 x `timeout expired` at +25.15 s), which accounts for the 25,122 ms on top of a cluster-side recovery at about +20.6 s. That 5 s is client behaviour, not a cluster window.
+
+The stall was not always about 20 s. Across the six MG04 runs in three artifacts it was 20.0 / 25.1 s (main run), 20.0 / 20.0 s and 25.1 / 56.2 s. In the 56.2 s run the first promotion attempt failed at +39.7 s, a second started at +48.3 s and succeeded at +57.8 s, and the client saw 8 x `Query read timeout` plus 8 x `portal execution failed ... EOF`. The cause of that failed first attempt was not investigated. The earlier artifacts are unpublished and cited only for this range.
+
+### Lagging standby (MG08)
+
+One standby was stopped for 20 s. In all three runs the primary's `pg_stat_replication` showed it 22,265,848 to 23,256,456 bytes behind (flush lag) just before the double kill. The lagging standby was not promoted in any run: the winner was the restarted original primary once and the up-to-date killed standby twice. A first version with a 5 s stop (5.4 to 5.8 MB behind) promoted the lagging standby in 1 of 3 runs with 0 lost, and proves nothing, because that much WAL may sit in the stopped standby's socket receive buffer and arrive after `SIGCONT` although the primary is dead. The buffer size was not measured. The 20 s stop makes the lag about four times larger, and that is the version reported.
+
+<Aside type="note" title="What 0 lost does and does not show">
+Zero acknowledged-but-lost in 2,216,532 checked writes is a result for `ANY 1` of 3 with `synchronous_commit=on`, process kills and one `SIGSTOP`, on one local rig. It does not cover network partitions, other durability policies, a gateway or etcd loss, or the loss of two cells other than the two-postgres case in MG08.
+</Aside>
+
+---
+
+## What clients saw
+
+Failover does not hide the fault from the client. Measured during the runs above:
+
+| Observation | Detail |
+|---|---|
+| In-flight statements fail | One failed INSERT per worker in every MG03 and MG04 run (8 of 8), 8 to 11 in MG02. Of the failed INSERTs, 0 to 5 per run were in the table anyway (committed, unacknowledged); the rest were absent |
+| Error text, verbatim fragments | `failed to read message: EOF`, `terminating connection due to unexpected postmaster exit`, `no writable primary is currently available`, and the client-side `Query read timeout` (MG04) |
+| New connections during a postgres kill (MG02, MG08, MG09) | `database is temporarily unavailable; please retry` or `no writable primary is currently available`. Failed connects per run: 45 to 237 (MG02), 349 to 561 (MG08), 13 to 59 (MG09) |
+| Refused logins with the correct password | In every one of those runs, 2 to 5 connects were refused with `password authentication failed for user "postgres"` although the same password connected before and after |
+| Held connects | 3 connects per run in MG02 and in two MG08 runs were accepted but held before completing (longest per run 1.2 to 4.6 s) |
+| New connections during cell loss (MG03) | 1,096 to 1,136 failed per run, all `no writable primary is currently available`, none held over 200 ms |
+| New connections to a hung primary (MG04) | Run a had 0 failed connects: the clients sat on their open sockets until the 20 s timeout |
+
+pgbench shows the reconnect burden plainly (MG05). In one long run with the simple protocol and one with `-M prepared`, all 8 clients aborted 45 to 51 ms after the kill, pgbench exited 2, and no client completed a transaction after the fault, so pgbench alone gives no failover window (reported n/a). A relaunch loop of 41 back-to-back `pgbench -T 2` runs, 21 of which exited non-zero, had 8 of 8 client slots complete transactions after the fault, with an ack stall of 2,283 ms and 240,174 transactions logged. pgbench's per-client log counts matched the per-client row counts: 0 acknowledged commits missing in all three runs, and rows exceeded logged transactions by 3 to 5 (committed, unacknowledged).
+
+The Multigres launch post says "During a failover, multigateway can hold requests until a new primary is promoted, thereby minimizing errors."[^sb-multigres-alpha] Statements already sent to the dead primary failed here, and most new connects were refused with an error rather than held; the 3 held connects per run are the part that matches.
+
+---
+
+## Gateway behaviour on one client
+
+MG06 re-ran the 9 probes of the pooler-semantics S01 matrix against the primary's own postgres (control, 9 of 9), the zone1 gateway and the zone2 gateway. Both gateways passed 9 of 9: `pid_stable`, `prepared_first`, `prepared_reuse` (bind and execute with no re-parse), `advisory_lock`, `listen_notify`, `session_guc`, `cursor_with_hold`, `temp_table` and `explicit_txn`.
+
+One client was connected, so the pool was uncontended. The gateway did not give that client a dedicated backend: autocommit statements ran on backend pid 9171 (both gateways), the explicit transaction on a different pid (9928 and 9931), and the control on 9927. Whether session state survives when other clients compete for the pool was not measured.
+
+MG07 connected roles `mg07_a` and `mg07_b` through the gateway; the primary's `pg_stat_activity` showed a backend with `usename` equal to each role, on different pids. That is consistent with the blog's "separate connection pool per user with no shared pool and no `SET ROLE` impersonation"[^sb-multigres-alpha] for two roles and one connection each. Pool sizing and fair-share allocation were not tested.
+
+---
+
+## Reading the numbers
+
+| Claim | Holds for | Does not follow |
+|---|---|---|
+| 0 acknowledged-but-lost | `ANY 1` of 3, `synchronous_commit=on`, process kill and `SIGSTOP`, 17 runs | Partitions, other policies, a contended pool |
+| Stall of 1.1 to 6.7 s after a postgres kill | This rig, a 500 ms orchestrator cycle | A default deployment; the spread is unexplained |
+| 14.7 to 15.1 s for a lost cell | Three runs, each on a fresh container | What an operator does with a dead pod: here nothing restarted the cell |
+| 20.0 to 56.2 s for a hung primary | Six runs in three artifacts; two of them in the main run | A bound: the 56.2 s run had a failed first promotion of unknown cause |
+| Latency and throughput | Context only: closed-loop figures from a Docker Desktop VM | Any comparison with a managed project |
+
+Not measured: the Kubernetes operator path and real node loss; the invite-only private alpha (no access); network partitions between cells (a frozen process is not a partition); loss of a gateway or of etcd; durability policies other than `ANY 1` of 3; whether `allow-unsafe-initial-cohort` and the 500 ms timers change the results; the cause of the detection spread and of the failed first promotion.
+
+The nearest managed comparison is the hand-rolled warm standby in [Supabase disaster recovery tiers](/reference/supabase-dr-tiers/), which is logical replication with a rehearsed cutover measured in minutes. This rig fails over inside the cluster in seconds on synchronous replication, with the caveats above. Moving data between two Postgres endpoints with logical replication is the subject of [pgmig](/reference/pgmig-logical-replication-migrator/).
+
+---
+
+## What to do about it
+
+Sizing and client rules from this page's own numbers. A row that is a design choice says so.
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Retry a failed write on a new connection, and make it idempotent. | In-flight INSERTs failed, one per worker in every MG03 and MG04 run; 0 to 5 failed INSERTs per run were committed anyway. | [MG02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg02-kill-postgres.ts), [MG03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg03-kill-cell.ts), [MG04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg04-freeze-primary.ts) |
+| Retry a refused login with the same password before alarming. | 2 to 5 connects per postgres-kill run answered `password authentication failed` with the correct password; cause not investigated. | [MG02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg02-kill-postgres.ts), [MG08](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg08-lagging-standby.ts), [MG09](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg09-idle-kill.ts) |
+| Budget about 15 s for a lost cell and 60 s for a hung primary. | 14.7 to 15.1 s (3 runs) and 20.0 to 56.2 s (six runs); the budgets are design choices above those ranges. | [MG03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg03-kill-cell.ts), [MG04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg04-freeze-primary.ts) |
+| Set the client statement timeout to the stall you can absorb. | The 20,016 ms stall matched the client's own 20 s statement timeout; recovery was at about +20 s. | [MG04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg04-freeze-primary.ts) |
+| Keep a connect timeout in the retry loop and count it in the stall. | A 5 s client connect timeout added 5 s (25,122 ms against recovery at about +20.6 s). | [MG04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg04-freeze-primary.ts) |
+| Relaunch pgbench in a loop around a failover. | All 8 clients aborted 45 to 51 ms after the kill and pgbench exited 2; a relaunch loop recovered with a 2,283 ms gap. | [MG05](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg05-pgbench-failover.ts) |
+| Replace a lost cell yourself; do not wait for a restart. | Nothing restarted the killed cell in this container: 2 nodes after 45 s, all three runs. Unknown under an operator. | [MG03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg03-kill-cell.ts) |
+| Test session state under a contended pool before relying on it. | 9 of 9 probes passed with one client, and autocommit and explicit-transaction statements ran on different backend pids. | [MG06](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg06-feature-matrix.ts) |
+
+---
+
+## Evidence
+
+| Number in this doc | Status | How it was checked |
+|---|---|---|
+| 17 failovers, 2,216,532 acknowledged writes, 0 lost | measured 2026-10-10 | per-run `acked` sums (MG05: `logged_transactions`) against the table read back after recovery, each run's row count equal on every surviving node and through the gateway; local Docker Desktop, 22 results all `pass` or `info` |
+| Postgres kill stall 1.1 to 4.2 s (MG02), 1.9 to 6.7 s (MG09) | measured 2026-10-10 | [MG02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg02-kill-postgres.ts) and [MG09](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg09-idle-kill.ts), n = 3 each; cause of the spread not found |
+| Cell kill stall 14.7 to 15.1 s | measured 2026-10-10 | [MG03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg03-kill-cell.ts), n = 3, fresh container each run |
+| Hung primary 20.0 and 25.1 s, and 20.0 to 56.2 s over six runs | measured 2026-10-10 (main run); earlier artifacts unpublished | [MG04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg04-freeze-primary.ts), n = 2 in the main run; the range includes three earlier artifacts |
+| Lagging standby 22,265,848 to 23,256,456 bytes behind, never promoted | measured 2026-10-10 | [MG08](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg08-lagging-standby.ts), `pg_stat_replication` flush lag, n = 3 |
+| Cluster stayed at 2 nodes for 45 s | measured 2026-10-10 | MG03 wait after the cell kill, 3 of 3 |
+| Gateway 9 of 9 on zone1 and zone2; per-user backends | measured 2026-10-10 | [MG06](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg06-feature-matrix.ts) and [MG07](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg07-per-user-pools.ts), one uncontended client, two roles |
+| Gateway holds requests; per-user pools; operator; 2026-06-04 post | documented | the launch post[^sb-multigres-alpha], read 2026-10-10 through a page-summarising fetch, not tested beyond the measurements above |
+| No `Dockerfile.cluster` at `v0.1.0` | measured 2026-10-10 | GitHub contents API answered 404 for it and for `docker-compose.yml` at that ref; release page[^mg-release-v010] |
+
+The one docs-versus-runtime difference is the gateway-holds-requests sentence against statements failing on the dead primary, described above.
+
+---
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| MG01 | multigres | [`mg01-cluster-facts.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg01-cluster-facts.ts) | none published |
+| MG02 | multigres | [`mg02-kill-postgres.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg02-kill-postgres.ts) | none published |
+| MG03 | multigres | [`mg03-kill-cell.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg03-kill-cell.ts) | none published |
+| MG04 | multigres | [`mg04-freeze-primary.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg04-freeze-primary.ts) | none published |
+| MG05 | multigres | [`mg05-pgbench-failover.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg05-pgbench-failover.ts) | none published |
+| MG06 | multigres | [`mg06-feature-matrix.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg06-feature-matrix.ts) | none published |
+| MG07 | multigres | [`mg07-per-user-pools.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg07-per-user-pools.ts) | none published |
+| MG08 | multigres | [`mg08-lagging-standby.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg08-lagging-standby.ts) | none published |
+| MG09 | multigres | [`mg09-idle-kill.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/tests/mg09-idle-kill.ts) | none published |
+| S01 | pooler-semantics | [`s01-feature-matrix.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-semantics/tests/s01-feature-matrix.ts) | none published for the MG06 re-run |
+
+The experiment's [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/multigres/RUNLOG.md) holds the per-run figures; its raw evidence directory is gitignored.
+
+## Related docs
+
+- [Supabase disaster recovery tiers](/reference/supabase-dr-tiers/): the managed-project tiers this is the self-run counterpart of.
+- [pgmig](/reference/pgmig-logical-replication-migrator/): moving a database between Postgres endpoints with logical replication.
+- [Supabase read replicas](/reference/supabase-read-replicas/): the managed read-scaling feature; its docs describe no promotion path (doc-read 2026-10-08).
+
+[^sb-multigres-alpha]: Supabase, "Multigres v0.1 Alpha: an operating system for Postgres," Supabase Blog, 2026-06-04. https://supabase.com/blog/multigres-v0-1-alpha
+[^mg-release-v010]: Multigres, "v0.1.0," GitHub Releases. https://github.com/multigres/multigres/releases/tag/v0.1.0

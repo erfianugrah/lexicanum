@@ -113,7 +113,22 @@ operation rather than a health endpoint:
 - **Pooler**: `select 1` over 6543 with a connect timeout. The error
   string names the operation underway (rows below). With the lab's 5 s
   probe timeout, recovery in timeout mode resolved only to about 5.5 s;
-  keep the timeout short if you want the window to the second.
+  keep the timeout short if you want the window to the second. A probe
+  that only connects does not see pool exhaustion: the client is accepted
+  in 43 to 52 ms and the error arrives on its first statement (PC01), so
+  run the `select 1`. If a probe or the app retries a statement that
+  failed on a reset connection, pause 300 ms first and not 0 ms. Through
+  a toxiproxy TCP fault between the client and the 6543 pooler (2026-10-10,
+  PC03), a retry-once at 0 ms rescued 0 of 30 failures after a 150 ms
+  flap on node-postgres and on Prisma, and a retry at 300 ms rescued 25
+  of 25 and 30 of 30. The pause covers a 150 ms flap. After a 2 s reset
+  or cut, 300 ms rescued 0 of 120 in each case on node-postgres and 30 and
+  10 of 120 on Prisma. postgres.js rescued every failure it
+  surfaced at both delays. No first attempt failed after the fault
+  cleared in the 111 runs that did not crash, so the three driver pools
+  evicted dead connections themselves, but a node-postgres `Pool` without
+  an `'error'` listener exited in 9 of 12 runs at the cut (`Unhandled
+  'error' event`).
 
 Declare recovery only after sustained success (the lab required 5 s of
 passing samples), because the pooler queues before it refuses and one
@@ -129,12 +144,50 @@ becomes a platform outage (platform-downtime "Reproducing").
 | PGRST301 | unknown signing key | key rotation/TPA config, not an outage |
 | PGRST002 | schema-cache wedge | `select pg_notify('pgrst','reload schema')` |
 | PGRST000 / 5xx on a real table | DB or tier failure | incident response |
-| 520/521/522 from CF front | gateway path | retry with backoff; cache serves reads |
+| 520/521/522 from CF front | gateway path | retry with backoff; cache serves reads. supabase-js GET and HEAD retry on 520 and 503 only (4 attempts at 1, 2, 4 s); 521, 522, 525 and 500 were each sent once (CR01a4, 2.112.3, injected statuses on a local fault proxy, 2026-10-10); a 503 with `Retry-After: 2` was waited 2 s, and a real Data-API-off 503 with `Retry-After: 0` was retried with no pause (CR01a6, CR01e1) |
 | 402 | billing restriction (Fair Use Policy: quota, spend cap, overdue invoice) | fix billing - card, cap toggle, or usage - not the platform; details in [the DR tiers reference](/reference/supabase-dr-tiers/) |
-| pooler `Failed to connect to database: {:error, :timeout}` | project restart underway (158 s measured, platform-downtime D01) | wait; REST kept serving |
+| pooler `Failed to connect to database: {:error, :timeout}` | project restart underway (158 s measured, platform-downtime D01; LO05 re-check, n=5, 2026-10-10: 50-58 s p50 per path) | wait; REST kept serving |
 | pooler `Failed to connect to database: {:error, :econnrefused}` | compute resize up underway (207 s measured, D03) | wait; REST kept serving |
-| pooler `terminating connection due to administrator command` | compute resize down underway (196 s measured, D04) | wait; REST kept serving |
+| pooler `terminating connection due to administrator command` | compute resize down underway (196 s measured, D04); also seen during restarts (LO05), so it does not name the operation by itself | wait; REST kept serving |
 | pooler `(EADDRNOTALLOWED) address not in tenant allow_list` | a network restriction was just applied and excludes this client (bites in 1 s, D02) | add the client's egress address to the allow-list |
+| pooler `XX000 (ECHECKOUTTIMEOUT) unable to check out connection from the pool after 60000ms in Transaction mode` | transaction pool exhausted (the project is otherwise up): the connect succeeds in 43-52 ms and the first statement fails after about 60 s (60,007-60,009 ms, 6 of 6, Micro, PC01) | fall back to the session pooler on 5432 (49-70 ms from the failure to the fallback's answer, PC02a) or add the direct or dedicated path (126-168 ms with the IPv4 add-on, PC02) |
+| pooler `(ECIRCUITBREAKER) too many authentication failures` | the pooler's circuit breaker: a wrong-password poll every 4 s opened it within about a minute, after which it refused the correct password too, before checking the password (restore-paths RP02 first attempt); also seen on failed JIT logins retried every 2 s for 60 s (JA01h) | poll a known-bad credential at most once a minute; read the breaker answer as no answer about the platform or the password |
+
+The pool-exhaustion row was measured 2026-10-10 on one Micro project in
+`ap-southeast-1` (PC01, PC02). The effective transaction pool was 16
+active backends while the API reported `default_pool_size null`, and a
+statement that queued for less than 60 s was served (6,018 to 6,056 ms
+behind 8 s holders, 4 of 4). A public status
+mirror quotes `after 15000ms` for an incident on another cluster on
+2026-08-24;[^pulsetic] this
+project answered 60000 ms in 6 of 6 trials and what sets the figure was
+not separated, so read it off the error text. The session pooler took
+one extra backend while the 16 transaction-mode backends were held (17
+active `pg_sleep` backends, PC02h, n=1); a herd of fallbacks was not
+tested, and each fallback client holds a backend for its whole
+connection. The direct host did not resolve from an IPv4-only client
+without the IPv4 add-on (`ENOTFOUND`, 6 of 6, PC02b), and the add-on took
+80 s from the PATCH to an IPv4 address on that resolver in both runs, so
+treat it as a setup step. On the breaker, the JIT
+run listed one banned IPv4 address through `POST /network-bans/retrieve`
+and `DELETE /network-bans` lifted it; its pooler rows after that point
+were discarded (JA01h, run 1).
+
+The restart row was re-checked on one Micro project with five restarts
+in sequence (LO05, 2026-10-10, 0.5 s sampling; the D01 numbers stand as
+measured). REST never failed in 5 of 5. Window p50 and max were 54 and
+60 s on Auth, 58 and 59 s on Storage, 54 and 151 s on the pooler and 50
+and 56 s on the direct path, with the first failure 2 to 3 s after the
+POST. Runs 1 and 2 ran about 30 s on every path except the pooler's 151 s
+in run 2, and runs 3 to 5 ran 50 to 60 s; one session cannot say whether
+that is drift, load or chance. The project status read `ACTIVE_HEALTHY`
+again at 40 to 71 s, and in run 2 it read healthy at 41 s while the
+pooler window ran to 151 s, so the status call does not mark the end of an
+outage. The pooler error text varied inside these restarts:
+`{:error, :timeout}`, `terminating connection due to administrator
+command` and `(EAUTHQUERY) auth_query secret check timed out`. Restart,
+resize and restriction costs side by side are in [what a platform
+operation costs](/reference/supabase-platform-operation-cost/).
 
 Detection also has a non-engineering half. Subscribe to
 [status.supabase.com](https://status.supabase.com/) so a platform
@@ -146,6 +199,25 @@ the full severity table is on [the SLA page](https://supabase.com/sla)). And
 on Team or Enterprise, give support at least 2 weeks' notice before a
 launch or heavy load event via the support form, which is the
 documented way to ask support to watch your project during that window.
+
+The status page can also gate your own changes, as an optional check on
+the probe side (LO01, `experiments/lifecycle-ops/lib/gate.ts`; one fetch
+of the JSON feed at 00:43 UTC on 2026-10-10 and a replay, so read it as a
+study of the feed's shape). Three properties of the feed set the rules.
+`status.supabase.com/api/v2/components.json` carries each of the 18 region
+names 10 or 11 times (189 components, no group or service field), so a
+lookup by region name takes the worst status over every match.
+`incidents.json` has no component or region field and
+`incidents/unresolved.json` answers 404, so read the region scope from
+the incident text, title first. `impact` is ignored: replayed over the
+25-incident feed, the gate refused 11 incidents for an upgrade, 3 of them
+published with impact `none`, and 10 for a restart, 2 of them with `none`.
+Component status has no positive case in the lab yet: all 189 components
+read `operational` on the day, so whether any of them flips during a
+regional incident was not measured. Over the feed's 1113 hours the replay
+would have refused a restart in `ap-southeast-1` for 38.5 h, on a text
+heuristic. Failing closed when the page cannot be
+read is a design choice and was not measured.
 
 ## Part 2: Exposure reduction - the jwt_exp lever
 
@@ -432,8 +504,35 @@ be dropped before a restore and recreated after (only the Realtime slot
 is exempted), so the standby's subscription dies with a primary restore
 and must be rebuilt with a re-sync. Mid-incident, restore-to-a-new-
 project keeps the original (and the replication) up instead of taking
-the size-dependent restore downtime. When restoring into a new project,
-wait for `ACTIVE_HEALTHY` and then retry the first write: 5 of 5 fresh
+the size-dependent restore downtime.
+
+No Management API route for it was found (checked 2026-10-10 on one Pro
+org, RP01). The published OpenAPI document (115 paths) has no
+path matching `clone`, the create-project body has no clone, restore,
+source or backup field, and the Dashboard's clone route answers a
+personal access token with `401 Unsupported access token`. The
+entitlements `project_cloning` and `backup.restore_to_new_project` read
+true on that org, so the feature is entitled and its route is the
+Dashboard's; it was not run, and the database password and Storage after a
+clone are unread. `POST database/backups/restore` with a backup id
+answered `400 This endpoint is unavailable at the moment` on a fresh Pro
+project. The in-place route that ran is `POST database/backups/restore-pitr`
+(PITR add-on on a Small project, RP02, 2026-10-10): the project returned
+to `ACTIVE_HEALTHY` after 30 s with a 10 MB database (n=3, 10 s polling)
+and after 81 s at 574 MB (n=1). REST, Auth and Realtime showed no failed
+1 s sample across the 9 clean restores (one unexplained simultaneous
+timeout on all three in the 574 MB run aside), Storage failed for 12 s (8
+of 9 restores), and the pooler for 5 to 13 s on 10 MB and 41 s at 574 MB.
+After each of the 9, the current database password logged in and the
+replaced one was refused, and the stored password verifier matched
+neither earlier value, which fits the platform's 2026-07-30 credential
+resync fix[^sb-restore-creds] (inference from fingerprints). Every target was minutes old; a target
+hours or days old was not run. An in-place restore rewinds the primary,
+so it unwinds the standby as described above. The full backup/PITR
+picture is in [the DR tiers reference](/reference/supabase-dr-tiers/).
+
+When restoring into a new project (from the Dashboard), wait for
+`ACTIVE_HEALTHY` and then retry the first write: 5 of 5 fresh
 projects refused the first `POST /auth/v1/admin/users` with 500 and
 accepted the next attempt one poll tick later. That figure is the
 placement reference's Verified row 'Create -> healthy, and healthy is not
@@ -442,8 +541,12 @@ own provisioning note in supabase-lab AGENTS.md records 2 of 2 fresh
 projects failing with `500 "Database error checking email"` on
 2026-08-03. Both are summarised in
 [what a platform operation costs](/reference/supabase-platform-operation-cost/).
-The full backup/PITR picture is in
-[the DR tiers reference](/reference/supabase-dr-tiers/).
+Three creates through `POST /v1/projects` on 2026-10-10 (LO03, 10 s poll)
+read `ACTIVE_HEALTHY` at the first poll twice and at 145 s once, and the
+project that read healthy at the first poll (LO05a) answered REST, Auth,
+Storage, the pooler and the direct path within 5 s. The lab recorded no
+first write on those projects, so the two sets of observations are not
+reconciled; keep the retry.
 
 ### 4.4 Rehearse
 
@@ -474,8 +577,14 @@ the file to object storage outside the incident blast radius.
 
 Each practice names the module or RUNLOG line it rests on; module ids resolve in the
 [edge-resilience RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/22fac44/experiments/edge-resilience/RUNLOG.md),
-the [platform-downtime RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/22fac44/experiments/platform-downtime/RUNLOG.md)
-and the [compute-disk RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/22fac44/experiments/compute-disk/RUNLOG.md).
+the [platform-downtime RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/22fac44/experiments/platform-downtime/RUNLOG.md),
+the [compute-disk RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/22fac44/experiments/compute-disk/RUNLOG.md),
+and, for the 2026-10-10 additions, the RUNLOGs of
+[pooler-checkout](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/RUNLOG.md),
+[lifecycle-ops](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/RUNLOG.md),
+[restore-paths](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/restore-paths/RUNLOG.md),
+[client-retries](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/RUNLOG.md) and
+[jit-db-access](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/RUNLOG.md).
 A line marked "design choice" is not a result.
 
 **Detection (Part 1)**
@@ -488,12 +597,42 @@ A line marked "design choice" is not a result.
 - Probe Storage against a real object, and on a fresh project expect
   `TenantNotFound` then `429 SlowDown` for the first minutes (W21).
 - Probe the pooler with `select 1` over 6543 under a short connect
-  timeout, and map the error string to the operation using the four rows
+  timeout, and map the error string to the operation using the pooler rows
   in the Part 1 table (platform-downtime pooler-mode table). With the
   lab's 5 s probe timeout a timing-out pooler was resampled about every
   5.5 s, which is the resolution its 158 s figure carries.
 - Declare recovery after sustained success and void rows that were failing
   before the operation began (platform-downtime "Reproducing").
+- Run a statement in the pooler probe, and read `ECHECKOUTTIMEOUT` as pool
+  exhaustion: the connect took 43 to 52 ms and the first statement failed
+  at 60,007 to 60,009 ms (6 of 6, PC01, Micro, 2026-10-10). The session
+  pooler on 5432 answered 49 to 70 ms after the failure (PC02a); the direct
+  host needs the IPv4 add-on from an IPv4-only client (PC02b), which took
+  80 s to resolve (PC02).
+- Retry a statement that failed on a reset pooler connection after 300 ms,
+  not 0 ms, and attach an `'error'` listener to a node-postgres `Pool`: 25
+  of 25 and 30 of 30 rescued at 300 ms against 0 of 30 at 0 ms after a
+  150 ms flap, and 9 of 12 runs exited without the listener (PC03).
+- Poll a known-bad credential at most once a minute and read
+  `ECIRCUITBREAKER` as no answer: a poll every 4 s opened it within about a
+  minute and it then refused the correct password (restore-paths RP02, the
+  aborted first attempt, no artifact), and a failed JIT login retried every
+  2 s for 60 s did the same (JA01h).
+- Gate a change on the status page by the worst status over every
+  component named for the region, with the scope read from incident text
+  and `impact` ignored (LO01, one fetch). Failing closed when the page
+  cannot be read is a design choice, and no component status has been seen
+  other than `operational`.
+- Budget about a minute per restart on Auth, Storage, the pooler and the
+  direct path, with a pooler run that reached 151 s, and do not read
+  `ACTIVE_HEALTHY` as the end: 40 to 71 s on the status call, 41 s in the
+  run whose pooler window ran to 151 s (LO05, n=5, one project).
+- Expect supabase-js to retry only GET and HEAD on 503 and 520, and set a
+  timeout yourself: a default client had none, and a request never
+  answered was still pending at 330 s on Bun and on Node (CR04, one trial
+  each, 2.112.3). Under Bun 1.3.14 an inline `AbortSignal.timeout` did not
+  end a call sleeping between retries; an `AbortController` with
+  `setTimeout` did (CR01d5a-b).
 
 **Exposure reduction (Part 2)**
 
@@ -532,7 +671,18 @@ A line marked "design choice" is not a result.
   reference, Verified row 'Create -> healthy, and healthy is not
   writable', 2026-08-04, n=5, bash run not in the lab repo), and 2 of 2
   with `500 "Database error checking email"` in the supabase-lab
-  provisioning note (2026-08-03).
+  provisioning note (2026-08-03). On 2026-10-10 three creates read
+  `ACTIVE_HEALTHY` at the first poll twice and at 145 s once (LO03), and a
+  first-poll-healthy project answered all five paths within 5 s (LO05a);
+  no first write was recorded, so keep the retry.
+- If the mid-incident restore has to be scripted, the Management API route
+  is an in-place `restore-pitr`, which takes the restore downtime and
+  unwinds the standby; restore to a new project was not found in the API
+  and was not run from the Dashboard (RP01: no clone path in the OpenAPI
+  document, the Dashboard route answers a PAT 401). `restore-pitr`
+  returned to `ACTIVE_HEALTHY` in 30 s on Small with 10 MB (n=3) and 81 s
+  at 574 MB (n=1), with Storage failing 12 s (RP02, 2026-10-10). The
+  current database password still logged in after 9 of 9 clean restores.
 - Not measured: failing back by reversing replication (4.3 step 7); a
   primary-side network restriction against the standby's walreceiver; the
   full routing-flip RTO end to end (per-step timings only: W05, W16, W17);
@@ -616,12 +766,23 @@ A line marked "design choice" is not a result.
 | Module | Experiment | Test | Artifact |
 |---|---|---|---|
 | C03 | tenant-consolidation | [`c03-users-merge-api.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/tenant-consolidation/tests/c03-users-merge-api.ts) | none published |
+| CR01 | client-retries | [`cr01-retry-matrix.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr01-retry-matrix.ts) | none published |
+| CR04 | client-retries | [`cr04-default-timeout.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr04-default-timeout.ts) | none published |
 | D01 | compute-disk | [`d01-compute-pg-limits.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/compute-disk/tests/d01-compute-pg-limits.ts) | none published |
 | D01 | platform-downtime | [`d01-restart.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-downtime/tests/d01-restart.ts) | none published |
 | D02 | platform-downtime | [`d02-restriction-flip.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-downtime/tests/d02-restriction-flip.ts) | none published |
 | D03 | platform-downtime | [`d03-resize-up.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-downtime/tests/d03-resize-up.ts) | none published |
 | D04 | platform-downtime | [`d04-resize-down.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-downtime/tests/d04-resize-down.ts) | none published |
 | D09 | compute-disk | [`d09-compute-resize-timing.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/compute-disk/tests/d09-compute-resize-timing.ts) | none published |
+| JA01 | jit-db-access | [`ja01-jit-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) | none published |
+| LO01 | lifecycle-ops | [`lo01-status-gate.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo01-status-gate.ts) | none published |
+| LO03 | lifecycle-ops | [`lo03-create-fallback.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo03-create-fallback.ts) | none published |
+| LO05 | lifecycle-ops | [`lo05-restart-envelope.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo05-restart-envelope.ts) | none published |
+| PC01 | pooler-checkout | [`pc01-checkout-timeout.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/tests/pc01-checkout-timeout.ts) | none published |
+| PC02 | pooler-checkout | [`pc02-fallback.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/tests/pc02-fallback.ts) | none published |
+| PC03 | pooler-checkout | [`pc03-driver-reset.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/tests/pc03-driver-reset.ts) | none published |
+| RP01 | restore-paths | [`rp01-pro-surface.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/restore-paths/tests/rp01-pro-surface.ts) | none published |
+| RP02 | restore-paths | [`rp02-pitr-restore.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/restore-paths/tests/rp02-pitr-restore.ts) | none published |
 | W03 | edge-resilience | [`w03-jwt-exp.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w03-jwt-exp.ts) | [`out/2026-08-16`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-16), [`out/2026-08-17`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-17) |
 | W04 | edge-resilience | [`w04-edge-cache-stale.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w04-edge-cache-stale.ts) | [`out/2026-08-16`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-16), [`out/2026-08-17`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-17) |
 | W05 | edge-resilience | [`w05-standby-replication.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w05-standby-replication.ts) | [`out/2026-08-16`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-16), [`out/2026-08-17`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-17) |
@@ -633,3 +794,6 @@ A line marked "design choice" is not a result.
 | W17 | edge-resilience | [`w17-config-parity.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w17-config-parity.ts) | [`out/2026-08-16`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-16), [`out/2026-08-17`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-17) |
 | W21 | edge-resilience | [`w21-spend-cap.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w21-spend-cap.ts) | [`out/2026-08-17`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-17) |
 | W24 | edge-resilience | [`w24-edge-failover-proxy.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w24-edge-failover-proxy.ts) | [`out/2026-08-16`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-16), [`out/2026-08-17`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-17) |
+
+[^pulsetic]: Supabase status mirror, "Error spikes in one of the eu-east-1 Supavisor clusters," 2026-08-24, Pulsetic. https://pulsetic.com/status/supabase/incidents/6635/
+[^sb-restore-creds]: Supabase, "Fixed stale database credentials left behind after a restore," Supabase Changelog, 2026-07-30. https://supabase.com/changelog/restore-credential-resync

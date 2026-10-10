@@ -1,6 +1,6 @@
 ---
 title: "Supabase incidents: what a client can do - a resilience reference"
-description: Every recurring Supabase incident class - JWT claim rejection, lifecycle downtime, pooler failures, capacity events, schema-cache wedges, storage billing shocks - with the client-visible signature, the workaround that exists, and which claims are lab-validated with numbers versus doc-claimed. Includes the measured warm-standby cutover path.
+description: Every recurring Supabase incident class - JWT claim rejection, lifecycle downtime, pooler failures, capacity events, schema-cache wedges, storage billing shocks, client retry behaviour - with the client-visible signature, the workaround that exists, and which claims are lab-validated with numbers versus doc-claimed. Includes the measured warm-standby cutover path.
 author: Erfi Anugrah
 category: supabase
 group: operations
@@ -25,6 +25,17 @@ Measured numbers come from the
 project in ap-southeast-1); the cutover drill ran cross-region
 ap-southeast-2 -> ap-southeast-1.
 
+Classes 2, 3, 4, 7 and 8 also carry measurements dated 2026-10-10 from six
+further experiments, each with a RUNLOG and no published `out/` artifact:
+`client-retries` (supabase-js 2.112.3 and 13 other versions on Bun 1.3.14,
+faults injected by a local proxy, n=1 per case unless stated),
+`pooler-checkout` (Micro, ap-southeast-1 and us-east-1, Pro org),
+`lifecycle-ops` (one Micro project, ap-southeast-1, n=5 restarts),
+`mgmt-api-faults` (supabase CLI 2.120.0, OpenTofu provider, the lab's own
+client, every fault injected, no real 5xx seen), `hostname-path` (one Pro
+project, ap-southeast-1, one APAC vantage) and `edge-runtime-auth` (the
+`functions.invoke` retry cell only). The Modules table maps each id to its test.
+
 **TL;DR** - Durability has its own tier ladder, priced out in
 [the DR tiers reference](/reference/supabase-dr-tiers/): daily backups
 (included, up to ~24h RPO), PITR (~2-minute worst-case RPO,
@@ -38,13 +49,18 @@ schemas (`auth.*`, `storage.*`) do not replicate at any tested size, so
 standby auth posture is token portability plus forced re-login, not user
 replication. The JWT clock-skew incident class has no runtime workaround -
 only exposure reduction (a token TTL lever that takes effect in ~6.5s) and
-detection (the PGRST code, not the HTTP status).
+detection (the PGRST code, not the HTTP status). The built-in supabase-js
+retries cover GET, HEAD and `rpc({ get: true })` on 503, 520 and connection
+resets only, with no default timeout (Class 8); a full transaction pool
+fails the first statement after 60 s while the connect succeeds (Class 3).
 
 ## Which do I pick
 
 | You need to survive... | Tier | Cost | Evidence |
 | --- | --- | --- | --- |
 | Origin 5xx on read paths | Edge cache Worker | One Worker, no infra change | Measured, W04 |
+| Transient 503 or 520 on a GET | Built-in supabase-js retries (2.102.0 and later) | On by default; a deadline is yours to add | Measured, CR01-CR04 |
+| Transaction pool full (`ECHECKOUTTIMEOUT`) | Session pooler on 5432 as fallback | Client-side switch | Measured, PC01-PC02 |
 | JWT claim rejections (PGRST303) | TTL raise + code-aware alerting | Config change | Measured, W01/W03 |
 | Auth outage with active sessions | Longer TTL (sessions keep validating) | Config change | Measured, W03 |
 | The whole PostgREST/Kong API layer (PGRST303, routing rollouts) | Own auth + claims over the wire | Rewrites the client; loses SDK surface | Measured, rls-wire-claims C01-C03 ([reference](/reference/rls-without-supabase-auth/)) |
@@ -128,6 +144,40 @@ under four operations at 500ms sampling.
 The per-path matrix is in [what a platform operation
 costs](/reference/supabase-platform-operation-cost/).
 
+Re-check on 2026-10-10 (lifecycle-ops LO05, one Micro project in
+ap-southeast-1, five sequential restarts, each after a readiness check, same
+0.5 s sampling; a window runs from the first failed sample to the first sample
+of a 5 s sustained recovery). The D01 row is the n=1 figure above, kept as it
+was; the two are different days and different projects, so the table is not a
+controlled comparison.
+
+| Path | D01, 2026-08-04, n=1 | LO05, 2026-10-10, n=5: window p50 / max | LO05 per run (s, runs 1 to 5) |
+| --- | --- | --- | --- |
+| REST | 0 failed samples | 0 of 5 runs failed | - |
+| Auth | 75 s | 54 s / 60 s | 32, 31, 54, 59, 60 |
+| Storage | 78 s | 58 s / 59 s | 28, 29, 58, 59, 59 |
+| Pooler (6543) | 158 s | 54 s / 151 s | 31, 151, 52, 54, 59 |
+| Direct (5432) | not sampled | 50 s / 56 s | 28, 28, 50, 55, 56 |
+
+The first failed sample came 2 to 3 s after the `POST /restart` on every
+failing path. The control-plane status read `ACTIVE_HEALTHY` again at 40, 41,
+61, 61 and 71 s (10 s poll), so it ended before the pooler recovered in run 2
+(41 s against a 151 s pooler window). Windows were about 30 s in runs 1 and 2
+(the pooler's 151 s in run 2 excepted) and 50 to 60 s in runs 3 to 5; five
+runs on one project cannot say whether that is drift across back-to-back
+restarts, platform load or chance. Realtime was not sampled in LO05, and D01's
+158 s sits near LO05's single 151 s pooler run, not near its other four.
+`POST /restart` answered HTTP 200 each time; a second `POST /restart` sent
+while the status read `RESTARTING` also answered 200 with an empty body (LO05c,
+whether it queued was not sampled). A restart sent about 70 s after the
+creating POST, to a project that already read `ACTIVE_HEALTHY`, was refused
+with HTTP 400 `Project restarts are only allowed ten minutes after the creation
+process has completed.` followed by text the artifact cut off; a restart 300 s after the first `ACTIVE_HEALTHY` read on
+another project was accepted (LO05f), so the boundary is unresolved. Probes on
+the macOS test machine used `dns.resolve6` for the AAAA-only direct host,
+because `dns.lookup` (getaddrinfo) returned `ENOTFOUND` for it while a TCP
+connect to the literal address worked.
+
 For probe design, anonymous network probes see nothing
 (network accept is not readiness), and the Auth probe must be the signUp
 REST surface - RLS blocks the password grant on a fresh project, so a
@@ -145,6 +195,100 @@ succeeds, the first statement fails 08P01/0A000, and prepared statements
 are unsupported. The same HTTP 400 can be a bad request or a capacity
 ceiling - read the SQLSTATE. Non-pooler 5432 can accept and then silently
 blackhole; always set connect and statement timeouts.
+
+### Pooler checkout timeout
+
+Measured 2026-10-10 in pooler-checkout (PC01, PC02; one Micro project per run,
+ap-southeast-1, Pro org, Supavisor transaction pooler on 6543, one IPv4-only
+vantage in Singapore). The Management API reports `default_pool_size null` for
+the project, so the 16 below is a measured concurrency; no configured value was read
+back.[^sb-conn-mgmt]
+
+| Observation | Value | Module |
+| --- | --- | --- |
+| Active `pg_sleep` backends 6 s into 40 concurrent `pg_sleep(25)` clients | 16 in both runs | PC01b |
+| Client 17 (16 backends held by `pg_sleep(75)`): `connect()` | succeeds in 43 to 52 ms | PC01c |
+| Same client, first `select 1` | fails after 60,007 to 60,009 ms (6 of 6 trials) | PC01c |
+| Error text | `XX000 (ECHECKOUTTIMEOUT) unable to check out connection from the pool after 60000ms in Transaction mode` | PC01c |
+| Holders sleeping 8 s, client 17 sends `select 1` 2 s in | served after 6,018 to 6,056 ms (4 of 4), no error | PC01d |
+| `select 1` after the holders ended | 7 to 8 ms | PC01c |
+
+A connect probe or a ping on connect does not see exhaustion; the client is
+accepted and the error arrives on the first statement. A statement that queues
+for less than 60 s is served. A public status-page mirror quotes the same error
+with `after 15000ms` for an incident on 2026-08-24 in one cluster;[^pulsetic]
+this project answered 60,000 ms in 6 of 6 trials, and whether the figure is set
+per cluster, per tenant or per Supavisor release was not separated (one project,
+one region, one day). Role `postgres` cancelled a `pg_sleep(130)` with
+`canceling statement due to statement timeout` at 120 s in an exploratory run
+(not an artifact row), so holders must sleep under 120 s.
+
+Fallback, with the 16 transaction-mode backends held (switch time is from the
+primary's failure to the fallback's answer; three trials per row in each of two
+runs):
+
+| Fallback | Switch time | Module |
+| --- | --- | --- |
+| Session pooler, 5432, after a 3,000 ms client deadline | 49 to 70 ms (total 3,092 to 3,131 ms) | PC02a |
+| Session pooler, 5432, after the server's own 60 s error | 56 to 117 ms (total 60,115 to 60,359 ms) | PC02c |
+| Direct 5432, no IPv4 add-on | 0 of 3 answered in each run; `ENOTFOUND` in 6 of 6 trials | PC02b |
+| Dedicated pooler (PgBouncer) 6543, IPv4 add-on on | 126 to 167 ms | PC02e |
+| Direct 5432, IPv4 add-on on | 135 to 168 ms | PC02f |
+
+The OS resolver on this vantage returned 0 IPv4 and 0 IPv6 addresses for the
+direct host without the add-on, while a public resolver (1.1.1.1) returned 1
+AAAA record (PC04d), so the `ENOTFOUND` is this vantage's view of an IPv6-only
+host. With the add-on enabled through `PATCH billing/addons`, this resolver
+returned an IPv4 address after 80 s in both runs, the dedicated pooler answered
+at 81 s and 80 s and direct at 81 s and 81 s (PC02d). One session-mode client
+running `pg_sleep(15)` beside the 16 held transaction backends took a 17th
+backend and completed (PC02h, n=1, pool setting unchanged), so one session-mode
+client fit as a 17th backend; it was not compared with a documented combined
+limit, and a herd of fallbacks was not run. Session mode behaves like a direct connection
+for prepared statements and `SET`, and each fallback client holds a backend for
+its whole connection.
+
+### Driver behaviour after a connection reset
+
+PC03 put toxiproxy between the client and the transaction pooler and ran 5
+workers issuing `select 1` every 200 ms for 22 s in a pool of 5, with a fault
+2 s long (`reset`, `cut`) or 150 ms long (`flap`), 6 runs per cell. After the
+fault cleared, 0 first attempts failed in the 111 runs that did not crash, for
+node-postgres, postgres.js and Prisma: all three evicted dead connections and
+recovered without a restart.
+
+| Driver, fault | Rescued by retry-once at 0 ms | Rescued by retry-once at 300 ms |
+| --- | --- | --- |
+| node-postgres, `flap` (150 ms) | 0 of 30 | 25 of 25 |
+| Prisma, `flap` (150 ms) | 0 of 30 | 30 of 30 |
+| node-postgres, `reset` | 2 of 254 | 0 of 120 |
+| Prisma, `reset` | 2 of 263 | 30 of 120 |
+| postgres.js, `reset` | 30 of 30 | 30 of 30 |
+
+A retry for a stale-connection failure has to wait longer than the outage it
+follows: at 0 ms it landed inside the 150 ms the proxy was down (an inference
+from the timing, not a separate probe). During a 2 s reset or cut, node-postgres
+and Prisma failed 40 to 50 first attempts per run at 0 ms and 20 per run at
+300 ms; postgres.js showed no failed first attempt in 9 of 12 `cut` runs, with
+the slowest statement at 1,902 to 2,103 ms, about the length of the cut.
+node-postgres `Pool` without an `'error'` listener exited non-zero in 9 of 12
+runs at the cut (`Unhandled 'error' event ... Connection terminated
+unexpectedly`); with the listener 0 of 36 runs crashed. Not measured: a real
+Supavisor node replacement, prepared statements (postgres.js ran with
+`prepare: false`), idle pools, TLS verification, other driver releases.
+
+### Pooler host prefix
+
+On 2026-10-10 a fresh Pro project in each of two regions (ap-southeast-1 in
+runs 1, 2 and 5, us-east-1 in run 7) reported an `aws-0` pooler host, and the
+same tenant on the `aws-1` host answered `XX000 (ENOTFOUND) tenant/user
+postgres.<ref> not found` (535 to 648 ms, and 3,636 and 3,684 ms in
+us-east-1) while the `aws-0` host answered (PC04). The hypothesis that `aws-0`
+hosts are the old ones is not supported by these four projects; older projects
+and other regions were not measured. Read `db_host` from `GET
+/v1/projects/{ref}/config/database/pooler` rather than writing the host into
+code. The lab's lint flagged 2 of 2 `aws-0` literals in its fixtures and
+ignored dedicated and direct hosts.
 
 ## Class 4: Capacity and control-plane events
 
@@ -168,6 +312,116 @@ spend cap is not a request-path breaker (W21: quota+5 renders all 200);
 the fix is a card, a cap toggle, or reduced usage.
 The full billing/cost picture is in
 [the DR tiers reference](/reference/supabase-dr-tiers/).
+
+### Status page as a change gate
+
+Measured in lifecycle-ops LO01 (2026-10-10, one fetch at 00:43 UTC, an earlier
+fetch at 00:33 UTC saw the same shapes, no credential). The status page's JSON
+under `/api/v2/` can gate a create, restart, resize or upgrade, with these
+shapes:[^sb-status]
+
+| What | Value |
+| --- | --- |
+| Components in `components.json` | 189 |
+| Region names present | 18, each occurring 10 or 11 times; no group, service or parent field |
+| Non-region components | 5 (Auth, Billing & Payments, Dashboard, Logging & Observability, Realtime) |
+| Component status | `operational` on all 189 |
+| Incidents in `incidents.json` | 25, oldest created 2026-08-24, 0 open; no component or region field |
+| `incidents/unresolved.json` | HTTP 404 |
+| `summary.json` | one scheduled maintenance, created 2026-06-29, still `scheduled` on 2026-10-10 |
+
+A lookup of the component named for a region therefore returns one of 10 or 11
+components with nothing saying which service it is, so a gate takes the worst
+status over every match. All 189 read `operational`, so component status has no
+positive case in the lab yet. Incident scope is in text only: the gate (12 unit
+tests, fixtures) reads the title first and treats a region found only in an
+update body as a warning unless the text also has lifecycle wording, because one
+incident whose title named no region listed a dozen regions in a PostgREST
+rollout message and the first version of the gate counted it as 94.6 hours of
+refused restarts for ap-southeast-1. `impact` is ignored: replayed for
+`upgrade` the gate would have refused 11 of the 25 incidents, 3 of them
+published with impact `none` (including "Upgrade Issues", whose update text says
+the ability to upgrade projects was suspended), and for `restart` it refuses 10,
+2 of them with impact `none`. The gate does not read maintenance windows, since
+the one entry is 100 days old and still `scheduled`.
+
+Replaying the 25-incident feed (1113 hours) through a restart gate, from
+incident text only because component status is not historical, would have
+refused ap-southeast-1 for 38.5 hours, eu-west-1 for 41.8 and us-east-1 for
+205.1 (one incident, "Intermittent latency in Eastern US", stayed open about 7
+days); 38.5 hours was the minimum over the 18 regions. That classification is a
+heuristic and not ground truth. Not measured: component behaviour during an
+incident, how late the feed runs against an incident's real start, and
+maintenance-window semantics.
+
+### Create, region fallback and abandoned requests
+
+Measured in lifecycle-ops LO03 (three creates) and LO04 (one), ap-southeast-1.
+Requests that must fail did so fast and created nothing: unknown region 400
+(194 ms), unknown org slug 404 (80 ms), missing `name` 400 (93 ms), unknown
+instance size 400 (55 ms). A fallback wrapper that fell through one 400 landed on
+the second region; `ACTIVE_HEALTHY` came back at the first poll twice (2 s) and
+at 145 s once (10 s poll, n=3, so both happen and the count says nothing on how
+often). The project that read healthy at the first poll served REST, Auth,
+Storage and the pooler, and direct 5 s later (LO05a). A provisioning or capacity
+failure on the platform side cannot be induced from a client and was not run.
+
+LO04 (n=1): a `POST /v1/projects` whose caller gave up after 1 s still created
+the project, and an identical re-send 1 s later answered HTTP 400 `Project with
+name "<name>" already exists in your organization.` after 0.17 s; 60 s later
+the organisation held exactly 1 project with that name, `ACTIVE_HEALTHY`. A
+client that retries after a lost response gets a 400 it has to read as "probably
+created, look it up by name", and keeps the name stable across retries of one
+logical create; a wrapper that adds a random suffix per attempt would not meet
+that check (reasoned from the 400, not run). Not measured: case sensitivity, a
+name freed by `DELETE`, two concurrent identical requests, an idempotency key.
+
+### Management API clients under injected faults
+
+Measured in mgmt-api-faults (MF01-MF05, 2026-10-10, Pro org, ap-southeast-1):
+a fault-injecting proxy in a local container sat between each tool and
+`api.supabase.com`, with the CLI pointed at it through a profile file whose
+`api_url` is the proxy, the OpenTofu provider through `endpoint`, and the
+lab's client through its base URL. Every fault is injected and no real 5xx
+was seen, so how a tool reacts to a real 5xx body is not measured. Attempt
+counts are proxy log rows; n=1 per cell unless stated.
+
+| Client | GET | POST | PUT, PATCH, DELETE | Timeout |
+| --- | --- | --- | --- | --- |
+| Lab harness `mgmt()` (MF01) | 1 attempt on 500, 502, 503, 504; the status is returned | not run | not run | throws `TimeoutError` at its 30 s default (30001 ms) |
+| supabase CLI 2.120.0 (MF03) | 6 attempts per call with no pause on 500 (also 502, 503, 504); 429 is 1 attempt | 1 attempt on 500, 502, 503, 504 and 429 | PUT and DELETE 6 attempts on 500; PATCH not reached by any command | 60 s per attempt; a GET held 100 s gave attempts at 0, 60, 120, 180, 240 and 300 s and exit 1 after 360220 ms |
+| OpenTofu 1.13.1 with `supabase/supabase` 1.11.0 (MF04) | 4 attempts over about 6 s on a persistent 503; 2 on one 500 or one 429 | 1 attempt on 500 | 1 attempt on 500 (PATCH, DELETE) | waited 130 s for a held create and exited 0 after 132978 ms; a GET held 100 s was 1 attempt, 103298 ms |
+
+`functionPresent()` in the same harness retries 429 only, with a fixed 15 s sleep
+(3 attempts in 30144 ms for two 429s), and a 500 on its read returns `present:
+false` with `status` 500, which a caller cannot tell from a missing function
+without checking `status` (MF01c). A held POST is not resent by either tool: the
+CLI exits 1 at 60 s (60448 ms for a 75 s hold) with the create already landed
+(MF05a), and the provider waited out the hold (MF05b). Writes answered 502, 503,
+504 or 429 in the provider, PATCH through the CLI and connection-level faults
+were not run.
+
+### Failed creates leave orphans
+
+A create answered 500 after upstream had created the project (injected by the
+proxy forwarding the request and replacing the answer) leaves the client with an
+error and the project upstream. In the provider (MF04b-c), apply exited 1 with 1
+POST, state held 0 resources, and a plain re-apply answered 400 (same name in
+the organisation) with the orphan still there; deleting the orphan through the
+API let the next apply exit 0 in 3468 ms. The CLI's `projects create` answered
+500 after upstream created it did the same, 1 attempt, exit 1, 1 project with
+the requested name (MF03). The same-name 400 is the only duplicate protection
+observed, and a retry with a fresh name is not covered and was not run (MF02c).
+A settings write that failed before upstream leaves the project in state without
+its settings (MF04d0); one that landed but answered 500 converges at the next
+plan (MF04d2); a `DELETE` that landed but answered 500 leaves a state entry that
+destroys cleanly later, because a 404 on the GET and the DELETE is accepted
+(MF04f2-f3). The harness create behaves the same way on an answer lost to its
+own 4 s timeout (MF02a, 1 project afterwards).
+
+Restore paths (PITR, Free-plan pause and unpause, and what the Management API
+exposes for each) are priced and compared in [the DR tiers
+reference](/reference/supabase-dr-tiers/), which owns that tier ladder.
 
 ## Class 5: Schema-cache wedge
 
@@ -260,13 +514,177 @@ pointed at a dead origin fails only that tenant (502 for it, 200
 elsewhere), and the eject costs a redeploy (10.6s) while the table
 lives in an env var (measured, edge-resilience W25).
 
+### Custom hostname and a resolver that cannot resolve supabase.co
+
+A hostname you own in front of the project is the client-side lever the
+platform itself used when it published a proxy domain during a regional block,
+which restored PostgREST, Realtime and Edge Functions while auth callbacks and
+storage object URLs stayed affected through hardcoded domain
+references.[^sb-regional-blocks] Measured in hostname-path (2026-10-10, one Pro
+project in ap-southeast-1, one APAC vantage, n=1 per row; the custom-domain
+add-on behaviour itself is in [Static hosting on Supabase](/reference/supabase-static-hosting/)):
+
+- HP06 resolution: the project host is 2 A records, no AAAA, TTL 300, the same
+  set through the system resolver, 1.1.1.1, 8.8.8.8, 9.9.9.9 and DoH on
+  Cloudflare and Google. A custom hostname set as a CNAME (TTL 60) to
+  `<ref>.supabase.co` returned the same 2 addresses on all six paths.
+  `supabase.co` is delegated root, then `co.` (4 NS), then 2 NS on Cloudflare,
+  with no DS at `.co` and no DNSKEY, and an unused label under it answers
+  NXDOMAIN (no wildcard).
+- HP07 rig: a recursive Unbound in Docker with a zone forward sending
+  `supabase.co.` to a dnsmasq that answers NXDOMAIN, and an app container whose
+  only resolver is that Unbound. The app is supabase-js doing 6 operations (a
+  DNS lookup, password sign-in, a REST read, a public Storage object, an Edge
+  Function call and a Realtime subscription). Control, recursion intact: 6 of 6
+  ok on the custom host and on the project host.
+- With `supabase.co` NXDOMAIN and the custom host a CNAME to the project host,
+  the app on the custom host did 0 of 6 operations (`getaddrinfo ENOTFOUND`),
+  and so did the app on the project host. The CNAME is in the answer and its
+  target is NXDOMAIN, so a custom hostname that is a CNAME to
+  `<ref>.supabase.co` does not survive a resolver that cannot resolve
+  `supabase.co`.
+- With the CNAME replaced by A records holding the project host's 2 addresses,
+  the same hostname answered `NOERROR` with 2 A records and the app did 6 of 6
+  operations. Before that, curl pinned to each address with SNI set to the
+  custom host returned `200` on both. The platform status still read
+  `5_services_reconfigured` a few seconds after the CNAME was removed. How long
+  the addresses stay valid (they are shared anycast addresses), a `reverify` or
+  certificate renewal without the CNAME, and whether the platform supports
+  address records were not tested; this records a measured behaviour and
+  recommends nothing.
+- A resolver that had the chain cached before the outage kept answering at
+  every 30 s sample to 271 s, and failed first at 301 s, matching the 300 s TTL
+  on the cached target A record (one resolver configuration, no serve-stale and
+  no prefetch; a stale-serving resolver would differ and was not run).
+
+Not simulated: an outage seen by some resolvers and not others, a failure at the
+`.co` TLD (the custom hostname sits under a different TLD, so only the CNAME
+target is affected), and ISP-side filtering. The auth side of the same hostname
+(the callback moving to the custom host about 6 s after activation, and an access
+token `iss` that stays on the project host) is measured in HP03 and HP04; the
+auth mechanics are in [Supabase Auth end to end](/reference/supabase-auth-end-to-end/).
+
 ## Class 8: Client retry behaviour
 
 Measured in edge-resilience W02 against supabase-js 2.112.3: 401 PGRST303 ->
 exactly 1 attempt (no retry amplification). 503 x3 then 200 -> 4 attempts,
 success in ~7.0s. Connection refused -> surfaced in ~7.0s. The built-in
-retries cover 408/409/503/504 and network failures, on by default since
-v2.102.0; custom policies go through `fetch-retry`.[^sb-retries]
+retries are on by default since v2.102.0; custom policies go through
+`fetch-retry`.[^sb-retries] Which statuses and methods they cover was
+measured on 2026-10-10 in client-retries (CR01-CR04): a local fault proxy sat
+between the client and the project's REST URL, so an injected status never
+reached the platform and the proxy log, including `X-Retry-Count`, is the
+source of every attempt count. supabase-js 2.112.3 on Bun 1.3.14 unless a row
+names another version or Node v26.11.1; n=1 per case unless stated.
+
+### Statuses by method
+
+| Answered by the server | GET, HEAD, `rpc({ get: true })` | POST insert, PATCH, DELETE, upsert, default `rpc()` |
+| --- | --- | --- |
+| 503 | 4 attempts at 1, 2, 4 s, `X-Retry-Count` 1, 2, 3 (7008 ms; CR01a2, CR01b3) | 1 attempt (CR01b1-b3) |
+| 520 | 4 attempts, 7012 ms (CR01a3) | 1 attempt (CR01b1) |
+| Connection reset | 4 client attempts, 7016 ms (CR01a5) | 1 attempt (CR01b1) |
+| 525, 502, 504, 500, 429, 408, 521, 522, 524 | 1 attempt for each of the nine (CR01a4) | not run per status; the method is never retried |
+| 409 | not in the measured set | not run |
+| 401 `PGRST303` | 1 attempt (W02) | not run |
+
+A GET reset gave 4 client attempts but 5 requests on the wire on the shared
+proxy in CR01a5 (the first request sent twice with no header change), and 4
+wire requests in every version in CR03, where each case had a fresh mock server;
+the cause of the extra request was not isolated. The 503 row holds with
+`Retry-After` unset. With it, the header sets the spacing: `Retry-After: 2` gave
+a 2000 ms gap, `0` gave 0 ms, `40` gave 40000 ms (above the 30 s cap), and an
+HTTP date was ignored with a 0 ms gap (CR01a6). The real Data-API-off 503
+(`PGRST002`, with the schema list emptied through the `postgrest` config
+endpoint of the Management API) carries `Retry-After: 0` on every answer, so the
+default client's four attempts ran back to back (gaps of 1700, 1800 and 2000 ms,
+each about the previous answer's duration plus 40 ms, 7252 ms in total) rather
+than at 1, 2, 4 s; a POST made 1 attempt and a GET with `.retry(false)` 1 (CR01e1-e3). The
+gateway's `edge_logs` showed 5 rows for those calls and no `X-Retry-Count`
+(`source = 'edge_logs'`), so attempts are visible there only as rows (CR01f).
+
+`supabase.functions.invoke` is a neighbour of this class and does not share the
+policy: supabase-js 2.117.3 made 1 attempt and the function received 1 request
+for an injected 503 (with and without `Retry-After`), 502, 500 and 429, 3 trials
+per status, error class `FunctionsHttpError` (edge-runtime-auth ER02-retry-503).
+A 503 produced by the platform's own relay, network errors and other client
+versions were not measured. Limits of the function side are in [Edge Function
+limits, one ceiling at a time](/reference/supabase-edge-function-limits/).
+
+### Versions and opt-out names
+
+Per version, from a local mock with a fresh server per case (CR03, both
+runtimes), cells are attempts:
+
+| supabase-js | GET 503 | GET 525 | POST 503 | `.retry(false)` | `db: { retry: false }` | `db: { retryEnabled: false }` |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2.101.1 | 1 | 1 | 1 | 1 | 1 | 1 |
+| 2.102.0 to 2.111.0 (10 versions) | 4 | 1 | 1 | 1 | 4 | 4 |
+| 2.112.0, 2.112.3, 2.117.3 | 4 | 1 | 1 | 1 | 1 | 4 |
+
+Retries begin at 2.102.0. `db: { retry: false }` is honoured from 2.112.0, so on
+2.102.0 to 2.111.0 only `.retry(false)` on the query opts out. `db.retryEnabled`,
+the name the changelog gives, changed nothing in any of the 14 versions. A
+per-query `.retry(true)` beats `db.retry = false` (4 attempts, CR01c4).
+
+### Timeouts and deadlines
+
+- There is no default timeout: a response held 10 s completed (10108 ms,
+  CR01d2), and a request the server accepted and never answered was still
+  pending when observation stopped at 330004 ms on Bun and 330016 ms on Node
+  (CR04, one trial each, default client, no `db.timeout`, no signal).
+- `db.timeout` is per attempt, not per call: with 2000 and a 503 on every
+  attempt the call made 4 attempts and took 7010 ms (CR01d4). An abort is not
+  retried: a response held 3 s with `db.timeout = 2000` ended at 2004 ms after 1
+  attempt (CR01d3).
+- Under Bun 1.3.14, the docs page's own pattern of
+  `.abortSignal(AbortSignal.timeout(n))` created inline did not end a call that
+  was sleeping between retries: a 5000 ms deadline with a 503 on every attempt
+  ran 4 attempts to 7011 ms (CR01d5a), and the same with 2500 ms ran 4 attempts
+  in about 7 s on every version from 2.102.0 (CR03). Node ended after 2
+  attempts at about 2.5 s. An `AbortController` with `setTimeout`, or a timeout
+  signal with an `abort` listener attached at creation, ended at the deadline on
+  both runtimes (CR01d5b and CR01d5c, 5005 ms and 5003 ms with 3 attempts).
+  The cause is not isolated and no Bun fix or other Bun version was checked.
+  A plain `fetch` with an inline `AbortSignal.timeout(2000)` against a held
+  request aborted at 2002 ms (a scratch check, Bun and Node).
+
+### Policies the built-in retries lack
+
+CR02 ran two client policies on Bun. A deadline plus one hedged GET (built-in
+retries off, one deadline signal with a listener, one extra request when the
+first fails with status 0 or 5xx or has been outstanding 1500 ms) bounded a held
+request to 1575 ms (first request held 10 s, deadline 5000 ms), and a request
+never answered to the 4000 ms deadline (ended at 4003 ms, 2 requests, both
+aborted). It sent 2 requests for a 525 where the built-in policy sends 1. Left
+on under the hedge, the built-in retries sent 6 requests in 6 s against 2 with
+them off (CR02f). The hedge is for GET only: a hedged `insert` into a table with
+no unique key wrote 2 rows for one logical write, and a hedged primary-key
+`upsert` wrote 1 (CR02g, the server made slow rather than the network). The
+policy retries immediately; a pause or jitter was not tested, and neither was
+retry load on the Data API connection pool, which the docs warn about.[^sb-retries]
+
+Refresh-then-retry on a 401 (one `auth.refreshSession()` and one repeat) recovered
+an injected 401 `PGRST303` with 1 refresh call and 2 REST requests (200 after
+136 ms), and a real 401 from a corrupted access-token signature
+(`PGRST301`) the same way; 401 on every request stopped after 1 refresh and
+1 retry; a session revoked with `POST /auth/v1/logout?scope=global` returned
+the original 401 after a failed refresh (`refresh_token_not_found`); five
+parallel requests each answered 401 once made 1 refresh call (CR02h, one trial,
+so client deduplication cannot be told from timing luck). The injected 401s are
+not the platform's: the incident class "fresh JWT rejected" was not reproduced.
+
+### Docs against runtime
+
+Neither public page lists 408, 409 or 504. This page's earlier text said the
+built-in set was 408/409/503/504; 408 and 504 each got 1 attempt on a GET
+(CR01a4) and 409 was not measured. The docs page lists GET, HEAD and OPTIONS (OPTIONS
+was not tested) with 503, 520 and network failures, and names the opt-out
+`db: { retry: false }`; the changelog says GET and HEAD, up to 3 retries at 1, 2, 4 s
+capped at 30 s, and names `retryEnabled`.[^sb-retries][^sb-retries-changelog]
+The spacing, the methods and the version match; `retryEnabled` does nothing and
+`db.retry` needs 2.112.0 (above). Neither page, as read, mentions `Retry-After`. Filed
+upstream: no.
 
 ## Class 9: Warm standby and cutover (the HA tier)
 
@@ -433,6 +851,15 @@ the [instance-sizing RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/22
 and the [compute-disk RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/22fac44/experiments/compute-disk/RUNLOG.md).
 The platform-downtime rows are n=1 per operation, so they rest on the
 ordering of the paths, not on the seconds.
+The 2026-10-10 rows resolve in the
+[client-retries RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/RUNLOG.md),
+the [pooler-checkout RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/RUNLOG.md),
+the [lifecycle-ops RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/RUNLOG.md),
+the [mgmt-api-faults RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/RUNLOG.md),
+the [hostname-path RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/hostname-path/RUNLOG.md) and
+the [edge-runtime-auth RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/edge-runtime-auth/RUNLOG.md); they are n=1 per
+cell unless the row gives a count, and the control-plane rows are injected
+faults.
 
 | Practice | Evidence | Module |
 | --- | --- | --- |
@@ -447,7 +874,20 @@ ordering of the paths, not on the seconds.
 | Diff the whole `config/auth` payload between primary and standby rather than a named field list. | On `GET /v1/projects/{ref}/config/auth`, `custom_oauth_max_providers` defaulted to 32767 on one project generation and 3 on another. | [W17](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w17-config-parity.ts) baseline diff, 2026-08-17 |
 | Poll the readback after any `config/auth` PATCH, including the restore in a drill. | The apply is async and an immediate readback returned the pre-restore value. | [W17](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w17-config-parity.ts), 2026-08-17 battery (24/25, green on re-probe) |
 | Check `max_replication_slots` before adding a subscription and drop orphan slots on the publisher first. | The limit is 10 on micro and on small. Each subscription pins one, and a dropped subscription can leave its slot on the publisher either way - after a plain drop (W05) and after `slot_name = none` then drop (W14) - so list `pg_replication_slots` on the publisher and `pg_drop_replication_slot` any orphan. | compute-disk [D01](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/compute-disk/tests/d01-compute-pg-limits.ts); [W05](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w05-standby-replication.ts), [W14](https://github.com/erfianugrah/supabase-lab/blob/22fac44/experiments/edge-resilience/RUNLOG.md) |
-| Add the 520-class statuses to the client retry set through `fetch-retry`. | The built-in set is 408/409/503/504 and network failures. Documented, not measured. | supabase-js docs[^sb-retries]; design row |
+| Add 504 and 408 to the GET retry set through `fetch-retry`; 520 is already retried. | The built-in GET, HEAD and `rpc({ get: true })` retries cover 503, 520 and connection resets, 4 attempts at 1, 2, 4 s. 504, 408, 525, 502, 500, 429, 521, 522 and 524 each got 1 attempt (injected, supabase-js 2.112.3, 2026-10-10). This row's earlier text, 408/409/503/504, was not what either docs page says[^sb-retries][^sb-retries-changelog]; 409 was not measured. | [CR01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr01-retry-matrix.ts), 2026-10-10 |
+| Opt out with `.retry(false)`; `db: { retry: false }` needs supabase-js 2.112.0. | `.retry(false)` gave 1 attempt from 2.102.0; `db: { retry: false }` was ignored through 2.111.0; `db: { retryEnabled: false }`, the changelog's name, did nothing in 14 versions. | [CR01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr01-retry-matrix.ts), [CR03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr03-version-matrix.ts) |
+| Bound every call with an `AbortController` and `setTimeout`, not an inline signal. | There is no default timeout (still pending at 330 s on Bun and Node, n=1 each) and `db.timeout` is per attempt (4 attempts, 7010 ms at 2000). On Bun 1.3.14 an inline `AbortSignal.timeout` did not end a call sleeping between retries (4 attempts, about 7 s for a 2.5 s or 5 s deadline); Node did. | [CR01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr01-retry-matrix.ts) (d4, d5), [CR03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr03-version-matrix.ts), [CR04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr04-default-timeout.ts) |
+| Hedge only GETs, with the built-in retries off under the hedge. | A hedged GET bounded a held request to 1575 ms; with the built-in retries left on it sent 6 requests in 6 s against 2. A hedged plain `insert` wrote 2 rows, a hedged primary-key `upsert` 1. | [CR02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr02-client-policy.ts) (f, g), Bun only |
+| Write the retry for `functions.invoke` yourself; the client makes 1 attempt. | 1 client attempt and 1 function-side request on an injected 503, 502, 500 or 429, 3 trials per status, supabase-js 2.117.3. A platform-relay 503 was not measured. | [ER02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/edge-runtime-auth/tests/er02-canary-drift-retry-latency.ts) (ER02-retry-503) |
+| Send the first statement on a full transaction pool through 5432 session mode. | Client 17 connects in 43 to 52 ms and its first statement fails at 60,007 to 60,009 ms (6 of 6); the session pooler answered 49 to 70 ms after the primary's failure and as a 17th backend. Direct 5432 is `ENOTFOUND` for an IPv4-only client without the add-on. | [PC01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/tests/pc01-checkout-timeout.ts), [PC02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/tests/pc02-fallback.ts), 2026-10-10 |
+| Wait longer than the outage before the one retry of a stale pooled connection. | After a 150 ms flap a retry at 0 ms rescued 0 of 30 on node-postgres and on Prisma; at 300 ms it rescued 25 of 25 and 30 of 30. | [PC03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/tests/pc03-driver-reset.ts) |
+| Attach an `'error'` listener to every node-postgres `Pool`. | A `Pool` without one exited non-zero in 9 of 12 runs at a 2 s cut; with one, 0 of 36 runs crashed. | [PC03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/tests/pc03-driver-reset.ts) |
+| Read `db_host` from the pooler config endpoint, not a literal `aws-0` host. | Fresh Pro projects in two regions reported `aws-0` and the `aws-1` host answered `ENOTFOUND` tenant/user. Older projects and other regions were not measured. | [PC04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/tests/pc04-pooler-host-lint.ts) |
+| Look a project up by name before retrying a create, and keep the name stable. | An abandoned create still created the project and an identical re-send answered 400 `already exists` (n=1). A provider create answered 500 after upstream created it left 0 resources in state, an orphan, and a 400 on every re-apply until the orphan was deleted. A fresh-name retry was not run. | [LO04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo04-duplicate-post.ts), [MF02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf02-harness-create.ts), [MF04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf04-tofu.ts) |
+| Gate lifecycle calls on the worst status over every component named for the region. | 189 components carry 18 region names 10 or 11 times each with no group field, `incidents.json` has no region field, and `impact` was `none` on incidents that suspended upgrades. A replayed restart gate would have refused ap-southeast-1 for 38.5 hours of 1113 (heuristic). | [LO01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo01-status-gate.ts), 2026-10-10 |
+| Do not read control-plane `ACTIVE_HEALTHY` as the end of a restart outage. | Status was back at 40 to 71 s while the pooler ran to 151 s in one of 5 restarts; REST never failed, Auth 54 s and Storage 58 s at p50. | [LO05](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo05-restart-envelope.ts) |
+| Do not rely on a CNAME to the project host as the only path through a DNS outage. | With `supabase.co` NXDOMAIN at the resolver a CNAME custom hostname did 0 of 6 operations; A records holding the 2 project addresses did 6 of 6. A resolver with the chain cached failed first at 301 s (300 s TTL). Certificate renewal without the CNAME was not tested. | [HP07](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/hostname-path/tests/hp07-nxdomain.ts), 2026-10-10 |
+| Cap Management API calls yourself; the CLI waits 360 s on a stalled GET. | The CLI retries GET, PUT and DELETE 6 times with no pause on a 500 and POST once, 60 s per attempt (a held GET took 360220 ms); the provider retries GET only; the harness `mgmt()` never retries. Every fault was injected; no real 5xx was seen. | [MF03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf03-cli.ts), [MF04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf04-tofu.ts) |
 
 Not measured: the KV/D1 eject time (W25 measured the
 env-var redeploy path only); whether a primary-side network restriction
@@ -491,7 +931,16 @@ digraph {
 | --- | --- | --- |
 | Skew tolerance boundary | +30s pass, +31s PGRST303 | Measured ([W01](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w01-jwt-skew.ts), two runs) |
 | jwt_exp acceptance-to-effect | ~6.5s | Measured ([W03](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w03-jwt-exp.ts)) |
-| supabase-js on PGRST303 | 1 attempt | Measured ([W02](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w02-retry-probe.ts), mock) |
+| supabase-js on PGRST303 | 1 attempt (supabase-js 2.112.3) | Measured ([W02](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w02-retry-probe.ts), mock; the other statuses are the CR rows below) |
+| Built-in retries, GET, HEAD, `rpc({ get: true })` | 503, 520, reset: 4 attempts at 1, 2, 4 s; 525, 502, 504, 500, 429, 408, 521, 522, 524: 1 | Measured, injected statuses on a local proxy, supabase-js 2.112.3, Bun 1.3.14 ([CR01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr01-retry-matrix.ts), 2026-10-10, n=1 per case); docs: 503, 520, network failures, not 408, 409 or 504[^sb-retries][^sb-retries-changelog]; filed upstream: no |
+| Built-in retries, POST, PATCH, DELETE, upsert, default `rpc()` | 1 attempt on 503, 520 and reset | Measured ([CR01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr01-retry-matrix.ts)) |
+| `Retry-After` on a 503 | 2 -> 2000 ms gap, 0 -> 0, 40 -> 40000 ms (above the 30 s cap), HTTP date ignored; real Data-API-off 503 sends 0, 4 attempts in 7252 ms | Measured ([CR01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr01-retry-matrix.ts)) |
+| Opt-out names by version | `.retry(false)` from 2.102.0; `db: { retry: false }` from 2.112.0; `db.retryEnabled` none of 14 versions | Measured ([CR03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr03-version-matrix.ts), Bun and Node) |
+| Default timeout | none: pending at 330004 ms on Bun, 330016 ms on Node; `db.timeout` per attempt | Measured ([CR04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr04-default-timeout.ts), one trial each; [CR01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr01-retry-matrix.ts)) |
+| Inline `AbortSignal.timeout` between retries | Bun 1.3.14: 4 attempts, about 7 s for a 2.5 s or 5 s deadline; Node: 2 attempts at about 2.5 s | Measured ([CR01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr01-retry-matrix.ts), [CR03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr03-version-matrix.ts)) |
+| Deadline plus one hedged GET | held request 1575 ms, hang 4003 ms at a 4000 ms deadline; built-in retries on under the hedge 6 requests in 6 s vs 2; hedged `insert` 2 rows, hedged PK `upsert` 1 | Measured ([CR02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr02-client-policy.ts), Bun only) |
+| Refresh-then-retry on a 401 | 1 refresh call and 2 REST requests; 5 parallel 401s made 1 refresh | Measured ([CR02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr02-client-policy.ts); the parallel case is one trial) |
+| `functions.invoke` on 503, 502, 500, 429 | 1 client attempt, 1 function-side request, 3 trials per status | Measured ([ER02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/edge-runtime-auth/tests/er02-canary-drift-retry-latency.ts), supabase-js 2.117.3, injected) |
 | Edge cache under origin outage | 200, byte-identical | Measured ([W04](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w04-edge-cache-stale.ts), forced outage) |
 | Standby replication lag | 34ms-1057ms | Measured ([W05](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w05-standby-replication.ts), three runs) |
 | Standby initial sync, 1M rows | 22.7s / 12.5s; lag after ~245-276ms | Measured ([W22](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w22-bulk-sync.ts), two runs) |
@@ -513,11 +962,25 @@ digraph {
 | Cold DR, 10k rows | dump 12.4s, restore 6.4s | Measured ([W06](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w06-cold-dr-timing.ts)) |
 | Break-glass minting works | 200 real / 401 wrong secret | Measured ([W07](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w07-breakglass-mint.ts)) |
 | Concurrent refresh race | both 200 | Measured ([W08](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w08-refresh-race.ts)) |
-| Restart gaps REST/Realtime/Auth/Storage/pooler | 0 failed samples / 0 / 75 s / 78 s / 158 s | Measured (platform-downtime [D01](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-downtime/tests/d01-restart.ts), 2026-08-04, n=1, 500 ms); RELIABILITY.md carried ~10s / ~26s / ~75s (N=3) with no artifact |
+| Restart gaps REST/Realtime/Auth/Storage/pooler | 0 failed samples / 0 / 75 s / 78 s / 158 s | Measured (platform-downtime [D01](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-downtime/tests/d01-restart.ts), 2026-08-04, n=1, 500 ms); RELIABILITY.md carried ~10s / ~26s / ~75s (N=3) with no artifact; re-checked 2026-10-10 in the next row |
+| Restart re-check REST/Auth/Storage/pooler/direct (Micro, ap-southeast-1, n=5) | 0 failed runs / 54 s / 58 s / 54 s / 50 s window p50; max 60 / 59 / 151 / 56 s; first failure 2 to 3 s after the POST; control plane `ACTIVE_HEALTHY` at 40 to 71 s | Measured ([LO05](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo05-restart-envelope.ts), 2026-10-10, 0.5 s sampling, Realtime not sampled) |
+| Restart refused after a create | 400 about 70 s after the creating POST; accepted 300 s after the first `ACTIVE_HEALTHY` read on another project | Measured ([LO05](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo05-restart-envelope.ts), two projects, boundary unresolved) |
 | Resize up Auth/Storage/pooler | 131 s / 127 s / 207 s | Measured (platform-downtime [D03](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-downtime/tests/d03-resize-up.ts), 2026-08-04, n=1) |
 | Fresh project: first write after `ACTIVE_HEALTHY` | 5 of 5 refused with 500, next attempt accepted | Measured elsewhere (placement reference, Verified row 'Create -> healthy, and healthy is not writable' (2026-08-04, n=5, bash run not in the lab repo); supabase-lab AGENTS.md provisioning note (2026-08-03, 2 of 2, `500 "Database error checking email"`); summarised in [operation cost](/reference/supabase-platform-operation-cost/)) |
 | Smart-group region selection on a Pro org | 201, landed ap-northeast-2, healthy in 135 s | Measured (instance-sizing [I02](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/instance-sizing/tests/i02-smart-region.ts), 2026-08-17) |
 | `max_replication_slots` on micro and small | 10 / 10 | Measured (compute-disk [D01](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/compute-disk/tests/d01-compute-pg-limits.ts)) |
+| Pooler checkout with 16 backends held (Micro) | client 17 connects in 43 to 52 ms; first statement fails at 60,007 to 60,009 ms with `ECHECKOUTTIMEOUT` (6 of 6); a statement queued under 60 s is served | Measured ([PC01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/tests/pc01-checkout-timeout.ts), 2026-10-10; a public status mirror quotes 15000ms for other clusters, not reproduced) |
+| Fallback to the session pooler on 5432 | 49 to 70 ms after the primary's failure, 56 to 117 ms after the 60 s error; direct 5432 `ENOTFOUND` for IPv4-only without the add-on | Measured ([PC02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/tests/pc02-fallback.ts)) |
+| Driver pools after a TCP reset | 0 failed first attempts after the fault cleared (111 runs); retry-once at 0 ms 0 of 30 after a 150 ms flap, at 300 ms 25 of 25 and 30 of 30; `Pool` without an `'error'` listener exited in 9 of 12 runs | Measured ([PC03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/tests/pc03-driver-reset.ts)) |
+| Pooler host prefix | API reported `aws-0` on fresh projects in two regions; `aws-1` answers `ENOTFOUND` tenant/user | Measured ([PC04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/tests/pc04-pooler-host-lint.ts), four projects) |
+| Status-page shape and change-gate replay | 189 components, 18 region names 10 or 11 times each, no group field; `impact` ignored; replay would refuse ap-southeast-1 for 38.5 h of 1113 | Measured ([LO01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo01-status-gate.ts), one fetch at 00:43 UTC; the replay is a heuristic) |
+| Create: bad bodies and `ACTIVE_HEALTHY` timing | 400, 404, 400, 400 in 55 to 194 ms, nothing created; healthy at 2 s twice and 145 s once | Measured ([LO03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo03-create-fallback.ts), n=3) |
+| Abandoned create re-sent | project created; identical re-send 400 `already exists` | Measured ([LO04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo04-duplicate-post.ts), n=1) |
+| supabase CLI 2.120.0 retries | GET, PUT, DELETE 6 attempts on 500 with no pause; POST 1 on 500, 502, 503, 504, 429; 60 s per attempt | Measured ([MF03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf03-cli.ts), injected faults, Pro org, ap-southeast-1) |
+| OpenTofu provider 1.11.0 retries | GET 4 attempts on a persistent 503, 2 on one 500 or 429; POST, PATCH, DELETE 1 on 500; a 130 s held create exited 0 | Measured ([MF04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf04-tofu.ts), [MF05](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf05-post-timeout.ts), injected faults) |
+| Lab harness `mgmt()` | 1 attempt on 500, 502, 503, 504; `TimeoutError` at 30001 ms | Measured ([MF01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf01-harness-client.ts), injected faults) |
+| Create answered 500 after upstream created it | provider state 0 resources, 1 orphan, re-apply 400 until deleted; CLI exit 1 with 1 project | Measured ([MF02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf02-harness-create.ts), [MF03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf03-cli.ts), [MF04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf04-tofu.ts), injected) |
+| Custom hostname as a CNAME with `supabase.co` NXDOMAIN at the resolver | 0 of 6 operations (`ENOTFOUND`); A records holding the 2 project addresses 6 of 6; cached chain failed first at 301 s | Measured ([HP07](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/hostname-path/tests/hp07-nxdomain.ts), [HP06](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/hostname-path/tests/hp06-resolution.ts), one resolver rig, n=1) |
 | 30s documented tolerance | documented | PostgREST v11 docs[^pgrst-auth] |
 | Transform billing model | \$5/1000 distinct origins/cycle | Supabase docs[^sb-transform-billing] |
 
@@ -535,6 +998,9 @@ race was fixed
 The platform-downtime, instance-sizing and compute-disk rows cite their
 RUNLOGs at the same commit; those experiments have no published `out/`
 artifact.
+The client-retries, pooler-checkout, lifecycle-ops, mgmt-api-faults,
+hostname-path and edge-runtime-auth rows are dated 2026-10-10, are quoted by
+hand from their RUNLOGs and have no published `out/` artifact either.
 
 ## Modules
 
@@ -542,13 +1008,35 @@ artifact.
 |---|---|---|---|
 | C01 | rls-wire-claims | [`c01-wire-claims.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/rls-wire-claims/tests/c01-wire-claims.ts) | none published |
 | C03 | tenant-consolidation | [`c03-users-merge-api.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/tenant-consolidation/tests/c03-users-merge-api.ts) | none published |
+| CR01 | client-retries | [`cr01-retry-matrix.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr01-retry-matrix.ts) | none published |
+| CR02 | client-retries | [`cr02-client-policy.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr02-client-policy.ts) | none published |
+| CR03 | client-retries | [`cr03-version-matrix.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr03-version-matrix.ts) | none published |
+| CR04 | client-retries | [`cr04-default-timeout.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/client-retries/tests/cr04-default-timeout.ts) | none published |
 | D01 | compute-disk | [`d01-compute-pg-limits.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/compute-disk/tests/d01-compute-pg-limits.ts) | none published |
 | D01 | platform-downtime | [`d01-restart.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-downtime/tests/d01-restart.ts) | none published |
 | D02 | platform-downtime | [`d02-restriction-flip.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-downtime/tests/d02-restriction-flip.ts) | none published |
 | D03 | platform-downtime | [`d03-resize-up.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-downtime/tests/d03-resize-up.ts) | none published |
 | D04 | platform-downtime | [`d04-resize-down.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-downtime/tests/d04-resize-down.ts) | none published |
 | D09 | compute-disk | [`d09-compute-resize-timing.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/compute-disk/tests/d09-compute-resize-timing.ts) | none published |
+| ER02 | edge-runtime-auth | [`er02-canary-drift-retry-latency.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/edge-runtime-auth/tests/er02-canary-drift-retry-latency.ts) | none published |
+| HP03 | hostname-path | [`hp03-domain-up.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/hostname-path/tests/hp03-domain-up.ts) | none published |
+| HP04 | hostname-path | [`hp04-oauth-custom.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/hostname-path/tests/hp04-oauth-custom.ts) | none published |
+| HP06 | hostname-path | [`hp06-resolution.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/hostname-path/tests/hp06-resolution.ts) | none published |
+| HP07 | hostname-path | [`hp07-nxdomain.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/hostname-path/tests/hp07-nxdomain.ts) | none published |
 | I02 | instance-sizing | [`i02-smart-region.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/instance-sizing/tests/i02-smart-region.ts) | none published |
+| LO01 | lifecycle-ops | [`lo01-status-gate.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo01-status-gate.ts) | none published |
+| LO03 | lifecycle-ops | [`lo03-create-fallback.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo03-create-fallback.ts) | none published |
+| LO04 | lifecycle-ops | [`lo04-duplicate-post.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo04-duplicate-post.ts) | none published |
+| LO05 | lifecycle-ops | [`lo05-restart-envelope.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo05-restart-envelope.ts) | none published |
+| MF01 | mgmt-api-faults | [`mf01-harness-client.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf01-harness-client.ts) | none published |
+| MF02 | mgmt-api-faults | [`mf02-harness-create.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf02-harness-create.ts) | none published |
+| MF03 | mgmt-api-faults | [`mf03-cli.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf03-cli.ts) | none published |
+| MF04 | mgmt-api-faults | [`mf04-tofu.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf04-tofu.ts) | none published |
+| MF05 | mgmt-api-faults | [`mf05-post-timeout.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf05-post-timeout.ts) | none published |
+| PC01 | pooler-checkout | [`pc01-checkout-timeout.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/tests/pc01-checkout-timeout.ts) | none published |
+| PC02 | pooler-checkout | [`pc02-fallback.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/tests/pc02-fallback.ts) | none published |
+| PC03 | pooler-checkout | [`pc03-driver-reset.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/tests/pc03-driver-reset.ts) | none published |
+| PC04 | pooler-checkout | [`pc04-pooler-host-lint.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pooler-checkout/tests/pc04-pooler-host-lint.ts) | none published |
 | W01 | edge-resilience | [`w01-jwt-skew.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w01-jwt-skew.ts) | [`out/2026-08-16`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-16), [`out/2026-08-17`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-17) |
 | W02 | edge-resilience | [`w02-retry-probe.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w02-retry-probe.ts) | [`out/2026-08-16`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-16), [`out/2026-08-17`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-17) |
 | W03 | edge-resilience | [`w03-jwt-exp.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/edge-resilience/tests/w03-jwt-exp.ts) | [`out/2026-08-16`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-16), [`out/2026-08-17`](https://github.com/erfianugrah/supabase-lab/tree/f703393/experiments/edge-resilience/out/2026-08-17) |
@@ -578,6 +1066,10 @@ artifact.
 [^gh-48123]: Supabase GitHub Discussion #48123, "Fresh Supabase Auth JWT rejected by PostgREST: PGRST303 'JWT issued at future'," 2026-07-21. https://github.com/orgs/supabase/discussions/48123
 [^sb-status]: Supabase, "Status - Incident History," status.supabase.com. https://status.supabase.com/
 [^sb-retries]: Supabase, "Automatic retries in supabase-js," Supabase Docs. https://supabase.com/docs/guides/api/automatic-retries-in-supabase-js
+[^sb-retries-changelog]: Supabase, "Automatic PostgREST retries for transient errors," Supabase Changelog. https://supabase.com/changelog/45071-automatic-postgrest-retries-for-transient-errors
+[^sb-conn-mgmt]: Supabase, "Connection management," Supabase Docs. https://supabase.com/docs/guides/database/connection-management
+[^pulsetic]: Supabase status mirror, "Error spikes in one of the eu-east-1 Supavisor clusters," 2026-08-24, Pulsetic. https://pulsetic.com/status/supabase/incidents/6635/
+[^sb-regional-blocks]: Supabase, "Navigating regional network blocks," Supabase Blog. https://supabase.com/blog/navigating-regional-network-blocks
 [^sb-transform-billing]: Supabase, "Manage Storage Image Transformations usage," Supabase Docs. https://supabase.com/docs/guides/platform/manage-your-usage/storage-image-transformations
 [^sb-read-replicas]: Supabase, "Read Replicas," Supabase Docs. https://supabase.com/docs/guides/platform/read-replicas
 [^sb-billing-faq]: Supabase, "Billing FAQ - Fair Use Policy," Supabase Docs. https://supabase.com/docs/guides/platform/billing-faq#fair-use-policy

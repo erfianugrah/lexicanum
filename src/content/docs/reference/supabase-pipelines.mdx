@@ -1,0 +1,338 @@
+---
+title: "Supabase Pipelines (public alpha): what a PAT reaches and how the engine replicates"
+description: "Supabase Pipelines cannot be driven with a personal access token - no pipelines route in the public Management API description, 401 on the platform replication routes, destination creation Dashboard-only - so this page records the open-source engine instead, pinned by commit with a DuckLake destination on local containers: initial copy time, lag against batch wait, RLS on the copy, DDL propagation and its skipped cases, duplicates after forced restarts, and the WAL a stopped pipeline retains until the slot is lost."
+author: Erfi Anugrah
+category: supabase
+group: architecture
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Supabase Pipelines streams changes from a project's Postgres to an external destination and has been in public alpha since 2026-07-21.[^sb-pl-changelog] This page covers two things: what a personal access token (PAT) can reach of the managed service, which is nothing, and how the open-source engine behind it copies, lags, applies DDL, handles RLS and behaves when stopped. It sits next to [pgmig](/reference/pgmig-logical-replication-migrator/), which uses the same Postgres logical replication for a one-off move, and [Supabase durability tiers](/reference/supabase-dr-tiers/), which covers what a replication slot does to a restore.
+
+## Scope and provenance
+
+The managed service could not be driven with a PAT, so no figure below is a managed-service figure.
+
+- The public Management API description (`GET /api/v1-json`, 115 paths) has no pipelines route (PL01a).
+- `GET /platform/replication/{ref}/{sources,destinations,pipelines}` with the PAT answered 401 `{"message":"Unsupported access token"}` on all three, while `GET /v1/projects` with the same PAT answered 200 (PL01b).
+- Creating a destination, including a DuckLake one, is done in the Dashboard. The request bodies are known only from the open-source Studio data layer, which was read and not run.[^sb-studio-repl]
+
+Every behaviour below comes from the open-source engine, which the docs say Supabase runs for the managed service,[^sb-pl-docs] run as its public container image[^sb-etl-repo] on 2026-10-10:
+
+| Part | What was used |
+|---|---|
+| Engine | commit `3fc88dd52a55...`, the main branch head on 2026-10-09; which commit the managed service runs was not observed |
+| Destination | DuckLake with a local Postgres 16 catalog and a local S3-compatible store (VersityGW), not Supabase projects |
+| Source | one Pro-organisation project, `eu-central-1`, Micro compute, IPv4 add-on (direct 5432 is IPv6-only otherwise and the replicator container has no IPv6), PostgreSQL 17.11 |
+| Vantage | a laptop in Singapore; `select 1` round trip to the source over 15 calls: p50 171 ms, max 176 ms (PL02a) |
+| Source settings | `wal_level` logical, `max_replication_slots` 10, `max_wal_senders` 10, `max_slot_wal_keep_size` 512MB, `wal_keep_size` 0, `checkpoint_timeout` 5min (PL02a) |
+
+The docs say managed pipelines run in AWS `eu-central-1`, independently of the source and destination regions.[^sb-pl-docs] The source here is in that region and the engine was not, so copy time and lag include a 171 ms round trip the managed topology does not have. Read them as pessimistic bounds on the engine. Two earlier development runs on the same day are not quoted except where named; they used a SeaweedFS object store that stalled the first large write for about 19 minutes, and it was replaced by VersityGW before the runs below.
+
+Run 1 was PL01-PL08 in one invocation (4 pass, 1 fail, the rest informational), run 2 repeated PL07 on the same project, and PL99 deleted the project (`DELETE` 200, 0 projects left under the lab's prefix). Local containers and volumes were removed. Figures are pasted from the `pvlab --facts` output of the run artifacts, which are not published. Module ids are in [Modules](#modules).
+
+Whether DuckLake is open to the Pro organisation used here was not observed. The 2026-07-21 changelog lists ClickHouse, Snowflake and DuckLake as available on request through an early access form,[^sb-pl-changelog] and the DuckLake guide read on 2026-10-10 lists it as public alpha.[^sb-pl-ducklake]
+
+**TL;DR:**
+
+- A PAT reaches no part of the managed pipelines control plane. The Management API description has no route for it and the platform replication routes refuse the token (PL01).
+- Initial copy of 1,000,000 rows (101.1 MB heap) took 53 s from start to `sync_done`, 13.3 s of it copy (PL02).
+- Lag follows `batch.max_fill_ms`: p50 5577 ms at the 10000 ms default, 1131 ms at 1000 ms (PL03).
+- RLS applies to neither the copy nor the change stream for a role with `BYPASSRLS`. A role without it copied only the 100 policy-visible rows of 1000, with no error (PL04).
+- Add, rename and drop column, drop `NOT NULL` and constant defaults reached the destination in about 5 s. Tightening `NOT NULL` and volatile defaults were skipped with a warning. An `int` to `bigint` change left the destination `INTEGER`, and a later out-of-range value made the replicator process exit while the table state still read `ready` (PL05).
+- 0 duplicate rows in 11 kill and stop trials, with and without a primary key. That is "none observed", not a bound (PL06).
+- A stopped pipeline retains WAL at about 410-620 bytes per 1 KB-class row written. Past `max_slot_wal_keep_size` the slot went `unreserved`, then `lost` at what is consistent with the next automatic checkpoint (PL07).
+- The `etl_pipeline` add-on is listed at 0.053 USD per hour and a PAT `PATCH` to attach it was refused with 400 (PL08).
+
+---
+
+## What the engine does and where it sits
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_src {
+    label="Source (eu-central-1)"; style=rounded; fontsize=12; margin=12;
+    pg    [label="Postgres 17.11\npublication + slots\netl schema", shape=cylinder];
+  }
+  subgraph cluster_lap {
+    label="Laptop, Singapore (171 ms RTT)"; style=rounded; fontsize=12; margin=12;
+    rep   [label="replicator\n(engine image)"];
+    cat   [label="DuckLake catalog\nPostgres 16", shape=cylinder];
+    obj   [label="S3-compatible store\n(VersityGW)"];
+  }
+
+  pg  -> rep [label="initial copy\n+ WAL stream"];
+  rep -> cat [label="metadata"];
+  rep -> obj [label="data files"];
+}
+```
+
+1. The source Postgres holds the publication, the slots and the `etl` schema.
+2. The replicator, the engine's container image, connects to the source, copies each table, then applies the WAL stream.
+3. The DuckLake destination is a Postgres catalog plus an object store, both local in this run.
+
+On first start the engine installed an `etl` schema in the source (state, schema and progress tables plus helper functions) and the event trigger `supabase_etl_ddl_message_trigger`, as the FAQ documents (PL02).[^sb-pl-faq] It used at most 2 slots during the copy, `supabase_etl_apply_<id>` and `supabase_etl_table_sync_<id>` (PL02).
+
+## Which question has which answer
+
+| Question | Answer | Basis |
+|---|---|---|
+| Can I create or stop a managed pipeline with a PAT? | No route in the API description; the platform routes answer 401 | PL01, measured 2026-10-10 |
+| How long is the initial copy? | 53 s for 1M rows through the engine from Singapore, 13.3 s of it copy | PL02, one run, not a managed figure |
+| How stale is the destination? | About the batch wait: p50 5577 ms at 10000 ms, 1131 ms at 1000 ms | PL03, 65 and 63 rows |
+| Does RLS filter what is copied? | Not for a `BYPASSRLS` role; for a role without it, the copy holds only visible rows | PL04, one run each |
+| Does DDL follow? | Most column changes in about 5 s; type changes and volatile defaults do not | PL05, one statement each |
+| Can a restart duplicate rows? | None seen in 11 trials; the docs say at-least-once | PL06; FAQ[^sb-pl-faq] |
+| What does a stopped pipeline cost the source? | Retained WAL, then a lost slot past `max_slot_wal_keep_size` | PL07, two runs plus one development run |
+
+---
+
+## What a PAT reaches
+
+PL01 sent one probe per route.
+
+| Probe | Result |
+|---|---|
+| `GET /api/v1-json` | 200, 115 paths, 0 matching any of `pipeline`, `replication`, `etl`, `destination`, `ducklake`, `warehouse` (read-replica routes excluded) |
+| `GET /platform/replication/{ref}/sources` | 401 `Unsupported access token` |
+| `GET /platform/replication/{ref}/destinations` | 401 `Unsupported access token` |
+| `GET /platform/replication/{ref}/pipelines` | 401 `Unsupported access token` |
+| `GET /v1/projects`, same PAT | 200 |
+
+The 401s came from an unused ref, because no lab project existed when PL01 ran in run 1. An earlier development run against a live lab project gave the same 401 on all three routes. Not measured: whether a Dashboard session token reaches those routes.
+
+What the Studio source shows is a `ducklake` destination definition with `catalog.type: supabase_project` and `storage.type: supabase_storage`, posted to `/platform/replication/{ref}/destinations-pipelines`.[^sb-studio-repl] That path is the Dashboard's, not part of the documented API.
+
+## Initial copy
+
+PL02 copied one table of 1,000,000 rows (heap 101.1 MB, 123.7 MB with indexes), seeded server-side in 5.4 s.
+
+| Interval | Time |
+|---|---|
+| `compose up` to `sync_done` | 53 s |
+| `data_sync` to `finished_copy` | 13.3 s (7.61 MB/s of heap) |
+| `finished_copy` to `sync_done` | 1.2 s |
+| one-row update to `ready` | 13.5 s |
+
+The rest of the 53 s is engine start and slot creation over the 171 ms link. The state timeline from the source's `etl.replication_state` was init, `data_sync`, `finished_copy`, `sync_done`. `ready` did not follow on its own: a table sits at `sync_done` until the apply loop sees later WAL, which here was the one-row update. Destination count, `sum(id)`, `sum(qty)` and `sum(length(note))` equalled the source.
+
+Not measured: managed copy time, copy of tables above 1M rows, the effect of the managed "Initial sync connections per table" and "Table sync workers" settings (engine defaults were used), and the documented initial sync price of 0.60 USD per GB.[^sb-pl-usage]
+
+## Lag against batch wait
+
+PL03 ran a writer that inserted a row every 0.8 to 1.6 s for 90 s per setting. A DuckDB session on the destination polled `max(id)` (poll duration p50 10-11 ms, p95 14 ms). Lag is the laptop clock at the first poll that saw the row minus the laptop clock at commit acknowledgement.
+
+| `batch.max_fill_ms` | rows | min | p50 | p95 | max |
+|---|---|---|---|---|---|
+| 10000 ms (engine default; docs list "Batch wait time" 10000 ms[^sb-pl-docs]) | 65 | 235 ms | 5577 ms | 10177 ms | 10940 ms |
+| 1000 ms | 63 | 90 ms | 1131 ms | 1880 ms | 1928 ms |
+
+All rows were seen. Lag tracks the batch wait, and the engine's own processing plus the laptop link add under about 1 s on top. Not measured: lag under sustained high write rates, and lag in the managed topology.
+
+## RLS on the copy and the stream
+
+PL04 used one run per setup on a 1000-row table.
+
+| Step | Engine connects as | Result |
+|---|---|---|
+| a, control | `authenticated`, reading the source | 0 of 1000 rows visible |
+| b | `postgres` (`rolbypassrls` true, PL02a) | destination 1000 of 1000 after the copy; after 200 inserts and 20 deletes, 1180 of 1180; 50 of 50 updates present |
+| c | publication `(id, owner) where (owner = 'keep')` | destination 500 of 1000 rows, columns `id owner`, owner values `keep` |
+| d | a role with `REPLICATION`, `NOBYPASSRLS` and `SELECT`, whose only policy exposes 100 of 1000 rows | copy reached `sync_done` with no error; destination held 100 of 1000 rows |
+
+So RLS filtered neither the copy nor the change stream for a `BYPASSRLS` role (step b). Step c is the publication's own row filter, which is a different mechanism. Step d is the case to decide on deliberately: the copy completes without error and delivers the policy-visible subset only. The change stream was not tested with that role. This is the same by-role rule as in [RLS enforcement by connection identity](/reference/cloudflare-supabase-architecture/#rls-enforcement-by-connection-identity).
+
+The docs read on 2026-10-10 do not mention RLS, so "RLS does not apply" is measured here and not documented. Which database role the managed service connects as was not observed.
+
+## DDL
+
+PL05 ran each statement once, on a `ready` table with the batch wait at 1000 ms, then inserted one row shaped for the new schema. "Visible" is the time until that row appeared at the destination. A plain row at the same batch wait showed a p50 of 1131 ms (PL03), so the schema change itself added about 4 s in these single probes. The check loop sleeps 700 ms between polls (5.7 s is 5 s plus one poll), and the near-constant 5 s may be a fixed engine or poll interval rather than a per-statement cost. One probe per statement cannot tell.
+
+| Source statement | Visible | Destination result |
+|---|---|---|
+| add nullable column | 5 s | column present, nullable |
+| add column default 42 | 5 s | column nullable, default `'42'`; old row 1 reads 42 |
+| add column default `gen_random_uuid()` | 5 s | column present, no default; WARN "skipping unsupported source column default" |
+| add `NOT NULL` column default 7 | 5.7 s | column nullable, default `'7'`; WARN "adding a source not null column as nullable" |
+| rename column | 5 s | renamed |
+| drop column | 5 s | column absent |
+| drop `NOT NULL` | 5 s | nullable |
+| set `NOT NULL` | 11.4 s | destination stays nullable; WARN "does not tighten an existing nullable column" |
+| set default 9 | 5 s | default `'9'`; a row without the column reads 9 |
+| drop default | 5 s | default removed |
+| type change `int` to `bigint`, then row `b=1` | 5.7 s | destination stays `INTEGER`; WARN "column type changes are currently unsupported ... may fail or behave unpredictably"; the row replicated |
+| row `b=5000000000` after the type change | not seen in 60 s | 62 WARN/ERROR lines, the first `error append row ... Call to EndRow before all columns have been appended to!`; destination `INTEGER` |
+| a later row `b=1` | not seen in 120 s | the replicator process had exited: `[DestinationAtomicBatchRetryable] DuckLake atomic table batch sequence failed after retries`; `etl.replication_state` still said `ready` |
+
+The final source column list was `id a b c2 e f g h` with `e`, `h` and `b` `NOT NULL`. The destination had the same names, all nullable except `id` and `b`.
+
+The attribution of the failure to the out-of-range value is an inference from the pair: row `b=1` passed and row `b=5000000000` failed after the same type change. The separating probe, a `bigint` destination, cannot be run because the destination cannot take the type change. The docs line "Data type changes are skipped with a warning in every destination"[^sb-pl-docs] holds for the schema change. It does not cover the rows that follow.
+
+<Aside type="caution">
+After the replicator exited, `etl.replication_state` still read `ready`. The table state alone does not show that the process is alive; the same was seen after slot invalidation (PL07e).
+</Aside>
+
+## Duplicates after a forced restart
+
+PL06 wrote to two tables at about 100 rows/s each (20-row inserts every 150 ms), one with a primary key and one without (insert-only). There were 11 trials: four SIGKILLs at 25-34 s and one SIGTERM at 30 s with the default batch wait, and six SIGKILLs at 8-19 s with a 1000 ms batch wait. After each trial the destination was waited on until it held every source id and had been stable for 20 s.
+
+- 0 duplicate rows in either table in all 11 trials: distinct ids equalled row count and every source id was present.
+- SIGKILL returned in 106-364 ms (10 trials); restart to a converged destination took 43-56 s.
+- The destination was behind the source at the kill (2086 of 2146 rows in default trial 1), so the kills landed with data in flight.
+
+This does not show that replay cannot duplicate. The docs say processing is at-least-once and that recovery can replay acknowledged data.[^sb-pl-faq] The engine also ships a `__etl_replay_epochs` table in the DuckLake catalog, seen in its start-up log notices and not studied, which may suppress replay on this destination. Eleven kills sample a narrow window, between the destination commit and the slot acknowledgement, a few times. Zero events in 11 is "none observed".
+
+## A stopped pipeline and the WAL it retains
+
+A logical slot that nothing consumes pins WAL, the same mechanism as an orphan slot after a dropped subscription in the [durability tiers](/reference/supabase-dr-tiers/) page and the `wal_status='lost'` abort in [pgmig's `watch`](/reference/pgmig-logical-replication-migrator/). Postgres marks a slot `unreserved` once `max_slot_wal_keep_size` is exceeded and `lost` after the WAL is removed.[^pg-wal-keep][^pg-slots-view] The source's limit was 512MB, which is 536.9 MB (10^6-byte MB throughout). The invalidation part used a table of 100,000 rows of about 1 KB. PL07 ran twice, plus one development run for the restart timing.
+
+| Step | Run 1 | Run 2 |
+|---|---|---|
+| running slot, `wal_status` `reserved` (a) | retained 1 MB, `safe_wal_size` 552.5 MB | retained 0 MB, `safe_wal_size` 547.7 MB |
+| stop with SIGTERM (b) | 0.6 s, slot `active` false | 0.8 s, slot `active` false |
+| retained WAL after 75,000 rows written (5000 per 10 s for 150 s) | 47.2 MB (616 bytes per row), stepped growth | 30.7 MB (409 bytes per row), linear growth |
+| `safe_wal_size` after that, slot still `reserved` | 506.3 MB | 517 MB |
+| restart to destination equal to source and under 1 MB unconfirmed (c) | did not drain in 180 s: 100,000 of 175,000 rows, 116.3 MB unconfirmed | 43.6 s (development run: 41.4 s) |
+| retained WAL after three full-table `UPDATE` passes, replicator stopped (d) | 773.6 MB, `safe_wal_size` -220.1 MB | 688.5 MB, `safe_wal_size` -140.8 MB |
+| `wal_status` after those passes | `unreserved` before any checkpoint | `unreserved` before any checkpoint |
+| time until `lost` (`invalidation_reason` `wal_removed`) | 368 s | 215 s |
+| restart with `invalidated_slot_behavior: recreate`, 50 rows deleted while lost (f) | 174,950 rows after 47.5 s | 174,950 rows after 43.3 s |
+
+- With no writes for 30 s the retained WAL did not grow (0 KB). Growth was linear in run 2 (`2 4 6 8 ... 30.7` MB) and stepped in run 1 (`3 5 7 18.6 20.6 ... 33.3 ...`). The 616 against 409 bytes per row spread is unexplained.
+- `pg_ls_waldir()` is readable by the `postgres` role: 18 files, 285.2 MB before and after the writes in run 1. The WAL directory peaked at 822.1 MB (50 files) during invalidation.
+- `CHECKPOINT` is refused for the `postgres` role (`permission denied to execute CHECKPOINT command`). No checkpoint was observed. The attribution of `lost` to an automatic checkpoint is inferred from `checkpoint_timeout` 5min, which both delays are consistent with. Postgres documents `unreserved` as WAL "to be removed at the next checkpoint".[^pg-slots-view]
+- `extended` was not seen: the first sample after each pass was already `unreserved`.
+- The run-1 stall in step c was not diagnosed. Restart to drain is n = 3 with one failure.
+- Restart with the default `invalidated_slot_behavior` (e): the container exited within 60 s with `[ReplicationSlotInvalidated] Replication slot has been invalidated`, and `etl.replication_state` still said `ready`.
+- With `recreate`, the deletes could not have come from the lost WAL, so the table was rebuilt and not caught up: states init, `data_sync`, `finished_copy`, `sync_done`, and a new slot `reserved` and active.
+
+Not tested: restarting while the slot is `unreserved`. Postgres documents that state as able to return to `reserved` or `extended`.[^pg-slots-view] See [Supabase compute and disk sizing](/reference/supabase-compute-disk/) for the disk this WAL lands on.
+
+## The billing add-on
+
+PL08 made two calls on the source project.
+
+- `GET /v1/projects/{ref}/billing/addons` lists `etl_pipeline`, variant `etl_pipeline_default`, listed as 39 USD per month, `price.amount` 0.053, interval hourly, type usage. 0.053 x 730 is 38.69 USD, which matches the docs' per-hour figure and the "ETL Pipeline Hours 730 Hours" example line on the usage page.[^sb-pl-usage]
+- `PATCH /v1/projects/{ref}/billing/addons` with `{addon_type: "etl_pipeline", addon_variant: "etl_pipeline_default"}` answered 400 `{"message":"addon_variant: Invalid input"}`. The same call shape worked for `ipv4` / `ipv4_default` on the same project. Nothing was attached, so no detach ran.
+
+The usage page says pipeline hours are measured while a pipeline remains configured, including while stopped, and that deleting the pipeline ends the charge.[^sb-pl-usage] That is documented and not tested: it needs a managed pipeline and an invoice or usage export.
+
+---
+
+## Reading the numbers
+
+- Copy time and lag carry a 171 ms round trip and a laptop-hosted destination, so they bound the engine from above and give no exact figure for the managed service. The batch-wait relationship in PL03 (lag about equal to the wait) holds at any round trip; the absolute millisecond figures do not.
+- PL05 is one statement per row. The 5 s visibility is a ceiling on these probes; the per-statement cost is unknown.
+- PL06 and PL04d are single setups. PL06 bounds nothing. PL04d shows that a silent partial copy exists; how a managed pipeline's role is set up was not observed.
+- PL07 retention per row (409 and 616 bytes) depends on row width and write shape. It is two runs on 1 KB-class rows, so it suits sizing a monitoring threshold and is too thin for a budget.
+- All engine behaviour is the commit pinned above. A managed rollout on a different commit can differ.
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Do not plan to script pipeline creation with a PAT. | API description has 0 matching routes in 115; `/platform/replication/{ref}/...` answers 401 `Unsupported access token` while `/v1` answers 200. A Dashboard session was not tried. | [PL01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl01-api-surface.ts) |
+| Monitor `wal_status` and retained WAL of the pipeline slots on the source. | Stopped: 409-616 bytes per 1 KB-class row, `unreserved` past 536.9 MB, `lost` 215-368 s later. `pg_ls_waldir()` is readable by `postgres`. | [PL07](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl07-paused-wal.ts) |
+| Delete a pipeline you will not restart soon instead of leaving it stopped. | Retained WAL grew linearly while stopped. Docs: billing continues while stopped and deleting ends it (not tested). Whether delete drops the slot was not observed. | [PL07](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl07-paused-wal.ts), [PL08](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl08-billing-addon.ts) |
+| Grant a non-`BYPASSRLS` role only after deciding what RLS means for the copy. | A role with `NOBYPASSRLS` and a 100-of-1000 policy copied 100 rows to `sync_done` with no error. Change stream not tested for that role. | [PL04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl04-rls.ts) |
+| Avoid volatile column defaults on replicated tables. | `gen_random_uuid()` default: destination column present with no default, WARN "skipping unsupported source column default". | [PL05](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl05-ddl.ts) |
+| Do not tighten `NOT NULL` on a replicated table and expect the destination to follow. | Set `NOT NULL`: 11.4 s, destination stays nullable, WARN "does not tighten an existing nullable column". | [PL05](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl05-ddl.ts) |
+| Do not change a replicated column's type in place. | `int` to `bigint`: destination stays `INTEGER`; `b=5000000000` was not seen in 60 s and the replicator process exited. Attribution is an inference from one pair of rows. | [PL05](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl05-ddl.ts) |
+| Alert on replicator process exit, not on table state `ready`. | `etl.replication_state` read `ready` after the DuckLake write failure and after `ReplicationSlotInvalidated`. | [PL05](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl05-ddl.ts), [PL07](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl07-paused-wal.ts) |
+| Set the batch wait from the lag you can accept. | Lag p50 5577 ms at 10000 ms, 1131 ms at 1000 ms. The managed "Batch wait time" setting was not exercised. | [PL03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl03-steady-lag.ts) |
+| Let append-only consumers tolerate repeated rows. | Docs say at-least-once. 0 duplicates in 11 trials on the engine, which is "none observed". | [PL06](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl06-duplicates.ts) |
+| Use `invalidated_slot_behavior: recreate` only where a table rebuild is acceptable. | After `lost`, `recreate` rebuilt the table (174,950 rows in 43.3-47.5 s); the default exits `ReplicationSlotInvalidated`. | [PL07](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl07-paused-wal.ts) |
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.35; ranksep=0.55;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  start [label="Pipeline stopped or\nnot delivering", shape=hexagon];
+  q     [label="pg_replication_slots\nwal_status", shape=diamond];
+  res   [label="restart: drain took\n41.4-43.6 s in 2 of 3,\n1 stalled at 180 s"];
+  unres [label="lost 215-368 s later in PL07;\nrestart at this state\nnot tried"];
+  lost  [label="default restart exits\nReplicationSlotInvalidated;\nrecreate rebuilds the table"];
+
+  start -> q;
+  q -> res   [label="reserved"];
+  q -> unres [label="unreserved"];
+  q -> lost  [label="lost"];
+}
+```
+
+1. `reserved`: restart. Drain took 41.4 s (development run) and 43.6 s (run 2); run 1 did not drain in 180 s and was not diagnosed.
+2. `unreserved`: the slot was lost 215 s and 368 s later in the two runs. Restarting at this state was not tried.
+3. `lost`: a default restart exits with `ReplicationSlotInvalidated`; `invalidated_slot_behavior: recreate` rebuilds the table.
+
+## Evidence
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| A PAT reaches no managed pipelines route | measured 2026-10-10 | [PL01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl01-api-surface.ts), one probe per route |
+| Initial copy 53 s, copy phase 13.3 s | measured on the engine, not managed | [PL02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl02-initial-copy.ts), n = 1 |
+| Lag p50 5577 ms at 10000 ms, 1131 ms at 1000 ms | measured on the engine | [PL03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl03-steady-lag.ts), 65 and 63 rows |
+| RLS applies to neither copy nor stream for `BYPASSRLS`; partial copy without it | measured on the engine; not in the docs | [PL04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl04-rls.ts), one run each |
+| Column DDL propagation; skipped cases | measured on the engine; skip-with-warning for types documented[^sb-pl-docs] | [PL05](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl05-ddl.ts), one statement each |
+| 0 duplicates in 11 trials | measured on the engine; at-least-once documented[^sb-pl-faq] | [PL06](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl06-duplicates.ts), 11 kills and stops |
+| Stopped pipeline retains WAL; slot `lost` past the keep size | measured on the engine | [PL07](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl07-paused-wal.ts), two runs |
+| `etl_pipeline` listed at 0.053 USD per hour; PAT `PATCH` refused 400 | listing and refusal measured | [PL08](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl08-billing-addon.ts), n = 1 |
+| Pipeline billed while stopped | documented, not tested[^sb-pl-usage] | usage page; needs an invoice or usage export |
+| Managed pipelines run in `eu-central-1` | documented, not tested[^sb-pl-docs] | docs page |
+| Plan: Pro, Team or Enterprise | documented, not tested[^sb-pl-faq] | FAQ; DuckLake access of the Pro organisation used here is unknown |
+
+The docs-versus-runtime differences here are two. The changelog lists DuckLake as available on request while the DuckLake guide lists it as public alpha, and the docs say nothing on RLS, which PL04 measured. The RUNLOG records no upstream filing for either.
+
+Not measured, with the missing prerequisite:
+
+- Everything on the managed service: a Dashboard session to create, stop and restart a pipeline, plus an invoice or usage export for billing while stopped.
+- The Supabase-backed DuckLake catalog and Storage: needs the Dashboard flow. The engine accepts a catalog URL and S3 credentials, which this lab pointed at local containers.
+- BigQuery, ClickHouse and Snowflake destinations: accounts the lab does not have.
+- Engine runs from the managed topology, a host in `eu-central-1`.
+
+## Reproducing
+
+The harness is [`experiments/pipelines/`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/pipelines) in supabase-lab: `make -C experiments/pipelines run`. PL02 creates a Pro-organisation project and PL99 deletes it. The engine image runs as local containers, with a local Postgres 16 catalog and a local S3-compatible store for the DuckLake destination. The step-by-step record is the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/RUNLOG.md).
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| PL01 | pipelines | [`pl01-api-surface.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl01-api-surface.ts) | none published |
+| PL02 | pipelines | [`pl02-initial-copy.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl02-initial-copy.ts) | none published |
+| PL03 | pipelines | [`pl03-steady-lag.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl03-steady-lag.ts) | none published |
+| PL04 | pipelines | [`pl04-rls.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl04-rls.ts) | none published |
+| PL05 | pipelines | [`pl05-ddl.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl05-ddl.ts) | none published |
+| PL06 | pipelines | [`pl06-duplicates.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl06-duplicates.ts) | none published |
+| PL07 | pipelines | [`pl07-paused-wal.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl07-paused-wal.ts) | none published |
+| PL08 | pipelines | [`pl08-billing-addon.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl08-billing-addon.ts) | none published |
+| PL99 | pipelines | [`pl99-teardown.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/pipelines/tests/pl99-teardown.ts) | none published |
+
+## Related docs
+
+- [pgmig: what a logical-replication move carries](/reference/pgmig-logical-replication-migrator/): the one-off move on the same logical replication, with the WAL watchdog and the `lost` slot abort.
+- [Supabase durability tiers](/reference/supabase-dr-tiers/): replication slots in a restore and the orphan-slot rule.
+- [Cloudflare Workers + Supabase: an architecture reference](/reference/cloudflare-supabase-architecture/): RLS by connection identity.
+- [Supabase compute and disk sizing](/reference/supabase-compute-disk/): the disk that retained WAL fills.
+
+## References
+
+[^sb-pl-changelog]: Supabase, "[Public Alpha] Supabase Pipelines," Supabase Changelog, 2026-07-21. https://supabase.com/changelog/pipelines
+[^sb-pl-docs]: Supabase, "Pipelines," Supabase Docs. https://supabase.com/docs/guides/database/replication/pipelines
+[^sb-pl-faq]: Supabase, "Pipelines FAQ," Supabase Docs. https://supabase.com/docs/guides/database/replication/pipelines-faq
+[^sb-pl-usage]: Supabase, "Manage Pipelines usage," Supabase Docs. https://supabase.com/docs/guides/platform/manage-your-usage/pipelines
+[^sb-pl-ducklake]: Supabase, "Pipelines: DuckLake," Supabase Docs. https://supabase.com/docs/guides/database/replication/pipelines/ducklake
+[^sb-etl-repo]: Supabase, "supabase/etl," GitHub. https://github.com/supabase/etl
+[^sb-studio-repl]: Supabase, "apps/studio/data/replication," supabase/supabase, GitHub. https://github.com/supabase/supabase/tree/master/apps/studio/data/replication
+[^pg-wal-keep]: PostgreSQL Global Development Group, "Replication - max_slot_wal_keep_size," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/current/runtime-config-replication.html
+[^pg-slots-view]: PostgreSQL Global Development Group, "pg_replication_slots," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/current/view-pg-replication-slots.html

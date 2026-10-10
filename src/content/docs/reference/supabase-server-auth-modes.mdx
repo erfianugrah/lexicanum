@@ -1,0 +1,389 @@
+---
+title: "@supabase/server auth modes on Edge Functions and Workers"
+description: "Which of 14 credential presentations each of the five @supabase/server auth modes lets through to the handler, on an Edge Function (verify_jwt false and true), on workerd and on a deployed Cloudflare Worker - the full matrix, where the package docs and the runtime disagree, and an Edge Function canary: redeploy drift, whether functions.invoke retries a 503, and latency against an RPC twin."
+author: Erfi Anugrah
+category: supabase
+group: architecture
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+`@supabase/server` wraps a handler in one of five auth modes (`none`, `user`, `secret`, `publishable`, `['user','secret']`) and runs unchanged on an Edge Function and on the Workers runtime. This page records which credentials each mode lets through on each, where the package docs disagree with what ran, and what an Edge Function canary showed about redeploys, client retries and latency.[^sb-server-docs]
+
+Everything marked measured was run on 2026-10-10 from the [`edge-runtime-auth`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/edge-runtime-auth) experiment in [supabase-lab](https://github.com/erfianugrah/supabase-lab), against throwaway projects on a Pro organisation in `ap-southeast-1`, one project per module run, each deleted by the module that created it. Library versions: `@supabase/server` 1.9.1, `@supabase/supabase-js` and `@supabase/functions-js` 2.117.3. The requests came from one machine in Singapore (a Cloudflare trace from it read `colo=SIN loc=SG`). "The docs" below means the files under `docs/` in the published 1.9.1 package, which the experiment's expectation table was written from.[^sb-server-docs] The artifacts are not published yet; the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/edge-runtime-auth/RUNLOG.md) carries every figure here.
+
+The workerd leg ran the Worker bundle inside a container on that machine (wrangler 4.149.0 in the image; the workerd build was not recorded). The Cloudflare leg deployed the same bundle to `workers.dev` with wrangler 4.147.0 on the host. The two legs ran in the same module run against the same project.
+
+**TL;DR:**
+
+- On an Edge Function with `verify_jwt` false, 0 of 44 cells the docs state differed from what ran. 26 of the 70 cells are ones the docs do not state, and they are in the matrix below.
+- On the Workers runtime, in three env configurations, on workerd and on Cloudflare, 0 of 70 cells differ from the workerd cell of the same configuration. All six targets are identical to each other. The one difference from the Edge Function is a well-formed unknown `sb_secret_` key, which the Edge Function gateway refuses with `401 Invalid API key` before the function runs, in every mode including `none`.
+- `user` mode accepts only a project-issued ES256 token. Expired, third-party-issuer, unregistered-key, legacy HS256 and legacy anon or service_role tokens are all refused with `INVALID_JWT`, and a bad JWT in `['user','secret']` is refused rather than falling through to the secret path.
+- Three docs statements fail on the runtime. `none` mode "needs no credentials" fails behind the gateway when `verify_jwt` is true (`Missing authorization header`). The instruction to disable `verify_jwt` for `publishable`, `secret` or `none` is stricter than the cells needed (valid `sb_` keys reached the handler with `verify_jwt` true). A valid user JWT with no `apikey` header, sent to `secret` or `publishable` mode, returns `INVALID_CREDENTIALS`, the code the docs call a fallback. The RUNLOG records no upstream filing for any of the three.
+- Canary: five redeploys with four concurrent pollers showed no mixed-version window (0 old-build answers after the first new-build answer, 0 non-200). `functions.invoke` made 1 attempt on an injected 503, 502, 500 and 429. Over 600 s at 1 request/s the Edge Function answered at p50 88 and p95 112 against an RPC twin at p50 27 and p95 44 (milliseconds; table in the latency section).
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  caller [label="Caller", style=rounded];
+
+  subgraph cluster_ef {
+    label="Edge Function"; style=rounded; fontsize=12; margin=12;
+    gw  [label="Platform gateway\n(Invalid API key,\nInvalid JWT,\nMissing authorization header)"];
+    lib1 [label="@supabase/server\nauth mode"];
+    h1  [label="Handler"];
+  }
+  subgraph cluster_wk {
+    label="Worker (workerd or Cloudflare)"; style=rounded; fontsize=12; margin=12;
+    lib2 [label="@supabase/server\nauth mode"];
+    h2  [label="Handler"];
+  }
+
+  caller -> gw   [label="request"];
+  gw -> lib1     [label="passed"];
+  lib1 -> h1     [label="ran:"];
+  caller -> lib2 [label="request"];
+  lib2 -> h2     [label="ran:"];
+}
+```
+
+An Edge Function request meets the platform gateway first, then the library. A Worker request meets only the library. Each matrix cell below records which layer answered: `gw:` for the gateway, `lib:` for the library (its `x-supabase-server-error` header), `ran:` when the handler body executed.
+
+---
+
+## Which mode for which caller
+
+| The caller presents | Mode that lets it through | Measured result |
+|---|---|---|
+| a project-issued user token | `user` | `200 ran:user`, with or without an `apikey` header |
+| the secret key in `apikey` | `secret` | `200 ran:secret` |
+| the publishable key in `apikey` (what a `supabase-js` client sends) | `publishable` | `200 ran:publishable`, whatever bearer rides along |
+| a user token or a secret key | `['user','secret']` | `200 ran:user` or `200 ran:secret` |
+| a token from a registered third-party issuer | none of the four; use `none` and verify in the handler | `INVALID_JWT` in `user` and `['user','secret']` |
+| nothing | `none`, with `verify_jwt` false on an Edge Function | `200 ran:none` |
+
+The first four rows are cells in the matrix below. The fifth is a design choice that follows from the `user` mode result, not a measured alternative: the experiment did not run a handler that verified a third-party token itself.
+
+---
+
+## The matrix: Edge Function, verify_jwt false
+
+Fourteen credential presentations at each of five modes, on five targets (70 cells per target): an Edge Function with `verify_jwt` false, the same with `verify_jwt` true, and three Worker configurations. Cell = HTTP status, then `ran:<mode>` if the handler executed, `lib:<code>` if the library refused, `gw:<message>` if the gateway refused before the function.
+
+Fixtures, all real and none generated by the library under test:
+
+- user token: a password sign-in on the project's own Auth; header `alg` ES256, `kid` present, lifetime 3600 s.
+- expired token: a real sign-in token issued with `jwt_exp` at 300 s and probed after its `exp`.
+- third-party token: ES256, signed by an in-process key whose JWKS an Edge Function on the project served, registered through the Management API third-party-auth endpoint (HTTP 201).
+- foreign token: ES256, signed by a key no project trusts.
+- legacy HS256 token: signed with the project's shared JWT secret, no `kid`, `sub` set to the real user.
+- keys: the project's legacy `anon` and `service_role` JWTs, and its `default` publishable and secret keys.
+
+Credential names: `_pub` means the request also carried the publishable key in `apikey` (the shape a `supabase-js` client sends); `_secret` means the secret key in `apikey`; `publishable_bearer` is the publishable key in both `apikey` and `Authorization`; `unknown_secret` is a well-formed `sb_secret_` string that is not a key of the project.
+
+| credential | `none` | `user` | `secret` | `publishable` | `['user','secret']` |
+|---|---|---|---|---|---|
+| legacy_anon | 200 ran:none | 401 lib:INVALID_JWT | 401 lib:INVALID_API_KEY | 401 lib:INVALID_API_KEY | 401 lib:INVALID_JWT |
+| legacy_service_role | 200 ran:none | 401 lib:INVALID_JWT | 401 lib:INVALID_API_KEY | 401 lib:INVALID_API_KEY | 401 lib:INVALID_JWT |
+| publishable | 200 ran:none | 401 lib:UNUSABLE_CREDENTIAL | 401 lib:INVALID_API_KEY | 200 ran:publishable | 401 lib:INVALID_API_KEY |
+| publishable_bearer | 200 ran:none | 401 lib:UNUSABLE_CREDENTIAL | 401 lib:INVALID_API_KEY | 200 ran:publishable | 401 lib:INVALID_API_KEY |
+| secret | 200 ran:none | 401 lib:UNUSABLE_CREDENTIAL | 200 ran:secret | 401 lib:INVALID_API_KEY | 200 ran:secret |
+| unknown_secret | 401 gw:Invalid API key | 401 gw:Invalid API key | 401 gw:Invalid API key | 401 gw:Invalid API key | 401 gw:Invalid API key |
+| user_jwt | 200 ran:none | 200 ran:user | 401 lib:INVALID_CREDENTIALS | 401 lib:INVALID_CREDENTIALS | 200 ran:user |
+| user_jwt_pub | 200 ran:none | 200 ran:user | 401 lib:INVALID_API_KEY | 200 ran:publishable | 200 ran:user |
+| user_jwt_secret | 200 ran:none | 200 ran:user | 200 ran:secret | 401 lib:INVALID_API_KEY | 200 ran:user |
+| expired_jwt_pub | 200 ran:none | 401 lib:INVALID_JWT | 401 lib:INVALID_API_KEY | 200 ran:publishable | 401 lib:INVALID_JWT |
+| tpa_jwt_pub | 200 ran:none | 401 lib:INVALID_JWT | 401 lib:INVALID_API_KEY | 200 ran:publishable | 401 lib:INVALID_JWT |
+| foreign_jwt_pub | 200 ran:none | 401 lib:INVALID_JWT | 401 lib:INVALID_API_KEY | 200 ran:publishable | 401 lib:INVALID_JWT |
+| legacy_hs256_jwt_pub | 200 ran:none | 401 lib:INVALID_JWT | 401 lib:INVALID_API_KEY | 200 ran:publishable | 401 lib:INVALID_JWT |
+| no_credentials | 200 ran:none | 401 lib:MISSING_CREDENTIALS | 401 lib:MISSING_CREDENTIALS | 401 lib:MISSING_CREDENTIALS | 401 lib:MISSING_CREDENTIALS |
+
+Measured 2026-10-10, one project, one pass of 14 requests per mode. Reading the table by mode:
+
+- `none` runs the handler for every credential the gateway lets through, including a bare publishable key and a legacy anon JWT. It verifies nothing.
+- `user` runs only for a real project-issued user token. A key presented where it looks for a token is `UNUSABLE_CREDENTIAL`; a JWT that is not a current project-issued ES256 token is `INVALID_JWT`.
+- `secret` and `publishable` read the `apikey` header. When a valid `publishable` key is in `apikey`, `publishable` mode ignores the bearer: the expired, third-party, foreign and legacy HS256 tokens all ran (`200 ran:publishable`).
+- `['user','secret']` runs for a user token or a secret key. A JWT that is present and fails verification is refused with `INVALID_JWT` even when a publishable key rides along; it is not downgraded to a later mode.
+- The legacy anon and service_role JWTs are refused with `INVALID_API_KEY` in `secret` and `publishable` modes and `INVALID_JWT` in `user` mode.
+
+Cells the docs do not state, a selection: a valid user token plus the secret key in `secret` mode ran the handler (`ran:secret`); a bare publishable key in `none` mode ran; `publishable` mode ignores a bad bearer when the publishable key is in `apikey`.
+
+---
+
+## What verify_jwt true changes
+
+The same code with the platform check on differs from the table above in 20 of 70 cells. Every one is a request the gateway refused before the function, and every one involves a bad or absent `Authorization` bearer:
+
+| credential | all five modes |
+|---|---|
+| expired_jwt_pub, tpa_jwt_pub, foreign_jwt_pub | 401 gw:Invalid JWT |
+| no_credentials | 401 gw:Missing authorization header |
+
+These did not change with `verify_jwt` true: a bare publishable key (`200 ran:publishable` in `publishable` mode), a bare secret key (`200 ran:secret` in `secret` mode), the publishable key in both headers, the legacy HS256 token, and the legacy anon and service_role JWTs (`200 ran:none`). The gateway passed the legacy HS256 token (`200 ran:none` in `none` mode, `200 ran:publishable` in `publishable` mode) that the library refuses in `user` mode with `INVALID_JWT`.
+
+The gateway and the library disagree about third-party tokens too. PostgREST answered the registered third-party token with 200, and the gateway refused it with `Invalid JWT` for the 120 s it was polled after registration, then again in the `verify_jwt` true matrix cell for that token. The time between registration and that cell was not recorded, so propagation longer than 120 s and a gateway rule are both still possible. Only one issuer type, a custom JWKS URL, was registered.
+
+<Aside type="caution" title="Tension with an earlier finding">
+The [Cloudflare reference](/reference/cloudflare-supabase-architecture/) says `verify_jwt` true turns away an `sb_publishable_` or `sb_secret_` key in the `Authorization` header. Here the publishable key in both headers reached the handler with `verify_jwt` true. The experiment never sent a key in `Authorization` alone, so the two results may describe different presentations; the earlier statement was not re-run. The [Auth reference](/reference/supabase-auth-end-to-end/) already supersedes the same statement.
+</Aside>
+
+---
+
+## The Workers runtime
+
+Three Worker configurations were run: env read from `process.env` under `nodejs_compat` (`wkauto` on workerd, `cfauto` on Cloudflare), env passed as explicit `env` overrides (`wkovr`, `cfovr`), and overrides plus the project's JWKS inline (`wkjwks`, `cfjwks`). The Cloudflare deployment used `compatibility_date` 2026-09-01 with `nodejs_compat`, and the project URL, publishable key, secret key and the JWKS document as Worker secrets. One Worker script served all three configurations, selected by a query parameter.
+
+| Cloudflare target | cells that differ from the workerd cell of the same configuration |
+|---|---|
+| `cfauto` against `wkauto` | 0 of 70 |
+| `cfovr` against `wkovr` | 0 of 70 |
+| `cfjwks` against `wkjwks` | 0 of 70 |
+
+The three Cloudflare configurations are identical to each other in all 70 cells, and so are the three workerd ones. Against the Edge Function with `verify_jwt` false, all six Worker targets differ in the same 5 cells, all in the `unknown_secret` row, because a Worker has no gateway in front of it:
+
+| mode | Edge Function | Worker |
+|---|---|---|
+| `none` | 401 gw:Invalid API key | 200 ran:none |
+| `user` | 401 gw:Invalid API key | 401 lib:UNUSABLE_CREDENTIAL |
+| `secret`, `publishable`, `['user','secret']` | 401 gw:Invalid API key | 401 lib:INVALID_API_KEY |
+
+A real user token (the `user_jwt` row, no `apikey`) in `user` mode was `200 ran:user` on all six Worker targets, including the two configurations per runtime that fetch the JWKS at run time and the one that gets it inline. The JWKS endpoint answered 200 with and without an `apikey` header (240 bytes, one key) from the host, from workerd and from the deployed Worker.
+
+Docs-stated cells against the expectation table: 0 differ on each Cloudflare target, and the docs-silent counts per mode (8, 2, 7, 7, 2 for `none`, `user`, `secret`, `publishable`, `['user','secret']`) equal those of the workerd targets.
+
+Other figures from the Cloudflare run, measured 2026-10-10 on one project and one account:
+
+| item | value |
+|---|---|
+| deploy to first answer | 18 s from the start of `wrangler deploy` to the first 200 from the `workers.dev` URL that showed the secret bindings present (the module polled every 3 s) |
+| project readiness | healthy 3 s after the create call returned (create call 1481 ms) |
+| teardown | Worker delete HTTP 200, project delete 200; the module's re-read of the account's Worker scripts found none with its name prefix |
+
+On a smoke deploy earlier that day (console output only, not in the artifact), the first 200 reported `process_env_has_url` false. The module now waits for the bindings to show before starting the matrices. A window between the script and its secrets is inferred from that one observation, not separated.
+
+<Aside type="note" title="A harness defect that looked like a library failure">
+Two earlier workerd runs showed the Worker `user`-family cells failing with `JWKS_FETCH_FAILED` ("internal error") in the configurations that fetch the JWKS at run time. The container image (`node:22-slim`) had no CA bundle, so workerd's outbound https failed for every host; the inline-JWKS configuration passed in the same run, which isolated it. Installing `ca-certificates` fixed it. Those results are superseded and are not library behaviour.
+</Aside>
+
+Not run: Durable Objects, Workers for Platforms, a custom domain, other colos, a request rate, cold-start latency, or the time for a Worker to see a changed secret. The Cloudflare `_runtime` probe response that the module stored was an HTML page rather than JSON, so the colo of this run is not in the artifact and the page is unexplained; the matrices that followed all answered from the Worker.
+
+---
+
+## What user mode accepts
+
+On an Edge Function with `verify_jwt` false (measured 2026-10-10), `user` mode ran only for a real project-issued ES256 token. It refused with `INVALID_JWT`: the expired token, the third-party-issuer token, the unregistered-key token, the legacy HS256 token under the shared secret, and the legacy anon and service_role JWTs. The Auth reference covers [which key signs a token and who verifies it](/reference/supabase-auth-end-to-end/); this adds one verifier with a narrower accept set than PostgREST, which answered 200 to the third-party token.
+
+Expiry boundary, `user` mode, Edge Function. The short token was probed about every 4.2 s around its `exp`, with offsets in seconds on the probing machine's clock. It was accepted at -20, -15.5, -11.3, -7.1 and -2.9, and refused with `INVALID_JWT` from +1.4 onward (12 probes). A second module run on a new project read -2.9 and +1.3. The 4.3 s between the last accepted and first refused probe is not resolved, and the probing machine's clock against the platform's was not measured, so a leeway under about 2 s is neither shown nor excluded.
+
+The `jwt_exp` setting lags its readback. After the Management API read back 300, the first sign-in still returned a 3600 s token; a second sign-in 10 s later returned 300 s (`short_lifetime_effective_after_s` 10, the resolution of the retry step). Restoring 3600 showed the same 10 s lag. Poll sign-ins for the lifetime in force rather than trusting the config readback. The [Cloudflare reference](/reference/cloudflare-supabase-architecture/) records the same lever applying at 6.5 s (W03).
+
+Runtime variables the Edge Function runtime injected, from the setup module on a new project:
+
+| variable | state |
+|---|---|
+| `SUPABASE_PUBLISHABLE_KEYS` | set, one key named `default` |
+| `SUPABASE_SECRET_KEYS` | set, one key named `default` |
+| `SUPABASE_JWKS` | set, one key of type EC/ES256 |
+| `SB_EXECUTION_ID`, `SUPABASE_FUNCTION_SLUG` | set |
+| `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY` (singular) | not set |
+| `SUPABASE_JWKS_URL` | not set |
+
+A new project carried the legacy anon and service_role keys, one publishable key and one secret key.
+
+---
+
+## Where the docs disagree with runtime
+
+Docs statements are quoted from the package's `auth-modes.md` as written in 1.9.1; the runtime column is the 2026-10-10 measurement.[^sb-server-docs]
+
+| Doc claim | Runtime measured | Filed upstream |
+|---|---|---|
+| "if your function uses `publishable`, `secret` or `none`, disable the platform-level JWT check" | with `verify_jwt` true, a bare publishable key, a bare secret key and the publishable key in both headers reached the handler (200); the gateway refused a missing credential and a bad bearer (expired, third-party, foreign). Stricter than these cells needed. Scope: three valid-key shapes and three bad-bearer shapes, one project | not recorded |
+| `none` mode needs no credentials | true on the library and on an Edge Function with `verify_jwt` false (`200 ran:none` for 13 of the 14 presentations; the 14th, `unknown_secret`, is refused by the gateway). Behind the gateway with `verify_jwt` true and no credentials: `401 gw:Missing authorization header`. The gateway refuses it, not the library | not recorded |
+| "the specific codes cover essentially every real failure; `INVALID_CREDENTIALS` is a fallback" | a valid user JWT with no `apikey`, sent to `secret` or `publishable` mode, got `INVALID_CREDENTIALS` (the `user_jwt` row, on every target); a plausible request, on a code described as rare | not recorded |
+| "legacy HS256 tokens and old-format keys are rejected, not silently downgraded" | held on both runtimes: the library refused the HS256 token in `user` and `['user','secret']` modes (`INVALID_JWT`), and the legacy anon and service_role keys in `secret` and `publishable` modes (`INVALID_API_KEY`). With `verify_jwt` true the gateway passed the HS256 token | not applicable |
+| "a JWT that is present and fails verification rejects immediately, it will not fall through to a later mode" | held in `['user','secret']`: the expired, third-party, foreign and HS256 tokens, each with a publishable key in `apikey`, were refused with `INVALID_JWT`; the secret key alone still matched `secret` | not applicable |
+
+The RUNLOG records no upstream filing for the three disagreements; "not recorded" is not a check of Supabase's issue tracker.
+
+---
+
+## Canary: redeploys, client retries, latency
+
+One Edge Function, deployed through the Management API multipart endpoint (not the CLI) with `verify_jwt` false, returning a build hash the module substituted into the source on each deploy. One project, one function, one region, requests from Singapore, measured 2026-10-10.
+
+### Redeploy drift
+
+Each cycle: 3 s of baseline polling of the old build, a redeploy to a new build, then polling until the new build was the only answer for 20 s. Four pollers ran as sequential loops with a 100 ms pause. Each cycle was observed for about 30 s (30.0 to 30.1 s) and collected 618 to 639 samples across the four pollers; the 3 s baselines held 74 to 105 samples each. Times are ms after the deploy API call returned.
+
+| cycle | deploy API ms | last old-build answer | first new-build answer | old-build answers after the first new one | non-200 |
+|---|---|---|---|---|---|
+| 1 | 1391 | 8 | 975 | 0 | 0 |
+| 2 | 1703 | none after the deploy returned | 781 | 0 | 0 |
+| 3 | 1441 | none after the deploy returned | 976 | 0 | 0 |
+| 4 | 1324 | 2 | 987 | 0 | 0 |
+| 5 | 1558 | 36 | 974 | 0 | 0 |
+
+Across the five cycles no old-build answer followed a new-build answer, 0 responses were non-200, and no answer of either build arrived between 36 ms and 781 ms after the deploy call returned. Latency of successful answers in the first 10 s after a deploy was p95 240 ms and max 1035 ms, against a pre-deploy p95 of 109 ms over the 3 s baselines. Requests issued around the deploy boundary took up to about 1 s and then returned the new build. The module did not record when each request was sent, so "held until the new version was ready" and "booted slowly" are not separated.
+
+The first ER02 run reported a 3 to 6 s mixed window, with 68 to 143 old-build answers after the first new one. That was a defect in the module's time origin, which counted pre-deploy samples as post-deploy. The module was corrected and the figures are withdrawn:
+
+| run | reported mixed window | status |
+|---|---|---|
+| first ER02 run, 2026-10-10 | 3 to 6 s, 68 to 143 old-build answers after the first new one | withdrawn: time-origin defect in the module |
+| corrected run, 2026-10-10 | 0 old-build answers after the first new one in 5 of 5 cycles | current |
+
+### functions.invoke against an injected failure
+
+`supabase-js` 2.117.3, `createClient` with a counting `global.fetch`, one `functions.invoke` per trial, 3 trials per status. The function returned the status itself and wrote one row to a table per request it received, keyed by a request id header. An in-memory counter was not used, because most latency-window answers reported a module-load age under 2 s.
+
+| injected status | client attempts per invoke (3 trials) | rows the function recorded (3 trials) | error class | `Retry-After` set |
+|---|---|---|---|---|
+| 503 | 1 / 1 / 1 | 1 / 1 / 1 | FunctionsHttpError | no |
+| 503 | 1 / 1 / 1 | 1 / 1 / 1 | FunctionsHttpError | 1 s |
+| 502 | 1 / 1 / 1 | 1 / 1 / 1 | FunctionsHttpError | no |
+| 500 | 1 / 1 / 1 | 1 / 1 / 1 | FunctionsHttpError | no |
+| 429 | 1 / 1 / 1 | 1 / 1 / 1 | FunctionsHttpError | no |
+| 200 (control) | 1 / 1 / 1 | not recorded | none | no |
+
+Neither the client nor the platform path to the function retried: each invoke produced one outbound request and one function-side request and returned an error object with the status. `Retry-After` made no difference. The data-API path behaves differently: the [Cloudflare reference](/reference/cloudflare-supabase-architecture/) records `supabase-js` 2.112.3 riding out three 503 answers in 4 attempts (W02). Not measured: a 503 produced by the platform relay rather than the function, a network failure (`FunctionsFetchError`), and other client versions.
+
+### Latency over 600 s
+
+The function and a SQL function behind PostgREST (`/rest/v1/rpc/`, same publishable key header) were called alternately, 600 of each at 1 request/s each, from the probing machine. All 1200 answered 200.
+
+| path | n | p50 ms | p95 ms | p99 ms | max ms |
+|---|---|---|---|---|---|
+| Edge Function | 600 | 88 | 112 | 146 | 242 |
+| RPC twin | 600 | 27 | 44 | 68 | 147 |
+
+Per 30 s bucket (20 buckets of 30 function requests), the function's p95 had median 110 and max 151 (milliseconds); 0 buckets exceeded twice the median. 466 of 600 function answers came from an instance whose `age_ms` (time since the canary's module load) was under 2 s; those had p50 91 and p95 115. The 134 answers with a served count above 1 had p50 61 and p95 86, still slower than the RPC twin's p50 in the table above. A young `age_ms` shows a recent module load, which the run does not separate from an instance start or a reload inside a longer-lived instance.
+
+Open item: the module counted 543 distinct instance ids over 600 answers, which does not agree with 134 answers carrying a served count above 1 (about 466 distinct ids if every reuse kept the same id). The disagreement is unresolved, so the instance id is not relied on here.
+
+Not measured: a request rate where instances stay warm, any window longer than 600 s, more than one function or region, concurrency above 1, the platform's own logs, and a p95 alert on a live incident. The "twice the median bucket p95" rule is a threshold chosen in the run and fired 0 times. The post-deploy 10 s p95 (240 ms) was 2.2x the pre-deploy p95 (109 ms) over a different window length, so it is not a like-for-like firing.
+
+---
+
+## Reading the numbers
+
+- The matrix is one pass of 14 requests per mode per target on one project. It shows which layer answered and with what code on 2026-10-10 and `@supabase/server` 1.9.1. A later library or gateway release can move any cell.
+- "Docs-stated" means the expectation table in the experiment's `lib/matrix.ts` states the cell; a cell the docs do not state counts as docs-silent, not as a pass. 0 of 44 differing is therefore a statement about 44 cells, not 70.
+- The gateway cells (`gw:`) belong to the platform and can change without a library release. The library cells (`lib:`) held across an Edge Function and the Workers runtime, which is the part that generalises between runtimes in this measurement.
+- Handler bodies did not use `ctx.supabase` or `ctx.supabaseAdmin`, so client construction, RLS and the admin client were not exercised. Other runtimes the package names (Vercel, Bun, Deno outside Supabase), unknown `sb_publishable_` strings and the named-key syntax (`publishable:<name>`, `secret:*`) were not run, nor was the platform clock against the probing machine's.
+- The canary figures are from one function and one vantage. The drift result covers the Management API deploy path only.
+
+---
+
+## What to do about it
+
+Module ids are results in the `edge-runtime-auth` experiment of [supabase-lab](https://github.com/erfianugrah/supabase-lab); a row that is a design choice rather than a result says so.
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Verify third-party-issuer tokens outside `user` mode | `user` mode refused the registered third-party token with `INVALID_JWT`, while PostgREST answered 200 to it. Design choice: no handler verified such a token in the run | ER01-ef-user, ER01-efvj-user |
+| Move clients off legacy HS256 tokens before relying on `user` mode | refused with `INVALID_JWT` in `user` and `['user','secret']`; with `verify_jwt` true the gateway still passed the token (`200 ran:none` in `none` mode) | ER01-ef-user, ER01-efvj-none |
+| Send the key the mode reads in `apikey`, not a user JWT alone | a valid user JWT with no `apikey` is `401 INVALID_CREDENTIALS` in `secret` and `publishable` mode | ER01, the `ef-secret` and `ef-publishable` targets |
+| Set `verify_jwt = false` when `none` mode must answer without credentials | with it true, no credentials got `401 gw:Missing authorization header` and an expired, third-party or foreign bearer got `401 gw:Invalid JWT` | ER01-efvj-none |
+| Pass `env.jwks` inline on a Worker that cannot reach the JWKS | design choice; the inline path verified a real user token on workerd and Cloudflare; the run-time fetch path did too once the container had a CA bundle | ER01-wkjwks-user, ER01-wkovr-user |
+| Write the 503 retry and fallback around `functions.invoke` yourself | 1 client attempt and 1 function-side row on 503 (with and without `Retry-After`), 502, 500 and 429, 3 trials each. A platform-relay 503 was not measured | ER02-retry-503 |
+| Stamp a build hash in the response and alert on an unexpected build | after a Management API redeploy the old build's last answer came at most 36 ms after the deploy call returned, in 5 of 5 cycles | ER02-drift |
+| Budget about 1 s of added latency for requests at a redeploy boundary | first-10-s max 1035 ms, p95 240 ms against 109 ms before; window lengths differ | ER02-drift |
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.35; ranksep=0.55;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  root [label="What does the caller present?", shape=hexagon];
+  user  [label="user mode"];
+  secret [label="secret mode"];
+  pub   [label="publishable mode"];
+  both  [label="user + secret array"];
+  none  [label="none mode\n(verify in the handler)"];
+  vj    [label="verify_jwt = false\non an Edge Function"];
+
+  root -> user   [label="a project-issued\nES256 user token"];
+  root -> secret [label="the secret key,\nserver to server"];
+  root -> pub    [label="the publishable key\nin apikey"];
+  root -> both   [label="either a user token\nor the secret key"];
+  root -> none   [label="another issuer's token,\nor nothing"];
+  none -> vj     [label="callers may send no\nbearer or a foreign one"];
+}
+```
+
+1. A project-issued ES256 user token: `user` mode.
+2. The secret key from a server: `secret` mode, with the key in `apikey`.
+3. The publishable key in `apikey`: `publishable` mode; it ignores the bearer.
+4. Either a user token or the secret key: `['user','secret']`.
+5. A token from another issuer, or no credential: `none` mode, with the check in the handler; on an Edge Function add `verify_jwt = false` if callers may send no bearer or a bearer the gateway rejects.
+
+---
+
+## Reproducing
+
+From a checkout of [supabase-lab](https://github.com/erfianugrah/supabase-lab/tree/c621e0d), with a Management API token in `SUPABASE_ACCESS_TOKEN`:
+
+```sh
+make probe PVLAB_ORG_PRO=<pro org slug> ONLY=ER01
+make probe PVLAB_ORG_PRO=<pro org slug> ONLY=ER02
+make unit
+```
+
+Both modules create and delete their own project (name prefix from `ER_PROJECT_PREFIX`, default `er-`); there is no OpenTofu state. ER01's workerd leg needs Docker. Its Cloudflare leg needs a Workers Scripts edit token and the account id in the environment and `wrangler` on the path; without the token a run has only the workerd targets. `ER_CYCLES` (default 5) and `ER_WINDOW_S` (default 600) size ER02. The package versions are pinned in the experiment's `package.json`, and `make unit` runs the expectation table, the drift arithmetic and the percentile logic without a project. Results and what they do not show are in the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/edge-runtime-auth/RUNLOG.md).
+
+---
+
+## Evidence
+
+| Claim | How it was checked | Status |
+|---|---|---|
+| 0 of 44 docs-stated cells differ on an Edge Function, `verify_jwt` false; 26 of 70 docs-silent | ER01 matrix against the expectation table in `lib/matrix.ts` | measured, 2026-10-10 |
+| 1 differing docs-stated cell with `verify_jwt` true (`none`, no credentials) | same, 43 stated, 26 docs-silent | measured, 2026-10-10 |
+| 0 of 70 cells differ between each Cloudflare target and its workerd cell; all six Worker targets identical | ER01 Cloudflare leg, same module run, same fixtures | measured, 2026-10-10 |
+| a real user token verified on all three Cloudflare configurations | `user_jwt` row in `user` mode, `200 ran:user` | measured, 2026-10-10 |
+| `user` mode accepts only a project-issued ES256 token | six refused fixtures, each `INVALID_JWT` | measured, 2026-10-10 |
+| gateway passes HS256 and refuses a third-party token that PostgREST accepts | `verify_jwt` true matrix, 120 s poll, data-API control | measured, 2026-10-10; propagation against rule unsettled |
+| no mixed-version window after a redeploy | ER02 five cycles, four pollers | measured, 2026-10-10; Management API deploy path only |
+| `functions.invoke` does not retry 503, 502, 500, 429 | counting `fetch` plus a table-row witness, 3 trials per status | measured, 2026-10-10; platform-relay 503 and network errors not run |
+| Edge Function latency against the RPC twin over 600 s (p50, p95, p99, max in the latency table) | 600 alternating requests each at 1 request/s | measured, 2026-10-10; one function, one vantage |
+| the docs sentences quoted in the disagreement table | the `docs/` files of the published 1.9.1 package, read in the run's expectation table | documented, 1.9.1 |
+| the 3 to 6 s mixed-version window | first ER02 run | withdrawn, time-origin defect |
+
+---
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| ER01 | edge-runtime-auth | [`er01-server-auth-matrix.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/edge-runtime-auth/tests/er01-server-auth-matrix.ts) | none published |
+| ER02 | edge-runtime-auth | [`er02-canary-drift-retry-latency.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/edge-runtime-auth/tests/er02-canary-drift-retry-latency.ts) | none published |
+
+The ids with a suffix in the practices table (`ER01-ef-user`, `ER02-retry-503`) are result rows inside these two modules. The figures are recorded in the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/edge-runtime-auth/RUNLOG.md) at that commit.
+
+---
+
+## Related docs
+
+- [Supabase Auth end to end](/reference/supabase-auth-end-to-end/) - which key signs a token and who verifies it; this page adds one more verifier and the gateway's view of the same tokens.
+- [Edge Function limits, one ceiling at a time](/reference/supabase-edge-function-limits/) - the runtime ceilings the canary function sits under.
+- [Cloudflare Workers + Supabase](/reference/cloudflare-supabase-architecture/) - edge JWT verification with `jose` from a Worker, and the data-API retry behaviour compared with `functions.invoke` above.
+- [A backend-for-frontend fan-out on Edge Functions](/guides/supabase-edge-function-bff-fanout/) - a handler that runs `withSupabase({ auth: "user" })` on `@supabase/server` 1.9.0; the `user` mode rows above apply to it.
+- [Migrating PBKDF2 password hashes](/reference/pbkdf2-supabase-auth-migration/) - a public Edge Function entry point that uses `auth: 'none'` with `--no-verify-jwt`, the combination the `none` rows measure.
+
+{/* References: cited inline as [^slug]; the numbered list renders below under "References". */}
+[^sb-server-docs]: Supabase, "supabase/server," GitHub. https://github.com/supabase/server
