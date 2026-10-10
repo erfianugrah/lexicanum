@@ -1,0 +1,260 @@
+---
+title: "Temporary token-based database access (JIT): grants, expiry and what gets logged"
+description: "Supabase temporary token-based database access lets a member log in to Postgres with their personal access token as the password, for a role the project granted with an expiry. Measured on a Pro org project on 2026-10-10 - the prerequisite, the grant body, the epoch-seconds expiry and the milliseconds example that never expires, what expiry and revocation stop, the connection paths, what the logs record, allowed_networks on the pooler, and where the docs and the runtime disagree."
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Temporary token-based database access (called JIT here, after the `/database/jit` routes) lets a project member log in to Postgres with their personal access token (PAT) as the password, for a role the project has granted them until an expiry.[^sb-jit-changelog][^sb-temp-access] This page is for the operator deciding whether to hand out database access this way, and covers how to turn it on, how to write a grant that expires, what expiry and revocation do to a session that is already open, and what the logs say afterwards.
+
+<Aside type="note">
+Everything marked measured ran on 2026-10-10 in the [supabase-lab](https://github.com/erfianugrah/supabase-lab) `jit-db-access` experiment: a Pro-plan organization, Postgres `17.11.0.003` in `ap-southeast-1`, five runs with one fresh Pro project each, created by the module and deleted in its `finally` block (the docs floor for the feature is `17.6.1.081`). The vantage was a laptop on an IPv4 network with an IPv6 route through a tunnel interface, `psql` 18.6. The PAT under test was both the bearer for the control-plane calls and the Postgres password. Run 1 tripped the pooler circuit breaker and its pooler rows after that point are not cited; run 3's 300 s open-session row is discarded because the orchestrating host stalled. Where a row holds for fewer than all five runs, it says which. No `out/` artifact was published, so the Modules table points at the test file and the RUNLOG. Claims taken from the changelog and the temporary-access page are labelled as documented.
+</Aside>
+
+**TL;DR:**
+
+- **The grant routes work on Pro.** `PUT /jit-access` with a state, and `PUT /database/jit`, both answered `200` in all five runs. The `500` recorded on Pro for JIT in the [placement doc](/reference/supabase-multi-tenant-placement/) was the invite route, `POST /database/jit/invite`, which this experiment never called (JA01c, JA01d).
+- **SSL enforcement is a prerequisite, and enabling without it answers `200` and enables nothing.** `GET /jit-access` reads `{"state":"unavailable","unavailableReason":"ssl_enforcement_required"}` and `PUT enabled` returns that same body. Turning SSL enforcement on is followed 1 s later by a `received fast shutdown request` row in `postgres_logs`, in 5 of 5 runs; a Postgres restart is the inferred reading (JA01b).
+- **The grant body key is `roles`.** The docs' `user_roles` answers `400 roles: Invalid input`; the response uses `user_roles`, and `PUT` replaces the user's whole role set (JA01d).
+- **`expires_at` is epoch seconds.** A seconds value refused fresh logins at +0 to +1 s. The docs example writes milliseconds, which is accepted with `200` and was not refused within 70 s, so copying the example yields a grant with no practical expiry (JA01g).
+- **Expiry and `DELETE /database/jit/{user_id}` stop new logins only.** Open sessions stayed alive 300 s after expiry and 15 s after the delete. `PUT /jit-access disabled` closed the pooler session and left the direct one (JA01g, JA01i).
+- **Nothing in the two log sources names the Supabase user.** A direct login logs the Postgres role and `method=pam`; a pooler login logs the role and the client address. The changelog's "see who accessed the database" is not visible there (JA01k).
+- **Per-client-IP scoping through the shared pooler is unproven.** The pooler appears to be judged on its own IPv6 address (not settled), and an IPv4-only grant gave `password, password, ok-v6, ok-v6` across four trials 8 s apart in one run (JA01j).
+- **Failed pooler logins trip a circuit breaker that also refuses valid grants.** Do not retry a refused JIT login in a loop (run 1).
+
+---
+
+## The paths
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  holder [label="Member holding a PAT", style=rounded];
+  mgmt   [label="Management API\nPUT /jit-access\nPUT /database/jit"];
+  shared [label="Shared pooler\n6543 and 5432\noptions=-c jit=true"];
+  direct [label="Direct host\nIPv6 only"];
+  dedic  [label="Dedicated pooler\n(refused)"];
+  pg     [label="Postgres", shape=cylinder];
+
+  holder -> mgmt   [label="grant: roles, expires_at"];
+  holder -> shared [label="PAT as password"];
+  holder -> direct [label="PAT as password"];
+  holder -> dedic  [label="PAT as password"];
+  shared -> pg;
+  direct -> pg [label="method=pam"];
+}
+```
+
+The same facts as a table:
+
+| Step | Route or host | Result on the Pro project |
+|---|---|---|
+| Enable | `PUT /v1/projects/{ref}/jit-access` with `{"state":"enabled"}` | `200`; reads back `enabled` once SSL enforcement is on (JA01c) |
+| Grant | `PUT /v1/projects/{ref}/database/jit` with `roles` and `expires_at` | `200` (JA01d) |
+| Log in, shared pooler | `:6543` or `:5432`, user `postgres.<ref>`, `options=-c jit=true` | works (JA01e) |
+| Log in, direct | `db.<ref>.supabase.co:5432`, user `postgres` | works over IPv6 only (JA01e) |
+| Log in, dedicated pooler | `db.<ref>.supabase.co:6543` | `SASL authentication failed` (JA01e) |
+
+## Which path to use
+
+| You need | Use | Why |
+|---|---|---|
+| A login from an IPv4-only network | shared pooler with `options=-c jit=true` | the direct host has an AAAA record and no A record without the IPv4 add-on (JA01e) |
+| The session to carry the client's own `application_name` | direct | through the pooler it reads `Supavisor` whatever the client sent (JA01f) |
+| Revocation to end an open session | none of the measured routes reliably | `PUT /jit-access disabled` closed the pooler session and not the direct one; expiry and `DELETE` closed neither (JA01g, JA01i) |
+| Source-address scoping | no measured path is dependable | direct with the `/128` was variable across runs, and the pooler appears to be judged on its own IPv6 address (JA01j) |
+
+## Enabling it
+
+The platform needs SSL enforcement on first. On a fresh project with it off, `GET /jit-access` answered `200` with `{"state":"unavailable","unavailableReason":"ssl_enforcement_required"}`, and `PUT /jit-access {"state":"enabled"}` answered `200` with that same `unavailable` body, so the call succeeds without enabling anything (JA01b, measured, runs 1-5). `PUT /ssl-enforcement` with `{"requestedConfig":{"database":true}}` answered `200` in 1-2 s and `GET /jit-access` then read `disabled`. The docs say SSL enforcement has to be on before temporary access can be used[^sb-temp-access]; the reason code and the `200` on the failed enable are the measured part.
+
+A `received fast shutdown request` row appeared in `postgres_logs` 1 s after the SSL enforcement `PUT` in each of the five runs. That reads as a Postgres restart on that change, an inference from the log row. Downtime was not measured.
+
+`PUT /jit-access {"state":"enabled"}` then answered `200` and read back `enabled` (JA01c). A client that checks only the status code of the enable call will not see the `unavailable` case; read `GET /jit-access` afterwards.
+
+## The grant body
+
+The docs example for `PUT /database/jit` uses the key `user_roles`.[^sb-temp-access] Measured, that body answered `400 {"message":"roles: Invalid input: expected array, received undefined"}`. The public Management API OpenAPI document, read 2026-10-10, names the request key `roles`; that body answered `200` and the response uses `user_roles` (JA01d, measured).
+
+`PUT` replaces the user's whole role set. After `PUT [postgres]` and then `PUT [ja_reader]` for the same user, the list showed only `ja_reader` (JA01d). Send every role the user should hold in each call.
+
+`GET /database/jit/list` items carry `expires_at`, `invite_id`, `primary_email`, `user_id` and `user_roles`. The list contains the member's email address, so do not paste a raw response into a ticket. `POST /database/jit` with `{role, rhost}`, the authorise check in the OpenAPI document, answered `403 {"message":"Unauthorized to assume role"}` for this PAT (JA01d).
+
+## Expiry is in seconds
+
+Grants were written in one `PUT` at the same instant: `postgres` with `expires_at` set to now plus 75 in epoch seconds, and `ja_reader` with the same instant in epoch milliseconds, which is what the docs example writes.[^sb-temp-access] Both calls answered `200` and both values read back verbatim (`1791600168` and `1791600168000` in run 5) (JA01g, measured).
+
+| `expires_at` unit | Fresh login after the instant | Runs |
+|---|---|---|
+| seconds | refused at +0 to +1 s on both paths (pooler `+1, +0, +0`; direct `+0` in all three); probe resolution was 1.5-2.5 s per loop pass | 2, 4, 5 |
+| milliseconds | not refused within 70 s on the direct path; the exploratory run saw the same on the pooler | 2, 4, 5 |
+
+Refusal text is `password authentication failed for user "postgres"` through the pooler and `PAM authentication failed for user "postgres"` direct. Run 3's offsets (pooler `+0`, direct `+0`) agree and are not counted, because that run is discarded for the open-session row.
+
+Read as seconds, the milliseconds value names a date far outside any practical horizon. The platform accepted it with `200`, so following the docs example literally produces a grant with no practical expiry. That reading rests on a 70 s observation window per run; the value was not waited out and no cap was found.
+
+## What expiry and revocation stop
+
+Each step started with a valid grant and, for the revocation rows, one held pooler session and one held direct session. The held sessions were pinged every 5 s and, for the revocation rows, once more 15 s after the first refusal.
+
+| Event | New pooler login | New direct login | Open sessions afterwards |
+|---|---|---|---|
+| expiry (seconds value) | refused at +0 to +1 s | refused at +0 s | three sessions (pooler `postgres`, direct `postgres`, direct `ja_reader`) answered every ping until 300 s after the instant in runs 4 and 5; in run 2 the two `postgres` sessions answered at +70 s |
+| `DELETE /database/jit/{user_id}` | refused after 0.2-0.5 s, `(EJITREQUESTFAILED) failed to reach JIT provider for user "postgres"` | refused after 0.5-2.9 s, `PAM authentication failed` | both alive, 4 of 4 clean runs |
+| `PUT /jit-access {"state":"disabled"}` | refused after 0.7-4.6 s, `password authentication failed` | refused after 0.9-1.9 s | pooler session closed, direct session alive, 4 of 4 clean runs |
+| `PUT /jit-access {"state":"enabled"}` after disabling | login restored | login restored | not applicable |
+
+- After `DELETE`, the grant list showed no mapping for the caller (run 5: none). After `disabled` it still showed `postgres` (run 5), and `PUT enabled` alone restored login in 0.8-4.7 s (runs 2-5) with no re-grant. The changelog says users regain access when temporary access is re-enabled[^sb-jit-changelog]; that held for the pooler and direct logins tried.
+- Extending works in the other direction: a `PUT` of a later `expires_at` after expiry restored a direct login 0.3-0.4 s later and a pooler login 0.3-0.5 s later (JA01h, runs 2-5).
+- The first pooler login after a grant worked 1.7 s (run 2), 0.4 s (run 3), 0.5 s (run 4) and 0.5 s (run 5) after the `PUT` returned (JA01e).
+
+Run 3 contradicts the open-session row and is discarded: its loop overran by about 225 s, the `ja_reader` probe returned 295 s after the instant with `server closed the connection unexpectedly`, and both held sessions were found closed. The run took 11 min against 5 min 41 s for run 2, and a timer on the same machine also failed to fire inside its window, so the orchestrating host stalled. The cause was not established. Runs 4 and 5 added a stall detector and `caffeinate -i` and show no gap above 6 s.
+
+Not settled: whether the platform ever closes the open sessions of an expired grant later than 300 s. Removing the project member and revoking the PAT, the two revocation routes the changelog describes, were not run (JA01l, below).
+
+## Connection paths
+
+Grant for these rows: `postgres` and a custom `ja_reader` role (`LOGIN`, no password, `select` only) for 30 minutes (JA01e, measured, runs 2-5).
+
+| Path, PAT as password | Result |
+|---|---|
+| shared pooler `:6543`, user `postgres.<ref>`, `options=-c jit=true` | login works |
+| shared pooler `:5432`, same | login works |
+| shared pooler, no `jit=true` option | `password authentication failed for user "postgres"` |
+| shared pooler, `jit=true`, a role with no mapping (`supabase_admin`) | `password authentication failed` |
+| direct `db.<ref>.supabase.co:5432`, user `postgres` | login works, over IPv6 |
+| dedicated pooler `db.<ref>.supabase.co:6543`, user `postgres` | `SASL authentication failed` |
+| pooler host from the docs example (`aws-1-...`) | `(ENOTFOUND) tenant/user postgres.<ref> not found` |
+
+- **Pooler host.** `GET /config/database/pooler` returned an `aws-0-` host for this project; the docs example uses `aws-1-`.[^sb-temp-access] The tenant was not found on the `aws-1-` host in 4 of 4 runs where it was tried. Use the host from the endpoint, not the docs string.
+- **Direct path.** The direct hostname has an AAAA record and no A record (A count 0, AAAA count 1; no IPv4 add-on bought). This vantage reached it over IPv6. macOS `getaddrinfo` refused the name (`could not translate host name`) until the module resolved the AAAA record itself and passed it as `hostaddr`. A vantage with no IPv6 route will not reach the direct path at all (not tested).
+- **Dedicated pooler.** The refusal matches the changelog, which says the feature is not available through the dedicated pooler on port 6543 of the database host.[^sb-jit-changelog] The error text, `SASL authentication failed`, does not say why.
+
+## What a PAT session is
+
+PAT-authenticated sessions (JA01f, measured, runs 2-5) show `current_user = session_user = postgres`, `pg_stat_activity.usename = postgres` and `rolsuper = false`. Through the pooler `application_name` reads `Supavisor` whatever the client sent; direct, it is the client's. The custom role connects as `ja_reader`, and `CREATE TABLE public.x` fails with `permission denied for schema public`. The role keeps its own privileges, as the docs say; the session carries no Supabase user identity of its own.
+
+## What the logs record
+
+Logs were read through `GET /analytics/endpoints/logs` with `log_connections` on and markers in `application_name`. Marker rows appeared 34-38 s after the logins (JA01k, measured, runs 2-5). The [logs endpoint guide](/guides/supabase-management-api-logs-endpoint/) covers the query shape.
+
+| Login | Source | What the row holds |
+|---|---|---|
+| direct | `postgres_logs` | `connection authenticated: identity="postgres" method=pam (...)`, then `connection authorized: user=postgres database=postgres application_name=<client value> SSL enabled (...)` |
+| pooler | `supavisor_logs` | `user` attribute `postgres`, `peer_ip` (the client's address), `app_name` (the client's value) |
+
+No `postgres_logs` row carries the client's marker for the pooler login. No row from any login contains the caller's user id or email, and no row in the preceding hour contains the string `sbp_` (0 rows, runs 1-5). The one row containing the user id was the Management API's own statement tag on `POST /database/query`, `-- user: scoped_pat:<id>`, written when the module created the `ja_reader` role. Marker row counts in runs 2-5: `postgres_logs` 1 each time (the direct login); `supavisor_logs` 1, 1, 2, 2, without a breakdown of which of the four marked attempts each belongs to, so what a refused attempt leaves in the logs is not measured.
+
+The changelog says it will be possible to see who accessed the database.[^sb-jit-changelog] That is not visible in these two sources for a JIT login. The dashboard view of JIT activity was not examined, and a Pro project has no platform audit log (see [the audit trail doc](/reference/supabase-audit-trail-integrity/)), so a record of who held a grant has to come from your own side: the grant calls and the list.
+
+## Source-address scoping
+
+`allowed_networks` takes `allowed_cidrs` for IPv4 and `allowed_cidrs_v6` for IPv6, per the OpenAPI document (JA01j, measured, runs 2-5 unless stated).
+
+| Grant | Direct | Shared pooler |
+|---|---|---|
+| documentation-range `192.0.2.0/24` | refused | refused in 3 of 3 trials in run 5 and in every single probe of runs 2-5 |
+| vantage IPv4 `/32` only | refused (the database sees an IPv6 client address on direct sessions) | refused in runs 2 and 4 at +3 s, allowed in runs 3 and 5 at +3 s; run 5's four trials 8 s apart read `password, password, ok-v6, ok-v6` |
+| vantage IPv4 `/32` plus `allowed_cidrs_v6` set to the `/128` the database saw for the direct session | ok in runs 2, 4 and 5, refused in run 3 | not tabulated |
+| `allowed_cidrs_v6: ["::/0"]` | ok in runs 2-5 | ok in runs 3, 4 and 5, refused in run 2 |
+
+On a pooler session `inet_client_addr()` is an IPv6 address, the pooler's own address and not the client's (runs 3, 4, 5; run 2 had no pooler login to read it from). The pooler's verdict on a changed grant appears to converge over 10-20 s and to differ between connections, since several pooler nodes answered during the runs; that is not confirmed. The direct `/128` result was variable across runs and the cause was not established. The address the database sees on a direct session may differ between connections; that was not checked.
+
+Not settled: whether the pooler judges the client's IPv4 address, its own IPv6 address, or both. Treat per-client-IP scoping through the shared pooler as unproven, and use a documentation-range or other deliberately wrong CIDR only as a refusal control.
+
+## The pooler circuit breaker
+
+Run 1 retried a refused pooler login every 2 s for 60 s (JA01h). The pooler then answered `FATAL: (ECIRCUITBREAKER) too many authentication failures` to logins that had a valid grant. `POST /network-bans/retrieve` listed one banned IPv4 address, and `DELETE /network-bans` lifted it. Run 1's pooler rows after that point are not interpretable and are not cited.
+
+For a CI job holding an expired grant, a retry loop on the shared pooler can lock out other users of the same address with valid grants for as long as the breaker stays open; the clearing time was not measured. From run 2 the module reads the error code of every refusal (`ECIRCUITBREAKER`, `EJITREQUESTFAILED`, `password`, `PAM`, `SASL`, `ENOTFOUND`), waits instead of retrying on a breaker answer, and checks the ban list after each phase: 0 bans in runs 2-5.
+
+## Docs versus runtime
+
+| Docs say | Measured | Filed upstream |
+|---|---|---|
+| The grant body key is `user_roles`[^sb-temp-access] | `400 roles: Invalid input: expected array, received undefined`; `roles` answers `200` and the response uses `user_roles` (JA01d) | no |
+| The example `expires_at` is in milliseconds[^sb-temp-access] | accepted with `200`; enforced as epoch seconds; the milliseconds value was not refused within 70 s (JA01g) | no |
+| The example pooler host starts `aws-1-`[^sb-temp-access] | `(ENOTFOUND) tenant/user postgres.<ref> not found` in 4 of 4 runs; the host from `GET /config/database/pooler` was `aws-0-` (JA01e) | no |
+| It will be possible to see who accessed the database[^sb-jit-changelog] | no `postgres_logs` or `supavisor_logs` row from a login names the user; the dashboard view was not examined (JA01k) | no |
+
+No upstream report is recorded for any of the four. The first three are disagreements in an example; the fourth is a gap in two log sources, a weaker finding than a disagreement.
+
+## Reading the numbers
+
+- **Refusal offsets are bounded by the probe loop.** One pass took 1.5-2.5 s, so "+0 to +1 s" means the first refusal was seen on the first or second pass after the instant, not that the platform's own latency is that figure.
+- **The open-session rows are bounded at 300 s for expiry and 15 s for revocation.** Runs 4 and 5 held three sessions for 300 s; the revocation steps looked 15 s past the first refusal. A later close was not ruled out.
+- **The pooler rows vary between runs and between connections.** The `allowed_networks` verdicts are the clearest case. Single-run pooler figures here are readings, and the circuit breaker can change a later row in the same run.
+- **One org class, one region, one vantage.** Pro, `ap-southeast-1`, an IPv4 laptop with an IPv6 tunnel. A vantage with native IPv6, a different region or a Team or Free org was not run.
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Send `roles`, not `user_roles`, in `PUT /database/jit`. | The docs' `user_roles` key answers `400 roles: Invalid input`; `roles` answers `200`. | [JA01d](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) |
+| Send every role the user should hold in each grant call. | `PUT` replaced the role set: `[postgres]` then `[ja_reader]` listed only `ja_reader`. | [JA01d](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) |
+| Write `expires_at` in epoch seconds, then read the grant back. | A seconds value refused fresh logins at +0 to +1 s; the docs' milliseconds example was accepted and not refused within 70 s. | [JA01g](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) |
+| Enable SSL enforcement first, then read `GET /jit-access` after enabling. | Without it `PUT enabled` answered `200` with `unavailable` / `ssl_enforcement_required`; SSL enforcement restarts Postgres, a fast shutdown row 1 s after the call in 5 of 5 runs. | [JA01b](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) |
+| Take the pooler host from `GET /config/database/pooler`. | The docs' `aws-1-` host answered `ENOTFOUND` in 4 of 4 runs; the endpoint returned `aws-0-`. | [JA01e](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) |
+| Connect through the shared pooler with `options=-c jit=true`. | Without the option, `password authentication failed`; the dedicated pooler answered `SASL authentication failed`. | [JA01e](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) |
+| Plan on revocation stopping new logins only. | Open sessions survived expiry for 300 s and `DELETE` for 15 s; `disabled` closed the pooler session and not the direct one. | [JA01g](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts), [JA01i](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) |
+| Do not retry a refused pooler login in a loop. | A 2 s retry for 60 s tripped `ECIRCUITBREAKER`, which refused valid grants and banned one IPv4 until `DELETE /network-bans`. | Run 1, [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/RUNLOG.md) |
+| Do not rely on `allowed_networks` for per-client scoping through the pooler. | The pooler appears to be judged on its own IPv6 address (not settled); one IPv4-only grant read `password, password, ok-v6, ok-v6` 8 s apart. | [JA01j](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) |
+| Keep your own record of who held a grant and when. | No login row in `postgres_logs` or `supavisor_logs` carries the user id, email or `sbp_` token. | [JA01k](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) |
+
+## Reproducing
+
+The experiment is [`experiments/jit-db-access`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/jit-db-access) in supabase-lab. It is self-provisioning with no OpenTofu state: `make run` creates one project on the Pro-plan organization named in `PVLAB_ORG_PRO`, runs every row on it and deletes it in `finally`. It needs `psql` on the path and, for the direct-path rows, an IPv6 route from the machine; the module checks both before creating the project and skips every row with a reason if either is missing. The PAT is passed to `psql` through `PGPASSWORD` and every `psql` error is scrubbed before it reaches a result. Wall time is about 10 minutes, mostly the 300 s open-session watch in JA01g and the log ingest wait in JA01k.
+
+Failed logins through the shared pooler trip the circuit breaker, so keep that in mind before adding a polling loop to the module.
+
+## Evidence
+
+| Claim | How it was checked |
+|---|---|
+| `PUT /jit-access` and `PUT /database/jit` answer `200` on Pro | Measured, [JA01c](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts), [JA01d](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts), five runs. The invite route `POST /database/jit/invite` was not called |
+| SSL enforcement prerequisite, `unavailable` reason code, fast shutdown row 1 s after | Measured, [JA01b](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts), runs 1-5 |
+| Grant body key, replace semantics, list item keys | Measured, [JA01d](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts); the `roles` key from the public OpenAPI document read 2026-10-10 |
+| Connection matrix and the `aws-0-` / `aws-1-` hosts | Measured, [JA01e](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts), runs 2-5 (run 1 agrees) |
+| `current_user`, `application_name`, custom role privileges | Measured, [JA01f](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts), runs 2-5 |
+| Seconds enforced, milliseconds not refused within 70 s, open sessions alive 300 s | Measured, [JA01g](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts); refusal in runs 2, 4, 5; 300 s hold in runs 4, 5; run 3 discarded |
+| Extending an expired grant | Measured, [JA01h](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts), runs 2-5 |
+| `DELETE` and `disabled` behaviour, `enabled` restoring login | Measured, [JA01i](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts), 4 of 4 clean runs |
+| `allowed_networks` verdicts | Measured, [JA01j](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts), runs 2-5, pooler trials repeated in run 5 |
+| Log attribution | Measured, [JA01k](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts), runs 2-5 (the `sbp_` search covers runs 1-5) |
+| Removing the project member revokes login immediately | Not run. Needs a second human user and an owner to remove them; documented in the changelog, not tested ([JA01l](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts)) |
+| Revoking the PAT ends access | Not run. Token creation is not on the `/v1` API (`GET /profile` answers `403 This endpoint requires a user-scoped access token`) and revoking the run's only token would end the run ([JA01l](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts)) |
+| Sessions beyond 300 s, `branches_only`, Team and Free orgs | Not run |
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| JA01a | jit-db-access | [`ja01-jit-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) | none published; [`RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/RUNLOG.md) |
+| JA01b | jit-db-access | [`ja01-jit-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) | none published; [`RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/RUNLOG.md) |
+| JA01c | jit-db-access | [`ja01-jit-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) | none published; [`RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/RUNLOG.md) |
+| JA01d | jit-db-access | [`ja01-jit-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) | none published; [`RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/RUNLOG.md) |
+| JA01e | jit-db-access | [`ja01-jit-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) | none published; [`RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/RUNLOG.md) |
+| JA01f | jit-db-access | [`ja01-jit-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) | none published; [`RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/RUNLOG.md) |
+| JA01g | jit-db-access | [`ja01-jit-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) | none published; [`RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/RUNLOG.md) |
+| JA01h | jit-db-access | [`ja01-jit-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) | none published; [`RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/RUNLOG.md) |
+| JA01i | jit-db-access | [`ja01-jit-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) | none published; [`RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/RUNLOG.md) |
+| JA01j | jit-db-access | [`ja01-jit-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) | none published; [`RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/RUNLOG.md) |
+| JA01k | jit-db-access | [`ja01-jit-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) | none published; [`RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/RUNLOG.md) |
+| JA01l | jit-db-access | [`ja01-jit-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) | none published; skipped, [`RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/RUNLOG.md) |
+
+## Related docs
+
+- [Auditing Supabase: where each copy of an event lives, and who can erase it](/reference/supabase-audit-trail-integrity/) - the other temporary credential, `POST /cli/login-role`, which mints a role and a password with a TTL; its revocation took effect on the next login, where JIT revocation leaves open sessions alive.
+- [Running a platform on the Supabase Management API](/guides/supabase-platform-management-api/) - the control-plane surface these grant routes sit on, and the invite route's `500` on Pro that this page did not reproduce on the grant route.
+- [Query Supabase project logs through the Management API after logs.all](/guides/supabase-management-api-logs-endpoint/) - how to read the `postgres_logs` and `supavisor_logs` rows used here.
+- [Where should a tenant live: one Supabase project per tenant, or many](/reference/supabase-multi-tenant-placement/) - the earlier A/B that recorded JIT as `200` on a platform org and `500` on Pro.
+
+[^sb-jit-changelog]: Supabase, "Feature Preview: Temporary Token-Based Database Access," Supabase Changelog, May 25, 2026. https://supabase.com/changelog/46346-feature-preview-temporary-token-based-database-access
+[^sb-temp-access]: Supabase, "Temporary access," Supabase Docs. https://supabase.com/docs/guides/platform/temporary-access

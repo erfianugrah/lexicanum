@@ -28,6 +28,10 @@ questions; its modules (GB04-GB06), artifacts and RUNLOG Runs 5-7 are at
 A third session on 2026-09-29 (GB07, project A only) measured where a
 preview gets its secrets; its module, RUNLOG Run 8 and artifact are at
 [6f55c11](https://github.com/erfianugrah/supabase-lab/tree/a150275/experiments/github-branching).
+A fourth session on 2026-10-10 (BN01-BN03, two runs each, no `git_branch`)
+measured what a merge applies from a branch created through the Management
+API; it ran on a Pro organization in
+`ap-southeast-1` and is described in [the merge section](#a-merge-applies-the-migration-history-not-the-schema-difference).
 Project A was connected with Working directory `apps/a`, project B with
 `apps/b`. The branching docs the results are compared against were read the
 same day.[^sb-gh-integration][^sb-working-branches] Anything not marked
@@ -60,6 +64,11 @@ measured is cited, or labelled as a design or as not run.
   closed and reopened.
 - Merging a pull request that changed only app A started a production action
   run on both projects, with "Supabase changes only" on. One merge was tried.
+- On a branch created through the Management API with no `git_branch`,
+  `POST /merge` applied what was written through
+  `POST /projects/{branch_ref}/database/migrations` and nothing written through
+  `POST /projects/{branch_ref}/database/query`, although `GET /diff` listed
+  both (BN01-BN03, two runs each, 2026-10-10).
 
 ```dot
 digraph {
@@ -326,11 +335,13 @@ Whether it changed anything on B was not measured, including whether
 both projects, but whether it seeded anything was not checked; the docs say
 seed files are ignored on production deploys.[^sb-gh-integration]
 
-### A merge with no migration files applies nothing
+### A merge applies the migration history, not the schema difference
 
-A separate run made that rule explicit on a branch created through the
-Management API with no git integration at all (medium-serverless MS15,
-2026-09-30).
+<a id="a-merge-with-no-migration-files-applies-nothing"></a>
+
+A separate run on a branch created through the Management API with no git
+integration at all (medium-serverless MS15, 2026-09-30) found the first
+instance.
 `POST /projects/{ref}/branches {branch_name, persistent: true}` answered `201`
 and the branch read `ACTIVE_HEALTHY` 2 s later, `supabase-postgres-17.6.1.171`
 at `ci_micro`. `prisma db push` (6.19.3) exited 0 in 14859 ms and left a table
@@ -340,15 +351,96 @@ primary key and index. `POST /branches/{id}/merge` then answered `201`
 `{"workflow_run_id": "...", "message": "ok"}`, and the parent had no such
 table 20 s later and still had no `pg_net` extension about 10 minutes later.
 
-So the merge is accepted and applies nothing when there are no migration
-files, because the promotion path is the migration files. For a `db push`
-workflow the promotion is `prisma db push` against the parent or
-`prisma migrate diff` generating `supabase/migrations` for the normal path.
-The branch itself works as an isolated staging database: push, insert and
-diff all behaved, and the connection ran through the branch's Supavisor
-tenant because `db.<ref>` is IPv6-only.
+MS15 read this as: the merge is accepted and
+applies nothing when there are no migration
+files. BN01-BN03 (2026-10-10, two runs each) measured the mechanism behind
+that reading and narrow it, below.
 
-Two harness notes from that run: a create call can time out at a client
+The `ACTIVE_HEALTHY` reading is not a readiness signal for the parent's
+schema. In BN01-BN03 each module created a throwaway parent in a Pro
+organization in `ap-southeast-1` and one non-persistent branch off it, with
+`with_data` false and no `git_branch`. `POST /projects/{ref}/branches`
+answered `201` in 0.9 to 1.7 s, and the branch read `ACTIVE_HEALTHY` 1-2 s
+after the create call in all six runs. The parent's baseline table was absent
+from the branch at that moment every time. In run 4 it was first seen at 53 s
+(BN01), 44 s (BN02) and 43 s (BN03). The branch workflow's step list is not a
+completion signal either: BN03's last read in run 4 had the baseline table
+present with `migrate` still `CREATED`. A `GET /diff` read inside that window,
+once by hand with the default and `pgdelta=true` variants, contained
+`drop table "public"."bn_base"` for the parent's own table; the drop was gone
+once the table had arrived. Wait for the baseline table itself before diffing or
+writing.
+
+Each module then wrote one change set on the branch: a table with an identity
+key, `enable row level security`, a `select` policy to `authenticated`,
+`revoke all` from `anon` and `authenticated` followed by `grant select` to
+`authenticated`, an immutable SQL function, and a column plus an index on a
+baseline table the parent holds. All writes were accepted in run 4 in all
+three modules (7 of 7), and the branch held the complete set. In run 3 BN01
+wrote 5 of 7, because the probe started writing before the baseline table
+arrived and the column and index failed with `42P01`; BN02 and BN03 wrote 7 of
+7. The parent held none of the set before the merge in all six runs. The
+modules differ in the write route and the step before the merge:
+
+| Module | Written on the branch through | Before the merge |
+|---|---|---|
+| BN01 | `POST /projects/{branch_ref}/database/query` | `GET /diff` in three variants |
+| BN02 | the `/database/query` set and a second set through `POST /projects/{branch_ref}/database/migrations`, on one branch, one merge | `GET /diff` in three variants |
+| BN03 | `POST /projects/{branch_ref}/database/query` | `PATCH /branches/{ref} {request_review: true}`, then `GET /diff` |
+
+What reached the parent after `POST /branches/{ref}/merge`, measured 2026-10-10:
+
+| Set | In `GET /diff` | Branch migration history after the write | On the parent after the merge |
+|---|---|---|---|
+| written through `/database/query` (BN01, BN03) | every object, in the default, `pgdelta=true` and `pgdelta=false` variants | `remote_schema` only, unchanged | none; polled 246 s (BN01 run 4), 245 s (BN01 run 3), 246 s (BN03 run 4), 258 s (BN03 run 3) |
+| written through `/database/migrations` (BN02) | every object | `remote_schema`, `bn_m_change` | complete (table, RLS on, policy, `SELECT` only for `authenticated`, none for `anon`, function, column, index), first seen at the 42 s poll (run 4) and 56 s (run 3), with a `bn_m_change` row added to the parent's history |
+| written through `/database/query`, same branch and same merge as the row above (BN02) | every object | `remote_schema`, `bn_m_change` | absent when the poll ended, at 73 s (run 4) and 87 s (run 3) |
+| MCP `execute_sql`, then `apply_migration`, then `merge_branch`, once by hand | not read | not recorded | `execute_sql` set absent; `apply_migration` set present (table, policy, function), history row `bn_y_change` added |
+
+The merge answered `201` with `{workflow_run_id, message: "ok"}` in all six
+runs, and its workflow steps read `clone`, `deploy`, `health`, `migrate`,
+`pull` and `seed` `EXITED` and `configure` `PAUSED` at the end of the window.
+`PATCH /branches/{ref} {request_review: true}` answered `200` and set
+`review_requested_at` on the parent's branch list, and the merge outcome
+was the one in the first row. The default `GET /diff` text was identical to
+`?pgdelta=false` in all six runs, and `?pgdelta=true` differed (1137 characters
+against 1430 for the default, BN01 run 4). The published OpenAPI document marks the
+endpoint Beta and describes `pgdelta` as "Use pg-delta instead of Migra for
+diffing when true"; it was read 2026-10-10.[^sb-openapi] The `pg_net`
+extension appears in every diff variant of every run and was never installed
+on the parent after any merge. Reading of the six runs: the merge applied the
+rows of the branch's migration history that the parent lacked, and ignored the
+rest of the difference that `GET /diff` listed. The platform's merge
+implementation was not read.
+
+The same by-hand trial found `GET /projects/{branch_ref}` answering `404`
+`Project not found` while `POST /projects/{branch_ref}/database/query` answered
+`201` on the branch ref (one trial).
+
+So a merge is accepted and applies nothing when there is no migration history
+row to apply. A change written through the SQL route is in the diff and survives
+`request_review`, and the parent still lacks it. MS15's `201` and nothing is the same
+outcome: after `prisma db push` the branch history held only the baseline row
+(inferred from the matching outcome; the Prisma path was not re-run in BN). For
+a `db push` workflow the promotion is `prisma db push` against the parent or
+`prisma migrate diff` generating `supabase/migrations` for the normal path.
+The Management API's migrations route is a third path, and the one BN02
+measured; whether `supabase/migrations` files reach a git-less branch's
+history was not measured. The branch itself works as an isolated staging
+database: push, insert and diff all behaved, and the connection ran through
+the branch's Supavisor tenant because `db.<ref>` is IPv6-only.
+
+Not measured: the dashboard's own SQL Editor and Table Editor routes, which
+reject a PAT, so whether Studio records a migration row for a change made
+there is unknown; the dashboard merge-request screen and its review diff;
+`migration_version` on the merge body; persistent branches in BN (MS15's was
+persistent), `with_data: true`, edge functions, merging twice, a branch whose
+history conflicts with the parent's, and a parent that already has migration
+files. Two earlier harness attempts of BN01 were stopped and left no artifact;
+one over-ran its background-task limit and one was killed by hand while the
+call wrapper retried a `200` body it had flagged as throttled.
+
+Two harness notes from the MS15 run: a create call can time out at a client
 default of 30 s while the platform creates the branch anyway, so adopt the
 branch on the retry rather than creating a second; and a persistent branch
 refuses deletion with `422 Cannot delete persistent branch.` until
@@ -418,7 +510,9 @@ and bot comment were not read.
 | In CI, check each secret a preview needs is on its secrets list by name. | An `env()` reference with no value reached `FUNCTIONS_DEPLOYED` with every step `EXITED` and the secret absent. | [GB07](https://github.com/erfianugrah/supabase-lab/blob/a150275/experiments/github-branching/tests/gb07-branch-secrets.ts) |
 | Compare secrets by digest: the secrets list returns SHA-256 values. | Parent A listed `PVLAB_GB07_PARENT`, and the dotenvx preview listed `PVLAB_GB07_DOTENV`, as the SHA-256 of the value GB07 set. | [GB07](https://github.com/erfianugrah/supabase-lab/blob/a150275/experiments/github-branching/tests/gb07-branch-secrets.ts) |
 | Budget for one billed preview per project per matching pull request. | Each branch is billed for its own usage;[^sb-branching-usage] with the setting off, 5 pull requests made 10 previews. | [GB01](https://github.com/erfianugrah/supabase-lab/blob/bf3b411/experiments/github-branching/tests/gb01-pr-scoping.ts) |
-| Generate `supabase/migrations` before merging - a merge with no migration files changes nothing on the parent. | `POST /branches/{id}/merge` answered `201` on a branch whose schema arrived by `prisma db push`, and the parent had neither the pushed table 20 s later nor the branch's `pg_net` extension about 10 minutes later. | medium-serverless [MS15d](https://github.com/erfianugrah/supabase-lab/blob/5fd3267/experiments/medium-serverless/tests/ms15-branch-prisma.ts) (2026-09-30) |
+| Wait for the parent's baseline table on a git-less branch before diffing or writing. | `ACTIVE_HEALTHY` 1-2 s after create; the baseline table first appeared at 43-53 s (run 4), and a diff read in between proposed `drop table` for it (one trial by hand). | [BN01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/branching-nogit/tests/bn01-sql-path.ts) |
+| Do not read `GET /diff` as a preview of what `POST /merge` applies on a git-less branch. | A table, RLS, policy, privilege change, function, column and index written through `/database/query` were all in the diff and none reached the parent after 245-258 s. | [BN01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/branching-nogit/tests/bn01-sql-path.ts), [BN03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/branching-nogit/tests/bn03-merge-request.ts) |
+| Generate `supabase/migrations` before merging; a merge applies history rows only. | The same objects through `POST /projects/{branch_ref}/database/migrations` merged in 42-56 s with a history row, on the branch and merge where the `/database/query` set stayed out; MS15 saw `201` and no table 20 s later, no `pg_net` about 10 minutes later, after `prisma db push`. Migration files on a git-less branch were not measured. | [BN02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/branching-nogit/tests/bn02-migration-path.ts), medium-serverless [MS15d](https://github.com/erfianugrah/supabase-lab/blob/5fd3267/experiments/medium-serverless/tests/ms15-branch-prisma.ts) (2026-09-30) |
 | Free a persistent branch with `PATCH {persistent: false}` before deleting it. | The first `DELETE` answered `422 Cannot delete persistent branch.`; after the PATCH the `DELETE` answered `200` and the branch was gone from the list after 1 s. | medium-serverless [MS15e](https://github.com/erfianugrah/supabase-lab/blob/5fd3267/experiments/medium-serverless/tests/ms15-branch-prisma.ts) (2026-09-30) |
 
 ## Where the docs are silent
@@ -432,8 +526,14 @@ and bot comment were not read.
 | Deploy to production is described per project; multiple projects on one repository are not mentioned | both connected projects ran production on a merge that changed only one app |
 | secrets are branch-specific and read through `env()`; an `env()` with no value is not described | the preview reached `FUNCTIONS_DEPLOYED`, every step `EXITED`, with the secret absent |
 | the executor "will automatically retrieve and use" dotenvx `.env.preview` values; a key mismatch is not described | the run died at `clone` and the branch `status` read `MIGRATIONS_FAILED` |
+| blog, 2026-05-04: "Every schema change you make in the SQL Editor or Table Editor is tracked."[^sb-blog-nogit] | untested for those editors: they reject a PAT. Through the Management API, a change written with `/database/query` left the branch history at `remote_schema` and stayed out of the merge |
+| blog: "When you merge a branch, pg-delta compares the two schemas and generates the correct migration statements."[^sb-blog-nogit] | not observed: the dashboard review diff was not opened. `GET /diff` default equalled `pgdelta=false`, which the OpenAPI document calls the Migra path, in 6 of 6 runs, and `POST /merge` applied history rows only |
+| the MCP `merge_branch` tool is described as merging "migrations and edge functions from a development branch to production" (tool description as served 2026-10-10) | consistent with the result: the `apply_migration` set merged and the `execute_sql` set did not, once by hand |
 
-None of these has been filed with Supabase as of 2026-09-29.
+None of these has been filed with Supabase as of 2026-09-29. The three rows
+added from BN01-BN03 were not filed either as of 2026-10-10 (filed: no). The
+blog's "tracked" claim is not marked as wrong here: only the Management API
+routes were tested, and the dashboard routes could behave differently.
 
 ## Reading the numbers
 
@@ -461,12 +561,22 @@ None of these has been filed with Supabase as of 2026-09-29.
   runs. The run therefore cannot say whether a wait step would ever read a
   lone project's own `skipped`.
 - The Vercel integration was not part of the run.
-- The merge-without-migrations result is from a different experiment and a
-different rig: one persistent branch created through the Management API with
-no git integration, a schema pushed by `prisma db push`, one merge, in one
-organization. It is a second data point on the same rule, not a repeat of
-GB06, and no one has watched a merge of a `db push` schema that DID carry
-migration files.
+- The merge-without-migrations result in MS15 is from a different experiment
+  and a different rig: one persistent branch created through the Management
+  API with no git integration, a schema pushed by `prisma db push`, one merge,
+  in one organization. BN01-BN03 repeated the shape on non-persistent
+  branches with the SQL and migrations routes, two runs each, on 2026-10-10,
+  and closed the open question for the Management API migrations route only:
+  BN02 watched a merge of a schema written through
+  `POST /projects/{branch_ref}/database/migrations`, and it applied. No one
+  has watched a merge of a `db push` schema that DID carry migration files, or
+  of migration files pushed any other way.
+- BN01-BN03 ran as three modules in parallel, each with its own parent, so six
+  runs make two per module. The parent was polled for 245-258 s after the
+  merge for the `/database/query` set; a later arrival is not excluded by
+  that window, though MS15 read the parent about 10 minutes after.
+  The by-hand observations (`GET /projects/{branch_ref}` `404`, the `drop
+  table` read, the MCP pair) are one trial each.
 - GB07 ran one pull request per secrets shape, on project A only. Not run:
   dotenvx with the key absent from the parent as well, the docs' `encrypted:`
   literal directly in `config.toml`, a parent secret referenced through
@@ -491,6 +601,11 @@ The third session's (GB07) are at
 The MS15 rows come from a different experiment on a different rig, with no git
 integration: [medium-serverless](https://github.com/erfianugrah/supabase-lab/blob/5fd3267/experiments/medium-serverless/RUNLOG.md),
 artifact under [out/2026-09-30/](https://github.com/erfianugrah/supabase-lab/tree/5fd3267/experiments/medium-serverless/out/2026-09-30).
+The BN rows (2026-10-10) come from
+[experiments/branching-nogit](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/branching-nogit),
+its [RUNLOG.md](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/branching-nogit/RUNLOG.md)
+and the redacted artifacts under
+[out/2026-10-10/](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/branching-nogit/out/2026-10-10).
 
 | Claim | Status | How it was checked |
 |---|---|---|
@@ -509,6 +624,13 @@ artifact under [out/2026-09-30/](https://github.com/erfianugrah/supabase-lab/tre
 | Decryption used the parent's copy of `DOTENV_PRIVATE_KEY_PREVIEW` | inferred | [GB07](https://github.com/erfianugrah/supabase-lab/blob/a150275/experiments/github-branching/tests/gb07-branch-secrets.ts) - the key was absent from the three previews that returned readings; no shape ran without it on the parent |
 | A branch with no git integration serves as isolated staging for a `prisma db push` schema, and diffs against the parent | measured | [MS15a](https://github.com/erfianugrah/supabase-lab/blob/5fd3267/experiments/medium-serverless/tests/ms15-branch-prisma.ts)-[MS15c](https://github.com/erfianugrah/supabase-lab/blob/5fd3267/experiments/medium-serverless/tests/ms15-branch-prisma.ts) (2026-09-30) - create `201`, `ACTIVE_HEALTHY` at 2 s, push exit 0 in 14859 ms, `GET /branches/{id}/diff` `200` with 2016 chars |
 | A merge with no migration files applies nothing to the parent | measured | [MS15d](https://github.com/erfianugrah/supabase-lab/blob/5fd3267/experiments/medium-serverless/tests/ms15-branch-prisma.ts), [MS15d2](https://github.com/erfianugrah/supabase-lab/blob/5fd3267/experiments/medium-serverless/tests/ms15-branch-prisma.ts) (2026-09-30) - the merge answered `201` and the parent's pushed table and the branch's `pg_net` extension were both absent (20 s and about 10 minutes after) |
+| A git-less branch reads `ACTIVE_HEALTHY` 1-2 s after create, before the parent's baseline table is on it (43-53 s, run 4) | measured | [BN01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/branching-nogit/tests/bn01-sql-path.ts)-[BN03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/branching-nogit/tests/bn03-merge-request.ts) - six runs, branch and workflow polled after create; the `drop table` diff in that window is one trial by hand |
+| `/database/query` writes (table, RLS, policy, privileges, function, column, index) are in `GET /diff` in all three variants and absent from the parent after `POST /merge` | measured | [BN01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/branching-nogit/tests/bn01-sql-path.ts), [BN03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/branching-nogit/tests/bn03-merge-request.ts) - two runs each; 7 of 7 writes in run 4 and in BN03 run 3, 5 of 7 in BN01 run 3; parent polled 245-258 s |
+| The same objects through `/database/migrations` merge with a history row | measured | [BN02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/branching-nogit/tests/bn02-migration-path.ts) - one branch, both sets, one merge; first seen at 42 s (run 4) and 56 s (run 3); the `/database/query` set absent at 73 s and 87 s |
+| `request_review: true` first changes nothing | measured | [BN03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/branching-nogit/tests/bn03-merge-request.ts) - PATCH `200`, `review_requested_at` set, merge outcome as BN01 |
+| `execute_sql` set stays out, `apply_migration` set merges (MCP) | measured | by hand, one trial; not a harness module |
+| The branch history of a `prisma db push` branch held only the baseline row | inferred | from the matching outcome of MS15d and BN01; the Prisma path was not re-run |
+| The Dashboard SQL Editor and Table Editor routes record a migration row | not run | they reject a PAT, so the blog's "tracked" is untested for them |
 | A persistent branch refuses `DELETE` until `persistent: false` | measured | [MS15e](https://github.com/erfianugrah/supabase-lab/blob/5fd3267/experiments/medium-serverless/tests/ms15-branch-prisma.ts) (2026-09-30) - `422 Cannot delete persistent branch.`, then `PATCH` `200`, then `DELETE` `200`, gone after 1 s |
 | The wait loop above | design | not run in CI |
 | Automatic branching off on one project, its branches created from CI | not run | not tested whether such a project still posts check-runs |
@@ -525,6 +647,9 @@ artifact under [out/2026-09-30/](https://github.com/erfianugrah/supabase-lab/tre
 | GB05 | github-branching | [`gb05-late-changes.ts`](https://github.com/erfianugrah/supabase-lab/blob/c622d79/experiments/github-branching/tests/gb05-late-changes.ts) | [`out/2026-09-23`](https://github.com/erfianugrah/supabase-lab/tree/c622d79/experiments/github-branching/out/2026-09-23) |
 | GB06 | github-branching | [`gb06-merge-fanout.ts`](https://github.com/erfianugrah/supabase-lab/blob/c622d79/experiments/github-branching/tests/gb06-merge-fanout.ts) | [`out/2026-09-23`](https://github.com/erfianugrah/supabase-lab/tree/c622d79/experiments/github-branching/out/2026-09-23) |
 | GB07 | github-branching | [`gb07-branch-secrets.ts`](https://github.com/erfianugrah/supabase-lab/blob/a150275/experiments/github-branching/tests/gb07-branch-secrets.ts) | [`out/2026-09-29`](https://github.com/erfianugrah/supabase-lab/tree/a150275/experiments/github-branching/out/2026-09-29) |
+| BN01 | branching-nogit | [`bn01-sql-path.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/branching-nogit/tests/bn01-sql-path.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/branching-nogit/out/2026-10-10) |
+| BN02 | branching-nogit | [`bn02-migration-path.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/branching-nogit/tests/bn02-migration-path.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/branching-nogit/out/2026-10-10) |
+| BN03 | branching-nogit | [`bn03-merge-request.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/branching-nogit/tests/bn03-merge-request.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/branching-nogit/out/2026-10-10) |
 | MS15 | medium-serverless | [`ms15-branch-prisma.ts`](https://github.com/erfianugrah/supabase-lab/blob/5fd3267/experiments/medium-serverless/tests/ms15-branch-prisma.ts) | [`out/2026-09-30`](https://github.com/erfianugrah/supabase-lab/tree/5fd3267/experiments/medium-serverless/out/2026-09-30) |
 
 ## Related docs
@@ -539,4 +664,5 @@ artifact under [out/2026-09-30/](https://github.com/erfianugrah/supabase-lab/tre
 [^sb-openapi]: Supabase, "Management API OpenAPI document (BranchResponse_Output.status)," api.supabase.com. https://api.supabase.com/api/v1-json
 [^sb-openapi-v2]: Supabase, "Management API v2 OpenAPI document," api.supabase.com. https://api.supabase.com/api/v2-json
 [^sb-branching-config]: Supabase, "Configuration," Supabase Docs. https://supabase.com/docs/guides/deployment/branching/configuration
+[^sb-blog-nogit]: Supabase, "Branching Without Git Is Now The Default," Supabase Blog, 2026-05-04. https://supabase.com/blog/branching-without-git-is-now-the-default
 [^sb-branching-usage]: Supabase, "Manage Branching usage," Supabase Docs. https://supabase.com/docs/guides/platform/manage-your-usage/branching

@@ -11,8 +11,9 @@ blurb: "Provision, size, meter, and operate tenant projects through the Manageme
 The Management API makes projects, keys, config, usage and lifecycle
 programmable. The docs cover the endpoints but not the platform layer on top
 of them: the provisioning loop, the rate budget, the metering, the OAuth
-paths and the pause playbook. This guide covers that layer. Every number in it was measured against the live API on 2026-08-17/18 on
-throwaway projects; where something is gated or untested, it says so. To
+paths and the pause playbook. This guide covers that layer. Every number in it was measured against the live API on throwaway projects, on
+2026-08-17/18 unless the text carries another date (later checks run to
+2026-10-10); where something is gated or untested, it says so. To
 follow along: a Supabase org on a paid plan, a personal access token with
 Management API access, and throwaway projects you will delete when done. The
 [placement doc](/reference/supabase-multi-tenant-placement/) decides where a
@@ -63,12 +64,61 @@ and `projects/{ref}/transfer` routes all answered `404` as well. The
 BYO-backend bridge is off by default regardless of plan, so the two shapes
 are not separable in practice until the bridge is enabled for the account.
 For a time-boxed, network-restricted, role-scoped grant instead of a full
-project handover, the JIT database access surface works on a
+project handover, the JIT database access invite route works on a
 `platform`-plan org: `POST /database/jit/invite` (email + role + `expires_at` +
 `allowed_networks` CIDRs) -> `200` with an `invite_id`, and
 `DELETE /database/jit/invite/{id}` -> `200` (measured 2026-08-24). The identical
-invite on a Pro org is rejected with a `500` (A/B measured 2026-08-25), so do not
-offer it there.
+invite on a Pro org is rejected with a `500` (A/B measured 2026-08-25, `S15`).
+That `500` belongs to the invite route. On a Pro org (Postgres 17, measured
+2026-10-10) the grant routes `PUT /jit-access` with `{state}` and
+`PUT /database/jit` answered `200` in all five runs (`JA01c`, `JA01d`), so on
+Pro use the grant route and do not use the invite route. The grant route needs
+SSL enforcement on first, takes the key `roles` and reads `expires_at` as epoch
+seconds; the
+[JIT database access page](/reference/supabase-jit-database-access/) has the measured surface.
+
+### Scoped personal access tokens
+
+Documented: scoped tokens "start with `sbp_fc`" and carry only the
+organisations, projects and permissions chosen at creation; they are created
+from the access tokens settings in the Dashboard, with an expiry up to one year
+out.[^sb-pat] The GA changelog adds that `supabase whoami` does not work with
+project- or organisation-scoped tokens.[^sb-scoped-pat] Both sentences are the reading of a summarising fetch on 2026-10-10, not a verbatim copy.
+
+Measured 2026-10-10 (`SP01`, `SP05`, `SP06`, one run each, a Pro org):
+
+- Creation has no API. The public `/v1` OpenAPI document (115 paths, 170
+  operations) has no access-token creation operation; the only token-named
+  routes are the OAuth token and revoke routes and the project claim-token
+  routes. The route the Dashboard uses, `GET /platform/profile/access-tokens`,
+  answers a PAT `401 {"message":"Unsupported access token"}`, while
+  `GET /v1/profile/access-tokens` and `GET /v1/access-tokens` answer `404` and
+  `GET /v1/organizations` answers `200`. Only GET was sent, so the Dashboard
+  route's POST was not tried and no token was minted.
+- The lab token has the `sbp_fc` format; which scope it was created with was
+  not read. With it, `GET /v1/profile` answers `403 {"message":"This endpoint
+  requires a user-scoped access token"}`, and the Supabase CLI 2.120.0 exits 1
+  on `supabase whoami` (`unexpected get profile status 403`) while
+  `supabase orgs list` and `supabase projects list` exit 0. That agrees with the
+  changelog sentence and does not test it, because the token's scope is unknown
+  and "token is scoped" is not separated from "token lacks a user-level grant".
+- The SQL read-only boundary has a control. `select 1` answers `201` on both
+  `/database/query` and `/database/query/read-only`; `create table` through the
+  read-only route is refused with `400` and
+  `ERROR: 25006: cannot execute CREATE TABLE in a read-only transaction` and the
+  table is absent on read-back, while `/database/query` answers `201` and the
+  table is present.
+
+Not measured, each with a named prerequisite in the experiment's run log: an
+organisation-scoped token on production (does it create projects, see later
+projects, and draw on the same request budget as its owner's token), the
+per-permission matrix and the body of the `403`, SQL read-only without the
+Database read-write permission, the project boundary of a project-scoped
+token, whether a token follows its creator's current role (needs a second human
+member), revocation latency, and immutability and expiry (Dashboard-only, so
+doc-cited and not tested). A run of the organisation-scoped module with the lab
+token standing in created a project (`201`, 3383 ms), listed, read and deleted
+it; it describes the lab token, not an organisation-scoped one (`SP04`).
 
 ## 2. Provision a tenant
 
@@ -96,6 +146,16 @@ One call creates a project; the rest is setup around it.
   `PATCH /v1/projects/{ref}/config/auth`
   `{oauth_server_enabled: true, oauth_server_authorization_path: ...}` -
   measured 200.
+- Treat a create that failed as possibly landed (2026-10-10). A
+  `POST /v1/projects` whose answer was lost to a 1 s client cap (`LO04`), to a 4 s
+  client timeout over an 8 s hold, or replaced by a `500` after upstream created
+  the project (`MF02`) left 1 project with that name in each case. An identical
+  re-send answers `400 Project with name "<name>" already exists in your
+  organization.` (`LO04`, n=1; `MF02`), which reads as "look it up by name". Keep the name stable across retries of one logical
+  create. The same-name `400` is the only duplicate protection observed: a retry
+  that generates a fresh name per attempt is not covered by it and was not run.
+  [Control-plane fault behaviour](#control-plane-fault-behaviour) has the
+  per-client retry counts.
 
 ## 3. Know the sizing floors
 
@@ -128,10 +188,21 @@ Measured on a normal paid org, on a cheap scoped read:
   endpoint is the API's own machine-readable JSON - but aggressive polling
   elsewhere has produced a non-JSON interstitial from the edge layer, so
   treat "non-JSON body" and "JSON 429" as the same back-off signal.
-- The budget is cumulative across a user's PATs (measured 2026-08-18):
-  alternating two tokens from the same user, each token's
-  `x-ratelimit-remaining` drops on the OTHER token's calls - one shared
-  counter per user per scope. PAT sharding does not multiply the budget.
+- The budget is cumulative across a user's PATs (measured 2026-08-18, `L01b`,
+  on one cheap scoped read): alternating two tokens from the same user on that
+  route, each token's `x-ratelimit-remaining` drops on the OTHER token's calls -
+  one shared counter per user per scope, on that route. PAT sharding does not
+  multiply the budget on the route measured.
+- `x-ratelimit-remaining` is a per-route counter at limit 120 (measured
+  2026-10-10, `SP10`, one token): the same route read 117, 116, 115, 114 on four
+  calls, and two alternated routes (`/organizations`, `/projects`) kept separate
+  sequences (113 then 112, and 118 then 117). A two-token comparison is valid
+  only on one route; across two routes it shows two counters, not two budgets.
+  The Management API introduction documents 120 requests per minute, per user,
+  per project or organisation, per endpoint[^sb-mgmt-ratelimit]; `SP10` agrees
+  with the documented scope. Whether the header separates
+  two tokens of one user on a given route was not re-measured in `SP10`, which
+  used one token.
 
 At fleet scale, build the client as a queue with a token bucket.
 
@@ -264,6 +335,46 @@ operation costs in client-visible downtime is in
   automatically paused project - the zero-waker result is the manual-pause
   path only.
 
+### Control-plane fault behaviour
+
+Measured 2026-10-10 on a Pro org in `ap-southeast-1` (`MF01` to `MF05`). Every
+fault was injected through a local proxy in front of `api.supabase.com`; no
+real 5xx was observed, so how each client reacts to a real 5xx body (an HTML
+interstitial, say) is not measured. `error-before` means the proxy answered
+without contacting upstream; `error-after` means it forwarded the request,
+upstream completed it, and the proxy replaced the answer with the error.
+Attempt counts are proxy-log rows. One trial per cell; the development and final
+runs gave the same counts wherever both measured a cell.
+
+| Client | Reads (GET) | Writes (POST, PUT, DELETE) | Slow answer |
+|---|---|---|---|
+| Lab harness `mgmt()` (`MF01`, `MF02`) | 1 attempt on 500, 502, 503 and 504; the status is returned, not thrown | no retry; the caller gets the 500 | throws `TimeoutError` at 30001 ms on its 30 s default; the proxy still forwarded and upstream answered 200 |
+| Lab harness `functionPresent()` (`MF01`) | retries 429 only, a fixed 15 s sleep: 3 attempts in 30144 ms for two 429s; a 500 on the read returns `present: false` with `status` 500 after 1 attempt | n/a | n/a |
+| supabase CLI 2.120.0 (`MF03`, `MF05`) | 6 attempts on 500, 502, 503 and 504, 3-4 ms apart first to last, exit 1; five 500s then upstream healthy: 6 attempts, exit 0; six 500s: exit 1; 429 is not retried (1 attempt) | PUT (`ssl-enforcement update`) and DELETE (`projects delete`, `domains delete`) on 500: 6 attempts each; POST (`projects create`, `secrets set`) on 500: 1 attempt; POST `secrets set` on 502, 503, 504 and 429: 1 attempt each | 60 s per attempt: a 100 s hold gave attempts at 0, 60, 120, 180, 240 and 300 s and exit 1 after 360220 ms; a held POST is not resent, so `projects create` held 75 s exited 1 after 60448 ms while the project was created |
+| OpenTofu 1.13.1, provider `supabase/supabase` 1.11.0 (`MF04`, `MF05`) | project read: 4 attempts on a persistent 503 (plan exit 1 after 6240 ms), 2 attempts on a single 500 or a single 429 (plan exit 0) | POST, PATCH and DELETE on 500: 1 attempt, not retried | a 100 s hold on the project read: 1 attempt, plan exit 0 after 103298 ms; a `create` held 130 s: apply exit 0 after 132978 ms, 1 POST |
+
+- A create answered `500` after upstream created the project leaves the
+  provider's state empty and an orphan upstream. The plain re-apply sends 1
+  POST and gets `400` (the name exists in the org), leaving the orphan; after
+  the orphan was deleted through the API, the re-apply exited 0 in 3468 ms with
+  1 resource in state (`MF04`). The provider's own error text in the first lines
+  was only "Client Error". The CLI leaves the same orphan: `projects create`
+  answered `500` after upstream created it exits 1 with 1 project carrying the
+  name (`MF03`). `tofu import` of the orphan was not run.
+- Partial applies converge as follows (`MF04`, one trial each). A settings
+  write answered `500` before upstream leaves the project in state and the
+  settings not: the next plan exits 2. A settings write that landed upstream but
+  answered `500` converges: the next plan exits 0 with no pending change. A
+  DELETE that landed but answered `500` leaves a state entry that the next
+  destroy removes cleanly, because the GET and DELETE both answer `404` and the
+  provider accepts that.
+- No tool duplicated a POST in any trial (`MF05`); the same-name `400` is the
+  only duplicate protection observed (`MF02`).
+- Not measured: real 5xx bodies, connection-level faults (reset, refused, TLS or
+  DNS failure), PATCH through the CLI, writes answered 502, 503, 504 or 429 in the
+  provider, other provider resources, and any documented retry or idempotency
+  behaviour of the CLI, the provider or the API (no docs were read for this).
+
 ## Verified / tested
 
 | Claim | How it was checked |
@@ -284,6 +395,14 @@ operation costs in client-visible downtime is in
 | No hibernation to 2 h idle; first request 0.447-0.763 s against 0.047-0.082 s follow-ups | Measured 2026-09-09 on a production free-plan nano project, 4 rungs of 8 |
 | Staging fleet still `ACTIVE_HEALTHY` after 13 days idle; production free projects auto-paused | Measured 2026-09-23, 12 staging nanos against 2 production free projects |
 | Staging and production control planes expose the same 169 operations | Measured 2026-09-09 - both OpenAPI documents fetched and their (verb, path) sets diffed, zero difference, 143 of them project-scoped |
+| The public `/v1` document has 115 paths and 170 operations, with `x-fga-permissions` declared on 164 of the 170 (73 distinct names) | Measured 2026-10-10 - `SP01` read the document; the 169 above and this 170 are different fetches on different days and no diff was run between them. `SP02` generated 59 probes from the extension and sent them with the lab token: 53 answered `2xx`, 0 answered `403` with `missing_permissions`, and 6 answered another `4xx` that looks like a feature-absent answer (`402`, `400`, `406`, `410`, `400`, `400`; read from the status codes, not the bodies). For those 6 the permission check may not have been reached. The reading of the extension (outer list OR, inner list AND) is a hypothesis until a narrow token runs |
+| Scoped-token creation has no API; `GET /platform/profile/access-tokens` answers a PAT `401 Unsupported access token` | Measured 2026-10-10 - `SP01`, GET only |
+| `GET /v1/profile` `403`, `supabase whoami` exit 1, `orgs list` and `projects list` exit 0, with an `sbp_fc` lab token | Measured 2026-10-10 - `SP06`, CLI 2.120.0; the token's scope was not read |
+| `/database/query/read-only` refuses `create table` with `25006`; `/database/query` creates it | Measured 2026-10-10 - `SP05`, the control for a read-only scoped token |
+| `x-ratelimit-remaining` is a per-route counter at limit 120 | Measured 2026-10-10 - `SP10`, one token, same route 117, 116, 115, 114; two alternated routes keep separate sequences |
+| Grant routes `PUT /jit-access` and `PUT /database/jit` answer `200` on Pro; the `500` is the invite route | Measured 2026-10-10 - `JA01c`, `JA01d`, 5 runs, Postgres 17; the invite route on Pro was not re-run (the `500` is `S15`, 2026-08-25) |
+| CLI retries: GET, PUT and DELETE 6 attempts on 500, POST 1; provider retries GET only; harness `mgmt()` never retries | Measured 2026-10-10 - `MF01` to `MF05`, every fault injected through a proxy, one trial per cell |
+| A create whose answer was lost still creates the project; the identical re-send is `400` on the name | Measured 2026-10-10 - `LO04` n=1 and `MF02`; a fresh-name retry not run |
 
 ## What to do about it
 
@@ -309,13 +428,13 @@ the two as separate questions.
 
 | Practice | Evidence | Module |
 |---|---|---|
-| Run the provisioning service under a dedicated automation user. | The rate budget is per user across all its PATs (each token's `x-ratelimit-remaining` drops on the other's calls), so a separate user is a separate 120-per-minute bucket; and a classic PAT reaches every organization the user belongs to, so the user's membership set is its blast radius. Use a scoped PAT limited to the platform organization: a probe found no scope endpoint on `/v1` (2026-08-03; later codified as F03), but the Personal Access Tokens guide now documents scoped tokens created in the dashboard.[^sb-pat] Project creation with a scoped token was not measured. | rate-limits [L01b](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/rate-limits/tests/r01-rate-limit-surface.ts) (2026-08-18); platform-facts [F03](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-facts/tests/f03-pat-scope.ts) |
+| Run the provisioning service under a dedicated automation user. | The rate budget is per user across all its PATs (each token's `x-ratelimit-remaining` drops on the other's calls), on the route measured (`x-ratelimit-remaining` itself counts per route, so compare two tokens on one route only), so a separate user is a separate 120-per-minute bucket; and a classic PAT reaches every organization the user belongs to, so the user's membership set is its blast radius. Use a scoped PAT limited to the platform organization: a probe found no scope endpoint on `/v1` (2026-08-03; later codified as F03), but the Personal Access Tokens guide now documents scoped tokens created in the dashboard.[^sb-pat] Project creation with a scoped token was not measured: the organisation-scoped module has only run with the lab token standing in (2026-10-10). | rate-limits [L01b](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/rate-limits/tests/r01-rate-limit-surface.ts) (2026-08-18); platform-facts [F03](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-facts/tests/f03-pat-scope.ts); scoped-pats [SP04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/scoped-pats/tests/sp04-org-scoped-token.ts), [SP10](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/scoped-pats/tests/sp10-ratelimit-header-control.ts) (2026-10-10) |
 | Poll `GET /v1/projects/{ref}/health?services=auth&services=rest&services=db` before the first write on a fresh tenant, then retry the write anyway. | 2 of 2 fresh projects passed the per-service poll and still failed the first `admin/users` call (2026-08-03); 5 of 5 refused the first write and took the second (2026-08-04). | supabase-lab `AGENTS.md`, provisioning note (2026-08-03); placement reference, Verified row 'Create -> healthy, and healthy is not writable' (2026-08-04, n=5, bash run not in the lab repo) |
 | Enumerate creatable regions per org with `GET /v1/projects/available-regions?organization_slug=<slug>` before offering a tenant a region picker. | A Team org answered 200 with `{recommendations, all: {smartGroup[], specific[]}}`, 17 specific regions and 3 smart groups; the call without the slug answers 400, and `/regions` and `/projects/regions` 404. | platform-facts [F04c](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-facts/tests/f04-regions.ts) (2026-08-20) |
 | Persist the rotated refresh token before acknowledging the refresh. | Every refresh grant returns a new refresh token alongside the 24-hour access token, so a dropped rotation loses the grant (2026-08-18). | byo-oauth [O01c](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/byo-oauth/tests/o01-oauth-lifecycle.ts), [O01e](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/byo-oauth/tests/o01-oauth-lifecycle.ts) (2026-08-18) |
 | Map a `404` on the refresh grant to "revoked, re-consent required". | Revocation answered 204 and the next refresh 404 on the first poll, 0 s lag. | byo-oauth [O01c](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/byo-oauth/tests/o01-oauth-lifecycle.ts), [O01e](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/byo-oauth/tests/o01-oauth-lifecycle.ts) (2026-08-18) |
 | Budget a manual dashboard step per environment for OAuth app registration. | OAuth app registration has no API: the project-claim route answers 404 on Pro (byo-oauth O02a) and `oauth/apps` 404 on the platform org (sfp-platforms S05, 2026-08-24), and the published spec's 169 operations hold only two org-scoped writes, organization creation and the project-claim callback. | byo-oauth RUNLOG, the manual drill; sfp-platforms [S05](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/sfp-platforms/tests/s05-project-claim.ts) (2026-08-24); platform-facts [F05](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-facts/tests/f05-control-plane-writes.ts) |
-| Do not offer JIT database access, `POST /database/jit/invite`, on a Pro org. | A `platform`-plan org answers `200` with an `invite_id` and the identical invite is rejected with `500` on Pro. | sfp-platforms [S15](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/sfp-platforms/tests/s15-jit-database-access.ts) (2026-08-25, A/B) |
+| Use the JIT grant route `PUT /database/jit` on Pro; avoid the invite route. | `POST /database/jit/invite` answers `200` with an `invite_id` on a `platform`-plan org and the identical invite is rejected with `500` on Pro (S15, 2026-08-25, A/B). On Pro the grant routes `PUT /jit-access` with `{state}` and `PUT /database/jit` answered `200` in 5 of 5 runs (2026-10-10, Postgres 17); the grant needs SSL enforcement on first, the key `roles` and epoch-seconds `expires_at` (see the [JIT database access page](/reference/supabase-jit-database-access/)). The invite route on Pro was not re-run. | sfp-platforms [S15](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/sfp-platforms/tests/s15-jit-database-access.ts) (2026-08-25, A/B); jit-db-access [JA01c](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts), [JA01d](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) (2026-10-10) |
 | Mint tenant-facing or worker credentials with `POST /v1/projects/{ref}/api-keys` and `secret_jwt_template`, and read them with `?reveal=true`. | The create response redacts `api_key` otherwise. The templated `role` and custom claim reach `auth.jwt()` on Pro and platform orgs. A fresh RPC answers `PGRST202` until `notify pgrst, 'reload schema'`. | sfp-platforms [S14](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/sfp-platforms/tests/s14-secret-jwt-template.ts) (2026-08-25, both org classes) |
 | Size a dedicated project at `ci_small` or above and enable PITR before promising a tenant read replicas via `POST /read-replicas/setup`. | The setup call answers `400 "Read replicas require a minimum size of small"` on Pro and platform orgs, then waits on a completed physical backup; the chain closed on Pro after `pitr_7` (setup `204`). PITR enable on the platform org is its own refusal, `400 "Organization is not entitled to the selected PITR duration"`. | sfp-platforms [S07](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/sfp-platforms/tests/s07-read-replicas.ts), [S07e](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/sfp-platforms/tests/s07-read-replicas.ts) (2026-08-25) |
 | Grow disk to 6 GB or more in one step on a fresh gp3 volume. | The fresh volume is 2 GB / 3000 IOPS / 125 MiB/s and the gp3 IOPS floor makes 2 -> 4 GB impossible. The grow is async (`201` with an empty body); 8 GB confirmed landed on a later poll. The floor was sent on a Pro 2 GB volume on 2026-10-01: 4 and 5 GB answered `400 Invalid IOPS value for gp3 volume 3000`, 6 GB `201`. | sfp-platforms [S08](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/sfp-platforms/tests/s08-disk-modification.ts) (2026-08-24/25); compute-disk D11 ([RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/b5b8bb6/experiments/compute-disk/RUNLOG.md), 2026-10-01) |
@@ -325,6 +444,12 @@ the two as separate questions.
 | Read tenant health from `status`, never from a `200` on a project-scoped read. | `GET /api-keys` answers `[]`, `GET /advisors/performance` `{"lints":[]}` and `GET /config/database/pooler` `[]` on a parked project, so a sweep that trusts the body reports parked tenants healthy and lint-free. | s2z-wake [Z01](https://github.com/erfianugrah/supabase-lab/blob/9d27845/experiments/s2z-wake/tests/z01-get-surface-wake.ts) (2026-09-09) |
 | Budget 53-71 s to park and 168-222 s to wake a tenant, and tolerate a `400` on a pause issued straight after a restore. | `POST /pause` reached `INACTIVE` in 53-71 s (n=4); `POST /restore` reached `ACTIVE_HEALTHY` in 168-222 s (n=3); the immediate re-pause answered `400` while the post-restore settle held. | s2z-wake [Z01](https://github.com/erfianugrah/supabase-lab/blob/9d27845/experiments/s2z-wake/tests/z01-get-surface-wake.ts) (2026-09-09) |
 | Run an auto-pause or hibernation arm against production free-plan projects, not a staging org. | Twelve staging nanos sat idle for 13 days without parking while two production free projects auto-paused over the same window, so `Z04` can never fire there; hibernation never appeared up to 2 hours idle on production either. | s2z-wake [Z04](https://github.com/erfianugrah/supabase-lab/blob/9d27845/experiments/s2z-wake/tests/z04-autopause-wake.ts) (2026-09-23 check-back) |
+| Hand-create each scoped PAT in the Dashboard; budget a manual step per environment. | There is no token-creation operation in the 170-operation `/v1` document and the Dashboard route answers a PAT `401 Unsupported access token` (2026-10-10, GET only). | scoped-pats [SP01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/scoped-pats/tests/sp01-creation-surface.ts) (2026-10-10) |
+| Probe a token with `GET /v1/organizations`, not `supabase whoami`. | With an `sbp_fc` lab token `GET /v1/profile` answers `403` and `supabase whoami` exits 1, while `supabase orgs list` and `supabase projects list` exit 0 (CLI 2.120.0; the token's scope was not read). | scoped-pats [SP06](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/scoped-pats/tests/sp06-cli-and-profile.ts) (2026-10-10) |
+| Treat a failed project create as possibly landed; list by name before re-applying. | A `500` after upstream created the project, or a lost answer, left 1 project with the name (CLI, harness and provider); the provider's state stayed empty and the re-apply got `400` until the orphan was deleted. | mgmt-api-faults [MF02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf02-harness-create.ts), [MF03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf03-cli.ts), [MF04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf04-tofu.ts) (2026-10-10, injected faults); lifecycle-ops [LO04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo04-duplicate-post.ts) (n=1) |
+| Keep the project name stable across the retries of one logical create. | The identical re-send answered `400` on the name and left 1 project (`LO04`, n=1; `MF02`); a fresh-name retry is not covered by that check and was not run. | lifecycle-ops [LO04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo04-duplicate-post.ts); mgmt-api-faults [MF02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf02-harness-create.ts) (2026-10-10) |
+| Do not wrap `mgmt()` POSTs in a blind retry. | `mgmt()` never retries (1 attempt on 500, 502, 503 and 504) and a lost create answer still creates the project, so a retry hits the same-name `400` or, with a fresh name, a second project. The second half is reasoned from the `400` and was not run. | mgmt-api-faults [MF01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf01-harness-client.ts), [MF02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf02-harness-create.ts) (2026-10-10) |
+| Check `status` as well as `present` after `functionPresent()`. | A `500` on its read returns `present: false` with `status` 500 after 1 attempt, which a caller cannot tell from a missing function. | mgmt-api-faults [MF01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf01-harness-client.ts) (2026-10-10) |
 
 ## Verification
 
@@ -337,13 +462,17 @@ project for the free-org rows.
   `region_selection: {type: "smartGroup", code: "apac"}` and read which
   region lands.
 - Rate budget (4) - burst a cheap scoped read until the 429, reading the
-  budget from the `x-ratelimit-*` headers; alternate two of your PATs to
-  re-check the shared counter.
+  budget from the `x-ratelimit-*` headers; alternate two of your PATs on the
+  same route to re-check the shared counter, and alternate two routes with one
+  token to see the per-route sequences.
 - OAuth (5) - authorize with an unknown `client_id`, then run the token
   lifecycle after a real consent: refresh, revoke, re-refresh.
 - Metering (6) - insert a known payload and read `pg_database_size()`;
   send a counted batch of REST GETs and watch `usage.api-counts` catch up;
   scrape per-project metrics through your gateway with a scoped key.
+- Control-plane faults (2, 8) - point the CLI profile's `api_url`, the
+  provider's `endpoint` or your client's base URL at a proxy that answers 500
+  before or after forwarding, and count the requests each tool sends.
 - Deletions and pauses (8) - delete the project and re-poll the list for
   the tail; pause a free-tier project and read the data API for the
   `HTTP 540 Project paused`.
@@ -361,6 +490,8 @@ above and reads the run logs in the repo.
 | 1, 5 - the claim flow and the OAuth surface | [`byo-oauth`](https://github.com/erfianugrah/supabase-lab/blob/22fac44/experiments/byo-oauth/RUNLOG.md) |
 | 1, 2, 3 - the platform-plan A/B: JIT access, templated keys, the replica and disk floors, the backup schedule | [`sfp-platforms`](https://github.com/erfianugrah/supabase-lab/blob/22fac44/experiments/sfp-platforms/RUNLOG.md) |
 | 2, 4 - the classic PAT's reach, the region catalogue, the read-only membership surface | [`platform-facts`](https://github.com/erfianugrah/supabase-lab/blob/22fac44/experiments/platform-facts/RUNLOG.md) |
+| 1 - JIT grant and invite routes on Pro, scoped tokens | [`jit-db-access`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/RUNLOG.md), [`scoped-pats`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/scoped-pats/RUNLOG.md) |
+| 2, 8 - control-plane faults and the lost-answer create | [`mgmt-api-faults`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/RUNLOG.md), [`lifecycle-ops`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/RUNLOG.md) |
 | 3, 8 - sizing floors, the legacy door, pause and restore | [`instance-sizing`](https://github.com/erfianugrah/supabase-lab/blob/22fac44/experiments/instance-sizing/RUNLOG.md) |
 | 4 - the rate budget | [`rate-limits`](https://github.com/erfianugrah/supabase-lab/blob/22fac44/experiments/rate-limits/RUNLOG.md) |
 | 6 - metering and the scoped-key gateway | [`usage-metering`](https://github.com/erfianugrah/supabase-lab/blob/22fac44/experiments/usage-metering/RUNLOG.md) |
@@ -375,7 +506,15 @@ above and reads the run logs in the repo.
 | F04c | platform-facts | [`f04-regions.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-facts/tests/f04-regions.ts) | none published |
 | F05 | platform-facts | [`f05-control-plane-writes.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/platform-facts/tests/f05-control-plane-writes.ts) | none published |
 | I03 | instance-sizing | [`i03-legacy-pause-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/instance-sizing/tests/i03-legacy-pause-lifecycle.ts) | none published |
+| JA01c | jit-db-access | [`ja01-jit-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) | none published |
+| JA01d | jit-db-access | [`ja01-jit-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/jit-db-access/tests/ja01-jit-lifecycle.ts) | none published |
 | L01b | rate-limits | [`r01-rate-limit-surface.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/rate-limits/tests/r01-rate-limit-surface.ts) | none published |
+| LO04 | lifecycle-ops | [`lo04-duplicate-post.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/lifecycle-ops/tests/lo04-duplicate-post.ts) | none published |
+| MF01 | mgmt-api-faults | [`mf01-harness-client.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf01-harness-client.ts) | none published |
+| MF02 | mgmt-api-faults | [`mf02-harness-create.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf02-harness-create.ts) | none published |
+| MF03 | mgmt-api-faults | [`mf03-cli.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf03-cli.ts) | none published |
+| MF04 | mgmt-api-faults | [`mf04-tofu.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf04-tofu.ts) | none published |
+| MF05 | mgmt-api-faults | [`mf05-post-timeout.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/mgmt-api-faults/tests/mf05-post-timeout.ts) | none published |
 | O01c | byo-oauth | [`o01-oauth-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/byo-oauth/tests/o01-oauth-lifecycle.ts) | none published |
 | O01e | byo-oauth | [`o01-oauth-lifecycle.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/byo-oauth/tests/o01-oauth-lifecycle.ts) | none published |
 | O02a | byo-oauth | [`o02-gated-oauth-surface.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/byo-oauth/tests/o02-gated-oauth-surface.ts) | none published |
@@ -386,6 +525,12 @@ above and reads the run logs in the repo.
 | S11 | sfp-platforms | [`s11-backup-schedule.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/sfp-platforms/tests/s11-backup-schedule.ts) | none published |
 | S14 | sfp-platforms | [`s14-secret-jwt-template.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/sfp-platforms/tests/s14-secret-jwt-template.ts) | none published |
 | S15 | sfp-platforms | [`s15-jit-database-access.ts`](https://github.com/erfianugrah/supabase-lab/blob/f703393/experiments/sfp-platforms/tests/s15-jit-database-access.ts) | none published |
+| SP01 | scoped-pats | [`sp01-creation-surface.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/scoped-pats/tests/sp01-creation-surface.ts) | none published |
+| SP02 | scoped-pats | [`sp02-permission-matrix.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/scoped-pats/tests/sp02-permission-matrix.ts) | none published |
+| SP04 | scoped-pats | [`sp04-org-scoped-token.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/scoped-pats/tests/sp04-org-scoped-token.ts) | none published |
+| SP05 | scoped-pats | [`sp05-sql-read-only.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/scoped-pats/tests/sp05-sql-read-only.ts) | none published |
+| SP06 | scoped-pats | [`sp06-cli-and-profile.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/scoped-pats/tests/sp06-cli-and-profile.ts) | none published |
+| SP10 | scoped-pats | [`sp10-ratelimit-header-control.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/scoped-pats/tests/sp10-ratelimit-header-control.ts) | none published |
 | Z01 | s2z-wake | [`z01-get-surface-wake.ts`](https://github.com/erfianugrah/supabase-lab/blob/9d27845/experiments/s2z-wake/tests/z01-get-surface-wake.ts) | none published |
 | Z02 | s2z-wake | [`z02-write-surface-wake.ts`](https://github.com/erfianugrah/supabase-lab/blob/9d27845/experiments/s2z-wake/tests/z02-write-surface-wake.ts) | none published |
 | Z04 | s2z-wake | [`z04-autopause-wake.ts`](https://github.com/erfianugrah/supabase-lab/blob/9d27845/experiments/s2z-wake/tests/z04-autopause-wake.ts) | none published |
@@ -399,7 +544,11 @@ above and reads the run logs in the repo.
 | Build the shared tier | [Shared tenancy guide](/guides/supabase-shared-tenancy/) |
 | Move a tenant to its own project | [Tenant promotion](/guides/supabase-tenant-promotion/) |
 | Merge many projects into one | [Tenant consolidation](/guides/supabase-tenant-consolidation/) |
+| Grant temporary database access with a PAT | [JIT database access](/reference/supabase-jit-database-access/) |
+| How should clients retry and what survives a restart? | [Resilience runbook](/guides/supabase-resilience-runbook/) |
 
 [^sfp]: [Supabase for Platforms](https://supabase.com/docs/guides/integrations/supabase-for-platforms) - the white-label programme; scale-to-zero is the platform plan's Nano create default (measured 2026-08-24), not a gated catalogue variant.
 [^oauth-integration]: [Build a Supabase OAuth integration](https://supabase.com/docs/guides/integrations/build-a-supabase-oauth-integration) - the Management API OAuth2 flow (authorize, token exchange, refresh, revoke).
-[^sb-pat]: Supabase, "Personal Access Tokens," Supabase Docs. https://supabase.com/docs/guides/platform/personal-access-tokens (read 2026-10-07).
+[^sb-pat]: Supabase, "Personal Access Tokens," Supabase Docs. https://supabase.com/docs/guides/platform/personal-access-tokens (read 2026-10-07; the `sbp_fc` prefix sentence re-read 2026-10-10).
+[^sb-scoped-pat]: Supabase Changelog, scoped personal access tokens GA (dated 2026-10-06 in the lab run log). https://supabase.com/changelog/scoped-personal-access-tokens-ga (read 2026-10-10).
+[^sb-mgmt-ratelimit]: Supabase, "Management API introduction" (rate limits), Supabase Docs. https://supabase.com/docs/reference/api/introduction (read 2026-10-10).

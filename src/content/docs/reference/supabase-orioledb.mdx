@@ -1,0 +1,328 @@
+---
+title: "OrioleDB on Supabase: what hosted projects do differently"
+description: "How a hosted OrioleDB project differs from a heap project - the create-body field that is typed deprecated null yet applied, the Postgres build underneath, which organisations can create one, WAL and bloat for unchanged-row writes, a pgbench pair, what an OrioleDB table refuses or accepts, the table conversion that ends the connection, and PITR. Measured on small projects in ap-southeast-1, 2026-10-10."
+author: Erfi Anugrah
+category: supabase
+group: architecture
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+OrioleDB is a storage engine for Postgres that Supabase offers as a per-project choice, with `USING orioledb` or `USING heap` chosen per table inside the project.[^sb-select-2026] This page records what an OrioleDB project did differently from a heap project when measured through the Management API and a session-mode pooler, for anyone deciding whether to create one or to leave tables on heap.
+
+Everything marked measured below was run on 2026-10-10 against hosted projects: one OrioleDB project, one heap control, and three further OrioleDB projects (a feature battery and two conversion probes), all compute `small` in `ap-southeast-1`, created in a Pro organisation and deleted at the end of the run. One more OrioleDB project was created in a Free organisation. Figures come from the published run artifacts under [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/orioledb/out/2026-10-10) and the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/orioledb/RUNLOG.md) in the [`orioledb`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/orioledb) experiment; a figure labelled manual was read from an ad-hoc call and is not in an artifact. Vantage was one machine, with a 7.1 to 7.8 ms round trip to the pooler (`select 1`, one client). Claims taken from Supabase pages are marked documented and were read on the same date; they were not all tested.
+
+**TL;DR**
+
+- `POST /v1/projects` with `postgres_engine: "17-oriole"` created an OrioleDB project although the published OpenAPI document types that field deprecated `null`.[^api-spec] The project read back PostgreSQL 17.6 on aarch64 and `OrioleDB public beta 14`; the heap control read 17.11 on x86_64.
+- A Free organisation created an OrioleDB project (`instances.orioledb` was true on the Pro, Team and Free organisations read). The changelog says the same.[^sb-changelog]
+- An unchanged-row upsert of 100,000 rows wrote 5,786,200 bytes of WAL on an OrioleDB table and 30,946,504 on a heap table in the same project. Ten all-row UPDATE rounds grew the heap table from 7,659,520 to 84,148,224 bytes and left the OrioleDB table at 8,445,952.
+- pgbench on `small` (12 clients, 30 s, 2 runs) showed no resolvable throughput difference between an OrioleDB and a heap table in one project. The `tpcb_like` cells sit at the round-trip bound.
+- Refused on an OrioleDB table: `CREATE INDEX CONCURRENTLY`, SERIALIZABLE, `VACUUM FULL`, `CLUSTER` and `ALTER TABLE ... SET ACCESS METHOD` in either direction. Accepted: GIN, GiST, BRIN, hash, foreign keys both ways to heap tables, triggers, RLS, partitions, TOAST, pgvector HNSW, logical slots, Realtime and the Data API.
+- `ALTER TABLE ... SET ACCESS METHOD orioledb` on a heap table ended the backend connection in both recorded attempts, and the server answered again after 3 s each time. Two earlier manual probes, not saved, suggested a crash loop that a restart did not clear. See the caution under [Converting a heap table](#converting-a-heap-table).
+- `PATCH /billing/addons` for `pitr_7` answered 400 on the OrioleDB project and 200 on the heap control.
+
+---
+
+## Which setting to pick
+
+| Question | Answer on a hosted OrioleDB project | Measured or documented |
+|---|---|---|
+| Can I create one on Free? | Yes, one Free organisation, one call | measured (OR10, OR01c) |
+| Does an unchanged-row write cost less WAL? | About a fifth of heap's, no table growth | measured (OR02, OR03) |
+| Does it raise throughput? | No difference resolvable at `small`, 12 clients, 30 s | measured (OR05) |
+| Can I run `CREATE INDEX CONCURRENTLY` or SERIALIZABLE? | No | measured (OR06) |
+| Can I convert a table later? | On an OrioleDB table, refused in both directions; heap -> OrioleDB ended the connection (2 recorded attempts) | measured (OR06, OR08) |
+| Can I add OrioleDB to an existing project? | A heap project has no `orioledb` extension | extension absence measured (OR01d); the creation-time rule is documented[^sb-orioledb-guide] |
+| Can I buy PITR? | The add-on is refused | measured (OR09) |
+| Is it faster at scale? | The vendor's 8xlarge benchmark was not run here | documented[^sb-orioledb-guide], not tested |
+
+---
+
+## Creation
+
+The create body takes `postgres_engine`. The published OpenAPI document (`api.supabase.com/api/v1-json`, fetched 2026-10-10, manual) types `postgres_engine` and `release_channel` on that body as deprecated `null`; branch creation lists `17-oriole`.[^api-spec] The route accepted the field and applied it (OR01a):
+
+| | OrioleDB project | Heap control |
+|---|---|---|
+| create body | `postgres_engine: "17-oriole"` | field omitted |
+| `database.postgres_engine` | `17-oriole` | `17` |
+| `release_channel` | `ga` | `ga` |
+| `database.version` | `orioledb` | `17.11.0.003` |
+
+Server facts read from the two projects (OR01b):
+
+| | OrioleDB project | Heap control |
+|---|---|---|
+| PostgreSQL | 17.6 | 17.11 |
+| CPU architecture | aarch64 | x86_64 |
+| extension | `orioledb 1.6`, `orioledb_version()` reads `OrioleDB public beta 14` | none |
+| `default_table_access_method` | `orioledb` | `heap` |
+| `wal_compression` | `pglz` | `zstd` |
+| `shared_buffers` | 512MB | 512MB |
+| `orioledb.main_buffers` | 65536 (blocks) | not present |
+| disk at creation | 8 GB gp3 | 2 GB gp3 |
+
+Both read `wal_level` `logical`, `max_wal_size` 4GB, `checkpoint_timeout` 5min, `autovacuum` on and `data_checksums` on. The two projects therefore differ in Postgres build, architecture, WAL compression and disk size as well as the storage engine. Compare `USING orioledb` with `USING heap` inside the OrioleDB project to isolate the engine; the heap-control column carries all four differences. A manual read of a heap control about 12 minutes after creation showed `size_gb` 8 (manual), consistent with disk autoscaling; the trigger was not probed.
+
+On the heap control, `CREATE EXTENSION orioledb` failed, `CREATE TABLE ... USING orioledb` answered `access method "orioledb" does not exist`, and the extension was absent from `pg_available_extensions` (OR01d). The guide says an OrioleDB project is chosen at creation and cannot be added or removed later;[^sb-orioledb-guide] that statement itself was not tested.
+
+The hosted `postgres` role is not a superuser, has `rolreplication` true and no `pg_checkpoint`: `CHECKPOINT` answered `permission denied to execute CHECKPOINT command` on both projects. WAL figures below therefore come without the checkpoint the local rig in [Redundant writes in Postgres](/reference/postgres-redundant-writes/) issued before each statement. OrioleDB tables also have no `xmin` (`orioledb tuples does not have system attribute: xmin`), so row-version counts exist for heap tables only; `ctid` reads. Measure OrioleDB write volume with the `pg_current_wal_insert_lsn()` diff across the transaction.
+
+### Which organisations can create one
+
+`GET /organizations/{slug}/entitlements` (OR01c) returned `instances.orioledb` `hasAccess=true` on the Pro, Team and Free organisations read. `POST /v1/projects` in the Free organisation with `postgres_engine: "17-oriole"` and no compute size returned 201, reached `ACTIVE_HEALTHY` and read back `17-oriole` with `OrioleDB public beta 14`, `shared_buffers` 224MB and `orioledb.main_buffers` 224MB (OR10). The changelog lists Pro, Team and Enterprise "not only Free",[^sb-changelog] which this call agrees with: one call, one Free organisation, Enterprise not tested. An earlier assumption in the lab notes was that OrioleDB needed Pro or above; the Free-organisation call contradicts it.
+
+Other entitlements read in the same call: `pitr.available_variants` was `pitr_7|pitr_14|pitr_28` on Pro and Team and empty on Free; `replication.etl` was true on Pro and Team and false on Free.
+
+---
+
+## Redundant writes, summarised
+
+The statements are the ones in [Redundant writes in Postgres](/reference/postgres-redundant-writes/), which has the guards, the full-page-image reasoning and the local numbers; this page repeats only the hosted OrioleDB result. Targets: an OrioleDB table in the OrioleDB project, a heap table in the same project, and a heap table in the heap control. Medians of 3 reps on a fresh fixture, checkpoint state unknown, `wal_fpi` 0 in every 100,000-row cell. WAL is the `pg_current_wal_insert_lsn()` diff across the transaction (OR02, OR03).
+
+| Statement, unchanged rows | Rows | OrioleDB table, WAL bytes | Heap table, same project, WAL bytes |
+|---|---|---|---|
+| plain `INSERT ... ON CONFLICT DO UPDATE` | 100,000 | 5,786,200 | 30,946,504 |
+| plain `INSERT ... ON CONFLICT DO UPDATE` | 1,000,000 | 57,864,400 | 309,578,424 |
+| plain `UPDATE ... FROM` | 100,000 | 5,786,176 | 25,330,048 |
+| guarded upsert (`IS DISTINCT FROM`) | 100,000 | 224 | 5,616,512 |
+| `suppress_redundant_updates_trigger()` | 100,000 | 224 | 5,616,584 |
+| pre-filtered batch | 100,000 | 48 | 184 |
+
+- Per row, the plain statement wrote 57.9 bytes of WAL on the OrioleDB table and 309.5 on the heap table (derived, roughly one fifth). The OrioleDB table stayed at 8,445,952 bytes at 100,000 rows; the heap table went from 7,659,520 to 15,319,040.
+- The guarded upsert and the suppress trigger lock every row on heap, where they wrote 56.2 bytes per row (derived). On the OrioleDB table they wrote 224 bytes in total. Whether OrioleDB takes row locks without logging them was not separated from the statement not reaching a row write; only the WAL figure is measured.
+- The heap table in the heap control agreed with the same-project heap table within 0.1% (30,954,048 against 30,946,504 for the plain upsert at 100,000 rows).
+- Server execution time of the plain upsert at 100,000 rows, median of 3, two runs each: 584 and 534 ms on the OrioleDB table, 863 and 826 ms on the heap table. At 1,000,000 rows: 5447 and 5413 ms against 9120 and 8995 ms.
+- `EXPLAIN (ANALYZE, WAL)` and the LSN diff agreed at 100,000 rows (5,762,249 against 5,786,200 bytes). A 10,000-row smoke with 1% changed (manual, not published) showed `EXPLAIN` WAL 0 against an LSN diff of 6,048, so read the LSN diff for small OrioleDB writes.
+
+### Bloat after repeated UPDATEs
+
+OR04a: 100,000 rows, autovacuum disabled by reloption on both engines, ten plain `UPDATE ... FROM` rounds.
+
+| | OrioleDB table | Heap table, same project |
+|---|---|---|
+| size before | 8,445,952 | 7,659,520 |
+| size after round 10 | 8,445,952 | 84,148,224 |
+| size after `VACUUM` | 8,445,952 | 84,148,224 |
+| WAL bytes, all ten rounds | 57,860,696 | 249,307,680 |
+| `n_dead_tup` after round 10 | 1,000,000 | 999,353 |
+| `VACUUM FULL` | refused | ok, 7,659,520 |
+
+`n_dead_tup` rose by the number of updated rows on the OrioleDB table although its size did not move and a `VACUUM (VERBOSE)` (manual) printed no section for the table. On an OrioleDB table that counter is a statistics number and does not count retained row versions. With autovacuum on (OR04b, 100,000 rows, three all-row rounds, polled every 15 s for 181 s), the heap table's `autovacuum_count` became 1 at 45 s and its size read 30,621,696 bytes; the OrioleDB table's `autovacuum_count` stayed 0 with `autoanalyze_count` 1, its `n_dead_tup` fell to 0 anyway and its size stayed 8,445,952. Whether a background worker acted on the OrioleDB table beyond the auto-analyze was not separated.
+
+The launch post says OrioleDB's undo log removes bloat and the need for VACUUM.[^sb-select-2026] The runs above cover one table shape, one size, ten rounds and no long-running readers; they are consistent with the post for that case and say nothing beyond it.
+
+---
+
+## pgbench
+
+Scale 20 (2,000,000 accounts), tables built by SQL in one schema per target, 30 s per run, 2 runs per cell in alternating target order after a discarded 15 s warm-up, run through the session-mode pooler. Twelve clients, because the pooler answered `EMAXCONNSESSION ... max clients are limited to pool_size: 15` above 15 in a smoke run (manual). No transaction failed in any cell. Each cell is the mean tps of the two runs (range) / server-side mean statement time per transaction in ms from `pg_stat_statements` deltas (OR05).
+
+| Script, clients | OrioleDB table | Heap table, same project | Heap control |
+|---|---|---|---|
+| tpcb_like (7 round trips), 12 | 212 (202-222) / 1.958 | 214.1 (207-221) / 2.051 | 208.6 (206-211) / 2.434 |
+| tpcb_fn (1 round trip), 12 | 1205 (1059-1352) / 0.387 | 1278 (1248-1308) / 0.429 | 1092.8 (995-1190) / 0.723 |
+| tpcb_fn, 4 | 466.3 (466.1-466.5) / 0.229 | 463.3 (462.9-463.6) / 0.265 | 401.8 (384.7-418.9) / 0.376 |
+| select_only, 12 | 1625 (1572-1678) / 0.019 | 1517 (1462-1573) / 0.044 | 1508 (1506-1511) / 0.066 |
+
+Between the two tables of one project the two-run ranges overlap in 3 of 4 cells (`select_only` by 1 tps). At 4 clients they do not overlap (466.1 to 466.5 on the OrioleDB table, 462.9 to 463.6 on the heap table, under 1% apart, derived). No difference between an OrioleDB and a heap table in one project is resolvable at two runs of 30 s per cell, although the `select_only` means differ by about 7% (1625 against 1517 tps, derived) with ranges that barely overlap. The `tpcb_like` cells sit at the round-trip bound: 12 clients over 7 round trips of about 8 ms is about 214 transactions per second (derived), the measured value for all three targets. The heap-control column differs in Postgres build, architecture and disk size as well as the engine.
+
+Not run: the vendor's 8xlarge TPC-C-derived benchmark, which the guide cites for its throughput claim,[^sb-orioledb-guide] runs longer than 30 s, more than 12 clients, and a vantage inside the region.
+
+---
+
+## What an OrioleDB table refuses and accepts
+
+OR06 ran 37 probes, one execution each, on a separate OrioleDB project. 31 behaved as expected (a statement ran, or for `fk_violation_enforced` the violating row was refused) and 6 were refused:
+
+| Probe | Server answer |
+|---|---|
+| `CREATE INDEX CONCURRENTLY` | `concurrent index creation is not supported for orioledb tables yet` |
+| `SERIALIZABLE` transaction | `orioledb does not support SERIALIZABLE isolation level` |
+| `VACUUM FULL` | `orioledb table "f_o" does not support VACUUM FULL` |
+| `CLUSTER` | `orioledb tables does not support CLUSTER` |
+| `ALTER TABLE ... SET ACCESS METHOD heap` | `changing access method is not supported for OrioleDB tables` |
+| `ALTER TABLE ... SET ACCESS METHOD orioledb` (on an OrioleDB table) | `changing access method is not supported for OrioleDB tables` |
+
+Accepted: GIN on `jsonb` and `tsvector`, GiST on a range and a point, BRIN, hash, expression, partial, unique-secondary and INCLUDE indexes; foreign keys heap to OrioleDB and OrioleDB to heap; a `BEFORE UPDATE` trigger; an RLS policy; `REPEATABLE READ`; `FOR UPDATE SKIP LOCKED`; `TRUNCATE`; `UNLOGGED` and `TEMP` tables; an OrioleDB partition of a partitioned table; `ADD COLUMN ... DEFAULT`, `DROP COLUMN`, `ALTER COLUMN TYPE`; `REPLICA IDENTITY FULL`; a 1,000,000-byte `text` value (TOAST); a table with no primary key; `VACUUM`, `REINDEX`, `ANALYZE`; and `CREATE INDEX ... USING hnsw` with an ordered query on a pgvector column. The probe checks that those statements run without error and does not check what they return. The guide says non-B-tree index types run through an index access method bridge;[^sb-orioledb-guide] a development probe printed `NOTICE: index bridging is enabled for orioledb table 'f_o'` for GIN (manual).
+
+Mixed use (OR06b): a join across a heap and an OrioleDB table returned 100 rows; one transaction inserting into both committed (1 row each) and a second rolled back (still 1 row each). Transaction ids read `orioledb_get_current_oxid()` 504 (`bigint`), `pg_current_xact_id()` 1292 (`xid8`), `age(datfrozenxid)` 563. That records types and small values; the launch post's 64-bit transaction id claim[^sb-select-2026] was not exercised.
+
+### Replication, Realtime and the Data API
+
+OR07, on the same separate project, one sequence per table (3 INSERT, 2 UPDATE, 1 DELETE), an OrioleDB table and a heap table side by side:
+
+- A publication and a `pgoutput` logical slot decoded both tables. Messages by first byte were identical for both: B 6, C 6, I 3, U 2, D 1, R 1 (OR07a). No subscriber was attached, so a downstream Postgres subscriber and Replication/ETL pipelines are not measured.
+- Both tables were added to `supabase_realtime`; the channel joined and `postgres_changes` delivered INSERT 3, UPDATE 2, DELETE 1 (6 of 6) for each (OR07b).
+- `GET /rest/v1/<table>` returned 200 and `POST` 201 on both after an explicit `GRANT` to `anon` (OR07c).
+
+### Converting a heap table
+
+The guide does not mention per-table conversion. A manual probe while developing OR06 showed `ALTER TABLE ... SET ACCESS METHOD orioledb` is accepted on a heap table.
+
+<Aside type="caution" title="Do not run this on a project you need">
+`ALTER TABLE ... SET ACCESS METHOD orioledb` on a heap table ended the backend connection in both recorded attempts (OR08): an empty table with a primary key, where the `ALTER TABLE` itself returned `Connection terminated unexpectedly`, and a table with a foreign key to an OrioleDB table, where the `ALTER TABLE` returned ok and the following `INSERT` ended the connection. Both projects answered again after 3 s and `select count(*)` worked. Two other projects probed by hand earlier the same day suggested a startup-process crash loop that a project restart did not clear; those observations were not saved, so treat them as unverified, one probe per shape, and no tally is drawn from them. The platform log query returned no matching rows for the two recorded projects (`log_signal_lines` 0), so no crash-loop log line is published. Not isolated: whether a converted table can wedge the server, what separates a 3 s recovery from a loop (table shape, a prior checkpoint or timing), and the instance-level cause. Create a scratch project for any conversion test.
+</Aside>
+
+---
+
+## PITR and backups
+
+OR09, one OrioleDB project and the heap control. `GET /billing/addons` listed `pitr_7`, `pitr_14` and `pitr_28` for both. `GET /database/backups` read:
+
+| | OrioleDB project | Heap control |
+|---|---|---|
+| `walg_enabled` | false | true |
+| `daily_backups_listed` | 0 | 1 |
+| `pitr_enabled` | false | false |
+| `PATCH /billing/addons` with `{addon_type: "pitr", addon_variant: "pitr_7"}` | HTTP 400 | HTTP 200 |
+
+The 400 body was `{"message":"Projects using the OrioleDB Technical Preview image do not support PITR addon."}`; the message says Technical Preview where the changelog says public beta. On the control, `pitr_enabled` read true 1 s after the first PATCH, which is the backups endpoint's flag and not a completed restore point. No restore was attempted on either project. A development repeat on another pair the same day (manual) gave the same 400 and 200. For the restore behaviour of a heap project, see [What a Supabase platform operation costs a client](/reference/supabase-platform-operation-cost/#point-in-time-restore-on-small).
+
+---
+
+## The heap control's disk filled
+
+The 1,000,000-row plain upsert on the heap control, created with a 2 GB disk (OR01a), failed in every run that used the default disk (OR02, runs A, B and E), in the first case: `could not extend file ...: No space left on device` once, `Connection terminated unexpectedly` twice. The server went into recovery and the next case failed with `econnrefused` or `No space left on device`. In run E the two completed reps recorded `pg_ls_waldir()` at 687,866,220 then 1,290,535,276 bytes and `pg_stat_archiver.archived_count` 35 then 65 with `failed_count` 0, on a project where `walg_enabled` is true (OR09). On the OrioleDB project, where `walg_enabled` is false and the disk was 8 GB, `archived_count` stayed 0 and the same statement completed. WAL per statement was 303 to 312 MB on the heap control (57.9 MB on the OrioleDB table), so retained WAL plus the fixture exhausted a 2 GB disk.
+
+After `POST /v1/projects/{ref}/config/disk` set the control to 8 GB (run F), the same cases completed, 3 reps, 0 failures. Not isolated: whether WAL archiving, `max_wal_size` or checkpoint timing explains the retention, and whether an 8 GB disk survives a longer sequence. The disk size, the archiving setting and the Postgres build all differed between the two projects and none was varied alone. For how a disk behaves at its limit, see [Supabase compute and disk sizing](/reference/supabase-compute-disk/).
+
+---
+
+## Reading the numbers
+
+- The WAL and bloat comparison is the cleanest on this page because both tables live in one project: same build, same disk, same pooler. The WAL ratio (about a fifth) held at both 100,000 and 1,000,000 rows.
+- The pgbench comparison is a null result at this size and run count: two runs of 30 s per cell, one scale, `small`, and a vantage seven to eight milliseconds from the pooler.
+- The heap-control column is a different Postgres build, architecture, `wal_compression` and disk. Use it for the disk-fill finding and as a cross-check on the same-project heap table; the timing baseline is the same-project heap table.
+- The conversion result is two recorded attempts, each a different table shape. Both ended the connection and both recovered; the crash-loop suggestion rests on unsaved manual probes. Read it as a reason to test on a scratch project, not as a failure rate.
+
+---
+
+## What to do about it
+
+Module ids are in the [orioledb experiment](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/orioledb) of supabase-lab; all runs are 2026-10-10 on `small` in `ap-southeast-1`.
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Create the OrioleDB project with `postgres_engine: "17-oriole"` and read it back. | The field is typed deprecated `null` in the OpenAPI document and was applied; `database.postgres_engine` read `17-oriole`. | OR01a |
+| Compare engines inside one project, not across two. | The heap control differed in build (17.11 against 17.6), architecture, `wal_compression` and disk (2 GB against 8 GB). | OR01a, OR01b |
+| Measure OrioleDB write volume with the WAL LSN diff. | `xmin` is absent on OrioleDB tables; `EXPLAIN` WAL read 0 against an LSN diff of 6,048 on a 10,000-row smoke (manual). | OR01b, OR02 |
+| Read `n_dead_tup` on an OrioleDB table as a statistic only. | It read 1,000,000 after ten rounds while the table stayed at 8,445,952 bytes. | OR04a |
+| Keep the redundant-write guards on heap tables. | The guarded upsert wrote 224 bytes on OrioleDB and 5,616,512 on heap; an unguarded one wrote 30,946,504 on heap. | OR02 |
+| Plan around the refusals: CREATE INDEX CONCURRENTLY, SERIALIZABLE, VACUUM FULL, CLUSTER. | 6 of 37 probes refused, with the server answers in the table above. | OR06 |
+| Decide the access method when the table is created. | `SET ACCESS METHOD` on an OrioleDB table is refused both ways; on a heap table it ended the connection. | OR06, OR08 |
+| Test `ALTER TABLE ... SET ACCESS METHOD orioledb` on a scratch project only. | 2 of 2 recorded attempts ended the connection and recovered after 3 s; unsaved manual probes suggested a crash loop. | OR08 |
+| Treat logical slots, Realtime and the Data API as unchanged on OrioleDB tables. | Decoded messages identical to heap; Realtime 6 of 6 events; Data API 200 and 201. No subscriber or ETL pipeline attached. | OR07a, OR07b, OR07c |
+| Plan backups without PITR on an OrioleDB project. | `pitr_7` answered 400 on the OrioleDB project and 200 on the control; `walg_enabled` false against true. | OR09 |
+| Benchmark your own workload at your compute size before choosing on throughput. | No resolvable difference at `small`, 12 clients, 30 s, 2 runs; the vendor's 8xlarge benchmark was not run. | OR05 |
+| Raise a 2 GB disk before a million-row bulk upsert on heap. | The 2 GB heap control filled at 303 to 312 MB WAL per statement; 8 GB passed. Cause not isolated. | OR02 (runs E, F) |
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.35; ranksep=0.55;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  root [label="New project:\nOrioleDB or heap?", shape=hexagon];
+  need_pitr [label="Need the PITR\nadd-on?", shape=diamond];
+  need_idx [label="Need CREATE INDEX CONCURRENTLY,\nSERIALIZABLE or CLUSTER?", shape=diamond];
+  write_heavy [label="Heavy unchanged-row\nupserts or UPDATEs?", shape=diamond];
+  heap [label="Heap project"];
+  oriole [label="OrioleDB project\n(USING heap per table\nis still available)"];
+  bench [label="Benchmark your own\nworkload first"];
+
+  root -> need_pitr;
+  need_pitr -> heap [label="yes"];
+  need_pitr -> need_idx [label="no"];
+  need_idx -> heap [label="yes"];
+  need_idx -> write_heavy [label="no"];
+  write_heavy -> oriole [label="yes"];
+  write_heavy -> bench [label="no"];
+}
+```
+
+1. If you need the PITR add-on, create a heap project: the add-on was refused on the OrioleDB project.
+2. If you need `CREATE INDEX CONCURRENTLY`, SERIALIZABLE or `CLUSTER` on the table, use heap for that table or project.
+3. If the workload is heavy in unchanged-row upserts or UPDATEs, an OrioleDB project wrote about a fifth of the WAL and did not grow the table in the measured case.
+4. Otherwise benchmark your own workload at your compute size; the pgbench pair at `small` showed no difference.
+
+---
+
+## Evidence
+
+| Claim | How it was checked | Status |
+|---|---|---|
+| `postgres_engine` typed deprecated `null` yet applied | OpenAPI document read, then a create and read-back, one project per engine (OR01a) | measured 2026-10-10 |
+| PostgreSQL 17.6 aarch64, `OrioleDB public beta 14`; control 17.11 x86_64 | `version()`, `orioledb_version()` and settings on each project (OR01b) | measured 2026-10-10 |
+| `instances.orioledb` true on Pro, Team and Free | `GET /organizations/{slug}/entitlements` (OR01c) | measured 2026-10-10 |
+| A Free organisation creates an OrioleDB project | one `POST /v1/projects`, 201 (OR10) | measured 2026-10-10, n=1 |
+| A heap project cannot create OrioleDB tables | `CREATE EXTENSION orioledb` failed, extension absent (OR01d) | measured 2026-10-10 |
+| About a fifth of heap's WAL for unchanged rows; no table growth | LSN diff, median of 3, same project (OR02, OR03) | measured 2026-10-10 |
+| No bloat after ten all-row UPDATE rounds | table size per round, autovacuum off (OR04a) | measured 2026-10-10, one shape |
+| No throughput difference | pgbench, 2 runs of 30 s per cell (OR05) | measured 2026-10-10; ranges overlap in 3 of 4 cells |
+| 1.8x throughput, 8xlarge, TPC-C-derived | not run | documented[^sb-orioledb-guide], not tested |
+| No bloat, no VACUUM; 64-bit transaction ids | table sizes only; types and small values only | documented[^sb-select-2026], partly tested |
+| 6 refusals in a 37-probe battery | one execution per statement (OR06) | measured 2026-10-10 |
+| Logical decoding, Realtime and Data API work as on heap | decoded stream, 6 of 6 events, 200 and 201 (OR07) | measured 2026-10-10; no subscriber |
+| Heap -> OrioleDB conversion ends the connection | 2 recorded attempts (OR08), one shape each; earlier crash-loop probes unsaved | measured 2026-10-10, n=2; loop not reproduced, no log lines published |
+| PITR add-on refused | `PATCH /billing/addons` (OR09) | measured 2026-10-10; no restore attempted |
+| 2 GB heap control disk fills during a 1,000,000-row upsert | runs A, B and E fail, run F passes at 8 GB (OR02) | measured 2026-10-10; cause not isolated |
+
+### Not covered
+
+- Compute sizes other than `small`, regions other than `ap-southeast-1`, one Pro and one Free organisation.
+- The 8xlarge TPC-C-derived benchmark, any run longer than 30 s, more than 12 clients, secondary indexes in OR02 to OR04, long-running readers.
+- The 64-bit transaction id claim, a PITR restore, a logical-replication subscriber, Replication/ETL pipelines, Realtime with RLS.
+- A checkpoint-controlled WAL comparison, because the hosted role cannot checkpoint.
+- Why the heap control's disk filled, and whether a converted table can wedge the server.
+
+---
+
+## Reproducing
+
+The experiment self-provisions through the Management API and needs a personal access token and the organisation slugs in its environment, plus `pgbench` on the path. It creates five `small` projects for about 40 minutes and deletes them at the end.
+
+```sh
+cd experiments/orioledb
+make probe     # OR01-OR10 then OR99
+make facts     # the newest run's measurements as markdown
+```
+
+The OR08 module ended the backend connection on both of its projects (each answered again after 3 s), and OR09 starts the PITR add-on's billing on the measured projects until they are deleted. Knobs (`OR_SIZES`, `OR_TARGETS`, `OR_HEAP_DISK_GB` and others) are in the experiment's [README](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/orioledb/README.md).
+
+---
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| OR01a, OR01b, OR01c, OR01d | orioledb | [`or01-environment.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/orioledb/tests/or01-environment.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/orioledb/out/2026-10-10) |
+| OR02 | orioledb | [`or02-upsert.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/orioledb/tests/or02-upsert.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/orioledb/out/2026-10-10) |
+| OR03 | orioledb | [`or03-update.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/orioledb/tests/or03-update.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/orioledb/out/2026-10-10) |
+| OR04a, OR04b | orioledb | [`or04-churn.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/orioledb/tests/or04-churn.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/orioledb/out/2026-10-10) |
+| OR05 | orioledb | [`or05-pgbench.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/orioledb/tests/or05-pgbench.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/orioledb/out/2026-10-10) |
+| OR06, OR06b | orioledb | [`or06-features.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/orioledb/tests/or06-features.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/orioledb/out/2026-10-10) |
+| OR07a, OR07b, OR07c | orioledb | [`or07-replication.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/orioledb/tests/or07-replication.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/orioledb/out/2026-10-10) |
+| OR08 | orioledb | [`or08-convert.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/orioledb/tests/or08-convert.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/orioledb/out/2026-10-10); the manual probes are in the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/orioledb/RUNLOG.md) only |
+| OR09 | orioledb | [`or09-pitr.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/orioledb/tests/or09-pitr.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/orioledb/out/2026-10-10) |
+| OR10 | orioledb | [`or10-free-org.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/orioledb/tests/or10-free-org.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/orioledb/out/2026-10-10) |
+| OR99 | orioledb | [`or99-teardown.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/orioledb/tests/or99-teardown.ts) | none published |
+
+## Related docs
+
+- [Redundant writes in Postgres](/reference/postgres-redundant-writes/) - the guards, the full-page-image reasoning and the local PG 15 and 17 numbers behind the hosted summary above.
+- [Supabase compute and disk sizing](/reference/supabase-compute-disk/) - disk types, autoscale and read-only mode, which frame the 2 GB disk-fill finding.
+- [What a Supabase platform operation costs a client](/reference/supabase-platform-operation-cost/) - the same `postgres_engine` field read from the upgrade-window side, and PITR restore timings on a heap project.
+- [Supabase disaster recovery tiers](/reference/supabase-dr-tiers/) - where PITR sits among the recovery options, which an OrioleDB project cannot buy.
+
+{/* References: cited inline as [^slug]; the numbered list renders below under "References". */}
+[^sb-select-2026]: Supabase, "Scale without limits: Multigres, OrioleDB, and dbarena," Supabase Blog. https://supabase.com/blog/select-2026-scale-without-limits
+[^sb-changelog]: Supabase, "OrioleDB is now in Public Beta with paid plans and paid features," Supabase Changelog. https://supabase.com/changelog/orioledb-public-beta
+[^sb-orioledb-guide]: Supabase, "OrioleDB Overview," Supabase Docs. https://supabase.com/docs/guides/database/orioledb
+[^api-spec]: Supabase, "Management API OpenAPI document," api.supabase.com. https://api.supabase.com/api/v1-json

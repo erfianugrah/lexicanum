@@ -1,0 +1,240 @@
+---
+title: "Supabase Auth providers: custom OIDC, passkeys, SAML and a sign-in canary"
+description: Four probes of the managed Auth server on throwaway projects, 2026-10-10 - custom OIDC providers (quota, update rules, PKCE, email and audience handling), passkeys with a virtual authenticator (RP ID and origin rules, cap, admin API), a per-method sign-in canary (error classes, a session while /auth/v1 is unreachable, an issuer outage), and SAML SSO with a lab-signed Response - each row with the status, error code and docs disagreement as measured.
+author: Erfi Anugrah
+category: supabase
+group: architecture
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Supabase Auth has three sign-in surfaces that sit outside the built-in providers: custom OIDC providers, passkeys and SAML SSO. This reference records what each one answered at its edges, and what a synthetic sign-in canary can and cannot tell apart per method. It is for someone deciding which of them to build on, or wiring a monitor to them.
+
+Third-party auth, where an external issuer is trusted by the Data API, is a different mechanism and is covered in [Supabase Auth end to end](/reference/supabase-auth-end-to-end/).
+
+Every row marked measured comes from one run of the four modules AU01-AU04 of the [auth-providers experiment](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/auth-providers) in the [supabase-lab](https://github.com/erfianugrah/supabase-lab) harness, on 2026-10-10 (UTC 00:09 to 00:27 for the artifacts cited here). Each module created its own throwaway project in `ap-southeast-1`, on a Pro organisation (AU01 also created one on a Free organisation), and deleted it afterwards. The vantage is one workstation with local Docker, calling the Management API and the project hosts. The Auth server version is not exposed by the platform and was not recorded. The client is supabase-js 2.112.3; the browser for AU02 is the Chromium in the `playwright:v1.64.0-noble` container image, driven with a CDP virtual authenticator. n is 1 run per row unless the row says otherwise. Documented rows cite the vendor page, read 2026-10-10, and were not run.
+
+TL;DR:
+
+- A custom OIDC provider is created through the Auth server's own admin API, `/auth/v1/admin/custom-providers`, with the secret key. The route is absent from the Management API OpenAPI document.[^sb-mgmt-openapi] The quota measured 3 providers per project on a Pro-organisation project and on a Free-organisation project, where the docs say Pro is unlimited.[^sb-custom-oauth] Whether 3 is a raisable default is open.
+- A provider update is a PUT, and `provider_type` and `identifier` in the body are ignored with a 200. PKCE is on by default and the authorize redirect carries `code_challenge` (S256) and `state` but no `nonce`.
+- A provider whose ID token has no email claim is refused until `email_optional=true`, after which the user has an empty email. A wrong `aud` is refused in the browser flow without naming the audience; `acceptable_client_ids` fixes both that and the `signInWithIdToken` refusal.
+- Passkeys answer 404 `passkey_disabled` by default. The server refuses an origin outside `webauthn_rp_origins` (400 `webauthn_verification_failed`); the browser refuses an RP ID that is not a suffix of the page host before any request is sent. After an admin delete, sign-in is `webauthn_verification_failed`, where the docs list `webauthn_credential_not_found`.[^sb-passkeys] The cap is 10 per user (422 `too_many_passkeys`).
+- Password, `signInWithIdToken` and the OAuth browser flow each answered 200; the highest latency in ms across the three was 223 (password, p50 / max 104 / 223). A bad-signature, an expired and a wrong-`iss` ID token share one error, "Bad ID token"; a wrong `aud`, an unknown provider and a disabled provider each have their own.
+- With the client unable to reach `/auth/v1`, a session kept working on REST until the access token expired, plus a grace between 8 and 38 s on one trial. A global sign-out did not stop PostgREST accepting an issued access token before its expiry.
+- With the custom issuer deleted, `signInWithIdToken` kept succeeding for the 482 s polled, the browser flow failed at the issuer, and password sign-in was unaffected. A canary that exercises only password sign-in sees none of this.
+- A SAML provider created from metadata XML needs no reachable IdP. A lab-signed Response signs in; a replay, a bad signature, an unsigned assertion, a wrong audience, an expired one and a wrong recipient are each refused, and the five assertion failures all return `validation_failed` with the whole Response XML as the description.
+
+## Which surface answers which question
+
+| You want | Surface | What the run measured | Section |
+|---|---|---|---|
+| Sign-in through an OIDC issuer you operate | Custom OIDC provider (admin API, secret key) | 3 providers per project on Pro-org and Free-org projects; update ignores `provider_type` and `identifier` | [Custom OIDC providers](#custom-oidc-providers) |
+| Passwordless sign-in with no email prompt | Passkeys (`auth.experimental.passkey` in supabase-js) | disabled by default; RP ID and origin rules; 10 per user | [Passkeys](#passkeys) |
+| A monitor that tells a bad token from a dead provider | Canary across password, `signInWithIdToken`, browser flow | three error classes for ID tokens that look alike; an issuer outage visible only on the browser flow | [The sign-in canary](#the-sign-in-canary) |
+| Enterprise sign-in | SAML SSO provider from metadata XML | signs in without a reachable IdP; five refusals indistinguishable by message | [SAML SSO](#saml-sso) |
+
+## Custom OIDC providers
+
+Rig: an OIDC issuer written for the lab (RS256, per-run key, discovery, JWKS, authorize, token and userinfo endpoints) deployed to Cloudflare Workers and deleted after each module, registered through `POST /auth/v1/admin/custom-providers` with the project's secret key. The Management API OpenAPI document, fetched 2026-10-10, has no `custom-providers` path.[^sb-mgmt-openapi] All rows are module AU01, artifact au01-final2, run 2026-10-10 00:14 UTC. "Pro-org" and "Free-org" name the organisation the throwaway project was created in.
+
+| Behaviour | Project | Docs say | Measured |
+|---|---|---|---|
+| Create with an unresolvable issuer ([AU01a](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au01-custom-oidc.ts)) | Pro-org | the discovery document is fetched from `{issuer}/.well-known/openid-configuration`; behaviour on failure is not described[^sb-custom-oauth] | issuer `https://invalid.example.invalid`: 400 `validation_failed`, "Unable to resolve hostname". A valid issuer: 201 |
+| Provider quota ([AU01b](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au01-custom-oidc.ts)) | Pro-org | "Pro plan and above have unlimited custom providers"[^sb-custom-oauth] | 1 provider existed, 2 more were created, the next create (the 4th) was refused: 400 `over_custom_provider_quota`, "Maximum number of custom OAuth/OIDC providers reached". Total at refusal: 3 |
+| Provider quota (AU01b) | Free-org | "Free plan projects can add up to 3"[^sb-custom-oauth] | 3 created, the 4th refused with the same code. Total at refusal: 3 |
+| Update ([AU01c](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au01-custom-oidc.ts)) | Pro-org | "Update any provider fields except `provider_type` and `identifier`"[^sb-custom-oauth] | the method is PUT (PATCH answers 405). A changed `provider_type`: 200. A changed `identifier`: 200. Read back: `provider_type` still `oidc`, `identifier` still `custom:au-1`. A `name` change: 200 and took |
+| PKCE ([AU01d](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au01-custom-oidc.ts)) | Pro-org | enabled by default (`pkce_enabled: true`)[^sb-custom-oauth] | the Auth server's redirect to the issuer carried `code_challenge`, `code_challenge_method=S256` and `state`, and the issuer verified the verifier at its token endpoint. With `pkce_enabled=false` there was no `code_challenge`. No `nonce` parameter in either case, and an ID token with no `nonce` claim was accepted. The client secret arrived by HTTP Basic although the lab discovery document advertised both Basic and post |
+| Email present ([AU01e](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au01-custom-oidc.ts)) | Pro-org | - | a session; `app_metadata.provider` and the identity `provider` both `custom:au-1`; a second sign-in with the same `sub` gave the same user id |
+| No email claim ([AU01f](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au01-custom-oidc.ts)) | Pro-org | "By default, providers must return an email address"[^sb-custom-oauth] | `email_optional=false`: callback redirect with `error=server_error`, `error_code=unexpected_failure`, "Error getting user email from external provider", no session. `email_optional=true`: a session, an empty `email`, the same user id on the second sign-in |
+| Wrong `aud` ([AU01g](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au01-custom-oidc.ts)) | Pro-org | `acceptable_client_ids` lists "additional client IDs that should be accepted for audience validation"[^sb-custom-oauth] | ID token `aud` = `stranger-client`: the browser flow was refused with "Error getting user profile from external provider", which does not mention the audience; `signInWithIdToken` answered 400 "Unacceptable audience in id_token: [stranger-client]". The right `aud`: 200. After `PUT {acceptable_client_ids: [stranger-client]}` the browser flow signed in and `signInWithIdToken` answered 200 |
+
+Claims in the ID token reach the user only if the provider lists them: AU01d read the PKCE marker the issuer put in the ID token back from `user_metadata.custom_claims`, with `custom_claims_allowlist` set on the provider (the test reads that field). A provider without the allowlist was not compared in this run. `signInWithIdToken` accepts a `custom:` provider; the custom-providers page does not mention that path ([AU03a](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au03-canary.ts)).
+
+Two things to hold loosely. The post-update browser-flow retries (up to 4 times 3 s apart for audience, up to 5 for email) are not instrumented, so whether a retry was needed to see the new setting is not recorded. And an earlier AU03 attempt (artifact au03-run2, 2026-10-10 00:08 UTC) got a 400 on the first provider create against a Worker deployed seconds before; the response text was not recorded, the helper now waits for the issuer to resolve, and later runs resolved at 0 s on the first attempt, so the cause (name propagation or something else) is not established.
+
+<Aside type="note" title="The quota is a measured default">
+The 3 was measured on one Pro-organisation project, against docs that say Pro is unlimited. Two readings fit the data: 3 is a plan ceiling, or 3 is a default that an entitlement or a per-project setting can raise. No run tested a raise, so the page reports the default as measured and makes no claim about the ceiling. Neither this disagreement nor any other on the page has been filed with Supabase as of 2026-10-10.
+</Aside>
+
+## Passkeys
+
+Rig: the Playwright container, headless Chromium with a CDP `WebAuthn` virtual authenticator (ctap2, internal, resident key, user verification on), the page served from `http://localhost:3000` by request interception, and supabase-js with `auth.experimental.passkey`. Settings go through `PATCH /v1/projects/{ref}/config/auth` (`passkey_enabled`, `webauthn_rp_id`, `webauthn_rp_origins`, `webauthn_rp_display_name`). All rows are module AU02, Pro-org project, artifact au02-final, run 2026-10-10 00:13 UTC.
+
+| Behaviour | Docs say | Measured |
+|---|---|---|
+| Disabled default ([AU02a](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au02-passkeys.ts)) | error `passkey_disabled`[^sb-passkeys] | `registerPasskey` after a password sign-in on the default config: HTTP 404 `passkey_disabled`, "Passkeys are disabled" |
+| Happy path ([AU02b](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au02-passkeys.ts)) | register, then sign in without an email prompt | `rp_id=localhost`, origin `http://localhost:3000`: the options showed `rpId` localhost 3 s after the config patch. `registerPasskey` returned `created_at`, `friendly_name`, `id` (`friendly_name` "Passkey"). `signInWithPasskey` after sign-out gave a session for the same user id with `amr` `[{"method":"passkey"}]`. The admin list returned 200 with `last_used_at` set after the sign-in |
+| Origin outside `webauthn_rp_origins` ([AU02c](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au02-passkeys.ts)) | each origin's hostname must match or be a subdomain of the RP ID[^sb-passkeys] | a page at `http://localhost:3001` with the credential imported: `signInWithPasskey` and `registerPasskey` both failed at the server, 400 `webauthn_verification_failed`, "Credential verification failed". The browser raised nothing, because any localhost port is valid for an RP ID of localhost |
+| RP ID not a suffix of the page host ([AU02d](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au02-passkeys.ts)) | the RP ID is the bare domain | `webauthn_rp_id=example.com`, origin `https://example.com` (patch 200), page `http://localhost:3000`: the browser refused both calls with `SecurityError`, "The RP ID "example.com" is invalid for this domain", with no HTTP status, so no verify request reached the server |
+| Non-loopback http origin ([AU02e](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au02-passkeys.ts)) | "HTTPS is required except for loopback addresses"[^sb-passkeys] | the config patch with `http://app.localhost:3000` answered 400, `WebAuthn RP origin "http://app.localhost:3000" must use HTTPS (HTTP is only allowed for localhost/127.0.0.1)`. The refusal comes at config time |
+| RP ID changed after enrolment (AU02e) | "Changing the RP ID makes every existing passkey unusable for sign-in"[^sb-passkeys] | `rp_id=example.com` with the page at `https://example.com`: the credential bound to `localhost` could not be used (`NotAllowedError`, raised by the browser, no HTTP status); a fresh registration under the new RP ID worked and signed in. The value was already set by AU02d, so this row says nothing about how fast an RP ID change propagates |
+| Admin API ([AU02f](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au02-passkeys.ts)) | the admin endpoints need the secret key | `GET /auth/v1/admin/users/{id}/passkeys` with the publishable key: 401; with the secret key: 200. `DELETE .../passkeys/{id}`: 204 (count 2 to 1) |
+| Sign-in after delete (AU02f) | `webauthn_credential_not_found` for a credential Auth does not know[^sb-passkeys] | with the deleted passkey's credential still held by the authenticator: 400 `webauthn_verification_failed`. One trial; the oldest enrolment (rpId localhost) was the one deleted |
+| Per-user cap ([AU02g](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au02-passkeys.ts)) | error `too_many_passkeys` exists; the number is not stated[^sb-passkeys] | 1 passkey existed, 9 more were registered (a fresh virtual authenticator each), the next was refused: 422 `too_many_passkeys`, "Maximum number of passkeys reached". Total at refusal: 10 |
+
+In artifact au02-run2, 10 passkeys were registered inside the loop because the user then had no passkey left from the preceding row; the total of 10 is the consistent figure.
+
+## The sign-in canary
+
+A canary that signs in has to choose a method, and the methods fail differently. Rig for module AU03: the lab issuer plus a custom provider `custom:canary` and one password user, on a Pro-org project, artifact au03-run3, run 2026-10-10 between 00:09 and 00:20 UTC. `signInWithIdToken` is `POST /auth/v1/token?grant_type=id_token` with `provider=custom:canary` and an RS256 ID token the test mints with the key the issuer publishes. Latencies are in milliseconds from the one workstation, so they carry that vantage's round trip to `ap-southeast-1`.
+
+### Per-method status and latency
+
+| Method | Sign-ins | HTTP | Latency p50 / max (ms) |
+|---|---|---|---|
+| Password | 10 of 10 | 200 | 104 / 223 |
+| `signInWithIdToken` with a custom provider | 10 of 10 | 200 | 43 / 80 |
+| OAuth browser flow through the issuer (3 hops, redirects followed by hand) | 4 of 4 sessions | 200 | 111 / 126 |
+
+Source: [AU03a](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au03-canary.ts).
+
+### Error classes
+
+| Input | Response ([AU03b](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au03-canary.ts)) |
+|---|---|
+| Wrong password; unknown user | both 400 `invalid_credentials` |
+| ID token with a bad signature; expired; wrong `iss` | all three 400 `invalid request`, "Bad ID token" (one class) |
+| ID token with a wrong `aud` | 400, "Unacceptable audience in id_token: [someone-else]" |
+| Unknown provider | 400 `validation_failed`, `Custom provider "custom:nope" not found` |
+| Provider disabled | 400 `provider_disabled`, `Custom provider "custom:canary" is disabled` |
+
+A monitor that alerts on "Bad ID token" cannot tell a rotated key from a clock problem from an issuer mismatch. A wrong audience, a missing provider and a disabled provider can each be told apart by code or message.
+
+### A session while the client cannot reach /auth/v1
+
+The block is a client-side `fetch` wrapper that throws for any `/auth/v1/` URL, so it simulates "Auth unreachable from this client". It does not simulate a server-side fault. `jwt_exp` was set to 60 s (patch 200; the OpenAPI document allows 0 to 604800). Rows are [AU03c](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au03-canary.ts), one trial.
+
+| Moment | Observed |
+|---|---|
+| Before expiry | REST (`/rest/v1/canary`) 200 with the access token. `getSession` returned the session. `getClaims` succeeded after one unblocked call that warmed it; whether it verified locally or by another route was not recorded. `getUser` failed, because it calls `/user` |
+| After expiry, 8 s | REST still 200 |
+| After expiry, first non-200 sample | 38 s after expiry: 401 `PGRST303`, "JWT expired" (polling about every 10 s, so the grace lies between 8 and 38 s on this project) |
+| After expiry, client | `getSession` returned null with the fetch error, because its auto-refresh was blocked. `getClaims` failed. Storage still held the session (15 blocked calls, paths `/token` and `/user`) |
+| After unblocking | `refreshSession` with the stored refresh token succeeded and REST answered 200 again |
+
+### Global sign-out against an issued token
+
+[AU03d](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au03-canary.ts), Pro-org project. `POST /logout?scope=global` answered 204. For the access token issued before it: REST 200 before and 200 after; `GET /user` 403 `session_not_found`; refresh with its refresh token 400 `refresh_token_not_found`. PostgREST accepted the token on signature and expiry alone, which matches the verification model in [Supabase Auth end to end](/reference/supabase-auth-end-to-end/). Revocation reaches the Auth server's own endpoints at once and the Data API at expiry.
+
+### Issuer outage
+
+[AU03e](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au03-canary.ts), Pro-org project. The issuer Worker was deleted (delete ok). Then:
+
+| Method | Observed |
+|---|---|
+| Password sign-in | 200, latency in ms 106 |
+| `signInWithIdToken`, a newly minted token and one minted before the outage | 200 on all 17 polls spaced about 30 s apart, the last at 482 s. The earlier token is valid 600 s, so reuse beyond that was not tested |
+| OAuth browser flow | the Auth server's authorize redirect, then a failure at the issuer: "issuer did not redirect: HTTP 404", latency in ms 89 |
+
+The Auth server kept verifying against keys it already had for at least 482 s. Which cache holds them (the Auth server or something in front of it) and for how long are not separated, and no refusal was seen to bound it. For a canary this means a `signInWithIdToken` probe stays green through an outage that a real user would meet in the browser flow, so the browser flow is the probe that detects it. The same caching shape appears one layer down in [Supabase Auth end to end](/reference/supabase-auth-end-to-end/), where a Data API consumer held a third-party key set for the windows measured there.
+
+These rows show what a client and a custom issuer outage do. Nothing in the run induces a server-side Auth fault (there is no lever), so they are not a reproduction of a platform incident. For the incident classes and client-side workarounds, see [Supabase incidents: what a client can do](/reference/supabase-incident-resilience/).
+
+## SAML SSO
+
+Rig for module AU04: a provider created from metadata XML through `POST /v1/projects/{ref}/config/auth/sso/providers` (`saml_enabled` patched to true first, then settled). The test acts as the IdP and the browser. It reads the AuthnRequest ID from the `POST /auth/v1/sso` redirect (`skip_http_redirect`), has `lib/saml-idp.mjs` (xml-crypto in a bun container) sign an assertion, and POSTs the Response to the ACS. The IdP is never reachable from Supabase. Pro-org project, artifact au04-final, run 2026-10-10 00:26 UTC.
+
+| Behaviour | Measured ([AU04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au04-saml-canary.ts)) |
+|---|---|
+| Setup (AU04a) | enable patch 200 and `saml_enabled` true in the settings; provider create 201 (response keys `created_at`, `disabled`, `domains`, `id`, `saml`, `updated_at`); SP metadata 200. The SP entity ID and ACS equal `https://<project host>/auth/v1/sso/saml/metadata` and `.../sso/saml/acs` |
+| Valid sign-in (AU04b) | `POST /sso` 200; the ACS POST gave a session; 4 sign-ins, the same user every time; ACS POST latency in ms, first and max of 4: 90 and 90. `app_metadata.provider` and the identity provider are `sso:<provider uuid>` |
+| Replay of the same Response (AU04b) | not signed in: `saml_relay_state_not_found`, "SAML RelayState does not exist, try logging in again?" |
+| Bad signature (signed with another key under the right certificate), unsigned assertion, wrong audience, expired conditions, wrong recipient (AU04c) | none signed in. All five redirect with `validation_failed` and a description that starts "SAML Assertion is not valid" and carries the whole SAML Response XML: 2431 characters for the unsigned one, 4383 to 4409 for the others |
+| Email at a different domain than the provider's `domains` entry (AU04c) | signed in (an `example.org` address asserted against a provider registered for a different domain) |
+| IdP-initiated Response, no `InResponseTo` and no RelayState (AU04c) | signed in |
+
+The five refusals cannot be told apart from the tail of the description, which is the Response XML each time. The reason text, if there is any, sits in the middle of the description and was not captured, so each refusal is attributed to its variant by contrast with the accepted one, not read from a message. Two earlier runs (artifacts au04 and au04-run2) gave the same outcomes, with a first-sign-in latency in ms of 104 in au04-run2.
+
+The IdP-initiated result matches the SSO testing page, which says IdP-initiated sign-in "is always available".[^sb-sso-testing] SAML 2.0 is documented as offered on "plans Pro and above"; AU04 ran on a Pro-organisation project only, so the Free-organisation answer is not measured.[^sb-sso-saml]
+
+## Where the docs disagree with runtime
+
+| Doc claim | Runtime measured | Severity | Filed upstream |
+|---|---|---|---|
+| Pro plan and above have unlimited custom providers[^sb-custom-oauth] | 4th create refused on a Pro-org project (`over_custom_provider_quota`), total 3; the Free-org project the same (AU01b) | docs overstate, or the 3 is a default that can be raised (open) | no |
+| Update any provider fields except `provider_type` and `identifier`[^sb-custom-oauth] | a changed `provider_type` or `identifier` answers 200 and is ignored (AU01c) | docs silent on ignore versus refuse | no |
+| `webauthn_credential_not_found` for a credential Auth does not know[^sb-passkeys] | after an admin delete, with the credential still on the authenticator: `webauthn_verification_failed` (AU02f, one trial) | docs list a code the deleted case does not return | no |
+| the custom-providers page describes browser-flow providers[^sb-custom-oauth] | `signInWithIdToken` accepts a `custom:` provider (AU03a) | docs silent on this path | no |
+
+None of the disagreements on this page has been filed with Supabase as of 2026-10-10.
+
+## Reading the numbers
+
+- One project per module, one region, one day, one workstation. The latencies include the round trip from that workstation to `ap-southeast-1`; read them for their order of magnitude and for the ordering between methods.
+- The 8 to 38 s grace after expiry is one trial at about 10 s polling on a project with a 60 s `jwt_exp`. It bounds the grace on that project and does not say whether it scales with `jwt_exp`.
+- The 482 s is a lower bound on how long a deleted issuer's keys kept verifying. Polling stopped there, and the behaviour had not ended.
+- The quota of 3 is a default observed on one Pro-organisation project and one Free-organisation project. Nothing here shows it is a plan ceiling.
+- The SAML refusals are attributed by contrast with the accepted case. The run did not read a reason from any message.
+- Several rows from prior runs were repeated: the quota, update and audience results in AU01 (artifacts au01 and au01-final), the per-user total in AU02 (au02-run2), and the SAML outcomes in AU04 (au04 and au04-run2). The figures above are from the final artifact of each module.
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Plan for 3 custom providers per project until a higher limit is confirmed. | The 4th create was refused on a Pro-org and a Free-org project, 400 `over_custom_provider_quota`. Docs say Pro is unlimited; whether 3 can be raised is untested. | [AU01b](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au01-custom-oidc.ts) |
+| Create providers through `/auth/v1/admin/custom-providers` with the secret key. | The route is absent from the Management API OpenAPI document of 2026-10-10. | [AU01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au01-custom-oidc.ts) |
+| Delete and recreate a provider to change its type or identifier. | A PUT with a changed `provider_type` or `identifier` answers 200 and changes nothing. | [AU01c](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au01-custom-oidc.ts) |
+| Set `acceptable_client_ids` before a second client signs in. | A wrong `aud` is refused in the browser flow without naming the audience, and by `signInWithIdToken` as "Unacceptable audience". | [AU01g](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au01-custom-oidc.ts) |
+| Make the issuer return an email, or set `email_optional=true` knowingly. | Without an email claim: `unexpected_failure`. With the flag: a user with an empty `email`. | [AU01f](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au01-custom-oidc.ts) |
+| List the claims you need in `custom_claims_allowlist`. | The claim the run read back reached `user_metadata.custom_claims` with the allowlist set; no case without it was run. | [AU01d](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au01-custom-oidc.ts) |
+| Do not rely on a `nonce` for replay protection of a custom provider. | The authorize redirect carried `state` and a PKCE `code_challenge` but no `nonce`, and a token with no `nonce` claim was accepted. | [AU01d](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au01-custom-oidc.ts) |
+| Keep `webauthn_rp_id` fixed once users enrol. | A credential bound to `localhost` was unusable after the RP ID changed; a new enrolment worked. | [AU02e](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au02-passkeys.ts) |
+| Put every serving origin in `webauthn_rp_origins`, over HTTPS except loopback. | An origin outside the list: 400 `webauthn_verification_failed`. A non-loopback http origin: 400 at config time. | [AU02c](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au02-passkeys.ts), [AU02e](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au02-passkeys.ts) |
+| Handle `webauthn_verification_failed` as the deleted-credential error too. | After an admin delete, sign-in returned it instead of the documented `webauthn_credential_not_found` (one trial). | [AU02f](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au02-passkeys.ts) |
+| Offer a passkey list and delete; stop at 10 per user. | The 11th registration: 422 `too_many_passkeys`. Admin list and delete need the secret key. | [AU02g](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au02-passkeys.ts), [AU02f](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au02-passkeys.ts) |
+| Probe each sign-in method you offer, not only password. | Password, `signInWithIdToken` and the browser flow each answered 200, and only the browser flow failed during the issuer outage. | [AU03a](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au03-canary.ts), [AU03e](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au03-canary.ts) |
+| Alert on the browser-flow probe to detect a custom issuer outage. | With the issuer deleted, `signInWithIdToken` succeeded on all 17 polls over 482 s; the browser flow failed at the issuer. | [AU03e](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au03-canary.ts) |
+| Do not triage "Bad ID token" by message. | A bad signature, an expired token and a wrong `iss` return the same error. | [AU03b](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au03-canary.ts) |
+| Treat an issued access token as valid until expiry on the Data API. | After a global sign-out, REST answered 200 with the old token while `/user` answered 403. | [AU03d](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au03-canary.ts) |
+| Expect REST to keep working only until the access token expires. | With `/auth/v1` blocked, REST was 200 at 8 s after expiry and 401 `PGRST303` by 38 s. | [AU03c](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au03-canary.ts) |
+| Test SAML sign-in with a signed Response from a lab IdP. | Metadata XML needs no reachable IdP; the signed Response signed in as `sso:<uuid>`. | [AU04b](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au04-saml-canary.ts) |
+| Do not read the SAML failure reason from the description. | Five different failures returned `validation_failed` with the full Response XML. | [AU04c](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au04-saml-canary.ts) |
+| Check the provider's `domains` entry is not your only email gate. | An asserted email at another domain, and an IdP-initiated Response, both signed in. | [AU04c](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au04-saml-canary.ts) |
+
+## Evidence
+
+The run record is the experiment's [RUNLOG.md](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/RUNLOG.md), and the redacted run artifacts (au01-final2, au02-final, au03-run3 and au04-final) belong under [out/2026-10-10](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/auth-providers/out/2026-10-10) once published. Every number in a measured row was taken from the RUNLOG tables.
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| Admin route `/auth/v1/admin/custom-providers` absent from the Management API OpenAPI document; create of an unresolvable issuer 400 `validation_failed`; quota 3 on Pro-org and Free-org projects; PUT ignores `provider_type` and `identifier` | measured 2026-10-10 | [AU01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au01-custom-oidc.ts), artifact au01-final2 - the OpenAPI document searched for the path; creates until refusal; update then read-back |
+| PKCE default with S256 and `state`, no `nonce`, secret by Basic; email and audience handling | measured 2026-10-10 | AU01, artifact au01-final2 - the issuer recorded the authorize parameters and the token request it received |
+| Passkey disabled default, origin and RP ID refusals, cap of 10, admin list and delete, sign-in after delete | measured 2026-10-10 | [AU02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au02-passkeys.ts), artifact au02-final - headless Chromium with a CDP virtual authenticator, supabase-js 2.112.3 |
+| Per-method status and latency; error classes; session without `/auth/v1`; global sign-out; issuer outage | measured 2026-10-10 | [AU03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au03-canary.ts), artifact au03-run3 - 10, 10 and 4 sign-ins per method; REST polling about every 10 s; 17 polls about 30 s apart during the outage |
+| SAML provider from metadata, signed Response, replay, five refusals, other-domain email, IdP-initiated | measured 2026-10-10 | [AU04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au04-saml-canary.ts), artifact au04-final - a lab IdP signing with xml-crypto, POSTed to the ACS |
+| Free plan 3 custom providers, Pro unlimited; passkey error codes and RP ID rule; SAML on Pro and above | documented | the three docs pages cited above, read 2026-10-10; not run except where a row above says so |
+| Pro limit above 3 | not measured | no run raised the quota |
+
+### Not covered
+
+- A Pro limit above 3 custom providers, and whether one can be granted.
+- Real IdPs (Okta, Entra): the SAML run used a lab-signed Response.
+- SAML metadata URL fetch and refresh.
+- Encrypted assertions.
+- Real platform or hardware authenticators, and Safari and Firefox.
+- SAML on a Free organisation.
+- A server-side Auth outage: there is no lever, so AU03c and AU03e are client-side and issuer-side only.
+- Also not run: `skip_nonce_check=true`, `discovery_url`, `authorization_params`, `attribute_mapping`, the OAuth2 provider type, and what disabling a provider does to existing users; unconfirmed, banned, anonymous and SSO users for passkeys, rename and delete as the user, challenge expiry (`webauthn_challenge_expired`) and replay of a used challenge; SAML session lifetime and logout.
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| AU01 | auth-providers | [`au01-custom-oidc.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au01-custom-oidc.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/auth-providers/out/2026-10-10) (au01-final2) |
+| AU02 | auth-providers | [`au02-passkeys.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au02-passkeys.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/auth-providers/out/2026-10-10) (au02-final) |
+| AU03 | auth-providers | [`au03-canary.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au03-canary.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/auth-providers/out/2026-10-10) (au03-run3) |
+| AU04 | auth-providers | [`au04-saml-canary.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/auth-providers/tests/au04-saml-canary.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/auth-providers/out/2026-10-10) (au04-final) |
+
+## Related docs
+
+- [Supabase Auth end to end](/reference/supabase-auth-end-to-end/) - how tokens are signed and verified, and how third-party auth trusts an external issuer for the Data API; the verification model behind the global sign-out and expiry rows here.
+- [Supabase incidents: what a client can do](/reference/supabase-incident-resilience/) - the incident classes and the `jwt_exp` lever that the "session without /auth/v1" rows put numbers on.
+- [Foreign keys to auth.users: the lock that freezes sign-in](/reference/supabase-auth-users-locks/) - another way sign-in stops, from the database side.
+- [Resilience runbook](/guides/supabase-resilience-runbook/) - the canary table probe for the Data API, which is the other half of a sign-in monitor.
+
+[^sb-custom-oauth]: Supabase, "Custom OAuth/OIDC providers," Supabase Docs, read 2026-10-10. https://supabase.com/docs/guides/auth/custom-oauth-providers
+[^sb-passkeys]: Supabase, "Passkeys," Supabase Docs, read 2026-10-10. https://supabase.com/docs/guides/auth/passkeys
+[^sb-sso-saml]: Supabase, "Single Sign-On with SAML 2.0," Supabase Docs, read 2026-10-10. https://supabase.com/docs/guides/auth/enterprise-sso/auth-sso-saml
+[^sb-sso-testing]: Supabase, "Testing best practices," Supabase Docs (SSO), read 2026-10-10. https://supabase.com/docs/guides/platform/sso/testing-best-practices
+[^sb-mgmt-openapi]: Supabase, "Management API OpenAPI document," api.supabase.com, as served on 2026-10-10 (the document changes without notice). https://api.supabase.com/api/v1-json

@@ -1,0 +1,363 @@
+---
+title: "Supabase CLI 2.120.0: pg-delta vs migra, config pull and the no-Docker stack"
+description: What the Supabase CLI 2.120.0 does when it turns a database into a migration, a dashboard setting into a config file and a checkout into a local stack - the migra and pg-delta diff engines compared by catalog fingerprint (223 against 238 of 238 lines), the declarative sync round trip, what config pull and pull write and skip, and the experimental stack that runs with no Docker daemon - measured on 2026-10-10 against what the changelog and blog say.
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+What the Supabase CLI 2.120.0 produces when it diffs a schema, pulls remote settings into `config.toml`, or starts a local stack without Docker, checked against the public changelog and blog. It is for anyone who generates migrations with `supabase db diff`, is moving to declarative schemas, or wants worktree-per-branch local stacks.
+
+Everything with a module id (CL01-CL04, CL20-CL22) was measured on 2026-10-10 by the `cli-surface` experiment in [supabase-lab](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/cli-surface). CL01-CL03 ran on a macOS arm64 host with Docker Desktop, using the `supabase` binary on its PATH (a Homebrew install), which reported 2.120.0. CL20-CL22 ran in a Debian bookworm container on the same host (linux/arm64, 10 CPUs, 7834 MB, non-root, no `docker` or `podman` binary and no socket) with the Linux release tarball, also 2.120.0. CL04 recorded no CLI version because its artifact predates that field; it ran on the same host install the same day, which is an inference with no record behind it. The figures are pasted from the published [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/cli-surface/out/2026-10-10) artifacts; the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/cli-surface/RUNLOG.md) has the rest. n is 1 per figure unless a row says otherwise. CL01-CL03 ran twice that day; counts, statuses and fingerprints matched and only timings differed, so the rerun is the one cited. What the docs say is cited as a footnote and kept apart from what the runs measured.
+
+**TL;DR:**
+
+- On a fixture with `FORCE ROW LEVEL SECURITY`, 6 policies, column and sequence grants, default privileges, comments and a `security_invoker` view, the migration from `db diff --use-migra` rebuilt 223 of 238 catalog lines. `--use-pg-delta` rebuilt 238 of 238 (CL01c).
+- A fresh `supabase init` on 2.120.0 used pg-delta with no flag. The changelog says pg-delta is not yet the default; the Select 2026 blog says it is for new `init` projects. The runtime agrees with the blog (CL01b).
+- The declarative path (`generate`, `sync`, `db reset`) also reached 238 of 238, and a second `sync`, `diff` and export were empty or identical (CL02). pg-delta named 17 of 22 object kinds in SQL; `--strict-coverage` fails on four of the other five (CL03c).
+- `config pull` wrote 3 of 6 remote differences after API-side changes and skipped an enabled GitHub provider. A storage bucket created through the Storage API did not appear in its diff (CL04b).
+- The experimental stack is off by default and runs with no Docker daemon: cold start 14145 ms, warm restart 643 ms, 252 MB of summed PSS asleep and 2145 MB awake per stack, one run (CL20, CL21).
+
+---
+
+## Which path to use
+
+| You need | Use | Evidence |
+|---|---|---|
+| A migration from a local database that uses FORCE RLS, column grants, default privileges or `security_invoker` views | `db diff --use-pg-delta` | 238 of 238 lines; migra 223 of 238 (CL01c) |
+| A schema tree under version control | `db schema declarative generate`, then `sync` | 238 of 238 after `db reset`; second `sync` writes nothing (CL02) |
+| CI that fails when an object kind is not managed | `--strict-coverage` | exit 1 for cast, operator, statistics object, `text search configuration` (CL03c) |
+| Remote settings back in `config.toml` | `config pull` | 3 of 6 differences written; provider secrets and buckets not (CL04b) |
+| Remote schema as a migration | `supabase pull` | exit 1 on a never-migrated project, migration still written (CL04d) |
+| A local stack in a container or a worktree with no Docker | `SUPABASE_EXPERIMENTAL_STACK=1` | 3 stacks, 30 distinct ports (CL21a) |
+
+---
+
+## Method: the catalog fingerprint
+
+CL01-CL03 apply `fixtures/schema.sql` to a local Postgres 17 started with `supabase db start` (the legacy Docker backend). The fixture has schema `app` plus `public`, 2 RLS-enabled tables in `app` and 1 in `public`, `FORCE ROW LEVEL SECURITY` on `app.docs`, 6 policies (one restrictive, one for `anon`, one `to public`), a column grant, sequence grants, 3 `ALTER DEFAULT PRIVILEGES` statements, two functions (one `SECURITY DEFINER` with a pinned `search_path` and its execute grant revoked from PUBLIC), a trigger, a generated column, a partial index and a GIN index, an extension, 2 comments and a `security_invoker` view.
+
+Fidelity is a catalog fingerprint (`lib/fingerprint.ts`): 238 sorted text lines covering relations with owner and RLS flags, columns, constraints, indexes, policies, triggers, function definitions and ACLs, enum labels, sequences, relation, column, schema and function ACLs, default privileges and extensions. The fingerprint is read from the fixture database and from a database rebuilt from a tool's output, and the two are compared line by line. It says nothing about what it does not cover: data, storage objects, publications, event triggers and roles.
+
+---
+
+## pg-delta against migra
+
+### Counting statements
+
+`db diff` against the fixture, both engines (CL01a):
+
+| Item | migra (`--use-migra`) | pg-delta (`--use-pg-delta`) |
+|---|---|---|
+| Statement-start lines in the diff | 57 | 57 |
+| `FORCE ROW LEVEL SECURITY` statements (fixture has 1) | 0 | 1 |
+| `COMMENT ON` statements (fixture has 2) | 0 | 3 (the third is the extension's own comment) |
+| `ALTER DEFAULT PRIVILEGES` (fixture has 3) | 0 | 3 |
+| `security_invoker` on the view | 0 | 1 |
+| Column-level grant | 0 | 1 |
+| Function ACL statements | 0 | 2 |
+| Sequence ACL statements | 0 | 4 |
+| REVOKE statements | 0 | 8 |
+| Statements that drop something | 1 (`drop extension if exists "pg_net"`) | 0 |
+| `db diff` wall time, second of two runs on one project (CL01d) | 3406 ms (first run 11358 ms) | 1683 ms (first run 6136 ms) |
+
+The two diffs have the same number of statement starts and different content. Counting statements does not tell the engines apart; the fingerprint does.
+
+### Rebuilding from the diff
+
+The diff was applied to a reset database and fingerprinted (CL01c):
+
+| Engine | Lines identical | Only in the fixture database | Only after the round trip |
+|---|---|---|---|
+| migra | 223 of 238 | 15 | 5 |
+| pg-delta | 238 of 238 | 0 | 0 |
+
+The 15 lines migra lost, by kind: column ACL 1, relation ACL 2, schema ACL 3, column comment 1, relation comment 1, default privileges 3, function 1, relation 2, sequence 1. The 5 it invented: default privileges 1, function 1, relation 2, sequence 1. Read against the lines themselves, the migra round trip:
+
+- dropped `FORCE ROW LEVEL SECURITY`, both comments, the 3 `USAGE` grants on schema `app`, the `authenticated` grant on `ticket_seq`, the select grant on `live_docs` for `anon` and the 3 default privileges in `app`;
+- lost `security_invoker` on the view, and turned the sequence start of 1000 into 1;
+- left the function with `EXECUTE` for PUBLIC and no explicit grant to `authenticated`, where the fixture had revoked PUBLIC and granted `authenticated`, and brought back the default function privilege for `anon` that the fixture had revoked.
+
+The last item widens a permission: a function the fixture closed to PUBLIC is open after the migra migration is applied. The raw line files behind this paragraph are in the lab's gitignored evidence directory and are not published; the counts above are in the artifact.
+
+### Which engine runs by default
+
+| Claim | Source | Measured on 2.120.0 | Filed upstream |
+|---|---|---|---|
+| pg-delta is not yet the default diff engine; enable it with `[experimental.pgdelta] enabled = true` or `--experimental` | Changelog, 2026-04-16[^sb-changelog-pgdelta] | - | - |
+| New projects created with `supabase init` use pg-delta by default | Blog, 2026-10-02[^sb-select-2026] | A fresh `init` project: JSON `engine` field `pg-delta`, output equal to explicit `--use-pg-delta`, generated `config.toml` has `[experimental.pgdelta] enabled = true` (CL01b) | no |
+
+The two sources are dated about five and a half months apart, so the disagreement may be a change over time. The runtime matches the later one for a fresh `init`. CL01b did not test an existing project whose `config.toml` lacks the section, which the blog says can turn it on by hand.
+
+### pg-delta output noise
+
+The pg-delta diff re-grants each owner's own privileges: `REVOKE ALL ... FROM "postgres"` followed by a `GRANT` that includes `MAINTAIN`. `MAINTAIN` is in the emitted text on a Postgres 17 database. Whether a Postgres 15 target accepts it was not run.
+
+Two timings come from outside the harness, with no artifact and no repeat. The very first `db diff --use-pg-delta` on the host took 4 min 25 s by shell `time`, before the Docker images and the CLI's shadow-baseline cache existed. Another run with an empty `SUPABASE_HOME` and the images present took 5.5 s by the same method. The cause of the 4 min 25 s was not separated; image pulls are the likely reading.
+
+---
+
+## Declarative schemas
+
+### Generate, sync, reset
+
+On the fixture database (CL02):
+
+- `db schema declarative generate --local` exited 0 in 321 ms and wrote 17 files (10407 bytes) with a load order of 16 entries in `.pgdelta-export.json` (`formatVersion` 1, profile `supabase`, `redactSecrets` true). `_cluster/extensions/` has 3 files, `app/` and `public/` have per-object directories, each schema has a `default_privileges.sql`, and `public/adp_wipes.sql` clears assumed destination defaults. The three extension files include `pgcrypto` and `uuid-ossp`; the fixture creates only `pg_trgm`, so the other two are consistent with coming from the platform baseline (not checked directly).
+- `sync --no-apply` against an empty `supabase/migrations` exited 0 in 3276 ms and wrote one migration of 6215 bytes with 59 statement starts, against 57 from `db diff --use-pg-delta`. The 2 extra statements are `REVOKE ALL ON SEQUENCE "app"."docs_id_seq" FROM "authenticated"` and `REVOKE ALL ON TABLE "app"."live_docs" FROM "authenticated"`. No statement appears only in the diff.
+- `db reset` applied that migration in 13704 ms and the fingerprint was 238 of 238 lines identical.
+- A second `sync` wrote 0 migrations and reported no schema changes, `db diff` after the reset was 0 bytes, and a second export into a scratch directory had 0 changed and 0 missing files out of 17.
+
+### Editing the tree
+
+One `sync --no-apply` after six edits (CL03a): a new column, a dropped policy, a changed policy predicate, a changed function body, a new table in a new file `aa_tags.sql` whose policy calls a function declared in another file, and a deleted table file. Statements by kind: add column 1, drop policy 2, create policy 2, create function 1, create table 1, drop table 1, alter policy 0.
+
+- A changed policy is rewritten as drop plus create, not an alter.
+- A deleted table file becomes `DROP TABLE "public"."profiles"`, and the CLI prints `Found destructive changes in schema diff` listing it.
+- `sync --apply` then left 2 rows in `migration list --local` (the baseline and the edit), the new column and table present, the dropped policy and table absent, and a second `sync` found no changes.
+
+Order (CL03b): a hand-written tree with no export and no load-order file, files named `01_policies.sql`, `02_functions.sql` and `03_tables.sql`. The migration put the table and the function before the policy, so ordering followed dependencies and not file names, in this one case. A declared `grant select ... to authenticated` was merged into the platform's default grant list for the table, with no separate statement. For a column named `owner`, pg-delta printed the policy expression as `USING (public.cl03_visible(OWNER))`: valid SQL, keyword-cased by the formatter.
+
+### Object-kind coverage
+
+CL03c created 22 kinds in one database and checked which marker names reached the emitted SQL: migra 8, pg-delta 17, declarative export 17. This is a regex on the marker name in the SQL text, not a check that the object is reproduced correctly.
+
+| Kinds | migra | pg-delta | Export |
+|---|---|---|---|
+| composite, enum, matview, partitioned, inherits, unlogged, storage_params, collation | yes | yes | yes |
+| domain, range, rule, aggregate, publication, event_trigger, role, schema_comment, foreign_table | no | yes | yes |
+| statistics, operator, cast, tsconfig, role_setting | no | no | no |
+
+`--strict-coverage` made both `db diff --use-pg-delta` and `declarative generate` exit 1 with `pg-delta does not manage these PostgreSQL object kinds: cast, operator, statistics object, text search configuration`. `ALTER ROLE ... SET` (role_setting) was not in that list and not in the SQL either.
+
+### Mixing engines
+
+With an exported tree present in `supabase/schemas`, `db diff --use-migra` exited 1: `ERROR: extension "pgcrypto" already exists (SQLSTATE 42710)`, after listing the declarative files it was building the local database from. `--use-pg-delta` exited 0. With the tree directory removed, migra ran (CL03d, CL01).
+
+---
+
+## config pull, pull and the linked diff
+
+CL04 used one Free-org project in ap-southeast-1, created and deleted by the module. The dashboard changes were made through the Management API and the Storage API, which the dashboard calls; the dashboard UI itself was not driven.
+
+### config pull
+
+On a new project against a freshly initialised config (CL04a): 13 differences, 12 to write and 1 to skip, in the scope `api, auth, database, pooler, realtime, storage`. The dry run left `config.toml` unchanged. After the write 1 difference remained (`auth.password_requirements`, local-only, not pulled). The output also lists 2 credential values it does not compare (`auth.external.apple.secret`, `auth.sms.twilio.auth_token`) and 9 declared properties "not part of the current comparison".
+
+After a GitHub provider was enabled with a client id and secret, anonymous sign-ins turned on, PostgREST `max_rows` set to 777, the storage global file size limit set to 12345678 bytes and one storage bucket created with a 1 MiB limit and a MIME allow-list (CL04b), the diff listed 6 entries, 3 to write and 3 to skip:
+
+| Setting | Result |
+|---|---|
+| `max_rows` | written: `max_rows = 777` |
+| storage global file size limit | written: `file_size_limit = "11.77MiB"` |
+| anonymous sign-ins | written: `enable_anonymous_sign_ins = true` |
+| `auth.external.github.enabled` and `client_id` | skipped: "remote-only, skip: requires values pull cannot write" |
+| Storage bucket | not listed; `[storage.buckets.cl-bucket]` absent from the written file |
+
+For the GitHub provider the CLI warns that `auth.external.github.secret` needs to be configured manually, and no `[auth.external.github]` section reached `config.toml`. The blog's sentence is that a setting changed in the dashboard comes back into the file with `supabase config pull`;[^sb-select-2026] on this project that held for 3 of the 5 changes (`max_rows`, the file size limit, anonymous sign-ins) and not for the provider or the bucket.
+
+### pull on a project that never had a migration
+
+`supabase pull --yes` (CL04d) exited 1 in 4704 ms. The summary rows: config unchanged; `migration_history` failed (`relation "supabase_migrations.schema_migrations" does not exist`, because the project had never had a migration applied); database changed (one migration, 6089 bytes); functions unchanged. The pulled migration, applied to a local database and compared with the remote catalogs through the same fingerprint query, was 238 of 238 lines identical. The blog describes `supabase pull` as pulling config, schema and Edge Functions in one command.[^sb-select-2026] The exit code is 1 although the schema migration was written.
+
+### Linked diff from one vantage
+
+After the fixture was applied to the project (CL04c, second of two runs), `db diff --linked --use-pg-delta` exited 0 with 57 statement starts in 2576 ms. `db diff --linked --use-migra` exited 1 in 2144 ms with `getaddrinfo ENOTFOUND` for the direct database host.
+
+The macOS host's resolver returns no A record for a project's direct database host (AAAA 1; the same vantage behaviour is recorded for `dns.lookup` in the [incident resilience reference](/reference/supabase-incident-resilience/)). Two readings fit: the migra path connects to the direct host, which this host cannot resolve, while the pg-delta path reaches the database another way; or the migra error is unrelated to the vantage. The run did not separate them. A vantage with IPv6 would.
+
+---
+
+## The experimental stack without Docker
+
+The stack is the CLI's native local runtime. The Select 2026 blog describes it as "in alpha today, off by default" and says several checkouts or git worktrees of one repository can run at the same time.[^sb-select-2026] Measured in the container, with no Docker available.
+
+### Switches
+
+Start exit status with no Docker present (CL22a, CL20a):
+
+| `SUPABASE_EXPERIMENTAL_STACK` | `[experimental] stack` | `supabase start` |
+|---|---|---|
+| unset | unset | exit 1 (`failed to inspect container health: docker: command not found (podman also not found)`) |
+| `1` | unset | exit 0 |
+| unset | `true` | exit 0 |
+| `0` | `true` | exit 1 (the variable wins) |
+| `1` | `false` | exit 0 |
+| unset | `false` | exit 1 |
+| `2` | any | exit 1 (`SUPABASE_EXPERIMENTAL_STACK must be 0 or 1 when set`) |
+| empty | any | exit 1 |
+
+The global `--experimental` flag also exited 1. The top-level help lists `stack` only when the variable is 1. `supabase init` under the variable writes `stack = true` under `[experimental]` and 0 `port =` lines (CL20b).
+
+### Start, stop and memory
+
+All of this is one run in one container (CL20b-d).
+
+| Step | Result |
+|---|---|
+| Cold start, empty `SUPABASE_HOME` (native artifacts downloaded) | exit 0 in 14145 ms; runtime `native`; 10 services; only `database` running at return, the other 9 sleeping (activation "lazy") |
+| Endpoints | 14 endpoints on 10 distinct ports, none of the legacy defaults; REST, auth, realtime, storage and functions share one gateway port |
+| `stop` | 12293 ms |
+| `start` with artifacts cached | 643 ms; 14 of 14 endpoint ports unchanged across the restart |
+| Native artifact cache | 1666 MB (postgres 388, studio 456, pgmeta 203, analytics 186, storage 155, edge-runtime 118, realtime 85, auth 33, mailpit 26, postgrest 20) |
+
+First request to each lazy service (CL20c): rest 312 ms, functions 307 ms, auth 615 ms, storage 1105 ms, realtime 1941 ms, studio 4937 ms (HTTP 307), mail 4 ms. All 10 services were running afterwards.
+
+| Memory, summed over the container | Asleep | All services awake |
+|---|---|---|
+| PSS | 252 MB | 2145 MB |
+| RSS (counts shared pages once per process, so overstates) | 392 MB | 3145 MB |
+| Processes | 18 | 69 |
+
+An application flow through the gateway passed (CL20e): an RLS table created with psql, sign-up 200, password sign-in 200 with a JWT, insert 201, select 200 `[{"body":"hello"}]`, anonymous select 200 `[]`, an edge function answering 200, the Mailpit API answering. The module's pass band was all of those steps, and one run is not a platform guarantee.
+
+### Worktrees
+
+A repository initialised under the stack (no port lines), with a main checkout and two linked worktrees (CL21a):
+
+- 3 stacks, `start` exit 0 in each, wall time 12245 / 2016 / 1922 ms (the first includes the artifact download), 10 distinct ports per stack, 0 ports shared between stacks, 3 distinct stack ids, runtime native for all. The 3 stacks together held 30 distinct ports.
+- A table created in one stack was absent from another, and both gateways answered 200 (CL21b). Summed PSS was 544 MB with all three asleep and 3978 MB with two awake (RSS 1011 and 6382 MB); processes 44 and 143; stack state on disk 180 MB.
+- Stopping one stack exited 0 in 11851 ms, its database port stopped listening and the other stack's gateway kept answering 200 with its table (CL21c).
+
+Stack identity is directory plus branch. The three stacks differed in both, so the data is consistent with that key; the run did not vary one at a time. After `git switch -c b2` inside a worktree, `status` said "No managed stack exists for the selected project", and `start` (2285 ms) created a second stack for the same directory on `refs/heads/b2` with an empty `public` schema. The stack on `refs/heads/b` stayed listed and reachable. Data does not follow a branch switch (CL21d).
+
+A project initialised with the legacy backend has 6 `port =` lines and no `stack` key. Run with the variable set to 1, the first worktree started and the second exited 1 in 339 ms with `Cannot bind ... sql at 127.0.0.1:54322`, naming the first stack as the claimant; the second stack was registered as `unavailable`. Shifting its ports (database 55322) started it (CL21e).
+
+### Command surface, services and config drift
+
+Against a running stack with no Docker (CL22b), 22 commands: 18 exited 0 and 4 did not.
+
+- Exit 0: `status`, `db diff` (default and `--use-pg-delta`), `declarative generate` and `sync`, `migration list`, `db reset`, `migration new` and `up`, `db dump` (empty database and data-only), `db lint`, `gen types`, `db query`, `db advisors`, `inspect db`, and `test db` (a pgTAP file, `.. ok`).
+- `db diff --use-migra` and `--use-pg-schema` exited non-zero: `The stack backend only supports the pg-delta engine. Do not pass --use-migra; set SUPABASE_EXPERIMENTAL_STACK=0.`
+- `functions serve` exited 124 (the 25 s timeout). It printed `Serving functions on http://127.0.0.1:8081/...` while the stack's functions gateway was on another port.
+- A schema `db dump` failed with `pg_dump: error: could not write to file: Resource temporarily unavailable` once the database held a pgTAP extension, one table and one policy: 4 of 5 repeats with stdout redirected and 4 of 5 with stdout captured. The empty-database and data-only dumps passed. A manual check outside the harness (no artifact) in a separate box with an empty database passed 7 of 7 schema dumps. The trigger was not isolated.
+
+Services (CL22c): `start --help` lists 13 `--exclude` names for the legacy backend (gotrue, realtime, storage-api, imgproxy, kong, mailpit, postgrest, postgres-meta, studio, edge-runtime, logflare, vector, supavisor) and 9 capability names for the stack (rest, auth, realtime, storage, functions, studio, mail, analytics, pooler).
+
+| Service | Result on the stack |
+|---|---|
+| Image rendering | 404 (`Route GET:/render/image/... not found`) with the config as `init` wrote it, where the section is commented out; 200 with a 283-byte PNG after enabling `[storage.image_transformation]` and a `stop` then `start`, with an `imgproxy` service then listed |
+| Realtime | WebSocket upgrade answered `HTTP/1.1 101 Switching Protocols` |
+| Analytics | health 200 |
+| Pooler | `[db.pooler] enabled = true` added to a running stack did nothing (`start` exit 0, `stack restart` `using its saved configuration`, no pooler service); after `stack destroy` and a fresh start the service list included `pooler` (sleeping, with an SQL endpoint) |
+
+A psql connection through the pooler as `postgres.app` was refused with `FATAL: (ENOTFOUND) tenant/user postgres.app not found` (rerun). The first run printed a different first line, `received invalid response to SSL negotiation: H`, on the same kind of connection (ports 32302 and 23240); the two runs disagree on what the pooler answers and the module did not separate the cause. The tenant name the pooler expects was not determined, so no query went through the pooler.
+
+Config drift (CL22d): after `enable_signup = false` with the stack running, `stack status` showed `config_drift` "changed" for `services.auth.config.disableSignup`. Sign-up HTTP status was 200 before the edit, 200 after `start`, 200 after `stack restart` (`restarted using its saved configuration`), 422 `signup_disabled` after `stop` then `start` with the marker table still present, and 422 after `stack destroy` and `start` with the marker table gone.
+
+---
+
+## Not measured
+
+- Linux amd64 (the container was arm64; the CLI lists native artifacts for linux-amd64, linux-arm64 and darwin-arm64), the glibc floor, a hosted CI runner, the macOS native runtime on the host and Podman.
+- Idle stops (the help text mentions automatic idle stops; none was awaited), `--preparation on-demand`, long-running stability and more than 3 stacks.
+- Postgres 15 targets for pg-delta output (the diff contains `MAINTAIN` grants); the unmanaged kinds beyond the four the diagnostic named; correctness of the 17 kinds pg-delta named beyond the marker regex.
+- The dashboard UI path for CL04b, `config push`, a project with an existing migration history table, a paid-plan or non-default-region project, and the pooler SQL path in CL22c.
+- Whether the migra linked-diff failure in CL04c depends on the vantage, and what triggers the intermittent schema `db dump` failure in CL22b.
+
+---
+
+## Reading the numbers
+
+- The 238-line fingerprint is a floor on what the fixture exercises. A tool that scores 238 of 238 has reproduced those lines; it has not been shown to reproduce an object the fixture lacks. The fixture covers the privilege and RLS surface that [locking down the Data API](/reference/supabase-data-surface-lockdown/) depends on, so the migra loss is a loss in the settings that decide who can read a table.
+- The migra result is a property of 2.120.0 on this fixture. No run used a schema without FORCE RLS, comments, default privileges and a `security_invoker` view, so how much migra loses there was not measured.
+- The stack timings are one container, one run, arm64. The cold start is dominated by the artifact download (14145 ms against 643 ms warm); a runner with cached artifacts looks like the warm figure, which was not measured on a runner.
+- The PSS figures are per stack with every service awake. Three stacks with two awake were 3978 MB, so the memory budget for a worktree-per-branch workflow scales with the number of awake stacks; three asleep stacks summed to 544 MB.
+
+---
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Generate migrations with `--use-pg-delta` when policies, grants or views carry settings. | migra rebuilt 223 of 238 lines and dropped FORCE RLS, comments, default privileges, schema USAGE grants and `security_invoker`; pg-delta 238 of 238 | CL01 |
+| Read function `EXECUTE` grants in any generated diff. | the migra round trip left PUBLIC execute and no grant to `authenticated`, where the fixture had revoked PUBLIC | CL01 |
+| Check `MAINTAIN` grants in pg-delta output before a Postgres 15 target. | the text contains `REVOKE ALL ... FROM "postgres"` then a `GRANT` with `MAINTAIN` on Postgres 17; a Postgres 15 target was not run | CL01 |
+| Remove `supabase/schemas` before `db diff --use-migra`, or use pg-delta. | exit 1, `extension "pgcrypto" already exists (SQLSTATE 42710)`, with an exported tree present | CL03 |
+| Pass `--strict-coverage` in CI. | exit 1 naming cast, operator, statistics object and `text search configuration`; `ALTER ROLE ... SET` was in neither the list nor the SQL; keep unmanaged DDL in `_custom/` as the diagnostic says | CL03 |
+| Read the destructive-changes warning from `sync` before applying. | a deleted table file became `DROP TABLE "public"."profiles"` with a warning | CL03 |
+| Re-enter provider secrets and bucket settings by hand after `config pull`. | an enabled GitHub provider was skipped (`requires values pull cannot write`); no bucket section was written | CL04 |
+| Expect exit 1 from the first `supabase pull` of a never-migrated project. | exit 1 on `migration_history`; the schema migration was still written, 238 of 238 lines on a local rebuild | CL04 |
+| Try `--use-pg-delta` when a linked `db diff --use-migra` fails with `ENOTFOUND`. | one vantage with no A record for the direct host: migra exit 1, pg-delta exit 0 with 57 statement starts; cause not separated | CL04 |
+| Set `SUPABASE_EXPERIMENTAL_STACK=0` to override `stack = true` in a config. | start exited 1 with the key `true` and the variable `0`, no Docker present | CL22 |
+| Initialise worktree repositories under `SUPABASE_EXPERIMENTAL_STACK=1`. | no port lines gave 3 stacks and 30 distinct ports; a config with 6 legacy `port =` lines made the second worktree fail to bind | CL21 |
+| Keep seed data in migrations or a seed file. | a branch switch inside a worktree then `start` made a second stack with an empty `public` schema | CL21 |
+| Apply a config change to a running stack with `stop` then `start`. | signup stayed 200 after `start` and `stack restart`, 422 after `stop` then `start`; `stack destroy` also applies it and deletes the data | CL22 |
+| Enable `[storage.image_transformation]` and `[db.pooler]` before the first `start`. | rendering was 404 until enabled and a `stop` then `start`; the pooler service appeared only after `stack destroy` and a fresh start | CL22 |
+| Budget about 2.1 GB of memory per awake stack and 0.25 GB asleep. | summed PSS 2145 MB awake and 252 MB asleep, one run in a linux/arm64 container with 10 CPUs; per-service memory not measured | CL20 |
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.35; ranksep=0.55;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  root [label="What do you need\nfrom the CLI?", shape=hexagon];
+
+  mig  [label="A migration from\na changed schema", shape=diamond];
+  cfg  [label="Remote settings\nlocally", shape=diamond];
+  stk  [label="A local stack,\nno Docker", shape=diamond];
+  root -> mig;
+  root -> cfg;
+  root -> stk;
+
+  delta  [label="db diff --use-pg-delta\n(add --strict-coverage in CI)"];
+  migra  [label="db diff --use-migra\n(no exported schemas tree)"];
+  cpull  [label="config pull, then set\nsecrets and buckets by hand"];
+  spull  [label="supabase pull\n(expect exit 1 if never migrated)"];
+  native [label="SUPABASE_EXPERIMENTAL_STACK=1\nat init, one stack per directory and branch"];
+  mig -> delta [label="policies, grants,\nviews matter"];
+  mig -> migra [label="none of those,\nlegacy workflow"];
+  cfg -> cpull [label="settings"];
+  cfg -> spull [label="schema"];
+  stk -> native [label="container or\nworktrees"];
+}
+```
+
+1. A migration from a changed schema: use `db diff --use-pg-delta` when policies, grants, default privileges or views carry settings, and add `--strict-coverage` in CI. Use `--use-migra` only when none of those matter and no exported `supabase/schemas` tree exists.
+2. Remote settings locally: `config pull` for settings, then set provider secrets and bucket settings by hand; `supabase pull` for the schema, expecting exit 1 on a project that never had a migration.
+3. A local stack with no Docker: set `SUPABASE_EXPERIMENTAL_STACK=1` at `init`, one stack per directory and branch.
+
+---
+
+## Reproducing
+
+The experiment lives in [`experiments/cli-surface`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/cli-surface) with a Makefile and a README; `Dockerfile.nodocker` builds the container CL20-CL22 ran in. CL04 provisions and deletes a throwaway project, so it needs a Supabase access token and an organisation. The published artifacts are in [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/cli-surface/out/2026-10-10): `run-2026-10-10T09-26-30-496Z` (CL01-CL03), `run-2026-10-10T00-32-16-898Z` (CL20, CL21 and the first CL22 run), `run-2026-10-10T00-36-06-597Z` (CL04) and `run-2026-10-10T00-41-23-157Z` (the CL22 rerun). Where CL22 appears above, the figure is from the rerun unless it says otherwise. The lab commit stamp in the artifacts is the worktree's base commit, not a commit of this experiment.
+
+---
+
+Measured 2026-10-10 with Supabase CLI 2.120.0 (CL04 inferred from the same host). One run per figure unless stated; Postgres 17 for CL01-CL03.
+
+---
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| CL01 | cli-surface | [`cl01-diff-engines.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/cli-surface/tests/cl01-diff-engines.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/cli-surface/out/2026-10-10) |
+| CL02 | cli-surface | [`cl02-declarative-roundtrip.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/cli-surface/tests/cl02-declarative-roundtrip.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/cli-surface/out/2026-10-10) |
+| CL03 | cli-surface | [`cl03-declarative-edits.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/cli-surface/tests/cl03-declarative-edits.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/cli-surface/out/2026-10-10) |
+| CL04 | cli-surface | [`cl04-config-pull-and-linked.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/cli-surface/tests/cl04-config-pull-and-linked.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/cli-surface/out/2026-10-10) |
+| CL20 | cli-surface | [`cl20-stack-no-docker.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/cli-surface/tests/cl20-stack-no-docker.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/cli-surface/out/2026-10-10) |
+| CL21 | cli-surface | [`cl21-two-worktrees.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/cli-surface/tests/cl21-two-worktrees.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/cli-surface/out/2026-10-10) |
+| CL22 | cli-surface | [`cl22-stack-surface.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/cli-surface/tests/cl22-stack-surface.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/cli-surface/out/2026-10-10) |
+
+---
+
+## Related docs
+
+- [Supabase preview-branch compute sizing](/guides/supabase-preview-branch-compute/): a branch reset replays every migration, effectively `supabase db reset`, so the migration a diff engine writes is what that replay runs.
+- [Supabase incidents: what a client can do](/reference/supabase-incident-resilience/): the same `ENOTFOUND` vantage behaviour for the IPv6-only direct host, measured for the lifecycle and pooler classes.
+- [Locking down Supabase](/reference/supabase-data-surface-lockdown/): the grants, default privileges and `security_invoker` views that migra dropped here are the controls that page relies on.
+- [Two Supabase projects on one GitHub repository](/reference/supabase-branching-two-projects-one-repo/): which migrations a preview branch applies once they exist.
+
+{/* References: cited inline as [^slug]; the numbered list renders below under "References". */}
+[^sb-changelog-pgdelta]: Supabase, "[Public Alpha] Declarative Schema Management with pg-delta," Supabase Changelog, 2026-04-16 (fetched 2026-10-10). https://supabase.com/changelog/44938-public-alpha-declarative-schema-management-with-pg-delta
+[^sb-select-2026]: Supabase, "Build anything: Supabase from code, and an MCP server for your app," Supabase Blog, 2026-10-02 (fetched 2026-10-10). https://supabase.com/blog/select-2026-build-anything

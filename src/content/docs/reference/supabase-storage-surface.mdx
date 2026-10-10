@@ -1,0 +1,244 @@
+---
+title: "Supabase Storage surface: direct SQL deletes, list pagination, S3 key handling"
+description: Three Storage behaviours measured on throwaway Pro-org projects in ap-southeast-1 - the trigger that refuses direct SQL deletes on storage.objects and storage.buckets and what a SQL delete leaves behind, list v1 (offset) against list v2 (cursor) at 5,000 to 100,000 rows, and which of 40 object keys the S3 endpoint accepts, with the AWS SDK on Bun and Node. Ends in practices and a list of what was not measured.
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+What Storage does when SQL touches `storage.objects`, when a listing goes deep, and when an object key contains a character other than a letter, for anyone who deletes, lists or migrates objects outside the SDK's happy path. The claims under test come from a Storage blog post dated 2026-03-05[^sb-storage-blog] and the Storage documentation on deleting objects[^sb-storage-delete] and S3 authentication[^sb-s3-auth].
+
+Every figure marked measured comes from the [supabase-lab](https://github.com/erfianugrah/supabase-lab) harness, [experiments/storage-surface](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/storage-surface), run on 2026-10-10 against Pro-org projects in `ap-southeast-1`. The delete and listing module (SS01) and the S3 key module (SS02) each ran 3 times, every run on its own freshly created project, six projects in all, created and deleted by the module. The vantage is one laptop. Storage server 1.80.2 and Postgres 17.11 in 3 of 3 runs; `storage.migrations` held 73 rows in 3 of 3 runs. Two earlier runs are not counted: an SS02 run whose key matrix was edited while it ran, and an SS01 run that stalled and was killed. Compute size was not read back. Anything not marked measured is cited to the documentation and was not run.
+
+**TL;DR:**
+
+- **A direct SQL `DELETE` on `storage.objects` or `storage.buckets` is refused**, SQLSTATE `42501`, even as `postgres` and even when the statement matches zero rows. The trigger is statement-level. Setting `storage.allow_delete_query` to the exact string `true` lifts it; `'on'` and `'TRUE'` do not.
+- **A SQL delete leaves the backing file.** After it, REST and S3 report the object absent, yet a row re-inserted with the original `version` serves the original bytes again. This is inferred from controlled reads. How long the file persists, and whether it counts toward storage size, was not measured.
+- **List v1 (offset) slows with depth, list v2 (cursor) does not, inside the database.** `storage.search` at the last page took 43 to 45 ms at 5,000 rows, 212 to 219 ms at 25,000 and 846 to 869 ms at 100,000; `storage.search_v2` took 1.2 to 1.5 ms at every size. Through the gateway from one laptop, v2 showed no depth trend beyond noise.
+- **The S3 endpoint accepts 18 of 40 test keys, refuses 19 with `400 InvalidKey` and answers `403 SignatureDoesNotMatch` for 3.** The split was identical on both hostnames and on Bun and Node. A REST GET of the refused keys returned the same `InvalidKey` body.
+- **supabase-js with a plain `?` in the key uploaded without error, yet a later S3 GET of that key answered 404.** Percent-encoding each path segment in REST calls round-tripped all 18 accepted keys.
+
+---
+
+## Which do I pick
+
+| You need | Use | Why |
+|---|---|---|
+| To remove objects | The Storage API (REST, S3 or an SDK) | A SQL delete is refused by default, and with the setting on it leaves the backing file |
+| To page through a large prefix | List v2 with a cursor | v1 cost grows with offset: database-side `search` rose from 43 to 45 ms at 5,000 rows to 846 to 869 ms at 100,000 |
+| To name objects after user input | Keys from the 18-key class, or a generated key with the original name stored beside it | 19 keys are refused and 3 fail the signature check |
+| To call REST with an awkward key | Percent-encode each path segment yourself | supabase-js with `a?b.txt` uploaded without error and a later S3 GET of that key answered 404 |
+| To copy a project's objects over S3 | List the source keys first and flag any outside the accepted class | See the [major-version upgrade guide](/guides/supabase-postgres-major-upgrade-e2e/) for the sync step; keys outside the class were refused on PutObject |
+
+---
+
+## The delete guard
+
+Two delete triggers exist, `protect_objects_delete` on `storage.objects` and `protect_buckets_delete` on `storage.buckets`, both statement-level and `BEFORE DELETE` (SS01a, 3 of 3 runs). The blog post says a statement-level trigger rejects `DELETE` on Storage schema tables unless the variable is `true`.[^sb-storage-blog] The measured rows agree. `storage.prefixes` is absent (`to_regclass` null, 3 of 3 runs). The tables in schema `storage` were `buckets`, `buckets_analytics`, `buckets_vectors`, `migrations`, `objects`, `s3_multipart_uploads`, `s3_multipart_uploads_parts` and `vector_indexes`.
+
+| Statement, as `postgres` | Measured, 2026-10-10 | Module |
+|---|---|---|
+| `DELETE FROM storage.objects WHERE false` through a session-mode pooler connection | refused, SQLSTATE `42501`, "Direct deletion from storage tables is not allowed. Use the Storage API instead." The statement matches zero rows, so the trigger fires per statement | SS01b |
+| `DELETE FROM storage.buckets WHERE false` | refused, same message | SS01b |
+| A `DELETE` on `storage.objects` through the Management API query endpoint | HTTP 400, same SQLSTATE and message | SS01b |
+| `SET storage.allow_delete_query = 'true'`, then the same `DELETE` | accepted, 0 rows | SS01b |
+| The setting as `'on'` or `'TRUE'` | refused, so the trigger compares the string `true` exactly | SS01b |
+| `SET LOCAL` of the setting inside a transaction | accepted inside; refused again after commit | SS01b |
+| `set ...; delete ...` in one Management API query request | HTTP 201, accepted | SS01b |
+| `TRUNCATE storage.objects` inside a transaction that was rolled back | no error: the trigger is on `DELETE` only. The statement was not committed | SS01b |
+
+<Aside type="caution" title="TRUNCATE is not covered">
+The blog post makes no claim about `TRUNCATE`. The last row is a measurement the post does not cover, taken in a rolled-back transaction. A committed `TRUNCATE` was not run, so what it does to the bucket contents is untested.
+</Aside>
+
+That the Storage API itself sets the variable is not stated in the post text that was fetched and was not tested.
+
+---
+
+## SQL-deleted objects leave the backing file
+
+Storage's read path appears to key the backing file by bucket, name and `storage.objects.version`. SS01c tests that from behaviour rather than assuming it. Each run used three objects: one uploaded through REST, one through the S3 endpoint and one control. Each row was captured as JSON before deletion. All steps below were identical in 3 of 3 runs.
+
+| Step | Measured |
+|---|---|
+| Control: API `DELETE`, then re-insert the captured row with its original `version` | REST read HTTP 400 with body `statusCode` 404 "The resource was not found". The API delete removed the backing file, and a row alone does not serve bytes |
+| SQL delete with the setting on, REST-uploaded object | 1 row deleted; REST read HTTP 400, body `statusCode` 404 "Object not found" |
+| SQL delete with the setting on, S3-uploaded object | 1 row deleted; S3 GET `NoSuchKey` (HTTP 404), HEAD 404, `ListObjectsV2` on the prefix returns 0 keys |
+| Re-insert the REST object's row with a new random `version` | REST read HTTP 400, body `statusCode` 404 |
+| Re-insert the REST object's row with its original `version` | REST read 200 and the original bytes |
+| Re-insert the S3 object's row with its original `version` | S3 GET 200 and the original bytes |
+
+After a SQL delete, REST and S3 both report the object absent while the backing file is still there. A row restored with the original `version` serves the original bytes; a row with another `version`, and a row restored after an API delete, do not. That is an orphan in the sense the documentation uses.[^sb-storage-delete] The status shape (HTTP 400 carrying `statusCode` 404) is the one the [image transformations page](/reference/supabase-image-transformations-billing/) and the [static hosting page](/reference/supabase-static-hosting/) record for a missing object.
+
+This is inference from controlled reads, not a view of the backend: a project offers no listing of the underlying bucket. Not measured: how long an orphan persists (the reads came soon after the delete and the delay was not recorded), whether a background process reclaims it, and whether it counts toward the project's storage size.
+
+---
+
+## List v1 against list v2
+
+v1 is `POST /storage/v1/object/list/<bucket>` with `limit` and `offset`. v2 is `POST /storage/v1/object/list-v2/<bucket>` with a `cursor`. Rows were inserted with `INSERT INTO storage.objects` (5,000, 25,000 and 100,000, each under its own flat prefix) and followed by `ANALYZE storage.objects`. No backing files exist for these rows, so the test times the listing query path only. Pages hold 100 rows, sorted by name ascending. Client-side cells go through the project gateway from one laptop; v1 depth points are the median of 7 requests per run. Database-side cells are the median of 5 executions of `storage.search` and `storage.search_v2` inside a pooler session, with no network. All cells are milliseconds, three runs in order.
+
+| Prefix rows | v1, offset 0 | v1, last page | v2, cursor of the last page | v2, median page over a full walk | Database-side `search`, last page | Database-side `search_v2`, last page |
+|---|---|---|---|---|---|---|
+| 5,000 | 54.3 / 87 / 82.6 | 86.1 / 89.7 / 112.5 | 41.9 / 45.9 / 60.3 | 50.1 / 50.6 / 54.7 | 43.5 / 43 / 44.6 | 1.5 / 1.5 / 1.5 |
+| 25,000 | 49.2 / 49 / 54.6 | 272.9 / 260.4 / 268.9 | 50.4 / 74 / 88.1 | 50.7 / 56 / 55.4 | 217 / 212 / 219.2 | 1.3 / 1.2 / 1.3 |
+| 100,000 | 61.5 / 76.6 / 59.1 | 931.5 / 913.9 / 944.8 | 50.8 / 50.6 / 65.6 | 52.4 / 56.4 / 63.2 | 864.2 / 845.9 / 869.2 | 1.5 / 1.3 / 1.3 |
+
+Whole-prefix walks, total seconds for all pages. v1 was walked only on the two smaller prefixes (50 and 250 requests); the 100,000-row v2 walk is 1,000 requests.
+
+| Prefix rows | v1 offset walk | v2 cursor walk |
+|---|---|---|
+| 5,000 | 5.2 / 4.5 / 4.2 | 3.3 / 3.5 / 2.9 |
+| 25,000 | 49.6 / 46.9 / 44.8 | 14.5 / 15.5 / 15.7 |
+| 100,000 | not run | 60.9 / 70.6 / 78.0 |
+
+Median page cost over the whole 25,000-row walk, in milliseconds, three runs in order: v1 179.3 / 171.9 / 170, v2 50.7 / 56 / 55.4. The v1 and v2 walks returned the same names in the same order on both prefixes where both ran (3 of 3 runs, at 5,000 and 25,000 rows). v1 returns names relative to the prefix and v2 returns full keys, so the module compares the last path segment.
+
+Derived from the last-page columns above, by arithmetic and not measured: client-side v1 over v2 at the last page, per run, is 5.4 / 3.5 / 3.1 at 25,000 rows and 18.3 / 18.1 / 14.4 at 100,000 rows. A round trip of 38 to 45.1 ms to the gateway (the median of 15 `GET /storage/v1/version` calls per SS01 run) and a page cost of about 50 ms hide most of the database-side gap.
+
+### Reading the numbers
+
+- The flat claim holds for the database-side `search_v2` column only: 1.2 to 1.5 ms at every size and run.
+- Client-side v2 latency shows no depth trend beyond run-to-run noise of roughly 40 to 130 ms on single samples. Within a run the v2 depth points sit above and below each other with no consistent direction. Three single samples stood out, all in run 3: the first page of the 100,000-row walk (131.4 ms, against 50.6 to 65.6 in the table), the last page of the 5,000-row walk (69.5 ms, against 41.9 to 60.3) and page 249 of the 25,000-row walk (88.1 ms, against a 55.4 median).
+- The v2 median page also differs between runs (100,000 rows: 52.4 / 56.4 / 63.2 ms), so run 3 was slower throughout. That is a time-of-run effect and says nothing about depth.
+- v1 latency grows about linearly with offset in the database-side column.
+- The post reports up to 14.8 times faster deep pagination on a 60-million-row table and says v2 runs in constant time regardless of depth.[^sb-storage-blog] The client-side ratio at 100,000 rows is of the same order, on a table 600 times smaller, with one flat prefix and a client one round trip away. It is not a reproduction of the 14.8x figure.
+
+---
+
+## S3 keys
+
+Credentials were the session-token form: access key id is the project ref, secret is the anon key, session token is the `service_role` JWT, as the S3 authentication page describes.[^sb-s3-auth] Dashboard-generated S3 access keys were not used (see [Not measured](#not-measured)). The client was the AWS SDK for JavaScript v3.
+
+Each run is four matrices: the gateway host `<ref>.supabase.co` and the direct host `<ref>.storage.supabase.co`, each with the SDK on Bun and on Node. A matrix is 40 keys, each put through PutObject, HeadObject, GetObject, ListObjectsV2 (`Prefix` = the key), a presigned GET fetched separately, CopyObject (the key as source), a one-part multipart upload, DeleteObject and a HEAD after the delete. All four matrices gave the same split in 3 of 3 runs (SS02a-d), and `other_failing_key_ids` was `none` in all 12 matrices.
+
+| Outcome | Keys | Which |
+|---|---|---|
+| Accepted, and all of the S3 operations above succeeded (18 of 18) | 18 | plain, space, `+`, `=`, `&`, `,`, `;`, `@`, `:`, `$`, `!`, `'`, `(` `)`, `*`, `?`, a nested path with spaces, a leading space, a trailing space |
+| `400 InvalidKey` on PutObject | 19 | `%` (alone, as a literal `%20`, as a literal `%2B`, and in a nested path), tilde, square brackets, curly braces, hash, caret, pipe, backtick, angle brackets, double quote, backslash, tab, and every non-ASCII key tried: NFC and NFD "cafe", CJK, an emoji, and a 204-character multibyte key |
+| `403 SignatureDoesNotMatch` | 3 | `a//b.txt`, `dot/./seg.txt`, `dot/../seg2.txt` |
+
+The REST GET on the refused keys returned the same `InvalidKey` body (the first failing operation recorded for each key). The REST upload status for them was not recorded, so the claim that the restriction sits in Storage's key validation on both protocols is a suggestion from that GET, not a measurement (SS02e). The error codes page lists `InvalidKey` as "Verify the key name and ensure it follows the naming conventions" and does not list the accepted characters,[^sb-storage-errors] so the 18/19 split above is the only statement of them here, for this Storage server and the 40 keys tried. The [static hosting page](/reference/supabase-static-hosting/) records the same `InvalidKey` for an empty key at the bucket root.
+
+### The three 403 keys
+
+A local control (SS02h) put a TCP listener on loopback in front of the SDK, recorded the request line it sent and recomputed the SigV4 signature over the path as sent and over the key encoded per segment.
+
+| Key | SDK on Bun | SDK on Node | Endpoint result |
+|---|---|---|---|
+| `a//b.txt` | sends `a//b.txt`, signature covers it | same | 403 on both hosts, both runtimes |
+| `dot/./seg.txt` | sends `dot/seg.txt` (path resolved after signing; the signature covers the original) | sends `dot/./seg.txt`, signature covers it | 403 on both hosts, both runtimes |
+| `dot/../seg2.txt` | sends `seg2.txt`, same pattern | sends `dot/../seg2.txt`, signature covers it | 403 on both hosts, both runtimes |
+
+On Bun the dot-segment mismatch is the client's: the request line was changed after signing. On Node the request line equals what was signed and the endpoint still answered 403, as it did for `//` on both runtimes. Those three cases are refused by the endpoint, on the gateway host and the direct storage host alike. Which layer in front of or inside Storage normalises the path before verifying the signature was not determined; the runs cannot tell a gateway from the Storage server. REST behaviour for these three keys was not isolated, because the REST legs failed at the S3 GET step or because the S3 PUT had failed.
+
+### REST and supabase-js on the 18 accepted keys
+
+| Client | Result on 18 keys (SS02e) |
+|---|---|
+| `fetch` with each path segment through `encodeURIComponent` | 18 of 18 round-tripped (REST GET of the S3-created object, REST POST then S3 GET) |
+| supabase-js `upload` and `download` with the key as a plain string | 17 of 18; for `a?b.txt` the upload returned no error and a later S3 GET of `sbjs/a?b.txt` answered 404 `NoSuchKey` |
+
+The likely cause is an unencoded `?` starting a query string in the client's request URL. The request URL was not captured, so that is inference. Stored names matched too: the 18 `rest/<key>` rows in `storage.objects` equalled the requested keys exactly (18 of 18, 3 of 3 runs; SS02f).
+
+---
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Delete objects through the Storage API, not SQL. | A SQL delete leaves the backing file: a row re-inserted with the original `version` served the original bytes over REST and S3. Inference from reads; persistence and storage accounting not measured. | SS01c |
+| Do not rely on the trigger to stop a `TRUNCATE`. | `TRUNCATE storage.objects` raised no error inside a rolled-back transaction. A committed one was not run. | SS01b |
+| Set the setting to exactly `true` if a SQL delete is unavoidable. | `'on'` and `'TRUE'` were refused; `SET`, `SET LOCAL` in a transaction and `set ...; delete ...` in one Management API request all worked. | SS01b |
+| Page deep prefixes with the cursor list. | Database-side `search` at the last page: 43 to 45 ms at 5,000 rows, 212 to 219 ms at 25,000, 846 to 869 ms at 100,000. `search_v2`: 1.2 to 1.5 ms. Client-side v1 over v2 at 100,000 rows: 14.4 to 18.3 (derived). | SS01d |
+| Restrict object keys to the 18-key class at upload. | 18 of 40 keys round-tripped on every operation; 19 got `400 InvalidKey`, 3 got `403 SignatureDoesNotMatch`. Identical on both hosts and on Bun and Node. | SS02a-d |
+| Never put `//` or dot segments in a key. | `a//b.txt`, `dot/./seg.txt` and `dot/../seg2.txt` answered 403 on both hosts. On Node the request matched what was signed. | SS02h |
+| Percent-encode each path segment in REST calls. | `fetch` with `encodeURIComponent` round-tripped 18 of 18; supabase-js with a plain `?` key uploaded without error and a later S3 GET answered 404 (likely an unencoded `?`, inferred). | SS02e |
+| Before an S3 sync, list source keys and flag any outside the class. | PutObject refused 19 keys. The `aws s3 sync` command was not run; the SDK was. | SS02a-d |
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  k [label="Object key"];
+  a [label="In the 18-key class\n(round-trips on S3 and REST)"];
+  b [label="400 InvalidKey\n(19 keys tried)"];
+  c [label="403 SignatureDoesNotMatch\n(// and dot segments)"];
+  k -> a [label="letters, digits, space, + = & , ; @ : $ ! ' ( ) * ?"];
+  k -> b [label="percent, hash, brackets, non-ASCII, ..."];
+  k -> c [label="double slash,\n. or .. segment"];
+}
+```
+
+1. A key built from the characters in the accepted row of the S3 keys table, with nested paths and a leading or trailing space allowed, round-trips on S3 and on REST when each REST path segment is percent-encoded.
+2. A key containing a percent sign, hash, bracket, brace, caret, pipe, backtick, angle bracket, quote, backslash, tab or any non-ASCII character was refused with `400 InvalidKey`.
+3. A key with `//` or a `.` or `..` segment was refused with `403 SignatureDoesNotMatch`.
+
+---
+
+## Where the documentation and the runtime stand
+
+| Source | Claim | Runtime measured | Standing |
+|---|---|---|---|
+| Blog post[^sb-storage-blog] | A statement-level trigger rejects `DELETE` on Storage tables unless the variable is `true` | Same, plus the exact-string match, `SET LOCAL` scope and the zero-row refusal | consistent |
+| Blog post | Up to 14.8x faster deep pagination on 60 million rows; constant time regardless of depth | Constant in the database-side `search_v2` column (1.2 to 1.5 ms); no depth trend client-side beyond noise; the 14.8x not reproduced | not comparable, table 600 times smaller |
+| Error codes page[^sb-storage-errors] | `InvalidKey`: follow the naming conventions | 18 keys accepted, 19 refused, 3 failed the signature check | the page names no accepted characters |
+| Blog post | No statement about `TRUNCATE` | Not covered by the trigger (rolled-back probe) | the post is silent |
+
+The RUNLOG records no upstream report for any row.
+
+---
+
+## Not measured
+
+- An Amazon S3 control for the three 403 keys. No valid AWS credentials were available: the credential pair tried was answered with `InvalidAccessKeyId`. The experiment's `make aws-control` target is the script to run once there are. Until then it is open whether Amazon S3 accepts those keys.
+- Dashboard-generated S3 access keys. No API route that creates them was found, which is a negative from a search and not a confirmation. They go through the same SigV4 verification by reasoning, not measurement.
+- The `DB_STATEMENT_TIMEOUT` setting and the vector `PutVector` body limit from the same blog post.
+- Listing: layouts with many sub-prefixes, delimiter behaviour on mixed folders, `sortBy` on columns other than name, listings with a `search` string, concurrent load, tables of millions of rows. Rows were inserted by SQL, from one laptop vantage.
+- S3 keys: user-JWT sessions under RLS, keys longer than the one 204-character multibyte key, objects larger than a few bytes, multipart with more than one part, `DeleteObjects` (batch), `CopyObject` with a special-character destination, any region other than `ap-southeast-1`, and any client other than the AWS SDK for JavaScript v3 and supabase-js.
+- A committed `TRUNCATE`, how long an orphaned file persists, and its effect on storage accounting.
+
+---
+
+## Evidence, by module
+
+| Claim | How it was checked | Module |
+|---|---|---|
+| `storage.prefixes` absent, two statement-level delete triggers, versions | `to_regclass` and a catalog query in 3 of 3 runs | [SS01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/storage-surface/tests/ss01-delete-guard-listing.ts) (SS01a) |
+| Refusal, exact-string match, `SET LOCAL` scope, Management API behaviour, `TRUNCATE` | statements run through a session-mode pooler connection and the Management API query endpoint; `TRUNCATE` inside a rolled-back transaction | [SS01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/storage-surface/tests/ss01-delete-guard-listing.ts) (SS01b) |
+| Orphaned backing file after a SQL delete | rows captured, deleted, re-inserted with the original and a different `version`, with an API-delete control; REST and S3 reads | [SS01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/storage-surface/tests/ss01-delete-guard-listing.ts) (SS01c) |
+| v1 against v2 at depth | 5,000, 25,000 and 100,000 SQL-inserted rows; depth points, whole-prefix walks, and `storage.search` against `storage.search_v2` in a pooler session | [SS01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/storage-surface/tests/ss01-delete-guard-listing.ts) (SS01d) |
+| 18 / 19 / 3 key split on both hosts and both runtimes | 40 keys through 9 operations, four matrices per run | [SS02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/storage-surface/tests/ss02-s3-key-canary.ts) (SS02a-d) |
+| REST and supabase-js on the 18 keys; stored names | `fetch` with encoded segments, supabase-js with plain strings, `storage.objects` rows compared with the requested keys | [SS02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/storage-surface/tests/ss02-s3-key-canary.ts) (SS02e, SS02f) |
+| The three 403 keys, client against endpoint | loopback listener recording the request line and recomputing the signature | [SS02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/storage-surface/tests/ss02-s3-key-canary.ts) (SS02h) |
+
+Results and caveats are in the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/storage-surface/RUNLOG.md). The artifacts, with refs and hostnames redacted, are in [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/storage-surface/out/2026-10-10).
+
+---
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| SS01 | storage-surface | [`ss01-delete-guard-listing.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/storage-surface/tests/ss01-delete-guard-listing.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/storage-surface/out/2026-10-10) |
+| SS02 | storage-surface | [`ss02-s3-key-canary.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/storage-surface/tests/ss02-s3-key-canary.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/storage-surface/out/2026-10-10) |
+
+## Related docs
+
+- [Upgrade a Supabase project to a new Postgres major version](/guides/supabase-postgres-major-upgrade-e2e/) -
+  its S3 sync step moves a clone's objects over this endpoint; the key classes above apply to what it can copy.
+- [Static site hosting on Supabase](/reference/supabase-static-hosting/) -
+  the other Storage behaviours measured at the project hostnames: content types, missing-object status and the bucket root `InvalidKey`.
+- [Storage image transformations](/reference/supabase-image-transformations-billing/) -
+  the render endpoints, billing and the HTTP 400 shape for a missing object.
+- [Cloudflare Workers + Supabase: an architecture reference](/reference/cloudflare-supabase-architecture/) -
+  Storage reached from a Worker over REST and signed URLs; the key practices above apply to those object paths.
+
+[^sb-storage-blog]: Supabase, "Storage performance, security and reliability updates" (blog post dated 2026-03-05), Supabase Blog. https://supabase.com/blog/supabase-storage-performance-security-reliability-updates
+[^sb-storage-delete]: Supabase, "Delete objects," Supabase Docs. https://supabase.com/docs/guides/storage/management/delete-objects
+[^sb-s3-auth]: Supabase, "S3 authentication," Supabase Docs. https://supabase.com/docs/guides/storage/s3/authentication
+[^sb-storage-errors]: Supabase, "Storage error codes," Supabase Docs. https://supabase.com/docs/guides/storage/debugging/error-codes

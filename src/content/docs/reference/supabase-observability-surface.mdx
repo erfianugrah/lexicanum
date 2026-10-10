@@ -1,0 +1,314 @@
+---
+title: "Supabase observability surface: trace headers, health advisors, log sources"
+description: What the Supabase observability surface does when probed from outside - which supabase-js releases attach traceparent and in which packagings, which log source carries the client's trace id, the real firing rule of the Health Check Advisors (a failing-request count in each of two consecutive five-minute buckets on this project, not the stated 10% share) with detection, cache and clearing times, log ingestion lag and sources, the supabase notebooks pull/push round trip, and the log-drain route that answered 403. Measured 2026-10-10 on a Pro-plan organisation in ap-southeast-1.
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+How a request made by supabase-js becomes a row in the project logs, when the platform's Health Check Advisors raise an error-rate lint, and how much of that surface a script can read or write from outside. It is for whoever has to wire tracing, alerting or log export on a Supabase project and wants to know which documented behaviour held when it was run.
+
+All measured rows below ran on 2026-10-10 from one macOS machine in Singapore (Bun 1.3.14, a current Node release for the esbuild bundles, `supabase` CLI 2.120.0), against throwaway projects in `ap-southeast-1` on a Pro-plan organisation, driven through the Management API from the same machine. Three runs are labelled `run1`, `run2` and `run3` in the lab's RUNLOG; every cell is n = 1 unless a row says otherwise. Rows marked documented come from the public pages cited at the claim and were not run. The lab's raw captures carry project refs and were not published, so the figures are quoted from the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/observability-surface/RUNLOG.md) of the [observability-surface experiment](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/observability-surface/), not from a published `out/` artifact.
+
+**TL;DR:**
+
+- supabase-js 2.111.0, 2.112.0 and 2.117.3 attach `traceparent` to REST and Edge Function calls made inside an active span, and never `tracestate` or `baggage` with the default provider.[^sb-client-tracing] A bundle run with no `node_modules` loses the header on 2.111.0 only, with no warning; 2.112.0 and 2.117.3 kept it in all five packagings.
+- The client's trace id lands in `edge_logs` as the `trace_id` attribute (38 of 38 rows carry one). `function_edge_logs` (0 of 39) and `function_logs` (0 of 78) do not; the id reaches `function_logs` only if the function prints the `traceparent` it received.
+- The Health Check Advisors fired on at least 5 failing 5xx requests in each of two consecutive five-minute buckets started at a UTC boundary, at shares from 1% to 100%, and did not fire on 4 or fewer. The lint text says "at least 10%".[^sb-health-advisors]
+- A lint appeared 35-66 s after the second bucket closed, the answer is cached for about 60 s, and it cleared 306-367 s after the last failing request.
+- The logs endpoint returned 36 of 36 marked requests per source within 30 s (15 s polling) in a 36-minute window, and carried 11 sources.
+- `supabase notebooks pull` and `push` round-trip by notebook name, keep cell ids, and leave a project notebook with no local file alone under `--yes` with a closed stdin.
+- Log drains were not measured: the v2 route answered 403 on a Pro and a Team organisation, and the v1 API publishes no route.
+
+---
+
+## Which surface answers which question
+
+| You want to | Surface | Held on 2026-10-10 |
+|---|---|---|
+| Correlate a client span with a gateway log row | `traceparent` from supabase-js, read as `edge_logs.trace_id` | yes, 14 of 14 sending variants |
+| Correlate a client span with an Edge Function log line | `traceparent` received by the function | only if the function logs it |
+| Be told that a service is failing | Health Check Advisors, `POST /v2/projects/{ref}/advisors/run` | after 5 failures in each of two buckets |
+| Read logs from a script | `analytics/endpoints/logs`, see the [logs endpoint guide](/guides/supabase-management-api-logs-endpoint/) | 11 sources, 15 s poll ceiling |
+| Keep dashboard notebooks in git | `supabase notebooks pull` / `push` | yes, by notebook name |
+| Ship logs to your own endpoint | log drains | not measured |
+
+---
+
+## Client trace propagation
+
+With tracing on, supabase-js attaches `traceparent`, `tracestate` and `baggage` to requests for Supabase domains only, and the trace id then shows in API Gateway and Edge Function logs.[^sb-client-tracing][^sb-trace-blog] From 2.112.0 the OpenTelemetry integration is the opt-in `@supabase/supabase-js/tracing` import; without it the client warns once and sends no headers. Releases 2.106.0 to 2.111.x load `@opentelemetry/api` dynamically and send nothing, silently, when it is missing.[^sb-client-tracing] Before 2.112.3 an unsampled span sends no headers; from 2.112.3 it sends `traceparent` only.[^sb-client-tracing]
+
+The probe used one client built on `@opentelemetry/sdk-trace-node` with the default W3C propagator, rendered once per variant against one project with a table and an Edge Function that logs the `traceparent` it receives. Releases came from npm aliases: 2.111.0 (the only stable 2.111.x on the registry on 2026-10-10), 2.112.0 and 2.117.3 (the latest that day). Headers were read at the client's own `fetch` boundary, so "sent" means the SDK attached them, not that a server kept them.
+
+### Releases against packagings
+
+A cell is `traceparent` attached to a REST call and to an Edge Function invoke made inside an active span; both calls gave the same answer in every cell. The same matrix came out in `run1`, `run2` and `run3`. `tracestate` and `baggage` were attached in no cell.
+
+| Release | Unbundled (Bun) | Bun bundle, next to `node_modules` | Bun bundle, no `node_modules` | esbuild bundle (Node), next to `node_modules` | esbuild bundle (Node), no `node_modules` |
+|---|---|---|---|---|---|
+| 2.111.0 | sent | sent | none, no warning | sent | none, no warning |
+| 2.112.0 | sent | sent | sent | sent | sent |
+| 2.117.3 | sent | sent | sent | sent | sent |
+
+The Bun bundles ran with Bun's runtime auto-install disabled. The same module without that setting showed 2.111.0 sending from the no-`node_modules` directory; that Bun fetched `@opentelemetry/api` from the registry at run time is an inference from the setting changing the outcome, and the fetch was not observed. The reading: the loss on 2.111.0 needs a bundle in which the SDK's runtime `import("@opentelemetry/api")` cannot resolve, and 2.112.0 and later carry the import statically through the `/tracing` subpath and kept the header.
+
+### Controls
+
+| Control | Result |
+|---|---|
+| 2.112.0 without the `/tracing` import | no headers, one `console.warn` beginning "tracePropagation is enabled but the tracing runtime is not loaded" (as documented) |
+| 2.112.0, unsampled span | no headers (documented for releases before 2.112.3) |
+| 2.117.3, unsampled span | `traceparent` sent (documented for 2.112.3 and later); `tracestate` and `baggage` not asked about in this row |
+| 2.117.3 with `tracePropagation` off | none |
+| REST call with no active span | none, in every variant |
+
+### Host check
+
+The wrapped `fetch` was exercised with a fake transport underneath, so nothing left the machine.
+
+| URL host handed to the wrapped `fetch` | Header attached |
+|---|---|
+| `third-party.example.test` | none, all three releases |
+| `xsupabase.co` | none, all three releases |
+| `supabase.co.example.test` | none, all three releases |
+| any other host under `.supabase.co` | `traceparent`, all three releases |
+| the base URL of a client created against a non-Supabase host (the self-hosted shape) | `traceparent`, on that host |
+
+The last row was observed; the explanation, that the SDK adds the base URL's hostname to the default targets, was read in the installed 2.117.3 `dist/index.mjs` (`getDefaultPropagationTargets`) and not tested separately. The docs page lists `*.supabase.co`, `*.supabase.in` and `localhost` as the defaults and does not mention the exception.[^sb-client-tracing] Not measured: a custom domain, redirects, and a custom `fetch` that rewrites the URL after the SDK's check (from the source, the check reads the URL before the custom `fetch` runs; not from a run).
+
+### Where the trace id lands
+
+Run `run3`, 19 variants, 57 trace ids.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  client [label="supabase-js\n(traceparent)"];
+  gw     [label="API gateway"];
+  elogs  [label="edge_logs\ntrace_id attribute"];
+  fn     [label="Edge Function\n(receives traceparent)"];
+  fedge  [label="function_edge_logs\nno trace id"];
+  flogs  [label="function_logs\nonly if the function logs it"];
+
+  client -> gw;
+  gw -> elogs;
+  gw -> fn;
+  gw -> fedge;
+  fn -> flogs [label="console.log"];
+}
+```
+
+Text version: the gateway writes the client's id to `edge_logs`; the function receives it; `function_edge_logs` records the invocation without it; `function_logs` holds it only when the function's own `console.log` wrote it.
+
+| Source | Rows with a `trace_id` |
+|---|---|
+| `edge_logs` | 38 of 38 |
+| `postgrest_logs` | 0 of 106 |
+| `function_edge_logs` | 0 of 39 |
+| `function_logs` | 0 of 78 |
+| `auth_logs` | 0 of 43 |
+| `storage_logs` | 0 of 3 |
+| `realtime_logs` | 0 of 5 |
+| `pgbouncer_logs` | 0 of 96 |
+| `postgres_logs` | 0 of 17 |
+
+- REST: the client's trace id came back as the `trace_id` attribute of an `edge_logs` row in 14 of 14 variants where the header was sent, and in none of the 5 where it was not. Every `edge_logs` row has a `trace_id`, including requests with no client header.
+- Edge Function: the function received a `traceparent` carrying the client's trace id in all 14 sending variants (the function echoes it). A search of every attribute key and the message of every source for six client trace ids (the REST id and the function id of each of the three unbundled variants) found the three REST ids as the `trace_id` attribute of `edge_logs` rows, and the three function ids only inside the `function_logs` message that the function's own `console.log` wrote.
+- A function call made with no active span still reached the function with a platform-generated `traceparent` (trace flags `00`) and a `baggage` entry `sb-request-id`, in every variant.
+
+The Edge Function result is the one row where measurement and the docs page differ: "trace id appears in Edge Function logs" held only for what the function prints itself. It is one project and one run, and the platform may stamp function rows under a key or source this query did not cover.
+
+Not measured: browser bundles, webpack, Vite and Turbopack, Realtime frames, the Swift, Dart and Python SDKs, Sentry and Datadog propagators, a `tracestate` or `baggage` value set by the app.
+
+---
+
+## Health Check Advisors
+
+The platform ships four checks, `log_data_api_error_rate_high`, `log_auth_error_rate_high`, `log_storage_error_rate_high` and `log_edge_function_error_rate_high`, "read from log data"; `POST /v2/projects/{ref}/advisors/run` returns them, results are cached, and an empty result means every check ran and found nothing.[^sb-health-advisors] The lint text the platform returns says 5xx for at least 10% of requests across two consecutive five-minute periods, and that failures must persist in both.
+
+The probe used one project per arm, arms concurrent. Each arm waited for the next UTC five-minute boundary, sent at fixed rates for two buckets (one bucket for the single-bucket arms), and polled the four health lints every 30 s until the lint cleared or 8 minutes after traffic ended. The 5xx were real service answers (see [Inducing a 5xx](#inducing-a-5xx)). `run1` had 11 arms, `run2` 8 and `run3` 5.
+
+### Firing rule
+
+| Arm | Requests per bucket | Failing per bucket | Share | Fired |
+|---|---|---|---|---|
+| data, 100% | 100 | 100 | 100% | yes |
+| data, 50% | 100 | 50 | 50% | yes |
+| data, 12% | 100 | 12 | 12% | yes |
+| data, 8% | 100 | 8 | 8% | yes |
+| data, 5% (`run2`, repeated in `run3`) | 100 | 5 | 5% | yes, yes |
+| data, 4% | 100 | 4 | 4% | no |
+| data, 3% (`run2`, repeated in `run3`) | 100 | 3 | 3% | no, no |
+| data, 2% | 250 | 5 | 2% | yes |
+| data, 1% | about 600 (598 sent) | 6 | 1% | yes |
+| data, 1% | 100 | 1 | 1% | no |
+| data, 100%, one request a minute | 5 | 5 | 100% | yes |
+| data, 20%, one request a minute | 5 | 1 | 20% | no |
+| data, 100%, one request per bucket | 1 | 1 | 100% | no |
+| data, 404 on every request | 100 | 0 (all 404) | 0% 5xx | no |
+| data, 100% failing in bucket 1 only, healthy bucket 2 | 100 | 100 then 0 | - | no |
+| data, healthy bucket 1, 100% failing in bucket 2 | 100 | 0 then 100 | - | no |
+| data, 100% failing for one bucket, no second bucket | 100 | 100 | - | no |
+| Auth admin create, 100% 500 | 100 | 100 | 100% | yes |
+| Storage list, 100% 500 | 100 | 100 | 100% | yes |
+| Edge Function returning 500 | 100 | 100 | 100% | yes |
+| Edge Function that throws | 100 | 100 | 100% | yes |
+
+The lint fired in every arm with at least 5 failing requests in each of two consecutive five-minute buckets and in no arm with 4 or fewer, at any share from 1% to 100%. On this project the operative rule looks like a failing-request count of about 5 per bucket, not the 10% share in the lint text; 6 of 600 (1%) fired while 1 of 100 (1%) did not. This is an inference from the rows above. Not run: exactly 4 against 5 at other volumes, a count of 5 at thousands of requests per bucket (whether a share rule applies on top of the count at that volume), and a start part-way through a bucket, so the clock alignment of the buckets is the design of the probe rather than a separated finding.
+
+### Timing
+
+Thirteen firings across the three runs.
+
+| Quantity | Measured | Resolution |
+|---|---|---|
+| First lint after the second bucket closed | 35-36 s in `run1` (9 arms), 65-66 s in `run2` and `run3` (4 arms) | 30 s polling, so each figure is an upper bound within 30 s |
+| Cache refresh (`observed_at` steps) | median 86-91 s per arm at 30 s polling | the next 30 s poll after a refresh |
+| Cache refresh, one project polled every 10 s | 62-64 s steps, four refreshes (exploratory, not archived) | about 60 s |
+| Lint gone after the last failing request | 306-337 s in 12 arms, 367 s in the 8% arm | first poll after the next bucket boundary plus the cache |
+
+The lint was absent at every poll before the second bucket had closed. An immediate second call at baseline returned the same empty list in all 24 arms. The detail text at firing reads `Failing: <service> (<share>% of <n> requests failing)`, where `<n>` is the request count of the most recent bucket (100, 250 and 600 in the arms above); for Edge Functions the service field is the function path. `level` was `ERROR` and `categories` was `HEALTH`. Arms sending 100 requests per bucket reported 100 and the 5-per-bucket arm reported 5; the 600-per-bucket arm reported 600 against 598 sent. In a first exploratory run (60 then 500 failing requests, not archived) the lint reported 538 requests against 560 sent, so a small fraction of requests may go uncounted. No other lint appeared in any arm and no `advisor_check_unavailable` was seen.
+
+### Inducing a 5xx
+
+| Service | Way to get a 5xx |
+|---|---|
+| Data API (PostgREST) | a function that runs `raise sqlstate 'PT500'` |
+| Auth | a raising `BEFORE INSERT` trigger on `auth.users`, then an admin create |
+| Storage | a raising function used by a `storage.objects` policy, then a list |
+| Edge Functions | a function returning 500, or one that throws |
+
+A 404-only load did not fire, so a 5xx has to come from the service itself.
+
+### Docs against runtime
+
+| Claim | Documented | Measured 2026-10-10 | Filed upstream |
+|---|---|---|---|
+| Advisor firing threshold | at least 10% of requests, two consecutive five-minute periods | 5 failing requests in each of two buckets fired at 1%, 2% and 5%; 4 or fewer did not | not checked; no report is recorded in the lab RUNLOG |
+| `tracestate` and `baggage` | attached with `traceparent`[^sb-client-tracing] | not attached by the default provider in any cell | not checked |
+| Trace id in Edge Function logs | appears in Edge Function logs[^sb-trace-blog] | absent from `function_edge_logs` and `function_logs` unless the function prints it | not checked |
+| Default propagation targets | `*.supabase.co`, `*.supabase.in`, `localhost` | also the client's own base URL host | not checked |
+
+Not measured: the other lints in the v2 enum, Realtime, projects with real user traffic, other regions and plans, the Studio Health tab.
+
+---
+
+## Logs endpoint: ingestion and sources
+
+The query shape, the `source` column and the traps of the endpoint are in [Query Supabase project logs through the Management API](/guides/supabase-management-api-logs-endpoint/); this section holds only what the observability probe added.
+
+Canary design (`run1`): one project, one marked REST request (lands in `edge_logs`) and one marked Edge Function invoke (lands in `function_edge_logs` by URL and in `function_logs` by the console line) every minute for 36 minutes, 00:48-01:24 UTC. A poller asked the logs endpoint for every marker every 15 s; the first poll that returned a marker is its first-seen time. The public pages make no claim about ingestion lag.
+
+| Source | Markers returned | Lag p50 | p90 | p99 | Max | Over 240 s |
+|---|---|---|---|---|---|---|
+| `edge_logs` | 36 of 36 | 15 s | 15.1 s | 30 s | 30 s | 0 |
+| `function_edge_logs` | 36 of 36 | 15 s | 15.1 s | 15.1 s | 15.1 s | 0 |
+| `function_logs` | 36 of 36 | 15 s | 15.1 s | 15.1 s | 15.1 s | 0 |
+
+The 15 s poll is the resolution: nearly every marker came back on the first poll after it was sent, so these figures are ceilings within one poll; the distribution below 15 s was not resolved. The row's own `timestamp` minus the send time was 0 to 1 s. There were 142 polls and none returned an error. A lag above 4 minutes recorded once in a separate lab experiment did not recur in this window, and one 36-minute window supports no alert threshold.
+
+- Sources on the project after one request of each kind: `auth_audit_logs`, `auth_logs`, `edge_logs`, `function_edge_logs`, `function_logs`, `pgbouncer_logs`, `postgres_logs`, `postgrest_logs`, `realtime_logs`, `storage_logs`, `supavisor_logs` (11). The run opened one connection through the shared pooler on 6543 and on 5432 and joined one websocket. Which source appeared when was not measured, and neither was whether `pgbouncer_logs` rows exist before any connection.
+- Message search of this run's own markers: the failing pooler statement's literal in `postgres_logs` (2 rows, one per port); the storage bucket and object name in `storage_logs` (2 rows) and `edge_logs` (1); the Auth user email in `auth_logs` and `auth_audit_logs` (1 each); the Realtime topic name in no source.
+- A 300-request REST burst, all answered 200, returned 300 rows from the logs endpoint.
+- `usage.api-requests-count` returned 341, equal to the project's `edge_logs` row count: the REST canary 36, the burst 300 and 5 further rows (not itemised). The 37 function invocations sit in `function_edge_logs`, in neither figure.
+- `usage.api-counts` returned per-minute `total_rest_requests`, `total_auth_requests`, `total_storage_requests` and `total_realtime_requests` buckets (HTTP 200).
+- `GET /platform/organizations/{org}/usage` with a personal access token answered 401 `Unsupported access token`, and the v1 OpenAPI document has no organisation usage path, so organisation-level logs GB figures were not reachable by token and no known log volume was compared with them.
+
+Not measured: logs per GB, query-quota billing, the Dashboard Logs Explorer, load above one request a minute other than the burst, other regions. No throttling was met at 4 logs queries a minute; the advisor arms ran alongside without a 429 seen by this module.
+
+---
+
+## Notebooks round trip
+
+The CLI help (2.120.0) and the v2 OpenAPI document say `pull` writes project notebooks to `supabase/notebooks`, keeping existing files unless an id is given; `push` writes local files and asks about project notebooks the directory lacks; an update replaces the body, a cell echoing its `id` keeps its identity, and a cell without one is added. Measured on `run2`, one project, one pass:
+
+| Step | Result |
+|---|---|
+| Create through `POST /v2/projects/{ref}/notebooks` with markdown, database and log cells | server-assigned ids on all 3 cells |
+| `pull` | one file `ob05-alpha.json` (file name is the notebook name); top-level keys `description`, `favorite`, `content`, no `id` and no `name`; cells equal to the API's |
+| Edit one `sql`, append a cell without an id, `push` | "0 created, 1 updated"; the API held 4 cells: the edited sql, the 3 original ids, an id on the new cell, `updated_by` set |
+| Second `pull` on the unchanged tree | wrote nothing ("Kept 1 existing local notebook(s) unchanged") |
+| `pull <id>` over a locally modified file | restored the project's version |
+| New local file, `push` | created on the project ("1 created, 1 updated") |
+| Local file for a project notebook removed, `push --yes`, stdin closed | updated the remaining notebook, reported "1 project notebook(s) are not in ...: ob05-alpha - Left alone - rerun interactively to resolve"; the notebook stayed on the project |
+
+The CLI exit code was 0 in every call, including the one that left a notebook alone, so a script has to read the output to see it. Not measured: the choices the interactive prompt offers, notebooks with a read-replica `database_identifier`, running a notebook (the v2 OpenAPI document has no run endpoint), concurrent edits from the Dashboard.
+
+---
+
+## Log drains: not measured
+
+Drains are documented on Pro, Team and Enterprise; an HTTP drain posts a JSON array in batches of at most 250 events or one second, with optional gzip and HTTP/1 or HTTP/2.[^sb-log-drains][^sb-log-drains-blog] On the Pro organisation, `GET /v1/organizations/{slug}/entitlements` read `log_drains` `hasAccess` true and `audit_log_drains` false. `GET` and `POST /v2/projects/{ref}/analytics/log-drains` both answered 403 `forbidden`, "Your organization does not have access to this API", on that Pro organisation's project (archived in the RUNLOG), and on a Team organisation's project in an exploratory check that was not archived. The v1 API publishes no log-drains route; the v2 document lists `/v2/projects/{ref}/analytics/log-drains` and its `/{id}` form.[^sb-api-v1] What grants access to the v2 route was not determined.
+
+No drain was created, so batch size, flush spacing, the content-encoding the platform sends, HTTP version, event fields, arrival lag and arriving sources are unmeasured. A Worker sink with a SQLite-backed Durable Object was tested on its own (a plain POST and a gzip POST stored, the gzip body decoded to `[{"probe":"gzip"}]`, HTTP/1.1 seen, a POST without the key answered 401) and waits for a drain. Residency consequences are in [Supabase data residency and sovereignty](/reference/supabase-data-residency/).
+
+---
+
+## Reading the numbers
+
+| Claim | Measured or documented | How it was checked |
+|---|---|---|
+| 2.111.0 loses `traceparent` in a bundle with no `node_modules`; 2.112.0 and 2.117.3 do not | measured, `run1` to `run3`, n = 1 per cell | recording `fetch` at the client boundary, five packagings per release |
+| Registry fetch explains the Bun 2.111.0 difference when auto-install is left on | inference | the setting changed the outcome; the fetch was not observed |
+| Default propagation targets include the client's base URL host | source read, one release | `getDefaultPropagationTargets` in 2.117.3 `dist/index.mjs`; the behaviour was also seen on a self-hosted-shaped base URL |
+| `edge_logs.trace_id` on 38 of 38 rows; other sources 0 | measured, `run3`, one project | per-source counts of rows with a `trace_id` |
+| 5 failing requests in each of two buckets fire the lint, at 1% to 100% | measured, 13 firings, n = 1 per arm except where repeated | `runAdvisors` polling every 30 s, per-arm projects |
+| Lint cached about 60 s | measured, exploratory, not archived | 10 s polling on one project; the archived 30 s runs show 86-91 s steps |
+| Ingestion lag at most 30 s | measured, one 36-minute window, 15 s resolution | marker per minute, first-seen time |
+| Notebook push and pull behaviour | measured, `run2`, one project, one pass | `supabase` CLI 2.120.0 against the v2 notebooks API |
+| v2 log-drain route 403 | measured on a Pro org and a Team org (neither artifact published) | `GET` and `POST`, PAT |
+| Documented behaviours cited above | documented, read 2026-10-10 | the footnoted pages |
+
+Two limits on generalising. Every number is one region, one plan tier and an idle project, so the advisor count threshold and the lag ceiling describe this probe's load and are no platform contract. The firing rule in particular has no run above 600 requests per bucket.
+
+---
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Use supabase-js 2.112.0 or later where a bundle runs without `node_modules`. | 2.111.0 sent no `traceparent` and no warning from a Bun bundle and an esbuild bundle with no `node_modules`; 2.112.0 and 2.117.3 sent in all five packagings. | [OB01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/observability-surface/tests/ob01-trace-propagation.ts), `run1` to `run3` |
+| Import `@supabase/supabase-js/tracing` on 2.112.0 and later. | Without it: no headers and one `console.warn`. | OB01a |
+| Query `edge_logs` for the `trace_id` attribute. | 38 of 38 rows carry one; the client's value matched in 14 of 14 sending variants. | OB01b, `run3` |
+| Log the received `traceparent` in the function when `function_logs` must carry it. | `function_edge_logs` 0 of 39 and `function_logs` 0 of 78 rows carried a trace id; function ids appeared only in the function's own `console.log` message. | OB01d, OB01e |
+| Send at least 5 failing 5xx in each of two aligned buckets when testing an advisor. | Fired at 5 of 100, 5 of 250 and 6 of 600; did not fire at 4 of 100, 3 of 100 (twice), 1 of 5 or on a 404-only load. | [OB02](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/observability-surface/tests/ob02-health-advisors.ts) |
+| Do not expect an advisor from one failing bucket. | A single failing bucket, or failures in only one of two buckets, did not fire. | OB02 |
+| Poll `advisors/run` no faster than every 60 s. | The returned `observed_at` stepped 86-91 s at 30 s polling and 62-64 s at 10 s polling; the 10 s figure is exploratory, not archived. | OB02 |
+| Expect a lint 35-66 s after the second bucket and a tail up to 367 s. | Detection 35-66 s at 30 s polling; gone 306-367 s after the last failure. | OB02 |
+| Name columns in logs queries and filter on `source`. | `select *` answered a backend error in an exploratory query (not archived); the [logs guide](/guides/supabase-management-api-logs-endpoint/) records the same trap. | OB03, exploratory |
+| Size a logs poller for a ceiling of 30 s at 15 s polling. | 36 of 36 markers per source returned, max 30 s; one 36-minute window, so no lag below 15 s was resolved. | [OB03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/observability-surface/tests/ob03-log-canary.ts) |
+| Read `supabase notebooks push` output for its result; the exit code carries none. | Exit 0 on every call, including "Left alone" for a notebook with no local file. | [OB05](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/observability-surface/tests/ob05-notebooks.ts), `run2` |
+| Expect to set up log drains by hand until the v2 route accepts the organisation; Dashboard setup was not tried here. | `GET` and `POST /v2/projects/{ref}/analytics/log-drains` answered 403 on a Pro and a Team org; v1 has no route. | [OB04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/observability-surface/tests/ob04-log-drain.ts), one pass |
+
+---
+
+## Modules
+
+The lab's captures for these runs carry project refs and were not published to `out/`, so each row has no artifact; the figures are in the experiment's [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/observability-surface/RUNLOG.md).
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| OB01 | observability-surface | [`ob01-trace-propagation.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/observability-surface/tests/ob01-trace-propagation.ts) | none published |
+| OB02 | observability-surface | [`ob02-health-advisors.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/observability-surface/tests/ob02-health-advisors.ts) | none published |
+| OB03 | observability-surface | [`ob03-log-canary.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/observability-surface/tests/ob03-log-canary.ts) | none published |
+| OB04 | observability-surface | [`ob04-log-drain.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/observability-surface/tests/ob04-log-drain.ts) | none published |
+| OB05 | observability-surface | [`ob05-notebooks.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/observability-surface/tests/ob05-notebooks.ts) | none published |
+
+## Related docs
+
+- [Query Supabase project logs through the Management API](/guides/supabase-management-api-logs-endpoint/): the query shape and traps of the endpoint whose ingestion and sources are measured here.
+- [Supabase data residency and sovereignty](/reference/supabase-data-residency/): where logs go, and the log-drain 403 in residency terms.
+- [Monitor Supabase with Grafana](/guides/supabase-grafana-monitoring/): the metrics-side alerting that sits beside the log-based advisors.
+- [Edge Function limits, one ceiling at a time](/reference/supabase-edge-function-limits/): the function-side ceilings behind the Edge Function arms above.
+
+[^sb-client-tracing]: Supabase, "Client-side tracing," Supabase Docs. https://supabase.com/docs/guides/observability/client-side-tracing
+[^sb-trace-blog]: Supabase, "Connect client traces to your logs," Supabase Blog. https://supabase.com/blog/connect-client-traces-to-your-logs
+[^sb-health-advisors]: Supabase, "Health Check Advisors," Supabase Changelog, 2026-09-18. https://supabase.com/changelog/50577-health-check-advisors
+[^sb-log-drains]: Supabase, "Log drains," Supabase Docs. https://supabase.com/docs/guides/observability/log-drains
+[^sb-log-drains-blog]: Supabase, "Log drains now available on Pro," Supabase Blog. https://supabase.com/blog/log-drains-now-available-on-pro
+[^sb-api-v1]: Supabase, "Management API OpenAPI document (v1)," Supabase. https://api.supabase.com/api/v1-json
