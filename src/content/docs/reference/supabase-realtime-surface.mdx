@@ -1,0 +1,334 @@
+---
+title: "Supabase Realtime: filters, disconnect loss, Broadcast Replay and binary"
+description: What Supabase Realtime did when four changelog and blog claims were run on fresh projects on 2026-10-10 - 19 Postgres Changes filters against a SQL oracle, select and DELETE under a column filter with replica identity default and full, a revoked column that subscribes without an error, the first-event delay on a new project, 25 rows lost across a 30 s disconnect and a heartbeat-row canary that recovered 40 of 40, Broadcast Replay limits and its private-channel and database-sent-only rules, binary Broadcast across five send paths on two client versions, and the realtime schema as the postgres role.
+author: Erfi Anugrah
+category: supabase
+group: architecture
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Realtime has three modes (Postgres Changes, Broadcast, Presence); this page covers what a client of the first two observed when a documented behaviour was run: which Postgres Changes filters deliver what Postgres selects, what is lost when a socket drops, what Broadcast Replay returns, and whether binary Broadcast arrives as binary. It is for anyone building a subscriber, including the Durable Object relay in [Cloudflare Workers + Supabase](/reference/cloudflare-supabase-architecture/#realtime), which rests on the disconnect result below.
+
+The existing coverage in this corpus is documented-only: the Realtime section of that page, the per-subscriber policy cost in [RLS policy cost](/reference/supabase-rls-policy-cost/), and the global-cluster and `realtime.messages` partitioning rows in [Data residency](/reference/supabase-data-residency/). This page adds measured rows and labels each one measured or documented.
+
+All measured rows were run on 2026-10-10 on throwaway projects created on a Pro-plan organisation, region `ap-southeast-1`, default compute, no add-ons, each deleted by the module that created it. The vantage was a local macOS machine outside the project region. Every count is n=1 per row on one project unless the row says otherwise; none is a rate. The run log is [`RUNLOG.md`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/realtime-surface/RUNLOG.md) and the published artifacts are in [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/realtime-surface/out/2026-10-10).
+
+**TL;DR:**
+
+- All 19 Postgres Changes filters tried (AND over two and three columns, two conditions on one column, `like`/`ilike`, `is`, `match`/`imatch`, `isdistinct`, `not.` forms) delivered exactly the ids the equivalent SQL predicate selects on the same 8 rows.
+- `select` always adds the primary key, and an UPDATE that changes only an unselected column still produces an event.
+- A DELETE under a column filter delivered 0 of 2 matching DELETEs with replica identity `default` and 2 of 2 with `full`. A primary-key filter and an unfiltered subscriber received their DELETEs either way.
+- A `select` or filter naming a column the subscribing role cannot read leaves the subscribe callback at `SUBSCRIBED` and delivers 0 events. The only signal is a channel `system` event.
+- A 30 s client-side gap with 25 rows inserted delivered 0 of 25 on rejoin. A heartbeat row, a 6 s staleness rule and a REST backfill recovered 40 of 40.
+- Broadcast Replay returned at most 25 messages (the newest 25) with no error for a larger `limit`; it refuses public channels and never holds client-sent messages.
+- Binary Broadcast arrived byte-for-byte on the current client over a WebSocket `ArrayBuffer`, `httpSend`, raw REST and `realtime.send_binary`; the old client received no binary event from any of them. A `Uint8Array` over WebSocket `send` arrived as a JSON object.
+- As the `postgres` role, writes to `realtime.schema_migrations` and `drop trigger tr_check_filters` were accepted, against the changelog's list.
+
+---
+
+## What each question returned
+
+| Question | Measured answer (2026-10-10, n=1) | Section |
+|---|---|---|
+| Do the documented filter forms match SQL? | 19 of 19 delivered the oracle's ids on 8 rows | [Filters](#postgres-changes-filters) |
+| Does `select` change which events arrive? | No: an unselected-column UPDATE still arrives, trimmed | [Select](#select-and-the-primary-key) |
+| Does a column filter see DELETEs? | 0 of 2 with identity `default`, 2 of 2 with `full` | [DELETE](#delete-under-a-column-filter) |
+| What happens on a revoked column? | `SUBSCRIBED`, 0 events, error only in the `system` event | [Revoked column](#a-column-the-role-cannot-read) |
+| Is a new project ready at `SUBSCRIBED`? | First event arrived about 11 s later on 5 of 5 projects | [First event](#first-event-on-a-fresh-project) |
+| Does a rejoin replay the gap? | 0 of 25 rows after a 30 s gap | [Disconnect loss](#disconnect-loss) |
+| What does Replay return? | The newest 25 at most, private channels, database-sent only | [Replay](#broadcast-replay) |
+| Does binary Broadcast arrive as binary? | Yes on the current client for four of five send paths; no on the old client | [Binary](#binary-broadcast) |
+| Is the realtime schema locked for `postgres`? | Six of ten operations refused, four accepted | [Schema](#the-realtime-schema-as-postgres) |
+
+---
+
+## Postgres Changes filters
+
+The Supabase blog (2026-08-05) says filters compose with a comma and "every condition has to match", and adds `like`, `ilike`, `is`, `match`, `imatch` and `isdistinct`.[^sb-pg-filters] The lab ran 19 filters, each on its own channel, against one INSERT batch of 8 rows in a table with RLS off, and compared each with `select id ... where <equivalent SQL predicate>` on the same rows. The `anon` role subscribed.
+
+| Filter | Delivered of 8 | Note |
+|---|---|---|
+| `team=eq.a` | 4 | |
+| `team=eq.a,status=eq.open` | 2 | AND over two columns |
+| `team=eq.a,status=eq.open,flag=eq.true` | 1 | AND over three columns |
+| `n=gt.2,n=lt.6` | 3 | two conditions on one column |
+| `team=in.(a,c)` | 5 | |
+| `email=like.a%` | 1 | |
+| `email=ilike.a%` | 2 | |
+| `note=is.null` | 2 | |
+| `flag=is.true` | 3 | |
+| `flag=is.false` | 3 | |
+| `email=match.^[a-d]` | 4 | |
+| `email=imatch.^[a-d]` | 5 | one more than `match` |
+| `note=isdistinct.active` | 6 | includes the two rows where `note` is NULL |
+| `status=not.eq.open` | 3 | the NULL-status row is excluded, as in SQL |
+| `email=not.like.a%` | 6 | |
+| `team=not.in.(a,b)` | 1 | |
+| `note=not.is.null` | 6 | |
+| `team=eq.a,status=not.eq.open` | 2 | |
+| `email=ilike.a%,flag=is.true` | 2 | |
+
+All 19 delivered exactly the oracle's ids, and an unfiltered control received 8 of 8. Not measured: OR (the blog describes AND only), the output of the `postgresChangesFilter()` builder, filters on other column types (timestamps, uuids, arrays), and a large batch.
+
+### Select and the primary key
+
+The blog says only the listed columns come back in the payload.[^sb-pg-filters] One INSERT, a `note`-only UPDATE, a `status` UPDATE and one DELETE were sent to subscribers with different `select` lists:
+
+- `select: ['status']` delivered INSERT keys `id,status`; `['id','team']` and `['status','email']` likewise carried `id` without it being listed.
+- The `note`-only UPDATE still produced an UPDATE event for subscribers whose `select` excluded `note`: 2 UPDATE events each, `new` trimmed to the selected columns plus `id`, `old` carrying `id` only.
+- DELETE events carried `old` = `{id}` and an empty `new`, with and without `select`.
+- The unselected control received all 8 columns on INSERT and UPDATE.
+- `select: ['nope']`, a column that does not exist: the subscribe callback reported `SUBSCRIBED`, the `system` event carried `status: error` with `invalid column for select nope`, and 0 events arrived.
+
+A subscriber that narrows `select` to save payload bytes therefore still receives one event per change to the row.
+
+### DELETE under a column filter
+
+The blog states that "DELETE events only carry the row's primary key, so column filters can't be evaluated on deletes."[^sb-pg-filters] It does not mention replica identity. Four rows were seeded (2 with `team` a) and deleted:
+
+| Subscriber | Replica identity `default` | Replica identity `full` |
+|---|---|---|
+| `team=eq.a`, event `*` | 0 DELETE events | 2 of 2 |
+| `team=eq.a,status=eq.open`, event DELETE | 0 | 1 of 1 |
+| `id=eq.<id>` (primary key) | 1 | 1 |
+| unfiltered, event DELETE | 4 | 4 |
+
+Under `full`, `old` carried all 8 columns. The full-identity rows are the lab's own finding, n=1; the WAL volume cost of `alter table ... replica identity full` was not measured. An UPDATE that moved a row out of `team=eq.a` produced no event for the `team=eq.a` subscriber, and the UPDATE that moved it back in produced 1 (`new.team` `a`).
+
+### A column the role cannot read
+
+The blog requires that "the columns you list must be selectable by the subscribing role."[^sb-pg-filters] The setup revoked `select` on the table from `authenticated` and granted every column except `secret`. `has_column_privilege('authenticated', ..., 'secret', 'select')` was false, and PostgREST as that user answered `42501 permission denied for table` for `select=secret`. With the user signed in on the client:
+
+| Subscription | Subscribe status | Events | `secret` in payloads |
+|---|---|---|---|
+| no `select` (all columns) | `SUBSCRIBED` | INSERT, both UPDATEs, DELETE | absent from every payload |
+| `select: ['id','team']` | `SUBSCRIBED` | arrived normally | not selected |
+| `select: ['id','secret']` | `SUBSCRIBED` | 0 | `system` event `status: error ... invalid column for select secret` |
+| `filter: 'secret=eq.s'` | `SUBSCRIBED` | 0 | `system` event `invalid column for filter secret` |
+| control: `anon`, table-level select intact, `select: ['id','secret']` | `SUBSCRIBED` | 4 | present (`s1`, `s1`, `s2`) |
+
+The documented requirement holds. The failure is not surfaced by the subscribe status callback and appears only in the `system` event, so a subscriber that checks `SUBSCRIBED` and nothing else sees a healthy channel that never delivers.
+
+<Aside type="note" title="The first read of this row was wrong">
+A client given an `Authorization` header and `realtime.setAuth(token)` had its realtime token reset to the anon key at the client's next token refresh (the mechanism is inferred from the symptoms, not read from source). On that client `secret` arrived in UPDATE payloads for an `authenticated` subscriber, and `httpSend` answered 401 and 403 against a private topic that a raw request with the user token reached (202). The figures above are from a client signed in with `signInWithPassword`, which showed neither.
+</Aside>
+
+### Delivered events with and without a filter
+
+Twenty INSERTs, 10 of them with `team` a: the unfiltered subscriber received 20, a `team=eq.a` subscriber 10, and `team=eq.a` with `select: ['id']` 10. Billed message counts were not readable with a PAT, and `usage.api-counts` `total_realtime_requests` read 7 before and 7 after the 20 events, so it does not count them. The claim that filtered events cost fewer messages rests on delivery counts only; that billing counts delivered events is the documentation's statement and was not measured. Per-subscriber policy checks, which scale with the number of subscribers, are covered in [RLS policy cost](/reference/supabase-rls-policy-cost/#realtime-multiplies-the-policy-cost-by-subscribers).
+
+---
+
+## First event on a fresh project
+
+On five fresh projects (RT01 three times, RT02 twice) the first change event reached the subscriber about 11 s after it subscribed. A canary INSERT was sent when the subscriber joined and another every 10 s. The values, in milliseconds, were 10655, 10635 and 10870 in RT01 and 10748 and 10790 in RT02.
+
+On the three projects whose runs recorded which canary arrived, it was the second, sent about 10 s after the first, each time; the first canary's event was not delivered. The two earlier runs did not record the index. On those three projects a subscribe that returned `SUBSCRIBED` was not proof that the change stream was wired. Lost versus late is not separated: the harness waited 1.5 s after the second canary's event (`sleep(1500)` in `lib/rt.ts`, a code constant rather than a measured timing), and the first canary's event had not arrived by then.
+
+A readiness check for a new project, or a preview branch, needs an event round trip rather than a subscribe status.
+
+---
+
+## Disconnect loss
+
+The Supabase blog of 2026-05-05 says: "If a client disconnects for 30 seconds and reconnects, the changes that happened during those 30 seconds are gone."[^sb-rt-pipelines] That is documented; this section is the measurement. The table `rt02_t` had RLS off and an `anon` Postgres Changes subscriber, with rows written by the service key over PostgREST at 1 per second. The socket was closed by the client with code 4000, so the server saw a clean close. This is not a network partition.
+
+| Run | Setup | Rows before / during / after | Received |
+|---|---|---|---|
+| RT02a | `reconnectAfterMs` fixed at 30 s, client reconnects itself | 3 / 25 / 3 | 3 of 3, 0 of 25, 3 of 3 |
+| RT02b | manual `disconnect()`, then `connect()` after 30 s, 25 rows in between | gap 25, then 1 inserted after | original channel: 0 of 25 gap rows and the 1 later row; fresh channel on the same client: 0 of 25 |
+
+In RT02a the status log read `SUBSCRIBED`, then `CHANNEL_ERROR` (4.7 s from the start), then `SUBSCRIBED` (34.7 s from the start), a rejoin delay after the drop of 30.1 s. None of the 25 gap rows was delivered at or after the rejoin. In RT02b the original channel was in state `joined` after `connect()` with no re-subscribe call.
+
+### Heartbeat-row canary
+
+RT02c ran a recovery pattern. A second table's single row is updated every 2 s (the heartbeat) and 40 data rows are written at 1 per second. At t=10 s the socket is dropped and does not reconnect on its own. The watcher declares the subscription stale after 6 s without a heartbeat event, tears the client down, subscribes a new one, then backfills `updated_at > last_seen` over REST and merges by id.
+
+| Quantity | Measured |
+|---|---|
+| Rows in the table | 40 |
+| Staleness declared | 4.8 s after the drop |
+| New subscription joined in | 0.1 s |
+| Backfill query returned in | under 0.1 s |
+| Rows live on the first channel | 9 |
+| Rows live on the second channel | 26 |
+| Rows backfilled | 5 |
+| Backfilled rows also seen live | 0 |
+| Missing after the union | 0 of 40 |
+
+The `>` boundary was not stressed. The rows had distinct `now()` values, so two rows committed with the same `updated_at` as `last_seen` is reasoned, not measured, as the case where `>` would drop a row. Not measured: a gap longer than 30 s, a server-side drop or a real network cut, and the blog's "With 100 subscribers watching a table, one INSERT generates 100 authorization queries."[^sb-rt-pipelines]
+
+For a Durable Object relay that holds one upstream subscription, this is the reason a staleness watcher with a REST backfill belongs next to the subscription: the rejoin is automatic and delivers nothing from the gap. Broadcast Replay below is a separate feature for database-sent Broadcast messages and does not cover Postgres Changes rows.
+
+---
+
+## Broadcast Replay
+
+The Broadcast documentation says Replay "enables private channels to access messages that were sent earlier", that `limit` must be a positive integer "with a maximum value of 25", that only messages "published via Broadcast From the Database" are available, and that partitions older than 72 hours are dropped, so a message stays at least 72 hours and at most 4 days.[^sb-broadcast] The lab sent 26 messages with `select realtime.send(jsonb_build_object('i', n), 'evt', topic, true)` as separate autocommit statements, with policies allowing `authenticated` to select and insert on `realtime.messages`, and an authenticated user signed in on the client. Each row below used a fresh subscriber with `since` set before the first message.
+
+| Subscription | Messages replayed | Ids (`i`) |
+|---|---|---|
+| `limit` omitted | 25 | 2 to 26, ascending (message 1 not delivered) |
+| `limit: 10` | 10 | 17 to 26 |
+| `limit: 25` | 25 | |
+| `limit: 26` | 25, no join error | |
+| `limit: 100` | 25, no join error | |
+
+Every replayed message carried `meta.replayed`. A `limit` above the cap is clamped without an error, so a client that asks for 100 cannot tell from the join reply that 75 were withheld; it has to count.
+
+- `since` set to the floor of the epoch milliseconds of message 13's `inserted_at`, and to that plus one millisecond, both with `limit: 25`, gave 13 messages, `i` 14 to 26. An unpublished iteration on a reused project returned 14 messages including 13 for the first value, so the boundary at sub-millisecond resolution is not settled.
+- Public channel: supabase-js refuses at construction (`tried to use replay on public channel`). A raw WebSocket join with `private: false` and a replay config received `UnableToReplayMessages: Replay is not allowed for public channels` and 0 broadcast frames. `realtime.send(..., private => false)` still wrote 1 row to `realtime.messages`.
+- Client-sent messages: 3 by WebSocket `send` and 3 by `httpSend` on a private topic were all acknowledged (`ok`, `success: true`), left 0 rows in `realtime.messages` for the topic, and a later replay subscriber received 0. Replay covers database-sent messages only, as documented.
+
+### The first private use of a fresh project
+
+Before the first Realtime connection `realtime.messages` was absent with 0 partitions on one project and present with 0 partitions on another. The first join answered after 187 and 171 milliseconds, and a partition for the current UTC day existed 5261 and 178 milliseconds later. In an earlier pass the same day on two other fresh projects, with no wait for the partition, `realtime.send` persisted 0 of 26 rows and the first private join answered `CHANNEL_ERROR (MissingPartition: Realtime was unable to find the expected messages partition)`. The modules now wait for the partition. The partitioning is placed in the residency picture in [Data residency](/reference/supabase-data-residency/#realtime).
+
+Not measured: the 72-hour partition boundary, `since` older than the retention, and ordering when two messages share an `inserted_at`.
+
+---
+
+## Binary Broadcast
+
+The changelog of 2026-06-11 says Broadcast carries binary payloads from client libraries over WebSocket, over the REST API and from the database, names minimum versions (supabase-js 2.91.0 for WebSocket, 2.107.0 for `httpSend`, Realtime server 2.103.2), and says binary sent to older clients is "silently dropped".[^sb-binary] The lab used a private topic with select and insert policies and two receivers signed in as the same user, one on the current supabase-js and one on the old client pinned in the experiment directory. The payload was 16 bytes (`00 01 02 03 7f 80 c8 fe ff 00 ff 00 10 20 40 80`), plus a 4096-byte payload over WebSocket `Uint8Array`.
+
+| Send path | Current receiver | Old receiver |
+|---|---|---|
+| WebSocket `send` with an `ArrayBuffer` | 1 event, `ArrayBuffer`, bytes equal | 0 events |
+| WebSocket `send` with a `Uint8Array` (16 B and 4096 B) | 1 event, a JSON object keyed `"0"` to `"15"`, not binary | the same JSON object |
+| `httpSend` with a `Uint8Array` | 1 event, `ArrayBuffer`, bytes equal | 0 events |
+| raw `POST` `application/octet-stream` | 1 event, `ArrayBuffer`, bytes equal | 0 events |
+| `realtime.send_binary(bytea, ...)` | 1 event, `ArrayBuffer`, bytes equal | 0 events |
+| JSON controls (WebSocket, `httpSend`, raw REST, `realtime.send`) | 1 event each, equal | 1 event each, equal |
+
+- The old receiver saw nothing for binary, including no other event names. It joined and received JSON normally, which is the silent drop.
+- A `Uint8Array` passed to WebSocket `send` on the current client arrived as a JSON-encoded object on both receivers, and only an `ArrayBuffer` went binary. `httpSend` converted a `Uint8Array` correctly. The old client sending a `Uint8Array` by WebSocket or `httpSend` also produced the JSON-encoded object at the current receiver. The lab read the changelog as covering `ArrayBuffer` and `ArrayBufferView` over WebSocket, so this differs from that reading; it was measured once, on one current client version. The 4096-byte row is the `Uint8Array` case only; a 4096-byte `ArrayBuffer` was not sent. The run log does not record a report filed upstream.
+- Stored form: a database send left rows with `extension` `broadcast`, `payload` null and a 16-byte `binary_payload`.
+- Private-channel policy applied to binary as to JSON. A topic with no select policy: the join answered `CHANNEL_ERROR (Unauthorized: You do not have permissions to read from this Channel topic: rt04:denied)`, and the anon key joining the policy-allowed topic got the same error. On a select-only topic the WebSocket binary and JSON sends by the authenticated user errored, raw REST binary and JSON with the user token answered 403, with the anon key 403, and a raw REST binary send with the secret API key answered 202 and the reader got the binary event.
+- Policies on `realtime.messages` combine with OR. A leftover permissive `with check (true)` policy from an earlier module made the select-only topic writable in an unpublished iteration, and the module now drops every policy on `realtime.messages` first.
+
+Not measured: client versions between the two used, so the changelog's minimum versions are not located; the Realtime server version; binary on `realtime.send_binary(..., private => false)`; an `ArrayBuffer` larger than 16 bytes over WebSocket; any size limit.
+
+---
+
+## The realtime schema as postgres
+
+The changelog of 2026-07-14 says the `realtime` schema is locked down: "creating, altering, or dropping objects fails with a permission error", while RLS policies on `realtime.messages` keep working.[^sb-rt-lockdown] The lab ran ten operations as the `postgres` role (`is_superuser` off) over the Management API query endpoint, with the session-mode pooler matching where tried. Each ran inside `begin; ...; rollback;` and was checked afterwards (89 rows in `realtime.schema_migrations` before and after, no probe row, `messages.topic` and `realtime.topic()` still present). Eight operations follow the changelog's list as the lab read it; `UPDATE` and `ALTER` on `realtime.schema_migrations` are the probe's own additions.
+
+| Operation | Measured |
+|---|---|
+| `create table realtime.dd_probe`; `create function realtime.dd_fn` | refused, `42501 permission denied for schema realtime` |
+| `alter table realtime.messages drop column topic`; `drop table realtime.messages`; `drop function realtime.topic()` | refused, `42501 must be owner of table messages` / `must be owner of function realtime.topic` |
+| `alter table realtime.schema_migrations add column ...` | refused, `42501 must be owner of table schema_migrations` |
+| `insert`, `update`, `delete` on `realtime.schema_migrations` | allowed (201) on both vantages; the table ACL gives `postgres` `arwdDxtm`, owner `supabase_admin` |
+| `drop trigger tr_check_filters on realtime.subscription` | allowed (201); the trigger existed before |
+| control: policy create, list, drop on `realtime.messages` | all succeed |
+
+Six of ten were refused and four allowed. The refusal text for the `messages` and `realtime.topic()` operations differs from the `permission denied for schema realtime` the lab read in the changelog for the blocked operations. The lab also read the changelog as listing `INSERT` and `DELETE` on `realtime.schema_migrations` and the trigger drop as refused; on this project they were accepted. Two readings remain: the lockdown is delivered per Realtime service version and this project's service was below 2.112.7 or had not applied it, or it covers only the other six operations. The service version was not read, the latest `schema_migrations` version was 20261002120000, and no persisted (not rolled-back) write was run, so the effect of an accepted write on Realtime is unmeasured. The run log does not record a report filed upstream for the difference. The wider set of platform lockdowns met by the `postgres` role is in [Locking down Supabase](/reference/supabase-data-surface-lockdown/).
+
+---
+
+## Reading the numbers
+
+- Every row is one run on one project. The 19-filter result, the delivery counts and the byte-for-byte binary equality are the kind of finding one run supports, because a mismatch would show on the first run. The 0 of 25 rejoin result and the 11 s first-event delay would need repeats to put a spread on them; the delay was seen on 5 of 5 projects.
+- The disconnect was a client-initiated close with code 4000, so the server saw a clean close. A real network cut, a server-side drop and a gap longer than 30 s were not run, and the 0 of 25 does not extend to them.
+- The vantage was a local machine outside `ap-southeast-1`. Timings (4.8 s to staleness, 0.1 s to rejoin, 11 s to first event) include that path.
+- Client versions are the current `@supabase/supabase-js` at run time (its version is in the RT01a row of the artifact) and one older pinned client. Behaviour between those versions, and on other SDKs, was not run.
+- The Realtime service version was not read on any project, so every service-side row is tied to the service as it ran on 2026-10-10 and may change with a release.
+- Billing and retention claims remain documented-only: billed message counts and the 72-hour partition boundary.
+
+## Evidence
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| 19 filters delivered the SQL oracle's ids on 8 rows | Measured 2026-10-10 | [RT01](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/realtime-surface/tests/rt01-postgres-changes-filters.ts), `RT01b` rows |
+| `select` adds the primary key; an unselected-column UPDATE still fires | Measured 2026-10-10 | RT01, `RT01c` rows |
+| DELETE under a column filter: 0 of 2 (default), 2 of 2 (full) | Measured 2026-10-10 | RT01, `RT01d` rows |
+| Revoked column: `SUBSCRIBED`, 0 events, `system` event error | Measured 2026-10-10, corrected client | RT01, `RT01e` rows |
+| First event about 11 s after subscribe on 5 of 5 projects | Measured 2026-10-10 | RT01a (three projects), [RT02](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/realtime-surface/tests) setup (two) |
+| 0 of 25 after a 30 s client-side gap; 40 of 40 with the canary | Measured 2026-10-10, clean close | RT02a, RT02b, RT02c |
+| Replay cap, `limit`, public refusal, client-sent not persisted | Measured 2026-10-10 | [RT03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/realtime-surface/tests/rt03-broadcast-replay.ts), `RT03b` to `RT03e` |
+| Binary arrival by send path and client; policy on binary | Measured 2026-10-10 | [RT04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/realtime-surface/tests/rt04-binary-broadcast.ts), `RT04a` to `RT04d` |
+| Realtime schema operations as `postgres` | Measured 2026-10-10 | [DD03](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/data-api-defaults/tests/dd03-platform-lockdowns.ts) |
+| Replay `limit` maximum 25, private channels only, 72 h to 4 days retention | Documented, page read 2026-10-10 | Broadcast documentation[^sb-broadcast]; the cap and private rule measured above, retention not |
+| Binary minimum versions, silent drop on old clients | Documented, page read 2026-10-10 | Changelog[^sb-binary]; the silent drop measured above, versions not located |
+| 100 subscribers, one INSERT, 100 authorization queries | Documented, not measured | Blog[^sb-rt-pipelines] |
+| OR filters, billed message counts, real network cut | Not measured | |
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Check a new filter operator against the same predicate in SQL on a sample batch. | 19 of 19 filters matched the oracle on 8 rows; OR was not run. | RT01 |
+| Set replica identity `full` on tables whose DELETEs a column filter must receive. | Column filter 0 of 2 DELETEs under `default`, 2 of 2 under `full`; WAL cost unmeasured. | RT01 |
+| Filter DELETE subscriptions on the primary key or subscribe unfiltered. | Primary-key filter got its 1 and the unfiltered subscriber all 4 under `default`. | RT01 |
+| Listen for the channel `system` event, not only the subscribe status. | `SUBSCRIBED` with 0 events and `invalid column for select secret` on a revoked column. | RT01 |
+| Keep `select` and filter columns to ones the subscribing role can read. | Filter on a revoked column: `invalid column for filter secret`, 0 events. | RT01 |
+| Wait for an event round trip before treating a new project's stream as wired. | First event about 11 s after subscribe on 5 of 5 projects; first canary undelivered on 3 of 3 that recorded it. | RT01 |
+| Run a heartbeat row and a REST backfill beside every long-lived subscription. | Gap 0 of 25 on rejoin; canary stale in 4.8 s, 40 of 40 recovered, 0 duplicated. | RT02 |
+| Backfill with an overlap on `updated_at` and merge by id. | The `>` boundary was reasoned, not measured: equal `updated_at` values would be dropped. | RT02 |
+| Use Replay on private channels with database-sent messages and `limit` of 25 or less. | `limit` 26 and 100 returned 25 with no error; public refused; client-sent not stored. | RT03 |
+| On a new project, join once and wait for the day's partition before `realtime.send`. | 0 of 26 persisted and `MissingPartition` with no wait for the partition. | RT03 |
+| Send binary by `httpSend`, raw REST, `send_binary` or a WebSocket `ArrayBuffer`. | Four paths arrived byte-for-byte on the current client; a WebSocket `Uint8Array` arrived as JSON. | RT04 |
+| Upgrade every receiver before sending binary. | The old client got 0 events and no error for binary, and JSON normally. | RT04 |
+| Leave `realtime.schema_migrations` and `tr_check_filters` alone. | Writes and the trigger drop were accepted against the changelog; effect on Realtime unmeasured. | DD03 |
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.35; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  root [label="What must the subscriber\nnot miss?", shape=hexagon];
+  chg  [label="Row changes\n(Postgres Changes)", shape=diamond];
+  bc   [label="Messages\n(Broadcast)", shape=diamond];
+  root -> chg; root -> bc;
+
+  canary [label="Heartbeat row +\nREST backfill by updated_at"];
+  del    [label="Column filter on DELETE?", shape=diamond];
+  full   [label="replica identity full,\nor filter on the primary key"];
+  chg -> canary [label="gaps matter"];
+  chg -> del    [label="filtering"];
+  del -> full;
+
+  replay [label="Replay: private channel,\ndatabase-sent, limit 25 or less"];
+  bin    [label="Binary: httpSend, REST,\nsend_binary, ArrayBuffer"];
+  bc -> replay [label="catch-up after a gap"];
+  bc -> bin    [label="byte payloads"];
+}
+```
+
+1. Row changes where gaps matter: run a heartbeat row and a REST backfill by `updated_at`.
+2. Row changes filtered by a column that must also see DELETEs: set replica identity `full`, or filter on the primary key.
+3. Broadcast catch-up after a gap: Replay on a private channel, database-sent messages, `limit` of 25 or less.
+4. Broadcast byte payloads: `httpSend`, raw REST, `realtime.send_binary` or a WebSocket `ArrayBuffer`, to receivers on a current client.
+
+---
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| RT01 | realtime-surface | [`rt01-postgres-changes-filters.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/realtime-surface/tests/rt01-postgres-changes-filters.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/realtime-surface/out/2026-10-10) |
+| RT02 | realtime-surface | [RT02 test, `tests/` directory](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/realtime-surface/tests) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/realtime-surface/out/2026-10-10) |
+| RT03 | realtime-surface | [`rt03-broadcast-replay.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/realtime-surface/tests/rt03-broadcast-replay.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/realtime-surface/out/2026-10-10) |
+| RT04 | realtime-surface | [`rt04-binary-broadcast.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/realtime-surface/tests/rt04-binary-broadcast.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/realtime-surface/out/2026-10-10) |
+| DD03 | data-api-defaults | [`dd03-platform-lockdowns.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/data-api-defaults/tests/dd03-platform-lockdowns.ts) | none published |
+
+## Related docs
+
+- [Cloudflare Workers + Supabase: an architecture reference](/reference/cloudflare-supabase-architecture/#realtime) - the Durable Object relay whose upstream rejoin delivers 0 of 25.
+- [RLS policy cost](/reference/supabase-rls-policy-cost/) - the per-subscriber policy check that a filtered subscription still pays.
+- [Data residency](/reference/supabase-data-residency/#realtime) - the global cluster and the `realtime.messages` partitioning.
+- [Locking down Supabase](/reference/supabase-data-surface-lockdown/) - the other platform lockdowns met by the `postgres` role.
+
+{/* References: cited inline as [^slug]; the numbered list renders below under "References". */}
+[^sb-pg-filters]: Supabase, "Postgres Changes gets AND filters, new operators, and column selection," Supabase Blog, 2026-08-05. https://supabase.com/blog/postgres-changes-filters-and-column-selection
+[^sb-binary]: Supabase, "Realtime Broadcast now supports binary payloads," Supabase Changelog, 2026-06-11. https://supabase.com/changelog/46834-realtime-broadcast-now-supports-binary-payloads
+[^sb-broadcast]: Supabase, "Broadcast," Supabase Docs. https://supabase.com/docs/guides/realtime/broadcast
+[^sb-rt-pipelines]: Supabase, "Realtime or Pipelines? How to choose the right tool," Supabase Blog, 2026-05-05. https://supabase.com/blog/realtime-or-pipelines-how-to-choose-the-right-tool
+[^sb-rt-lockdown]: Supabase, "Realtime schema is now fully locked down against modifications," Supabase Changelog, 2026-07-14. https://supabase.com/changelog/realtime-schema-locked-down-against-modification

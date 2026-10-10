@@ -1,0 +1,341 @@
+---
+title: "Self-hosted Supabase Docker defaults in 2026"
+description: "What the self-hosted Docker stack does out of the box after the 2026 default changes, read off a running stack rather than its compose file - Envoy instead of Kong (with the kong alias kept), how sb_ keys pass the gateway and what PostgREST sees, the empty opaque-key variables, Postgres 17 with pg_graphql off, Studio and postgres-meta as postgres, logs as an opt-in override, and API_EXTERNAL_URL and SAML under /auth/v1."
+author: Erfi Anugrah
+category: supabase
+group: architecture
+---
+
+The self-hosted stack under `docker/` in the public supabase/supabase repository changed its defaults between June and August 2026: logs became opt-in, Postgres 17 and the `postgres` role for Studio became the default, `API_EXTERNAL_URL` gained `/auth/v1`, and Envoy replaced Kong.[^sb-selfhost-changelog] This page records which of those changes a fresh stack shows on the wire, in the database and in its containers, and where the gateway behaviour differs from a managed project.
+
+Everything marked measured was run on 2026-10-10 from the [`self-hosted-defaults`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/self-hosted-defaults) experiment in [supabase-lab](https://github.com/erfianugrah/supabase-lab): one fresh stack, 26 checks passing and 0 failing, on one Docker Desktop host (Apple silicon, so the Postgres image answered `aarch64-unknown-linux-gnu`). The stack is `docker/` copied out of supabase/supabase at commit [`8617532`](https://github.com/supabase/supabase/tree/8617532ae1a41571d5d557cd24c6f5f2565d9230/docker) (master, committed 2026-10-09), with `.env.example` copied to `.env` and the two upstream key scripts run as the self-hosting guide runs them. Requests went to the published gateway port `127.0.0.1:8000`, plus `docker exec` into the database container and `docker compose` in the stack directory. There is no Supabase project and no personal access token in this run. "Documented" below means a statement in the changelog at that commit or in the linked discussions, which the run did not itself verify. The run's [artifact](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/out/2026-10-10/run-2026-10-10T01-01-31-585Z.json) and [facts file](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/out/2026-10-10/run-2026-10-10T01-01-31-585Z.facts.md) are published, and the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/RUNLOG.md) carries the module rows.
+
+**TL;DR:**
+
+- The gateway is Envoy, on service `api-gw` and container `supabase-envoy`. The resolved compose model has 11 services and none matches "kong"; nothing listens on host port 8443 or 8001. With the Kong override applied, 8443 accepts and the `server` header reads `kong/3.9.3`; with it removed, Envoy is back and 8443 is refused. The Envoy container still answers to the network aliases `envoy` and `kong`.
+- No key, or a made-up `sb_secret_` key, gets Envoy's own `401` (`Unauthorized`, `text/plain`). A valid `sb_publishable_` key gets the same status as the legacy anon JWT on six routes, and a valid `sb_secret_` key the same as the legacy `service_role` JWT. PostgREST sees `role` `anon` or `service_role`.
+- `.env.example` ships the four opaque-key variables empty. With them emptied on a running stack, Envoy logged `legacy API key mode (sb_ keys disabled)` and answered `401` to both `sb_` keys while the legacy JWTs still worked. `utils/add-new-auth-keys.sh` also uncomments four lines in `docker-compose.yml`.
+- The database is Postgres 17.6 (image `supabase/postgres:17.6.1.136`). `pg_graphql` is available and not created, and `POST /graphql/v1` answers `200` with an `errors` body. Studio and postgres-meta run as `postgres`, which is not a superuser; Realtime, Supavisor, `pg_cron` and `pg_net` connect as `supabase_admin`.
+- Analytics and Vector exist only with `docker-compose.logs.yml`, which adds exactly those two services and flips Studio's `ENABLED_FEATURES_LOGS_ALL` to `true`. Vector is the only service that mounts the Docker socket.
+- `API_EXTERNAL_URL` is the public URL plus `/auth/v1` and equals `GOTRUE_JWT_ISSUER`; the token `iss` is that value. SAML metadata is served at `/auth/v1/sso/saml/metadata`, and the unprefixed `/sso/saml/metadata` falls to the dashboard gate. No real IdP assertion was exercised.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  client [label="Client\n127.0.0.1:8000", style=rounded];
+
+  subgraph cluster_default {
+    label="Default docker-compose.yml (11 services)"; style=rounded; fontsize=12; margin=12;
+    gw    [label="api-gw (Envoy)\naliases: envoy, kong"];
+    auth  [label="auth"];
+    rest  [label="rest (PostgREST)"];
+    meta  [label="meta (postgres-meta)"];
+    studio [label="studio"];
+    db    [label="db (Postgres 17)", shape=cylinder];
+  }
+  subgraph cluster_logs {
+    label="docker-compose.logs.yml"; style=rounded; fontsize=12; margin=12;
+    analytics [label="analytics"];
+    vector    [label="vector\n(Docker socket)"];
+  }
+
+  client -> gw      [label="apikey / sb_ key"];
+  gw -> auth        [label="/auth/v1"];
+  gw -> rest        [label="/rest/v1, /graphql/v1"];
+  gw -> meta        [label="/pg"];
+  gw -> studio      [label="/ (basic auth)"];
+  meta -> db        [label="postgres"];
+  rest -> db;
+  auth -> db;
+  vector -> analytics;
+}
+```
+
+Every route a client uses goes through `api-gw`; the services behind it are not published on the host. Two override files change the picture: `docker-compose.logs.yml` adds the two services in the second cluster, and `docker-compose.kong.yml` swaps the gateway for Kong.
+
+1. The client reaches `api-gw` on host port 8000 with an `apikey` header, an `Authorization` bearer or dashboard basic-auth credentials.
+2. `api-gw` forwards `/auth/v1` to Auth, `/rest/v1` and `/graphql/v1` to PostgREST, `/pg` to postgres-meta and `/` to Studio behind basic auth.
+3. Postgres is reached by Auth, PostgREST and postgres-meta; Analytics and Vector are present only with the logs override.
+
+---
+
+## What changed and what was measured
+
+Four changelog entries describe the defaults; each row says whether this run observed it.
+
+| Changelog date | Documented statement | Measured 2026-10-10 |
+|---|---|---|
+| 2026-06-03 | Logs and analytics leave the default `docker-compose.yml`; `docker-compose.logs.yml` is added[^sb-selfhost-logs] | yes (SD05) |
+| 2026-06-17 | Postgres 17 is the default; Studio and Postgres Meta connect as `postgres`, not `supabase_admin`; `pg_graphql` is off on fresh installs[^sb-selfhost-pg17][^sb-selfhost-studio-role] | yes, with one gap: Studio's own connection, if it has one, was not observed (SD03, SD04) |
+| 2026-07-07 | `API_EXTERNAL_URL` ends in `/auth/v1`; SAML endpoints move to `/auth/v1/sso/saml/*`[^sb-selfhost-ext-url] | the current location only; the earlier layout was not started (SD06) |
+| 2026-08-11 | Envoy replaces Kong as the default gateway; Kong stays as an opt-in override[^sb-selfhost-envoy] | yes, with a Kong control (SD01, SD07) |
+
+The changelog entry for the gateway says only that Envoy is the default, that Kong is an opt-in override (`sh run.sh config add kong`) and that the `kong` service is renamed `api-gw`. The 8443 detail is from a comment in `docker/docker-compose.kong.yml` at the same commit: "Kong re-adds an HTTPS listener on 8443".[^sb-kong-override] No disagreement between these statements and the run was found, so nothing has been filed upstream.
+
+---
+
+## Gateway: Envoy, with the kong name kept
+
+Measured on the default stack (SD01):
+
+| Check | Result |
+|---|---|
+| Resolved compose model | 11 services; `api-gw` on `envoyproxy/envoy:v1.39.1`; 0 services or images matching "kong"; the gateway publishes `8000:8000` only |
+| Running containers | one gateway, `supabase-envoy`, on `0.0.0.0:8000`; 0 Kong containers; 11 containers running |
+| `GET /auth/v1/health` with the publishable key | `200`, `server: envoy` |
+| TCP connect to host 8443 and 8001 | refused, both |
+| `GET /` | `401` without credentials; `307` to `/project/default` with the dashboard credentials |
+| Network aliases on the Envoy container | `supabase-envoy`, `api-gw`, `envoy`, `kong` |
+
+The absences (no Kong service, no 8443, no 8001) are reads of a stack that has no Kong. SD07 is the control that shows the probes can see Kong. With `docker-compose.kong.yml` applied, the gateway was a `kong/kong:3.9.3` container publishing 8000 and 8443, TCP 8443 was accepted, `GET /auth/v1/health` over HTTPS on 8443 answered `200` with `server: kong/3.9.3`, and port 8000 carried the same `server` header. Through Kong the statuses matched Envoy's on the probes made: publishable key `403` and secret key `200` on the OpenAPI route, `401` with no key on `/auth/v1/health`. With the override removed the gateway was `envoyproxy/envoy:v1.39.1` again, 8443 was refused and the header read `envoy`. The two `up` calls took 7 s (Kong) and 13 s (Envoy back); the images were probably in the local Docker cache from earlier runs that day, which the artifact does not record, so the times exclude pulls.
+
+The `kong` alias is stated in `docker-compose.yml` and in the Envoy guide, and SD01d read it from the running container. A hostname setting, a health check or a firewall rule that still says `kong` reaches Envoy, so a search for the string does not show that Kong is gone. The `server` header and a connection to 8443 do.
+
+---
+
+## Keys: what Envoy does with sb_ keys
+
+The key probes ran on a stack where `utils/generate-keys.sh` and `utils/add-new-auth-keys.sh` had written the four opaque-key values into `.env` (SD02). Six routes were probed per key: `/auth/v1/settings`, the OpenAPI root `/rest/v1/`, `POST /pg/query`, a table read, an RPC and `/storage/v1/bucket`.
+
+| Key | settings | OpenAPI | `/pg/query` | table read | RPC | storage |
+|---|---|---|---|---|---|---|
+| `sb_publishable_` | 200 | 403 | 403 | 200 | 200 | 200 |
+| legacy anon JWT | 200 | 403 | 403 | 200 | 200 | 200 |
+| `sb_secret_` | 200 | 200 | 200 | 200 | 200 | 200 |
+| legacy `service_role` JWT | 200 | 200 | 200 | 200 | 200 | 200 |
+
+On a table with RLS enabled and no policy, the publishable key and the legacy anon JWT read 0 rows; the secret key and the legacy `service_role` JWT read 1. Inside PostgREST, `request.jwt.claims` carried `role` `service_role` for the secret key and `anon` for the publishable key. The claim names for the secret key were `exp`, `iat`, `iss` and `role`, with `iss` set to `supabase`, and the opaque key value did not appear in the claims. PostgREST therefore receives a token with the legacy role name and not the opaque key, so policies written against `anon` and `service_role` should apply unchanged, which this run did not test with a policy.
+
+With no key, or with a made-up `sb_secret_` key, the five protected routes answered `401` with the body `Unauthorized`, `content-type: text/plain` and `server: envoy`. The refusal comes from Envoy, before PostgREST or Auth. `/storage/v1/bucket` answered `400` without a key instead of `401`, which is consistent with that route not being gated by Envoy's key check; it was one request and the gateway configuration was not read.
+
+The same probes on a managed project on 2026-10-10 read differently at the edges. `GET /rest/v1/` without a key was `401` `No API key found in request`, and the anon and publishable keys were `401` with hints (`Invalid API key` and `Secret API key required`). Envoy answers the keyless request with a bare `401` `Unauthorized` and the anon and publishable keys with `403`.[^sb-lockdown-dd04] A client or monitor that matches on status or body text for these refusals needs a rule per platform. [Data API surface lockdown](/reference/supabase-data-surface-lockdown/) has the managed-side table.
+
+### When the opaque-key variables are empty
+
+`.env.example` ships `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, `ANON_KEY_ASYMMETRIC` and `SERVICE_ROLE_KEY_ASYMMETRIC` empty (read from the file). SD08 emptied those four values in `.env` on the running stack and recreated the gateway container alone:
+
+| State | Envoy startup log | `sb_` keys | legacy JWTs |
+|---|---|---|---|
+| four variables empty | `Envoy running in legacy API key mode (sb_ keys disabled)` | publishable: settings 401, OpenAPI 401; secret: settings 401, OpenAPI 401 | anon: settings 200, OpenAPI 403; `service_role`: settings 200, OpenAPI 200 |
+| `.env` restored | `Envoy sb_ key translation enabled` | publishable: settings 200, OpenAPI 403; secret: settings 200, OpenAPI 200 | unchanged |
+
+SD08 did not start a second stack from an untouched `.env.example`. That a stack which never ran `utils/add-new-auth-keys.sh` behaves like the empty-variable row is a reading of the entrypoint script and this result, not a separate observation. The practical consequence is a stack whose legacy JWTs work and whose `sb_` keys all return `401`, and the one log line quoted above is the only pointer found to the missing variables.
+
+`utils/add-new-auth-keys.sh --update-env` also edits `docker-compose.yml`. It uncommented 4 lines, for `GOTRUE_JWT_KEYS`, `API_JWT_JWKS`, `JWT_JWKS` and `SUPABASE_JWKS` (SD02d). On the stack where it had run, an access token from a password grant was ES256 with a `kid`, `aud` `authenticated`, and its signature verified against the one key in the gateway's `/auth/v1/.well-known/jwks.json` (SD06b). A stack where the script was not run was not measured, so its signing algorithm here is unknown. [Supabase Auth end to end](/reference/supabase-auth-end-to-end/) covers which key signs a token and who verifies it.
+
+Not measured: `sb_` keys against Realtime and Edge Functions. The compose file gives the functions container `SUPABASE_PUBLISHABLE_KEYS` and `SUPABASE_SECRET_KEYS`, but no function was deployed or called.
+
+---
+
+## Database: Postgres 17, pg_graphql off, and which role connects
+
+### Version
+
+SD03a read the version five ways and all said 17: the compose model and the running container both named `supabase/postgres:17.6.1.136`, `server_version` reported `17.6`, the `PG_VERSION` file said `17`, and `version()` began `PostgreSQL 17.6 on aarch64-unknown-linux-gnu`. SD03b read the override files without starting them: `docker-compose.pg17.yml` repeats the base tag, and `docker-compose.pg15.yml` pins `15.8.1.085`. Postgres 15 was not started, and a 15 to 17 upgrade of an existing data directory (`utils/upgrade-pg17.sh`) was not run.
+
+### pg_graphql
+
+On the fresh stack (SD03c) `pg_extension` had 0 rows for `pg_graphql`, `pg_available_extensions` listed it at version `1.5.11`, and the schemas `graphql` and `graphql_public` existed. `POST /graphql/v1` with the publishable key answered HTTP `200` with the body `{"errors": [{"message": "pg_graphql extension is not enabled."}]}`. A client that checks only the status code does not notice the extension is absent. A new managed project measured the same way on the same date gave the same status and message, with `pg_available_extensions` offering 1.6.2 against 1.5.11 here ([DD02a](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/data-api-defaults/tests/dd02-pg-graphql.ts), covered in [Data API surface lockdown](/reference/supabase-data-surface-lockdown/)).
+
+### Roles
+
+| Check | Result |
+|---|---|
+| postgres-meta environment | `PG_META_DB_USER=postgres` |
+| Studio environment | `POSTGRES_USER_READ_WRITE=postgres` |
+| `current_user` and `session_user` through `/pg/query` (secret key) | `postgres` and `postgres`, HTTP 200 |
+| the same through Studio's `/api/platform/pg-meta/default/query` (dashboard credentials) | `postgres` and `postgres`, HTTP 200 |
+| `pg_stat_activity` during a `pg_sleep` on each path | one active backend per path, user `postgres`, application name starting `postgres-meta`, on both |
+| `rolsuper` | `postgres` false; `supabase_admin` true |
+| users with live sessions at the snapshot | `authenticator`, `supabase_admin`, `supabase_storage_admin` |
+| `supabase_admin` application names | Realtime (`cluster_node_realtime`, `supabase_mt_realtime`), Supavisor (`cluster_node_supavisor`, `supavisor_meta`), `pg_cron scheduler`, `pg_net 0.20.3`, `psql` |
+
+The database cannot tell Studio's path from postgres-meta's: Studio's pg-meta route goes through postgres-meta, and both showed a `postgres-meta` application name. Whether Studio makes a connection of its own was not observed. The `psql` session under `supabase_admin` is most likely the probe's own `docker exec psql`, judged from the code path and not confirmed from the session list. The change removes superuser from the tools an operator clicks in; it does not remove `supabase_admin` from the stack, whose background services still use it.
+
+---
+
+## Logs and analytics: an override, not a default
+
+| Check (SD05) | Default stack | With `docker-compose.logs.yml` |
+|---|---|---|
+| Services | `api-gw`, `auth`, `db`, `functions`, `imgproxy`, `meta`, `realtime`, `rest`, `storage`, `studio`, `supavisor` (11) | the override adds exactly `analytics` and `vector`; both healthy |
+| Images | no Logflare or Vector image | `supabase/logflare:1.50.10`, `timberio/vector:0.53.0-alpine` |
+| Services mounting the Docker socket | 0 | 1: `vector` |
+| Studio `ENABLED_FEATURES_LOGS_ALL` | `false` | `true` |
+| `docker compose up -d --wait` | n/a | returned after 13 s (warm image cache) |
+
+The flag flipped; whether the Studio container was recreated was not recorded. `GET /analytics/v1/health` with the secret key answered `401` `User authentication failed. Missing username and password.`, which reads like the dashboard route's basic-auth gate and is consistent with Envoy having no analytics route. That is one request and the gateway configuration was not read. The Docker-socket mount is the part to weigh before adding the override: the default stack has no container with that mount, and the logs stack has one.
+
+---
+
+## External URL and SAML
+
+### API_EXTERNAL_URL
+
+On the local stack (SD06a to SD06c) `API_EXTERNAL_URL` was `http://localhost:8000/auth/v1` in `.env`, on the Auth container, and as `GOTRUE_JWT_ISSUER`; `SUPABASE_PUBLIC_URL` was `http://localhost:8000`. The access token `iss` was `http://localhost:8000/auth/v1`. `generate_link` for a magic link answered `200` and the `action_link` path was `/auth/v1/verify`, not `/auth/v1/auth/v1/verify`, while `MAILER_URLPATHS_CONFIRMATION` is `/auth/v1/verify`.
+
+### SAML
+
+| Check | Result |
+|---|---|
+| SAML disabled (default): `GET /auth/v1/sso/saml/metadata` | `404`, `error_code` `saml_provider_disabled`; the request reached Auth |
+| SAML disabled: `GET /sso/saml/metadata`, no credentials | `401` `User authentication failed. Missing username and password.`, the dashboard gate |
+| SAML enabled (2048-bit RSA key, `GOTRUE_SAML_ENABLED`, applied as an override file) | metadata `200` `application/xml`; `entityID` `http://localhost:8000/auth/v1/sso/saml/metadata`; ACS `Location` `http://localhost:8000/auth/v1/sso/saml/acs` |
+| Register an invented IdP with the secret key | `201` |
+| `POST /auth/v1/sso` for that IdP's domain | `200`, redirect to the IdP host (`idp.example.com`) carrying a `SAMLRequest` |
+| `POST /auth/v1/sso/saml/acs`, no `apikey`, garbage `SAMLResponse` | `303` to the site URL with `error_code=validation_failed`, which is Auth's answer; Envoy did not return its `401` |
+
+The metadata `entityID` and ACS URL are `API_EXTERNAL_URL` plus `/sso/saml/metadata` and `/sso/saml/acs`, so the prefix comes from the one variable. The IdP was deleted afterwards. The word "move" in the changelog compares with the earlier layout, which this run did not start. SD06d shows only that the unprefixed path does not reach Auth on this gateway without dashboard credentials. A valid assertion from a real IdP was not exercised; SD06f stops at the redirect to an invented IdP and at a rejected garbage response.
+
+---
+
+## Reading the numbers
+
+- One pinned commit, one fresh stack, one run (n = 1), on aarch64. Most outcomes are deterministic reads of configuration and container state, but no repetition separates a flaky healthcheck from a stable one. Tags, not digests, are recorded, and a registry can move a tag.
+- The modules ran in id order in one process on one stack. SD05 to SD08 change the stack (logs override, SAML, Kong swap, `.env` rewrite), so a later module's result rests on the earlier ones having been undone; SD07b and SD08b are those undo checks.
+- Earlier runs the same day were not published. One failed SD02c because an exploratory probe had left a table behind that the module's setup then reused (two rows where one was expected); the setup now drops and recreates the table. The published run is the first full run after the last module change.
+- A single status from a single request supports "consistent with", not "is": the storage `400`, the `/analytics/v1` `401` and the `/pg/query` role path are each labelled that way above.
+- What generalises is the shape: the gateway answers refusals itself, opaque keys map to the two legacy roles, and the role and URL changes are configuration. The version strings, image tags and `localhost` URLs are this pin's. The stack is versioned by commit rather than by an image tag, so a later commit can move any of them.
+
+Not measured: `sb_` keys against Realtime and Edge Functions, a Postgres 15 to 17 upgrade, the Postgres 15 override, Linux amd64, image digests, the browser-facing dashboard (only Studio's API route and the basic-auth gate were requested), repeat runs, and a real SAML IdP.
+
+---
+
+## What to do about it
+
+Module ids are results in the `self-hosted-defaults` experiment of [supabase-lab](https://github.com/erfianugrah/supabase-lab); the Evidence column states what was observed, and rows that carry an inference or a file read say so.
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Find the gateway from the `server` header and port 8443, not the string `kong` | the `kong` alias resolves to Envoy; with the Kong override 8443 accepted and `server` read `kong/3.9.3` | SD01d, SD07a |
+| Probe an unknown `sb_secret_` key after an upgrade | `401` `Unauthorized` `text/plain` from Envoy on five routes; storage `400` without a key | SD02a |
+| Fill the four opaque-key variables before relying on `sb_` keys | empty: `legacy API key mode (sb_ keys disabled)` and `401` for both `sb_` keys, legacy JWTs `200` | SD08a |
+| Read the Envoy startup log for the key mode | `legacy API key mode` against `sb_ key translation enabled` after the variables were restored | SD08a, SD08b |
+| Diff `docker-compose.yml` after the key script | the script uncommented 4 lines: `GOTRUE_JWT_KEYS`, `API_JWT_JWKS`, `JWT_JWKS`, `SUPABASE_JWKS` | SD02d |
+| Check `pg_extension`, not the `/graphql/v1` status | `200` with an `errors` body and 0 rows for `pg_graphql`; 1.5.11 available | SD03c |
+| Filter superuser audits by application name | `postgres` on both Studio paths; `supabase_admin` for Realtime, Supavisor, `pg_cron`, `pg_net` | SD04c, SD04d |
+| Add the logs override only where a Docker-socket mount is acceptable | 0 services mount it by default; `vector` does with the override | SD05b |
+| Keep `API_EXTERNAL_URL` equal to `GOTRUE_JWT_ISSUER`, ending in `/auth/v1` | `iss` and the `generate_link` path both followed it, with no doubled prefix | SD06a, SD06b, SD06c |
+| Register IdP metadata and ACS under `/auth/v1/sso/saml/` | unprefixed metadata hit the dashboard gate; prefixed reached Auth. A real IdP was not run | SD06d, SD06e |
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.35; ranksep=0.55;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  root [label="Which files does the stack need?", shape=hexagon];
+  base [label="docker-compose.yml\n(Envoy, Postgres 17, no logs)"];
+  logs [label="add docker-compose.logs.yml\n(analytics, vector)"];
+  kong [label="add docker-compose.kong.yml\n(Kong, 8443)"];
+  pg15 [label="docker-compose.pg15.yml\n(15.x tag, read not run)"];
+  saml [label="SAML env on auth\n(metadata under /auth/v1/sso/saml)"];
+
+  root -> base [label="default"];
+  root -> logs [label="Studio logs, Docker-socket\nmount acceptable"];
+  root -> kong [label="Kong behaviour or an\nHTTPS listener on 8443"];
+  root -> pg15 [label="stay on Postgres 15"];
+  root -> saml [label="enterprise SSO"];
+}
+```
+
+1. Default: `docker-compose.yml` alone, with the four opaque-key variables filled by the two key scripts.
+2. Studio logs, where a service with the Docker socket is acceptable: add `docker-compose.logs.yml` (measured).
+3. Kong behaviour or an HTTPS listener on 8443: add `docker-compose.kong.yml` (measured; the changelog names `sh run.sh config add kong`).
+4. Staying on Postgres 15: `docker-compose.pg15.yml` pins `15.8.1.085` (file read, not started).
+5. SAML: enable it on Auth and register IdP URLs under `/auth/v1/sso/saml/` (measured up to the redirect and a rejected garbage response).
+
+---
+
+## Reproducing
+
+From a checkout of [supabase-lab](https://github.com/erfianugrah/supabase-lab/tree/c621e0d), with Docker running and host ports 8000, 5432 and 6543 free. No project and no token are needed.
+
+```sh
+cd experiments/self-hosted-defaults
+make clean stack up probe
+make clean
+```
+
+`make stack` clones supabase/supabase at the pinned commit into the gitignored `work/`, copies `docker/` to `work/stack`, writes `.env` from `.env.example` and runs the two key scripts with their option that writes the result into `.env`; their output is discarded and the values stay in `work/stack/.env`, which `make clean` deletes together with the data directories. `ONLY=SD01,SD04 make probe` runs a subset. Start from `make clean stack up` for a full run, since SD06d skips on a stack where SAML was already enabled. `make unit` runs the offline tests of the rig without a stack. `work/` holds a full clone of supabase/supabase, so `bun test` must be given a path (`make unit` does) or it also discovers the clone's own test files. Results and what they do not show are in the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/RUNLOG.md).
+
+---
+
+## Evidence
+
+| Claim | How it was checked | Status |
+|---|---|---|
+| 11 services, `api-gw` on Envoy `v1.39.1`, 0 matching "kong", only `8000:8000` published | resolved compose model and running containers ([SD01a, SD01b](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd01-gateway.ts)) | measured, 2026-10-10 |
+| `server: envoy`; 8443 and 8001 refused; aliases include `kong` | wire probes and container inspection ([SD01c, SD01d](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd01-gateway.ts)) | measured, 2026-10-10 |
+| the Kong override puts Kong on 8000 and 8443; removing it restores Envoy | swap and swap back on the same stack ([SD07](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd07-kong-control.ts)) | measured, 2026-10-10 |
+| `sb_` keys behave as the legacy anon and `service_role` JWTs on six routes; PostgREST sees `anon` or `service_role` | status per key per route and `request.jwt.claims` ([SD02b, SD02c](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd02-opaque-keys.ts)) | measured, 2026-10-10 |
+| no key or a made-up `sb_secret_` key gets Envoy's `401` | five routes, body, `content-type` and `server` header ([SD02a](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd02-opaque-keys.ts)) | measured, 2026-10-10 |
+| empty opaque-key variables put Envoy in legacy mode | variables emptied, gateway recreated alone, restored ([SD08](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd08-keys-unset.ts)) | measured, 2026-10-10; second stack from an untouched `.env.example` not run |
+| the key script uncomments 4 lines in `docker-compose.yml` | diff against the pinned file ([SD02d](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd02-opaque-keys.ts)) | measured, 2026-10-10 |
+| Postgres 17.6; `pg_graphql` available and not created; `/graphql/v1` `200` with an `errors` body | five version reads, `pg_extension`, `pg_available_extensions`, one request ([SD03a, SD03c](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd03-postgres17.ts)) | measured, 2026-10-10 |
+| `docker-compose.pg15.yml` pins `15.8.1.085` | file read ([SD03b](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd03-postgres17.ts)) | read, Postgres 15 not started |
+| Studio and postgres-meta run as `postgres`, not a superuser; `supabase_admin` is | environment, `current_user`, `pg_stat_activity`, `rolsuper` ([SD04](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd04-postgres-role.ts)) | measured, 2026-10-10; Studio's own connection not observed |
+| Analytics and Vector only with the logs override; Vector alone mounts the Docker socket | model and containers before and after ([SD05](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd05-logs-optional.ts)) | measured, 2026-10-10 |
+| `API_EXTERNAL_URL` equals `GOTRUE_JWT_ISSUER`; `iss` follows it; `generate_link` path not doubled | `.env`, container, a real token, one `generate_link` ([SD06a to SD06c](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd06-external-url-saml.ts)) | measured, 2026-10-10 |
+| ES256 token with a `kid` verifies against `/auth/v1/.well-known/jwks.json` | one password-grant token, signature check ([SD06b](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd06-external-url-saml.ts)) | measured, 2026-10-10; stack with the key script run |
+| SAML metadata and ACS under `/auth/v1/sso/saml/`; ACS needs no `apikey`; an invented IdP yields a `SAMLRequest` redirect | SAML disabled, then enabled, then an invented IdP ([SD06d to SD06f](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd06-external-url-saml.ts)) | measured, 2026-10-10; no real IdP |
+| the changelog dates and statements in the table at the top | `docker/CHANGELOG.md` at the pinned commit | documented |
+| the earlier layout of `API_EXTERNAL_URL` and SAML paths | not started | not measured |
+
+---
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| SD01 | self-hosted-defaults | [`sd01-gateway.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd01-gateway.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/self-hosted-defaults/out/2026-10-10) |
+| SD02 | self-hosted-defaults | [`sd02-opaque-keys.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd02-opaque-keys.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/self-hosted-defaults/out/2026-10-10) |
+| SD03 | self-hosted-defaults | [`sd03-postgres17.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd03-postgres17.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/self-hosted-defaults/out/2026-10-10) |
+| SD04 | self-hosted-defaults | [`sd04-postgres-role.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd04-postgres-role.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/self-hosted-defaults/out/2026-10-10) |
+| SD05 | self-hosted-defaults | [`sd05-logs-optional.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd05-logs-optional.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/self-hosted-defaults/out/2026-10-10) |
+| SD06 | self-hosted-defaults | [`sd06-external-url-saml.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd06-external-url-saml.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/self-hosted-defaults/out/2026-10-10) |
+| SD07 | self-hosted-defaults | [`sd07-kong-control.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd07-kong-control.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/self-hosted-defaults/out/2026-10-10) |
+| SD08 | self-hosted-defaults | [`sd08-keys-unset.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd08-keys-unset.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/self-hosted-defaults/out/2026-10-10) |
+| DD02a | data-api-defaults | [`dd02-pg-graphql.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/data-api-defaults/tests/dd02-pg-graphql.ts) | none published |
+
+Ids with a letter suffix (SD02c, SD06f) are result rows inside the module of the same number; the facts file lists them.
+
+---
+
+## Related docs
+
+- [Supabase Auth end to end](/reference/supabase-auth-end-to-end/) - which key signs a token and who verifies it, including a self-hosted GoTrue on a managed project; this page covers the self-hosted Docker stack's own gateway and key script.
+- [Data API surface lockdown](/reference/supabase-data-surface-lockdown/) - the managed-project `/rest/v1/` and `/graphql/v1` answers per key that the comparisons above rest on.
+- [@supabase/server auth modes](/reference/supabase-server-auth-modes/) - how a managed Edge Function gateway treats the same `sb_` keys; the self-hosted Functions container was not probed here.
+- [RLS without Supabase Auth](/reference/rls-without-supabase-auth/) - setting `request.jwt.claims` yourself, which is what Envoy's key translation does for PostgREST on this stack.
+
+{/* References: cited inline as [^slug]; the numbered list renders below under "References". */}
+
+[^sb-selfhost-changelog]: Supabase, "docker/CHANGELOG.md," supabase/supabase, GitHub, at commit 8617532. https://github.com/supabase/supabase/blob/8617532ae1a41571d5d557cd24c6f5f2565d9230/docker/CHANGELOG.md
+
+[^sb-selfhost-logs]: Supabase, "Self-hosted Supabase: making Analytics and Vector opt-in," GitHub Discussions. https://github.com/orgs/supabase/discussions/46084
+
+[^sb-selfhost-pg17]: Supabase, "Self-hosted Supabase: upgrading from PG 15 to 17 (breaking change)," GitHub Discussions. https://github.com/orgs/supabase/discussions/46080
+
+[^sb-selfhost-studio-role]: Supabase, "Self-hosted Supabase: switching Studio from supabase_admin to postgres (breaking change)," GitHub Discussions. https://github.com/orgs/supabase/discussions/46081
+
+[^sb-selfhost-ext-url]: Supabase, "Self-hosted Supabase: API_EXTERNAL_URL to include /auth/v1," GitHub Discussions. https://github.com/orgs/supabase/discussions/47093
+
+[^sb-selfhost-envoy]: Supabase, "Self-hosted Supabase: Envoy becomes the default API gateway (breaking change)," GitHub Discussions. https://github.com/orgs/supabase/discussions/48048
+
+[^sb-kong-override]: Supabase, "docker/docker-compose.kong.yml," supabase/supabase, GitHub, at commit 8617532. https://github.com/supabase/supabase/blob/8617532ae1a41571d5d557cd24c6f5f2565d9230/docker/docker-compose.kong.yml
+
+[^sb-lockdown-dd04]: Erfi Anugrah, "Data API surface lockdown," lexicanum, section on the OpenAPI root per key (data-api-defaults DD04, 2026-10-10). https://erfi.dev/reference/supabase-data-surface-lockdown/
