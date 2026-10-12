@@ -1,0 +1,366 @@
+---
+title: "One envelope-encrypted app on managed and self-hosted Supabase"
+description: A reference application run unchanged against two managed regions and the self-hosted Docker stack - a Postgres catalogue with RLS and a custom access token hook, an operator key service outside Supabase, AES-256-GCM chunked envelope encryption on the client, 2 GiB S3 multipart and TUS uploads killed and resumed, ranged decrypting reads over four paths, and static tenant-to-region routing. Parity table for 13 assertions on four targets, the Storage policy a user-token multipart resume needs, error-shape and version differences, and what was not measured.
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Whether one application, with no code branch on where it runs, behaves the same on managed Supabase and on the self-hosted Docker stack when it encrypts large objects on the client, keeps the key-encryption key (KEK) outside Supabase, resumes interrupted uploads and reads byte ranges. For anyone designing client-side encryption over Supabase Storage, or carrying one application across both deployment models.
+
+Everything marked measured comes from the [client-keyed-objects](https://github.com/erfianugrah/supabase-lab/tree/5f7ce52/experiments/client-keyed-objects) experiment in [supabase-lab](https://github.com/erfianugrah/supabase-lab), run on 2026-10-12 against four targets: `onprem` (the self-hosted stack with a MinIO backend), `onprem-file` (the same stack on the file backend), `region-a` (a managed Pro-org micro project in `ap-southeast-1`) and `region-b` (the same in `eu-central-1`). The self-hosted stack is supabase/supabase `docker/` at commit `8617532`, the pin the [self-hosted defaults page](/reference/supabase-self-hosted-defaults/) uses, with the Storage image raised to the version managed reported. The vantage is one laptop in Singapore on Docker Desktop for Mac, one run per target (n = 1). The parity table is generated from four published artifacts; the run list, partial rows and the operator's notes are in the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/RUNLOG.md). Statements marked source-read come from the Storage server source or the experiment's own code and were not measured. Statements cited to documentation were not run.
+
+TL;DR:
+
+- The same four migrations left the same catalogue on all four targets (fingerprint `de77a73c2298ee14`: 22 policies, 6 functions, 4 triggers, 6 tables), and a scan of 15 client and migration files found 0 branches on target identity (CK01).
+- Resuming an S3 multipart upload with a user's session token re-sent every part until a SELECT policy existed on `storage.s3_multipart_uploads_parts`. Without it: 0 of 32 parts kept, and the bytes and SHA-256 still matched, so a content check alone passes a resume that did not resume. With it: 13 of 32 kept on `onprem` and `region-a` (CK04).
+- TUS resumed from offset 861929472 on `onprem`, `region-a` and `region-b` with no policy change (CK05).
+- Ranged reads returned exactly the covering ciphertext chunks on all four read paths, 25 of 25 per path on `onprem` and `region-a`. On `region-a`, reads through fresh signed URLs had a p50 of 30479 ms (`MISS:25`) against 548 ms for `/object/authenticated` (`MISS:1 HIT:24`) and 419 ms for S3 GetObject. One vantage, one run (CK06).
+- Tamper, ciphertext-only and key-service-down checks passed on all four targets; region isolation held both ways between the two managed projects (CK07-CK10).
+- 8 of 22 failing requests had a different error shape on managed and self-hosted. The Data API and S3 differences come from the layer in front of the service (Envoy's own `401`; `text/plain` from the managed edge), the Storage REST one is configuration or gateway with no Storage version gap, and the Auth one is not separated from the Auth version (CK12, CK13).
+- One failed cell: CK04 on `region-b`, where the resume process timed out on the Data API during a stretch of host sleep. It was not re-run, and a platform cause is neither excluded nor shown.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  client [label="Client library\n(Bun or browser)\nAES-256-GCM per 8 MiB chunk", style=rounded];
+  dir [label="Static directory\ntenant -> region -> target", shape=note];
+  keysvc [label="Operator key service\none KEK per tenant\nwrap / unwrap"];
+
+  subgraph cluster_target {
+    label="One Supabase target per region\n(managed project or self-hosted stack)"; style=rounded; fontsize=12; margin=12;
+    auth [label="Auth\n+ custom access token hook"];
+    rest [label="Data API\n(PostgREST)"];
+    storage [label="Storage\nREST, S3, TUS"];
+    pg [label="Postgres\ncatalogue + RLS", shape=cylinder];
+  }
+
+  client -> dir [label="resolve target"];
+  client -> auth [label="sign in, refresh"];
+  client -> rest [label="catalogue rows,\nwrapped DEK, chunk hashes"];
+  client -> storage [label="ciphertext:\nmultipart, TUS, ranged GET"];
+  client -> keysvc [label="wrap / unwrap DEK\n(bearer = access token)"];
+  keysvc -> auth [label="JWKS"];
+  keysvc -> rest [label="membership check\n(caller's token)"];
+  auth -> pg;
+  rest -> pg;
+  storage -> pg [label="storage.objects RLS"];
+}
+```
+
+1. The client resolves the tenant's target from a static directory, then signs in to that target's Auth; the hook adds `tenant_ids` to the access token.
+2. To upload, it asks the key service to wrap a fresh data-encryption key (DEK), writes the asset row and the wrapped DEK through the Data API, and sends ciphertext to Storage.
+3. To read, it fetches the wrapped DEK and the chunk hashes, asks the key service to unwrap, fetches only the covering ciphertext range from Storage, verifies and decrypts.
+4. The key service verifies the caller's token against the target's JWKS and checks membership through the Data API with the caller's own token, so RLS decides who may unwrap. Supabase never holds the KEK or an unwrapped DEK.
+
+---
+
+## Which do I pick
+
+| You need | Use | Why |
+|---|---|---|
+| One codebase on managed and self-hosted | The same migrations, one config per target (URLs, keys, S3 key id and region), no target branch | Catalogue fingerprint `de77a73c2298ee14` on all four targets; 0 target branches in 15 files (CK01) |
+| To resume an S3 multipart upload with a user's token | A SELECT policy on `storage.s3_multipart_uploads_parts` scoped to the uploader's tenant | Without it ListParts returned no parts and the client re-sent 32 of 32; with it 13 of 32 were kept (CK04) |
+| To resume a large upload without touching Storage policies | TUS | Resumed from offset 861929472 on three targets (CK05) |
+| Repeated ranged reads of one large object on managed | `/object/authenticated` or S3, not a fresh signed URL per read | Signed-URL p50 30479 ms against 548 ms and 419 ms, one run (CK06) |
+| Ranged reads in a browser on managed | Compute ranges from the catalogue; do not read `Content-Range` or `ETag` from a signed-URL response | Managed exposed only `content-length,content-type` to the page (CK11) |
+| Keys that never reach Supabase | An operator key service with `wrap` / `unwrap` only, behind the user's access token | No DEK or KEK found in 39 (self-hosted) or 41 (managed) readable tables; `wrapped_dek` found in `app.assets` (CK08) |
+| The file backend on Docker Desktop for Mac | A named Docker volume, not the upstream `./volumes/storage` bind mount | The bind mount failed every upload with `500` on extended attributes (CK03-CK05) |
+
+---
+
+## The application
+
+The experiment builds the application as a reference implementation and runs the same acceptance suite against every target. The key service is a stand-in for an operator's KMS or HSM, not a recommendation of one.
+
+### Catalogue in Postgres
+
+Schema `app` holds `tenants`, `memberships` (role `owner`, `editor` or `viewer`), `records`, `assets` (wrapped DEK, nonce prefix, sizes, upload state), `asset_chunks` (a SHA-256 per ciphertext chunk) and `access_log`. Members read their tenant's rows, editors write, viewers only read. Storage policies on `storage.objects` key on the tenant id as the first path segment (`<tenant_id>/<asset_id>/data`) in a private bucket, so an object key alone grants nothing without a membership ([migrations](https://github.com/erfianugrah/supabase-lab/tree/5f7ce52/experiments/client-keyed-objects/supabase/migrations), source-read).
+
+A custom access token hook adds `tenant_ids` (sorted UUID strings) to every access token.[^sb-hook] It is the same function on every target, enabled through the Management API auth config on managed and the `GOTRUE_HOOK_CUSTOM_ACCESS_TOKEN_*` variables on self-hosted, and CK01 confirmed it is executable by `supabase_auth_admin` and not by `authenticated`. Every target issued ES256 access tokens with a 300 s lifetime carrying the claim (CK02).
+
+The RLS matrix (CK03) checked 8 cells for each of 4 actors (owner, editor, viewer, non-member) on catalogue rows and on objects over REST and S3 with the user's token, identically on all four targets. A non-member's S3 GET answered `404 NoSuchKey` and a REST GET `400`; a viewer's S3 PUT answered `403 AccessDenied`.
+
+### Key service
+
+One KEK per tenant, two calls: `POST /wrap {tenant_id, dek}` and `POST /unwrap {tenant_id, wrapped}`. Both need the caller's Supabase access token as a bearer. The service verifies it against the JWKS of the tenant's home target, with the issuer pinned per target and audience `authenticated`, then reads the caller's membership through that target's Data API with the caller's token. `wrap` needs `owner` or `editor`; `unwrap` needs any membership. The DEK is wrapped with AES-256-GCM under the tenant KEK with the tenant id in the associated data ([`keysvc/server.ts`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/keysvc/server.ts), source-read). The service ran in Docker on the laptop for every target.
+
+### Envelope format
+
+| Element | Value ([`client/src/envelope.ts`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/client/src/envelope.ts), source-read) |
+|---|---|
+| DEK | random 256-bit key per asset, wrapped by the key service |
+| Chunk | 8 MiB of plaintext; ciphertext chunk = plaintext + 16-byte GCM tag |
+| Cipher | AES-256-GCM through WebCrypto, the same code in Bun and the browser |
+| Nonce | 8 random bytes per asset (`nonce_prefix`) followed by the chunk index as a 32-bit big-endian integer |
+| AAD | asset id, then the chunk index, then the chunk count |
+| Integrity | ciphertext SHA-256 per chunk in `asset_chunks`; plaintext SHA-256 per asset |
+
+The associated data binds each chunk to its asset, its position and the total count, so a reordered, swapped or truncated chunk fails the tag check even when the catalogue hashes are not consulted. A 2 GiB plaintext (2147483648 bytes) is 256 chunks and 2147487744 bytes of ciphertext (CK04).
+
+### Uploads and reads
+
+| Path | How | Resume |
+|---|---|---|
+| S3 multipart | 64 MiB parts (32 for 2 GiB), signed with the session-token form of S3 credentials, which applies the user's RLS[^sb-s3-auth] | `ListParts` on the upload id stored in `assets` |
+| TUS | 6 MiB transport chunks, the size the resumable upload docs require[^sb-tus]; the ciphertext stream is independent of the transport chunking | `HEAD` for the offset |
+
+A ranged read maps a plaintext range to chunk indices, fetches one ciphertext `Range` GET, checks the chunk hashes against `asset_chunks`, decrypts and slices. It runs over four paths: S3 GetObject, an S3 presigned GET, a Storage signed URL and `/object/authenticated`.
+
+### Region routing
+
+A static directory in config maps tenant -> home region -> target, and the client resolves the target before every call. There are no cross-region reads, and a user exists per region because each project has its own Auth.
+
+---
+
+## Parity table
+
+Generated from the artifacts by `scripts/parity.ts` ([`parity.md`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/out/2026-10-12/parity.md)); sources are the final managed run, the final `onprem` run, the final `onprem-file` run and its CK02 re-run.
+
+| Assertion | onprem | onprem-file | region-a | region-b |
+|---|---|---|---|---|
+| CK01 catalogue after migrations | pass (`de77a73c2298ee14`) | pass (`de77a73c2298ee14`) | pass (`de77a73c2298ee14`) | pass (`de77a73c2298ee14`) |
+| CK02 auth flows, hook claim | pass (ES256) | pass (ES256) | pass (ES256) | pass (ES256) |
+| CK03 RLS matrix (catalogue and objects) | pass | pass | pass | pass |
+| CK04 2 GiB S3 multipart, kill, resume, verify | pass (killed at 0.4063, 13 parts kept) | not measured | pass (killed at 0.4063, 13 parts kept) | fail (killed at 0.4063, resume timed out) |
+| CK05 2 GiB TUS, kill, resume, verify | pass (killed at 0.4014, offset 861929472) | not measured | pass (killed at 0.4014, offset 861929472) | pass (killed at 0.4014, offset 861929472) |
+| CK06 100 ranged reads across 4 paths | pass | not measured | pass | skip |
+| CK07 tamper fails closed | pass | pass | pass | pass |
+| CK08 ciphertext only | pass | pass | pass | pass |
+| CK09 key service down | pass | pass | pass | pass |
+| CK10 region isolation | skip | not measured | pass | pass |
+| CK11 browser | pass | pass | pass | pass |
+| CK12 error shapes | recorded | recorded | recorded | recorded |
+| CK13 versions | recorded | recorded | recorded | recorded |
+
+The no-target-branch scan (CK01-code) runs once per run and passed in all 4 runs.
+
+| Cell | Reason |
+|---|---|
+| CK04 `region-b` fail | The resume process ended with `data api unreachable: The operation timed out.` after 300412 ms. It overlapped a stretch where the laptop entered maintenance sleep every few minutes (operator notes). Not re-run, for time. A platform cause is neither excluded nor shown |
+| CK06 `region-b` skip | CK06 reads the 2 GiB asset CK04 leaves behind, and there was none on this target |
+| CK04-CK06 `onprem-file` not measured | The file backend's named volume lives on the Docker VM disk, which had about 4 GB free; two 2 GiB objects would have filled it and the stack beside it |
+| CK10 `onprem`, `onprem-file` | Region isolation needs two regions in one run; the self-hosted runs have one |
+
+---
+
+## Findings
+
+### A user-token multipart resume needs a policy on the parts table
+
+The first `onprem` run, with three migrations, killed the uploader at 40 % and resumed from a new process: `parts_skipped` 0 of 32. The object's bytes and its plaintext SHA-256 still matched the fixture, because the client re-sent every part. With migration 0004 the same flow kept 13 of 32 parts, and all 13 resumed ETags matched (`resumed_etag_matches` 13, mismatches 0), on `onprem` and on `region-a` (CK04).
+
+The cause, from the Storage source at v1.80.2 and not measured: UploadPart writes the part row as the storage superuser, while `listParts` reads `storage.s3_multipart_uploads_parts` as the caller's role. That table has RLS enabled and a SELECT grant to `authenticated`, and Storage ships no policy on it ([`0021-s3-multipart-uploads.sql`](https://github.com/supabase/storage/blob/v1.80.2/migrations/tenant/0021-s3-multipart-uploads.sql), [`s3-handler.ts`](https://github.com/supabase/storage/blob/v1.80.2/src/storage/protocols/s3/s3-handler.ts) `listParts`). With a user's token, ListParts therefore returns no rows. The policy the experiment adds:
+
+```sql
+create policy ck_multipart_parts_read on storage.s3_multipart_uploads_parts for select to authenticated
+  using (bucket_id = 'assets' and app.my_role(app.key_tenant(key)) in ('owner', 'editor'));
+```
+
+`supabase db push` created it on managed, running as `postgres`. The part ETag was the MD5 of the part on MinIO and on managed: 13 matches and 0 mismatches on both.
+
+<Aside type="caution" title="A content check does not prove a resume">
+The run without the policy passed a full-read SHA-256 check while re-uploading 32 of 32 parts. Count the parts the server already held, or assert on transferred bytes, when testing resume.
+</Aside>
+
+### Ranged reads per path
+
+Every ranged read on `onprem` and `region-a` returned exactly the ciphertext chunks covering the requested plaintext: 25 of 25 per path, and per-path body bytes equal to the covering-chunk bytes (CK06). The 100 ranges ran from 1 KiB to 64 MiB and asked for 499413339 plaintext bytes in all.
+
+| Path | onprem p50 / p95 (ms) | region-a p50 / p95 (ms) | region-a `cf-cache-status` |
+|---|---|---|---|
+| S3 GetObject | 181 / 361 | 419 / 1472 | not present |
+| S3 presigned GET | 182 / 301 | 385 / 946 | `DYNAMIC:25` |
+| Signed URL | 109 / 187 | 30479 / 66340 | `MISS:25` |
+| `/object/authenticated` | 116 / 226 | 548 / 1577 | `MISS:1 HIT:24` |
+
+These are info values from one laptop and one run per target. On `region-a` the signed URLs were the slowest path, and the authenticated path was served from the CDN after one miss. The likely cause, inferred and not shown: each fresh signed URL carries its own token and so is its own cache key (the [data residency page](/reference/supabase-data-residency/) records the Storage CDN cache key as the object or token), and a miss on a 2 GiB object waits on the origin.
+
+### Error shapes and where the difference comes from
+
+Of 22 failing requests sent to each target, 14 had the same status, media type, body keys and code on all four (CK12). The differences, with the version gap from CK13 beside each:
+
+| Request | Self-hosted | Managed | Version gap | Attribution |
+|---|---|---|---|---|
+| Auth `/user` without a bearer | `403` `bad_jwt` | `401` `no_authorization` | Auth v2.196.0 against v2.197.0 | not separated: the Auth version or the gateway in front of it |
+| Data API without `apikey` | `401` `text/plain` `Unauthorized` | `401` `application/json` with `hint,message` | PostgREST 14.17 against 14.18 | the gateway answers, not PostgREST: Envoy's own `401` on self-hosted ([self-hosted defaults](/reference/supabase-self-hosted-defaults/), SD02) |
+| Storage REST without auth | `400` `NoSuchKey` | `400` `InvalidRequest` | none, Storage 1.80.2 on both | configuration or gateway, not the Storage version |
+| S3 `NoSuchKey`, missing bucket, bad signature, range past EOF, RLS-denied PUT (5 requests) | `application/xml` | `text/plain`, same XML elements and codes | none, Storage 1.80.2 on both | the managed edge sets the media type; body and code match |
+
+A request for a missing bucket over S3 answered `NoSuchKey`, not `NoSuchBucket`, on every target. CK02's refusals (wrong password `invalid_credentials`, disabled user `user_banned`, an expired token `403 bad_jwt` from Auth and `401 PGRST303` from the Data API) were identical on all four. The RUNLOG records no upstream report for any of these differences.
+
+### Versions
+
+| Service | Self-hosted (image tag, live) | Managed (live) |
+|---|---|---|
+| Auth | `supabase/gotrue:v2.196.0`, v2.196.0 | v2.197.0 |
+| PostgREST | `postgrest/postgrest:v14.17`, 14.17 | 14.18 |
+| Storage | `public.ecr.aws/supabase/storage-api:v1.80.2`, 1.80.2 (the pinned compose file names v1.74.0; the experiment's override raised it) | 1.80.2 |
+| Postgres | `supabase/postgres:17.6.1.136`, 17.6 | 17.11 |
+
+### PostgREST accepts a just-expired token, Auth does not
+
+At `exp` + 5 s, Auth answered `403` and the Data API `200`; at `exp` + 45 s both refused. The same on all four targets (CK02). PostgREST documents a 30-second clock skew allowance on its claim checks,[^pgrst-auth] which covers the 5 s probe. By that allowance, a Data API `200` does not prove the token is unexpired for up to 30 s past `exp`. The [Auth end to end page](/reference/supabase-auth-end-to-end/) covers who verifies a token and with what tolerance.
+
+### Region isolation
+
+A `region-a` token sent to `region-b` got Auth `403 bad_jwt`, Data API `401 PGRST301`, Storage REST `400 AccessDenied` and S3 `403 AccessDenied`; the object key answered `404` there, and the key service refused the other region's token with `401 invalid_token`. The reverse direction gave the same results (CK10).
+
+### Encryption checks
+
+| Check | Measured on all four targets | Module |
+|---|---|---|
+| Flip a bit in a stored chunk, or swap two chunks | `ChunkHashMismatch` with the catalogue hash check, `ChunkAuthFailed` with AES-GCM alone | CK07 |
+| Truncate the object | `TruncatedObject` with and without the hash check; the restored copy reads `ok` | CK07 |
+| Plaintext in the object store | 0 marker hits outside the positive control through the API, and in the full read of the 2 GiB objects. On `onprem` a scan of the MinIO data found the marker in the control's file only; managed's object store cannot be scanned | CK08 |
+| DEK or KEK in Postgres | found in 0 of 39 (self-hosted) or 41 (managed) readable tables, hex and base64; `wrapped_dek` found in `app.assets` | CK08 |
+| What Storage records for an encrypted object | `storage.objects.metadata` keys `cacheControl,contentLength,eTag,httpStatusCode,lastModified,mimetype,size`, `mimetype` `application/octet-stream`, `cacheControl` `no-cache`, `user_metadata` `{}` | CK08 |
+| Key service stopped | upload and read fail with `KeyServiceUnavailable`; asset, chunk and object counts and the ETag unchanged; read `ok` after restart | CK09 |
+
+### Browser
+
+Headless Chromium ran the same library from a page on every target: S3 multipart upload, then ranged reads through a signed URL, S3 and `/object/authenticated`, 3 of 3 each (CK11). Part ETags were readable from the UploadPart response on all targets, so the ListParts fallback was never needed. A ranged signed-URL GET exposed `content-length,content-type` to the page on managed, and `content-range,etag,content-length,content-type` on self-hosted. The managed preflights answered `allow-origin=*` with no expose list; the self-hosted ones echoed the page origin with `expose=*`. storage-surface SS03h recorded the same split, covered on the [large objects page](/reference/supabase-storage-large-objects/).
+
+### Self-hosted only
+
+- Storage verifies an S3 SigV4 signature against the host of `STORAGE_PUBLIC_URL`. In the first `onprem` run the page reached the stack under another host name and CreateMultipartUpload got `SignatureDoesNotMatch`; with the same URL as every other client it worked (CK11). Source: `getHostHeader` in [`signature-v4.ts`](https://github.com/supabase/storage/blob/v1.80.2/src/storage/protocols/s3/signature-v4.ts).
+- The upstream file backend (`./volumes/storage` bind mount) failed every upload on Docker Desktop for Mac: REST upload `500` "The file system does not support extended attributes", S3 UploadPart and TUS create `500`. The file backend keeps metadata in extended attributes (`fs-xattr` in the v1.74.0 and v1.80.2 images, source-read). On a named Docker volume every module passed (CK03-CK05).
+- PostgREST 14.17 refused a just-issued token with `401 PGRST303 JWT issued at future` once each in CK05 and CK06 of the final `onprem` run, and 0 times on managed. The client now retries once after 2 s and counts it (`iat_future_retries`). That run started at 12:23Z, inside the period the operator notes give for the Docker VM clock running about 260 s behind the host; whether the drift caused it was not separated.
+
+### Client-side lessons
+
+These are this application's code, not platform behaviour.
+
+- tus-js-client's Node HTTP stack under Bun stalled twice: a Buffer body got a server `408 stream timeout`, and with a Readable body one PATCH to `region-b` hung with no bytes moving. [`tus-fetch.ts`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/client/src/tus-fetch.ts) replaces it with `fetch` and a 120 s per-request timeout.
+- A ranged read fetches ciphertext and chunk hashes in parallel, and both calls refreshed the same session. Auth answered the second refresh with `400 refresh_token_already_used`, and later calls carried an expired token. The session refresh is single-flight now.
+- Bun's `fetch` reused pooled keep-alive connections the far side had closed (`The socket connection was closed unexpectedly`); Auth grants and the harness HTTP helper retry on that network error.
+
+---
+
+## Transfer and timing
+
+Info values only: one laptop vantage in Singapore, n = 1 per target. These are not throughput claims, and the `onprem` column is a stack on the same machine.
+
+| Measurement | onprem | region-a | region-b |
+|---|---|---|---|
+| CK04 upload, MiB/s (2 GiB, kill and resume) | 133.2 | 13 | not measured |
+| CK04 full read, MiB/s | 161.8 | 43.9 | not measured |
+| CK05 upload, MiB/s | 33.9 | 10.2 | 6.4 |
+| CK05 full read, MiB/s | 123.1 | 36.9 | 23.3 |
+| CK06 plaintext bytes asked (100 ranges) | 499413339 | 499413339 | not measured |
+
+## Reading the numbers
+
+- The parity rows assert correctness; the timing rows are context from one vantage.
+- The signed-URL p50 is one run from one vantage against one project. A cache miss per URL on a 2 GiB origin object fits it, and the data residency measurements make that plausible, but the run did not isolate the cause.
+- The `region-b` CK04 failure coincides with host sleep. It is recorded as a fail; the TUS upload of the same size on the same project passed.
+- The error-shape differences with no version gap point at configuration or the layer in front of the service. The Auth one could be either, and the run cannot tell.
+
+---
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Add a SELECT policy on `storage.s3_multipart_uploads_parts` for user-token resume. | Without it, 0 of 32 parts kept and the SHA-256 still matched; with it, 13 of 32 kept and 13 ETags matched on `onprem` and `region-a`. Cause source-read: `listParts` runs as the caller's role, and no policy ships. | CK04 |
+| Test resume by counting parts or bytes the server kept, not by content hash. | The resume that re-sent every part passed the full-read SHA-256 check. | CK04 |
+| Use TUS where a Storage policy change is not possible. | Resumed at offset 861929472 on `onprem`, `region-a` and `region-b`. | CK05 |
+| Keep per-chunk hashes in the catalogue and bind chunk position in the AAD. | Flip and swap failed on the hash (`ChunkHashMismatch`) and on AES-GCM alone (`ChunkAuthFailed`); truncation failed as `TruncatedObject`. | CK07 |
+| Keep wrap and unwrap behind the user's token and an RLS membership read. | No DEK or KEK in 39 or 41 readable tables; key service down left catalogue and objects unchanged. | CK08, CK09 |
+| Avoid a fresh signed URL per ranged read of a large object on managed. | p50 30479 ms with `MISS:25`, against 548 ms on `/object/authenticated` and 419 ms on S3. One run, cause inferred. | CK06 |
+| Do not depend on `Content-Range` or `ETag` from a signed-URL GET in a browser. | Managed exposed `content-length,content-type` only. | CK11 |
+| Treat a Data API `200` near `exp` as within PostgREST's skew window. | At `exp` + 5 s Auth `403`, Data API `200`; both refused at `exp` + 45 s. | CK02 |
+| Point self-hosted S3 clients at the host in `STORAGE_PUBLIC_URL`. | Another host name got `SignatureDoesNotMatch` on CreateMultipartUpload. | CK11 |
+| Back the self-hosted file backend with a named volume on Docker Desktop for Mac. | The bind mount failed every upload with a `500` on extended attributes. | CK03-CK05 |
+| Retry once on `PGRST303 JWT issued at future` from a self-hosted Data API. | 1 retry each in CK05 and CK06 of the final `onprem` run, 0 on managed. | CK05, CK06 |
+| Compare error codes across targets, not media types or Auth statuses. | 8 of 22 shapes differed; S3 bodies and codes matched while media types did not. | CK12 |
+
+---
+
+## Not measured
+
+- CK04 and CK06 on `region-b`: the resume died during host sleep and was not re-run.
+- CK04-CK06 on `onprem-file`: the Docker VM disk had no room for two 2 GiB objects.
+- CK10 on the self-hosted targets, which have one region per run.
+- A scan of managed's object store for plaintext: there is no access to it.
+- Any other vantage, region or repeat run. Every target ran once.
+- Self-hosted on Linux amd64 or Kubernetes, high availability for the self-hosted stack, and self-hosted backup and restore.
+- A real KMS or HSM behind the key service, and fitness for any regulatory or contractual regime.
+- The cause of the slow signed-URL reads on `region-a`.
+- Two managed attempts before the final one produced no artifact (one hit a background-job time limit, one was stopped by hand) and are not counted.
+
+---
+
+## Evidence, by module
+
+| Claim | How it was checked | Module |
+|---|---|---|
+| Same catalogue on four targets; no target branch | catalogue fingerprint of policies, functions, triggers, tables, grants, hook grants and bucket; grep of 15 files | [CK01](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck01-catalogue.ts) |
+| ES256, 300 s, hook claim; refusal shapes; expiry skew | sign-up, sign-in, refresh, wrong password, banned user, expired token at `exp` + 5 s and + 45 s | [CK02](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck02-auth.ts) |
+| RLS matrix | 8 cells x 4 actors on catalogue rows and objects over REST and S3 | [CK03](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck03-rls-matrix.ts) |
+| Multipart resume and the parts policy | 2 GiB, SIGKILL at 40 %, resume from a new process, parts kept, ETags compared, full read SHA-256 | [CK04](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck04-s3-multipart.ts) |
+| TUS resume | the same flow through TUS, offset at resume | [CK05](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck05-tus.ts) |
+| Ranged reads and per-path timing | 100 random ranges, 25 per path, bytes and covering chunks compared, `cf-cache-status` counted | [CK06](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck06-ranged-reads.ts) |
+| Tamper fails closed | flip, swap and truncate a copy over S3, read with and without hashes, restore | [CK07](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck07-tamper.ts) |
+| Ciphertext only; Storage metadata | marker scan with a positive control over the API and the MinIO data; Postgres scan for DEK and KEK | [CK08](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck08-ciphertext-only.ts) |
+| Key service down | stop the container, upload and read, compare counts and ETag, restart and read | [CK09](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck09-keysvc-down.ts) |
+| Region isolation | one region's token against the other's Auth, Data API, Storage REST, S3 and key service, both directions | [CK10](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck10-region-isolation.ts) |
+| Browser, CORS, SigV4 host | headless Chromium in a container: preflights, page upload, ranged reads, readable headers | [CK11](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck11-browser.ts) |
+| Error shapes | 22 fixed failing requests per target: status, media type, body keys, code | [CK12](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck12-error-shapes.ts) |
+| Versions | live version endpoints per target, image tags on self-hosted | [CK13](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck13-versions.ts) |
+| xattr failure on the bind mount | `onprem-file` run with the upstream bind mount | [`run-2026-10-12T08-36-46-437Z.facts.md`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/out/2026-10-12/run-2026-10-12T08-36-46-437Z.facts.md) |
+| Resume without the parts policy; SigV4 host mismatch | first `onprem` run, three migrations | [`run-2026-10-12T08-20-58-489Z.facts.md`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/out/2026-10-12/run-2026-10-12T08-20-58-489Z.facts.md) |
+
+Results, the run list and the operator's notes are in the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/RUNLOG.md). The artifacts, with refs, hostnames and emails redacted, are in [`out/2026-10-12`](https://github.com/erfianugrah/supabase-lab/tree/5f7ce52/experiments/client-keyed-objects/out/2026-10-12).
+
+---
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| CK01 | client-keyed-objects | [`ck01-catalogue.ts`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck01-catalogue.ts) | [`out/2026-10-12`](https://github.com/erfianugrah/supabase-lab/tree/5f7ce52/experiments/client-keyed-objects/out/2026-10-12) |
+| CK02 | client-keyed-objects | [`ck02-auth.ts`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck02-auth.ts) | [`out/2026-10-12`](https://github.com/erfianugrah/supabase-lab/tree/5f7ce52/experiments/client-keyed-objects/out/2026-10-12) |
+| CK03 | client-keyed-objects | [`ck03-rls-matrix.ts`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck03-rls-matrix.ts) | [`out/2026-10-12`](https://github.com/erfianugrah/supabase-lab/tree/5f7ce52/experiments/client-keyed-objects/out/2026-10-12) |
+| CK04 | client-keyed-objects | [`ck04-s3-multipart.ts`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck04-s3-multipart.ts) | [`out/2026-10-12`](https://github.com/erfianugrah/supabase-lab/tree/5f7ce52/experiments/client-keyed-objects/out/2026-10-12) |
+| CK05 | client-keyed-objects | [`ck05-tus.ts`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck05-tus.ts) | [`out/2026-10-12`](https://github.com/erfianugrah/supabase-lab/tree/5f7ce52/experiments/client-keyed-objects/out/2026-10-12) |
+| CK06 | client-keyed-objects | [`ck06-ranged-reads.ts`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck06-ranged-reads.ts) | [`out/2026-10-12`](https://github.com/erfianugrah/supabase-lab/tree/5f7ce52/experiments/client-keyed-objects/out/2026-10-12) |
+| CK07 | client-keyed-objects | [`ck07-tamper.ts`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck07-tamper.ts) | [`out/2026-10-12`](https://github.com/erfianugrah/supabase-lab/tree/5f7ce52/experiments/client-keyed-objects/out/2026-10-12) |
+| CK08 | client-keyed-objects | [`ck08-ciphertext-only.ts`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck08-ciphertext-only.ts) | [`out/2026-10-12`](https://github.com/erfianugrah/supabase-lab/tree/5f7ce52/experiments/client-keyed-objects/out/2026-10-12) |
+| CK09 | client-keyed-objects | [`ck09-keysvc-down.ts`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck09-keysvc-down.ts) | [`out/2026-10-12`](https://github.com/erfianugrah/supabase-lab/tree/5f7ce52/experiments/client-keyed-objects/out/2026-10-12) |
+| CK10 | client-keyed-objects | [`ck10-region-isolation.ts`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck10-region-isolation.ts) | [`out/2026-10-12`](https://github.com/erfianugrah/supabase-lab/tree/5f7ce52/experiments/client-keyed-objects/out/2026-10-12) |
+| CK11 | client-keyed-objects | [`ck11-browser.ts`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck11-browser.ts) | [`out/2026-10-12`](https://github.com/erfianugrah/supabase-lab/tree/5f7ce52/experiments/client-keyed-objects/out/2026-10-12) |
+| CK12 | client-keyed-objects | [`ck12-error-shapes.ts`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck12-error-shapes.ts) | [`out/2026-10-12`](https://github.com/erfianugrah/supabase-lab/tree/5f7ce52/experiments/client-keyed-objects/out/2026-10-12) |
+| CK13 | client-keyed-objects | [`ck13-versions.ts`](https://github.com/erfianugrah/supabase-lab/blob/5f7ce52/experiments/client-keyed-objects/tests/ck13-versions.ts) | [`out/2026-10-12`](https://github.com/erfianugrah/supabase-lab/tree/5f7ce52/experiments/client-keyed-objects/out/2026-10-12) |
+| SD02 | self-hosted-defaults | [`sd02-opaque-keys.ts`](https://github.com/erfianugrah/supabase-lab/blob/c621e0d/experiments/self-hosted-defaults/tests/sd02-opaque-keys.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/c621e0d/experiments/self-hosted-defaults/out/2026-10-10) |
+| SS03 | storage-surface | [`ss03-large-objects.ts`](https://github.com/erfianugrah/supabase-lab/blob/0c2a5a0/experiments/storage-surface/tests/ss03-large-objects.ts) | [`out/2026-10-12`](https://github.com/erfianugrah/supabase-lab/tree/0c2a5a0/experiments/storage-surface/out/2026-10-12) |
+
+Ids with a letter suffix (SS03h) are result rows inside the module of the same number.
+
+## Related docs
+
+- [Supabase Storage large objects](/reference/supabase-storage-large-objects/) -
+  the S3 contract, TUS and the managed-against-self-hosted Storage diff (storage-surface SS03 onwards) this application was built on.
+- [Supabase Storage surface](/reference/supabase-storage-surface/) -
+  direct SQL deletes, list pagination and the S3 key classes; object keys here are UUID paths inside the accepted class.
+- [Self-hosted Supabase Docker defaults in 2026](/reference/supabase-self-hosted-defaults/) -
+  the same pinned stack, and the Envoy `401` behind the Data API error-shape difference above.
+- [Supabase Auth end to end](/reference/supabase-auth-end-to-end/) -
+  token signing, verification tolerance and session refresh, which the key service and the skew finding rest on.
+- [Supabase data residency and sovereignty](/reference/supabase-data-residency/) -
+  the Storage CDN cache key behind the signed-URL inference, and what a project region pins.
+
+[^sb-hook]: Supabase, "Custom Access Token Hook," Supabase Docs. https://supabase.com/docs/guides/auth/auth-hooks/custom-access-token-hook
+[^sb-s3-auth]: Supabase, "S3 Authentication," Supabase Docs. https://supabase.com/docs/guides/storage/s3/authentication
+[^sb-tus]: Supabase, "Resumable Uploads," Supabase Docs. https://supabase.com/docs/guides/storage/uploads/resumable-uploads
+[^pgrst-auth]: PostgREST, "Authentication," PostgREST 14 documentation. https://docs.postgrest.org/en/v14/references/auth.html
