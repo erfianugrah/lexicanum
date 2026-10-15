@@ -1,10 +1,10 @@
 ---
 title: GPU voltage-frequency curve control without Afterburner
-description: vfctl - a Go CLI that reads and writes NVIDIA VF curves via NVAPI, replacing MSI Afterburner for undervolting. Verified write path, full telemetry, and the Blackwell DVFS findings that explain where the card runs.
+description: vfctl - a Go CLI that reads and writes NVIDIA VF curves via NVAPI, replacing MSI Afterburner for undervolting, and programs the motherboard fan chip so FanControl can go too. Verified write path, full telemetry, the Blackwell DVFS findings, and what sensor polling costs an 8 kHz mouse.
 author: "Erfi Anugrah"
 category: workstations
 featured: true
-blurb: "GPU undervolting that doesn't fight the curve editor."
+blurb: "GPU undervolting and fan curves without Afterburner or FanControl."
 ---
 
 vfctl is a Go CLI that reads and writes NVIDIA GPU voltage-frequency curves directly via NVAPI, replacing MSI Afterburner's curve editor. Built after Afterburner's editor repeatedly produced broken curves - notch artifacts at selection boundaries, temperature-stale baselines, and unexpected whole-curve shifts[^afterburner] - on an RTX 5090 FE.
@@ -16,8 +16,9 @@ Curve struct layouts are from the PenguinBurner reverse-engineering effort[^peng
 - Curve write, telemetry, persistence and automated stability search in one static binary, replacing Afterburner for undervolting.
 - Writes are read-modify-write via `ClkVfPointsSetControl`, confirmed by selftest on the card.
 - Telemetry covers clock, voltage, utilisation, temperature and live power draw, logged as CSV with a voltage histogram summary.
-- A logon task runs `vfctl hold`, which applies the curve and re-applies it whenever a driver reset wipes the offsets.
+- A logon task runs `vfctl hold`, which applies the curve and re-applies it whenever a driver reset wipes the offsets. It reacts to driver events instead of polling.
 - On Blackwell the curve sets the frequency ceiling per voltage, and the DVFS governor picks where the card sits.
+- Since v0.4.0 vfctl also writes the fan curves into the motherboard's Nuvoton NCT6799D, which then runs them with no software in the loop. That replaced FanControl, whose once-a-second polling cost an 8 kHz mouse dozens of missed polls a minute; most of that cost was the NVAPI GPU temperature read.
 
 ## Architecture
 
@@ -29,7 +30,11 @@ Curve struct layouts are from the PenguinBurner reverse-engineering effort[^peng
 | `internal/profile` | Afterburner .cfg INI read/write | legacy import path |
 | `internal/task` | Task Scheduler XML for `persist` | no 72h limit, restart on failure |
 | `internal/nvapi` | nvapi64.dll syscall layer | curve writes + telemetry reads |
-| `cmd/vfctl` | CLI dispatch | 16 commands |
+| `internal/drvevents` | System event log subscription for `hold` | TDR (4101) and driver install (UserPnp 20003) |
+| `internal/sio` | Nuvoton NCT6799D access over a two-method port interface | tested against a simulated chip |
+| `internal/pawnio` | PawnIO driver binding, embedded signed LpcIO module | shared ISA-bus mutex |
+| `internal/fancurve` | FanControl curve import, 4-point chip fit | pure maths |
+| `cmd/vfctl` | CLI dispatch | 20 commands |
 
 Built partly by a self-correcting loop on a local Gemma 4 26B model - the `internal/curve` and `internal/testloop` extractions converged in one iteration each against a `go test` sensor, with human review catching a dropped sentinel guard the tests missed.
 
@@ -102,7 +107,49 @@ NVIDIA snaps frequencies to 15 MHz steps. A bounds guard rejects values outside 
 
 The offsets live in driver memory. A reboot clears them, and so does any driver reload - including a driver reinstall by the NVIDIA installer while the desktop is running. On 2026-10-08 an installer run reinstalled `nvlddmkm` mid-session and the card went back to the stock curve with nothing signalling the process that had set it; the original logon-only `set` task never noticed.
 
-`vfctl hold` closes that gap. It applies the curve, then every 15 s opens a fresh NVAPI session, re-reads the curve, and re-applies when the offsets drift from what it last wrote. After 20 failed checks in a row it exits non-zero so Task Scheduler restarts it with a freshly loaded `nvapi64.dll`. `persist` installs the binary under `%ProgramFiles%` (the task runs elevated, so its executable must not sit in a user-writable folder) and registers the task without the default 72-hour execution limit. Verified live: resetting the card to stock while `hold` ran was undone within one check.
+`vfctl hold` closes that gap. It applies the curve, then checks it only when the driver may have reset it: it subscribes to the System event log for a TDR (Event 4101) or a driver install (Event 20003 from UserPnp, which the 2026-10-08 reinstall logged for `nvlddmkm`) and checks 10 s after one fires. A safety check every 15 minutes covers anything the log misses and is skipped while a fullscreen game is in front. The first version polled every 15 s, then every 30 s; seven days of its log showed the poll catching drift once, 30 s after startup, so v0.3.0 moved to events. Each check opens a fresh NVAPI session, compares the offsets with what `hold` last wrote, and re-applies on drift. After 20 failed checks in a row it exits non-zero so Task Scheduler restarts it with a freshly loaded `nvapi64.dll`.
+
+`persist --profile` installs the binary and a machine profile under `%ProgramFiles%` (the task runs elevated, so neither may sit in a user-writable folder) and registers the task without the default 72-hour execution limit. The profile is a JSON file kept in the repo with the undervolt and fan settings, so changing a setting means editing the file and running `persist` again. Verified live: a fake Event 4101 written to the System log produced a check that found the curve intact, and resetting the card to stock followed by another fake 4101 got the curve re-applied (63 points verified).
+
+## Fan curves on the motherboard chip
+
+FanControl reads every enabled sensor through LibreHardwareMonitor once a second and rewrites each fan's duty in manual mode every tick. On this machine (ASUS ROG STRIX X670E-I, whose fan headers hang off a Nuvoton NCT6799D Super I/O) that polling showed up as missed polls on an 8 kHz mouse. The chip can run a fan curve itself in its SmartFan IV mode, which is how the BIOS Q-Fan curves already work, so vfctl writes the curves once and leaves the chip to run them.
+
+How it works:
+
+- Chip access goes through PawnIO[^pawnio], the signed kernel driver FanControl and LibreHardwareMonitor already install, using its signed `LpcIO` module[^pawnio-lpcio] embedded in vfctl. Every transaction holds the shared `Global\Access_ISABUS.HTP.Method` mutex those tools use, and vfctl refuses to touch the chip while FanControl runs.
+- Each FanControl curve (10-13 points) is fitted to the chip's 4 points plus a full-speed temperature. The fitter tries every 4-point subset and keeps the one with the smallest worst-case duty error: 2.2, 3.7 and 6.4 percentage points for the three curves here.
+- Before the first write vfctl saves the BIOS register values, and `vfctl fan restore` puts them back. Every write is read back. vfctl never puts a fan in manual mode, so if it dies the chip keeps running the last curve.
+- `hold` writes the curves at logon and re-reads them on its 15-minute safety check. Between checks it makes no fan-side calls.
+
+Register addresses come from the Linux `nct6775` driver[^nct6775] and the NCT6796D datasheet[^nct6796d] (Nuvoton publishes no NCT6799D datasheet). Several facts only showed up on the hardware:
+
+| Finding | How it was checked |
+|---------|-------------------|
+| PawnIO's `ioctl_find_bars` returns `0x80070490` (not found) unless the chip is already in extended-function mode, because it reads the chip id first | measured: first run failed; the module source confirms the order[^pawnio-lpcio] |
+| The BIOS runs the CPU and chassis channels on source 28, the AMD CPU temperature over SB-TSI (register `0x4F4`), not on the PECI or CPUTIN sources | measured: register dump; rose 50 -> 66 C under a 30 s all-core load |
+| Registers `0x073`-`0x07D` show each fan channel's current input temperature, not fixed sensors, so LibreHardwareMonitor's names for them (PECI_0, CPUTIN, SYSTIN, AUXTIN0-2) do not fit this board | measured: `0x073` read 0 when channel 0 moved to an unset source, then the value written into that source |
+| SmartFan IV interpolates linearly between the 4 points | measured: three channels within one duty step of the linear value |
+| Index `0x03` is the step-up time and `0x04` the step-down time (some sources swap them). The ASUS BIOS leaves both at 0 and the duty-per-step register `0x66` at 0, so writing a non-zero step time freezes the output | measured: with step times written, the chip's computed target (`0x0B`) was right but two outputs never moved; keeping the BIOS 0/0 fixed it. Register meanings from the datasheet[^nct6796d] |
+| Source 31 reads the channel's software-writable Virtual1 register, so a program can feed the chip an outside temperature | measured: monitor slot and output followed the written value |
+| The ASUS embedded controller does not rewrite the registers | measured: unchanged 7 minutes later and across restarts of `hold` |
+
+## What sensor polling costs an 8 kHz mouse
+
+MousePlotter[^mouseplotter] recordings of an Endgame Gear OP1 8k at 8 kHz showed the missed polls that started this work. Each run below counts gaps over 0.4 ms per minute while the mouse was moving. The runs are 30-65 s each, and two that should match (the "curves on the chip" and "chip read only" rows) differ by 2x, so treat a single row as plus or minus half. The direction held across every run.
+
+| Configuration | Gaps over 0.4 ms per minute |
+|---------------|------------------------------|
+| FanControl running (Motherboard, CPU and NVAPI sources) | 54 |
+| FanControl closed | 11 |
+| vfctl curves on the chip, nothing polling | 15 |
+| `hold` reading only the fan chip every 5 s | 7 |
+| `hold` reading the GPU temperature through NVAPI every 5 s | 49-60 |
+| `hold` reading the GPU temperature every 60 s | 36 |
+
+A chip register read through PawnIO (p99 0.53 ms of wall time) cost nothing measurable. The NVAPI GPU temperature read cost most of FanControl's overhead, whether the session stayed open or was opened per read, and the gaps came with the stall signature of a system-wide pause: MousePlotter lost its kernel timestamps for them. That runs against the usual view that on-die GPU temperature reads are cheap, at "a few microseconds" of CPU time[^unwinder]; on this RTX 5090 the CPU time may be small, but the stall it causes is not. Why the driver stalls is not established.
+
+So the chassis fan, which FanControl drove from the higher of the CPU and GPU curves, now follows the CPU curve on the chip. vfctl can still drive a channel from max(CPU, GPU) by writing the GPU temperature into the channel's Virtual1 register at a set interval; the profile leaves that off.
 
 ## Stability testing methodology
 
@@ -119,7 +166,8 @@ On driver 610.88, the stability cliff for a 5090 FE is exactly one 15 MHz step w
 - The curve does not pin the operating voltage; the DVFS governor adds margin under sustained load. Forcing lower needs a declining curve, which is notch territory
 - The undocumented curve interfaces may change between driver releases
 - Windows only today. The Linux driver ships `libnvidia-api.so.1` with the same `nvapi_QueryInterface` entry point and VF function IDs (LACT's VF curve editor uses them[^lact-957]), so a Linux backend is a port of the call layer, not new reverse engineering
-- Fan control is out of scope: manual % clamps to 30% minimum; 0 RPM is vBIOS-auto only. FanControl handles it
+- GPU fan control is out of scope: manual % clamps to 30% minimum and 0 RPM is vBIOS-auto only; the card's own curve stays in charge
+- Motherboard fan control covers the Nuvoton NCT6799D only, verified on one ASUS board; other Super I/O chips need their own register map
 - Tested on a single card: RTX 5090 FE (Blackwell GB202)
 
 {/* References: cited inline as [^slug]; the numbered list renders below under "References". */}
@@ -133,5 +181,17 @@ On driver 610.88, the stability cliff for a 5090 FE is exactly one 15 MHz step w
 [^nvapi-sys]: arcnmx, "nvapi-sys," Rust crate. https://docs.rs/nvapi-sys - struct layouts for power/thermal reads
 
 [^nvapi-docs]: NVIDIA, "NVAPI Reference Documentation," Release 590. https://docs.nvidia.com/nvapi - documented clock/thermal APIs
+
+[^pawnio]: namazso, "PawnIO," scriptable kernel driver for hardware access. https://pawnio.eu
+
+[^pawnio-lpcio]: namazso, "LpcIO.p," PawnIO.Modules. https://github.com/namazso/PawnIO.Modules/blob/24425a5299e84410751da882c121f322fb030b82/LpcIO.p
+
+[^nct6775]: Linux kernel, "nct6775-core.c," hwmon driver for Nuvoton NCT677x/679x Super I/O chips. https://github.com/torvalds/linux/blob/0fcb05b72344f40806cbe810de8872f1698bf053/drivers/hwmon/nct6775-core.c
+
+[^nct6796d]: Nuvoton, "NCT6796D Datasheet," Version 0.6, 2017. https://www.nuvoton.com/resource-files/NCT6796D_Datasheet_V0_6.pdf
+
+[^mouseplotter]: XBAB Tech, "MousePlotter." https://github.com/XBAB-Tech/MousePlotter
+
+[^unwinder]: Unwinder, "Does hardware polling software like RTSS, HWiNFO64 have a discernible impact on performance?," Guru3D forums. https://forums.guru3d.com/threads/does-hardware-polling-software-like-rtss-hwinfo64-have-a-discernible-impact-on-performance.443665/
 
 [^afterburner]: st4rdog, "MSI Afterburner curve editor shortcuts," GitHub Gist. https://gist.github.com/st4rdog/d305609977037e64684a7932609446de
