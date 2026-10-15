@@ -8,7 +8,7 @@ Deploy with `bun run deploy` - it is `wrangler deploy` PLUS a zone cache purge
 per-PoP cache (`cf-cache-status: HIT` even on `max-age=0, must-revalidate`
 HTML), and without the purge some PoPs serve the previous deploy for tens of
 minutes (observed 2026-08-17). The purge needs CLOUDFLARE_API_TOKEN, or
-CLOUDFLARE_API_KEY + CLOUDFLARE_EMAIL, in env; it skips silently without them.
+CLOUDFLARE_API_KEY + CLOUDFLARE_EMAIL, in env; it warns and skips without them.
 
 PUSHING TO MAIN ALSO DEPLOYS: `.forgejo/workflows/deploy.yml` (Forgejo Actions) runs on every
 push to main - build + test gate, then `wrangler-action` deploy and a

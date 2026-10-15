@@ -14,7 +14,8 @@ convention, house style). Read it before adding or editing docs.
 ```
 .
 ├── scripts/
-│   │   └── new-doc.ts       # `bun run new` doc scaffolder
+│   ├── new-doc.ts           # `bun run new` doc scaffolder
+│   └── purge-cache.ts       # post-deploy Cloudflare zone cache purge
 ├── src/
 │   ├── content/
 │   │   └── docs/
@@ -70,10 +71,10 @@ aliases:                  # optional: old published URLs, emitted as redirects
 | `bun install`            | Install dependencies                            |
 | `bun run new`            | Scaffold a new doc (frontmatter + skeleton)     |
 | `bun dev`                | Dev server at `localhost:4321`                  |
-| `bun run build`          | Run all doc tests, then build to `./dist/`      |
+| `bun run build`          | Test the corpus, build to `./dist/`, re-test the built output |
 | `bun test`               | Run the doc checks without building             |
 | `bun run verify:docs:links` | Opt-in external-link reachability check      |
-| `bun run deploy`         | Deploy via Wrangler                             |
+| `bun run deploy`         | Deploy via Wrangler, then purge the zone cache                |
 
 ## Resources
 
