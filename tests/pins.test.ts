@@ -1776,6 +1776,7 @@ const practicePages: Array<[doc: string, heading: RegExp]> = [
   ["reference/supabase-edge-function-limits", /^## What to do about each ceiling$/m],
   ["reference/supabase-image-transformations-billing", PRACTICES_HEADING],
   ["reference/supabase-incident-resilience", PRACTICES_HEADING],
+  ["reference/supabase-logs-volume", PRACTICES_HEADING],
   ["reference/supabase-multi-tenant-placement", PRACTICES_HEADING],
   ["reference/supabase-platform-operation-cost", PRACTICES_HEADING],
   ["reference/supabase-read-replicas", PRACTICES_HEADING],

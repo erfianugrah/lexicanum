@@ -1,0 +1,232 @@
+---
+title: "Supabase logs volume: what each request writes, and which Postgres settings add to it"
+description: How many log rows and how much log content a Supabase project writes per client action, by source - REST reads and writes, bulk inserts, Edge Functions with and without console output, getUser against getClaims, cached public Storage reads, Realtime broadcast, an idle project - and what log_statement, log_min_duration_statement, pgaudit.log and RAISE add depending on the role they are set on and the connection path. Measured 2026-10-15 on a Pro-plan organisation in ap-southeast-1.
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+Logs Ingest on Supabase is billed per byte across every service, at \$0.50 per GB after 20 GB included on paid plans.[^sb-logs-ingest] This page measures where those bytes come from: how much each kind of client request writes to the project logs, and how much the Postgres logging settings a project owner can change add on top. It is for whoever has to explain a logs line on an invoice, or decide which change on their side moves it.
+
+All measured rows below ran on 2026-10-15 from one macOS machine in Singapore (Bun 1.3.14) against throwaway projects in `ap-southeast-1` on a Pro-plan organisation, one project per module run, created and read back through the Management API from the same machine; the client actions went straight to the project API. LV01 ran twice (`run1`, `run2`) with 100 actions per row; LV02 ran three times (`run1` to `run3`) with 50 requests or statements per condition. The figures are quoted from the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/e1fa570/experiments/logs-volume/RUNLOG.md) of the [logs-volume experiment](https://github.com/erfianugrah/supabase-lab/tree/e1fa570/experiments/logs-volume/), and redacted copies of the run artifacts are linked in [Modules](#modules). Rows marked documented come from the public pages cited at the claim and were not run.
+
+Size is a proxy throughout. Metered ingest bytes are not readable with a personal access token (the organisation usage route answered 401, [observability surface](/reference/supabase-observability-surface/)), so "bytes" here is the length of a row's `event_message` plus every key and value in its `log_attributes` map, as the logs endpoint returns it. The figures compare actions with each other; they do not predict the GB on an invoice.
+
+**TL;DR:**
+
+- A REST read or single-row write produced about 0.9 `edge_logs` rows per request; a REST GET row is 1807 bytes. A 100-row bulk insert produced one row.
+- An Edge Function call with no console output wrote about 3,019 bytes in 2.81 rows: a `function_edge_logs` row plus a Boot and a Shutdown row in `function_logs`. Each ~100-character `console.log` line added about 520-540 bytes.
+- `auth.getUser()` wrote 2,604 bytes per call; `auth.getClaims()` with an ES256 token wrote 27 bytes per call (2 rows for 100 calls).
+- Public Storage reads served from the CDN cache are logged: 100 reads with 99 `cf-cache-status: HIT` produced 99 (`run1`) and 90 (`run2`) `edge_logs` rows.
+- 100 Realtime broadcast messages over an open WebSocket wrote no `realtime_logs` or `edge_logs` rows (both runs; `run2` 0 rows and 2 bytes per message after idle subtraction).
+- On a new project (`log_statement=ddl`, `log_min_duration_statement=-1`) REST GETs and SQL `select` statements wrote 0 `postgres_logs` rows. Of `postgres`, `authenticator` and `anon`, only settings on `authenticator` logged REST requests: `log_statement=all` added 4,405 bytes per REST request and `log_min_duration_statement=0` added 9,026 bytes.
+- A role setting on `postgres` reached new direct sessions at once and had not reached new sessions through the shared pooler 75-453 s later. `alter role authenticator reset all` returned OK and cleared nothing.
+
+---
+
+## Which change moves which source
+
+| Source in the logs | What writes it | Lever on the project side | Measured here |
+|---|---|---|---|
+| `edge_logs` | every HTTP request to the project API, cache hits included | send fewer requests: client or app caching, Realtime in place of polling, bulk writes, fewer round trips | LV01b-d, LV01h-j |
+| `auth_logs` | Auth server calls such as `getUser` | verify the JWT locally with `getClaims` | LV01h, LV01i |
+| `function_edge_logs`, `function_logs` | every Edge Function invocation, plus the function's own console output | fewer invocations; remove debug `console.log` | LV01e-g |
+| `postgres_logs` | Postgres itself, per the logging settings in force | reset `log_statement`, `log_min_duration_statement`, `pgaudit.log` where raised; avoid `RAISE LOG` in hot functions | LV02 |
+| `pgbouncer_logs`, background `postgres_logs` | the platform, with no client traffic | none | LV01a |
+| `realtime_logs` | not seen per message in either LV01 run | - | LV01k, LV01l |
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  client [label="client request"];
+  gw [label="API gateway\nedge_logs ~1.8 KB"];
+  rest [label="PostgREST\n(authenticator -> anon)"];
+  pg [label="Postgres\npostgres_logs: 0 at defaults"];
+  auth [label="Auth\nauth_logs 608 B"];
+  fn [label="Edge Function\nfunction_edge_logs + Boot + Shutdown"];
+  st [label="Storage CDN\nedge_logs on HIT"];
+  rt [label="Realtime broadcast\nno rows per message"];
+  client -> gw;
+  gw -> rest -> pg;
+  gw -> auth;
+  client -> fn;
+  gw -> st;
+  client -> rt [label="open WebSocket"];
+}
+```
+
+Text version of the diagram:
+
+1. A REST, Auth or Storage request to the project API wrote up to one `edge_logs` row at the gateway (0.83-0.97 per request; 1807 bytes for a REST GET), including Storage reads served from the CDN cache; an Edge Function call wrote a `function_edge_logs` row instead.
+2. Behind the gateway, PostgREST logs in as `authenticator` and switches to `anon` or `authenticated`; at defaults Postgres wrote no `postgres_logs` row for a REST GET (LV02a), and one row per call for a function that runs `RAISE LOG` (LV02i).
+3. An Auth call writes an `auth_logs` row (608 bytes for `getUser`) as well as its gateway row.
+4. An Edge Function call writes a `function_edge_logs` row and a Boot and a Shutdown row in `function_logs`, plus one row per console line.
+5. A Realtime broadcast message on an already open WebSocket wrote no `realtime_logs` or `edge_logs` row.
+
+---
+
+## Per client action
+
+Measured, LV01 `run2`, 100 actions per row (LV01d n = 1), sequential, one project. `run1` values in brackets where it measured the same thing. Keys: the legacy anon key for REST GETs, Edge Functions and Realtime; the legacy service_role key for REST inserts and Storage setup; no key for the public Storage reads; a password-signed-in user with an ES256 access token for the Auth rows. Per-action figures for the non-function rows subtract the idle rate from LV01a.
+
+| Row | Action | Rows per action | Bytes per action | Where the bytes are |
+|---|---|---|---|---|
+| LV01b | REST GET, anon key | 0.91 (0.85) | 1659 (1520) | `edge_logs`, 1807 bytes per row |
+| LV01c | REST insert, service_role key, one row per request | 0.92 (0.88) | 1610 (1525) | `edge_logs` |
+| LV01d | REST insert, service_role key, 100 rows in one request (n = 1) | 1 `edge_logs` row (1) | 1771 (1771), `edge_logs` only | one row in both runs; all sources 2047 (1554), the difference is `pgbouncer_logs` idle-subtraction noise |
+| LV01h | `auth.getUser()`, signed-in user | 1.98 (1.89) | 2604 (2343) | `edge_logs` plus one `auth_logs` row of 608 bytes |
+| LV01i | `auth.getClaims()`, same user, ES256 token | 0.03 (0.03) | 27 (27) | 1 `auth_logs` and 1 `edge_logs` row for the 100 calls |
+| LV01j | Storage public object, no key, same object | 0.97 (1.12) | 1014 (1144) | `edge_logs`; responses 1 MISS, 99 HIT in both runs; `run1` 1.12 includes 0.06 late `function_logs` and 0.06 `pgbouncer_logs` rows |
+| LV01k | Realtime broadcast over an open WebSocket | 0 | 2 | 100 of 100 messages received |
+| LV01e | Edge Function, anon key, no console output | 2.81 | 3019 | `function_edge_logs` 0.91 rows; `function_logs` Boot:95 Shutdown:95 |
+| LV01f | Edge Function, one ~100-character `console.log` | 3.88 | 3622 | Boot:97 Log:100 Shutdown:97 |
+| LV01g | Edge Function, ten `console.log` lines | 12.77 | 8221 | Boot:93 Log:1000 Shutdown:93 |
+
+100 rows written one per request produced 91 `edge_logs` rows (LV01c, `run2`); 100 rows written in one request produced 1 (LV01d).
+
+### Edge Functions
+
+A silent invocation still wrote rows, even when the function printed nothing: a gateway row in `function_edge_logs` and two lifecycle rows in `function_logs`, Boot and Shutdown. The 100 sequential calls in LV01e (`run2`) produced 95 Boot and 95 Shutdown rows, which suggests nearly every call started its own worker (inferred from the event types). Each ~100-character console line then added about 520-540 bytes: LV01f minus LV01e is 1,482 - 940 bytes of `function_logs` per invocation, and LV01g gives (6,150 - 940) / 10.
+
+Shutdown rows arrived up to about 3.5 minutes after the request (an exploratory probe of 20 invocations with 20 Boot and 20 Shutdown rows, not archived). Counting `function_logs` by time window therefore undercounts: `run1` did that and attributed 0.98 `function_logs` rows per invocation, and the late rows (event type not recorded in `run1`) showed up in later windows. `run2` counts by `log_attributes['function_id']` from the start of each phase, and that is the figure above.
+
+### Auth: getUser against getClaims
+
+`getUser()` calls the Auth server, and each call wrote an `edge_logs` row and an `auth_logs` row, 2,604 bytes in `run2`. `getClaims()` verifies the token locally against a cached JWKS when the project signs with asymmetric keys, and calls the Auth server when it signs with the legacy symmetric secret.[^sb-server-client] New projects issued ES256 user tokens here, and 100 `getClaims()` calls wrote 1 `auth_logs` and 1 `edge_logs` row in total. The request path of those two rows was not recorded; a JWKS fetch is what the docs describe. A server that calls `getUser()` on every request adds about 2,604 bytes to each request (derived from LV01h).
+
+### Caching and Storage
+
+Public Storage reads served from the CDN cache are logged. The same 1 KB object, fetched 100 times with no query string, came back 1 MISS and 99 HIT (`cf-cache-status`) in both runs and produced 99 (`run1`) and 90 (`run2`) `edge_logs` rows, about 1 KB each: a CDN cache HIT still wrote an `edge_logs` row. A cache in the client, the application or the project owner's own CDN keeps the request from reaching the project at all; that follows from LV01b, where each request reaching the gateway is one row, and was not separately measured.
+
+### Realtime against polling
+
+100 broadcast messages over an open WebSocket, all received, wrote no `realtime_logs` or `edge_logs` rows (LV01k, both runs), and two subscribed clients idling for 180 s wrote nothing attributable to them (LV01l: every source at or below the idle rate in `run2`; `run1` had 1 `edge_logs` row and 70 late `function_logs` rows in the 186 s window). The same updates fetched by polling cost a gateway row per poll: one client polling every 5 seconds sends 17,280 requests a day, which at LV01b's 1,659 bytes is about 28.7 MB (10^6 bytes) a day, or 0.86 GB over 30 days, per open client (derived from LV01b, not measured as a polling run). Realtime Postgres Changes were not measured.
+
+### Idle background
+
+With no client traffic, a project wrote at a rate of 520 `pgbouncer_logs`, 40 `postgres_logs` and 60 `function_logs` rows an hour (both runs), extrapolated from one 180 s window, about 4.2 MiB a day (`run1` 4.4). The 3 `function_logs` rows in that window are probably Shutdown rows from the setup's warm-up invocations (not determined). No setting for the `pgbouncer_logs` and `postgres_logs` background was found (not tested).
+
+### Row completeness
+
+Not every request produced a row the run could find. For 100 marked REST GETs, `edge_logs` held 84 (`run1`) and 92 (`run2`) rows, unchanged after a 300 s tail in `run2`; `function_edge_logs` counts per 100 invocations were 86-94 across both runs, and Boot counts were 93-97 (`run2`). Whether that is sampling, loss, or arrival later than the run waited is not determined. Read every per-request row count on this page as covering about 83-97 of every 100 requests (lowest: LV01h `run1`, 83 `edge_logs` rows).
+
+---
+
+## Postgres logging settings
+
+The `postgres` role can change `log_statement`, `log_min_duration_statement` and `pgaudit.*` at role level through supautils; `log_connections` and `log_disconnections` are listed as CLI-only project settings.[^sb-custom-pg-config] The logs-ingest page lists `log_statement`, `log_min_duration_statement`, `log_connections`, pgAudit, and `RAISE NOTICE` / `RAISE LOG` in functions as the volume sources a project owner controls.[^sb-logs-ingest] On a new project the defaults were `log_statement=ddl`, `log_min_duration_statement=-1`, `log_min_messages=warning` and `log_connections=off`, and the platform roles `supabase_auth_admin`, `supabase_storage_admin` and `supabase_admin` carry `log_statement=none` at role level (read on a dev project, not archived).
+
+Measured, LV02 `run3`, 50 anon REST requests and 50 SQL statements per path per condition. Settings were applied with `alter role ... set` from a `postgres` session through the shared pooler (session mode, 5432); REST traffic waited 45 s after each change, longer than PostgREST's default 30 s `db-pool-max-idletime`,[^pgrst-config] so PostgREST should open a new pool connection (not measured; the platform's own value was not read). `run1` and `run2` gave the same REST rows per request except `run1` LV02e (0.02); bytes were within 16 bytes per request of `run3`. The direct path was measured in `run3` only.
+
+| Row | Setting | `postgres_logs` per REST request | Per SQL statement, direct connection | Per SQL statement, shared pooler (session mode, 5432) |
+|---|---|---|---|---|
+| LV02a | defaults | 0 | 0 | 0 |
+| LV02b | `postgres` `log_statement=all` | 0 | 1.02 rows, 621 bytes | 0 (session reported `log_statement=ddl`) |
+| LV02c | `authenticator` `log_statement=all` | 4.02 rows, 4405 bytes | 0 | 0 |
+| LV02d | `anon` `log_statement=all` | 0 | 0 | 0 |
+| LV02e | `postgres` `log_min_duration_statement=0` | 0 | 1.02 rows, 661 bytes | 0 (session reported `log_min_duration_statement=-1`) |
+| LV02f | `authenticator` `log_min_duration_statement=0` | 8.1 rows, 9026 bytes | 0 | 0 |
+| LV02g | `postgres` `pgaudit.log=all` | 0 | 1.02 rows, 681 bytes | 0 (session reported `pgaudit.log=none`) |
+| LV02h | defaults, RPC with `RAISE NOTICE` | 0 | - | - |
+| LV02i | defaults, RPC with `RAISE LOG` | 1 row, 1336 bytes | - | - |
+
+The role that matters for REST requests is `authenticator`, the role PostgREST logs in as. The same `log_statement=all` on `anon`, the role it switches to per request, logged nothing in three runs. Against LV01b's 1,659 bytes for a REST GET, `log_statement=all` on `authenticator` takes a request to about 6,064 bytes (3.7x) and `log_min_duration_statement=0` to about 10,685 bytes (6.4x); the ratios combine figures from two modules on different projects and are derived. `authenticated`, `service_role` and database-level settings were not tested.
+
+A role setting on `postgres` reached new direct sessions at once and had not reached new sessions through the shared pooler 75-453 s later. In LV02b, e and g, each "new" pooled session reported the pre-change value of the setting under test, with a backend age that grew by about 75 s per condition across all conditions, from 75 s to 453 s (`run2` and `run3`), which fits one reused server connection, and logged nothing. When the pooler opens a fresh server connection, and the setting with it, was not measured.
+
+`alter role authenticator reset all` returned OK and left `log_statement=all` in place, in all three runs; `alter role authenticator reset log_statement` removed it. At defaults `RAISE NOTICE` wrote nothing, because `log_min_messages=warning` sits above it, and `RAISE LOG` wrote one row per call.
+
+---
+
+## Reading the numbers
+
+| Claim | Measured or documented | How it was checked |
+|---|---|---|
+| Per-action rows and bytes by source | measured, LV01 `run1` and `run2`, n = 100 per row (LV01d n = 1; LV01a and LV01l one window each) | sequential actions in their own time window, rows per source minus the idle rate, size proxy from the logs endpoint |
+| Edge Function rows by event type | measured, LV01 `run2` | `function_logs` filtered on `log_attributes['function_id']`, grouped by `event_type` |
+| Shutdown rows arrive up to about 3.5 minutes late | measured, exploratory, not archived | 20 invocations on a dev project, polled at 60, 180 and 300 s |
+| Cached Storage reads are logged | measured, LV01j, both runs | `cf-cache-status` per response against `edge_logs` rows in the window |
+| Polling at 5 s costs about 28.7 MB a day per client | derived | 17,280 requests times LV01b's 1,659 bytes |
+| Postgres settings by role and path | measured, LV02, REST three runs, direct path `run3`, pooler session settings `run2` and `run3` | `postgres_logs` rows in each window; each SQL session read its own `current_setting` and backend start |
+| `reset all` clears nothing | measured, LV02j, three runs | `pg_db_role_setting` read after each statement |
+| Metered GB equals the proxy | not checked | metered bytes are not readable by token |
+| Logs Ingest price and the settings a project owner can change | documented, read 2026-10-15 | the footnoted pages |
+
+None of the behaviours above has been filed upstream as a docs disagreement. Two limits on generalising: every number is one region, one plan tier and sequential single requests on a nearly empty project, so row sizes will differ with longer URLs, headers and statements; and the size proxy tracks what the logs endpoint returns, which the metered byte count may not match.
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  start [label="logs ingest higher than expected"];
+  which [label="which source carries the rows?"];
+  edge_ [label="edge_logs / auth_logs:\ncount requests reaching the project"];
+  fn [label="function_logs:\ncount invocations and console lines"];
+  pg [label="postgres_logs:\nread role settings on authenticator and postgres"];
+  bg [label="pgbouncer_logs only:\nplatform background, no lever"];
+  start -> which;
+  which -> edge_ [label="gateway"];
+  which -> fn [label="functions"];
+  which -> pg [label="Postgres"];
+  which -> bg [label="idle"];
+}
+```
+
+Text version of the decision guide:
+
+1. Group the project's rows by `source` first; the lever depends on which one carries the volume.
+2. `edge_logs` and `auth_logs`: count the requests reaching the project. Per-request `getUser` (LV01h) and single-row writes (LV01c) are the measured multipliers; polling and refetching on every render follow from LV01b's row per request and were not measured.
+3. `function_logs`: count invocations and console lines per invocation. Each ~100-character line is about 520-540 bytes; each silent call is about 3,019 bytes.
+4. `postgres_logs`: read `pg_db_role_setting` for `authenticator` and `postgres`, and search hot functions for `RAISE LOG`. At defaults REST GETs and `select` statements wrote 0 rows here; `RAISE LOG` wrote 1 row per call.
+5. `pgbouncer_logs` and a few `postgres_logs` rows an hour with no traffic are platform background.
+
+---
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Group logs by `source` before changing anything. | Each source has a different lever; the gateway, function and Postgres rows above move independently. | LV01, LV02 |
+| Replace polling with Realtime where updates are pushed. | A REST GET is about 0.9 `edge_logs` rows and 1,659 bytes; 100 broadcast messages wrote none. | [LV01](https://github.com/erfianugrah/supabase-lab/blob/e1fa570/experiments/logs-volume/tests/lv01-request-footprint.ts) b, k |
+| Batch writes into one request. | 100 single-row inserts produced 91 `edge_logs` rows (`run2`); one 100-row insert produced 1. | LV01c, LV01d |
+| Verify auth with `getClaims()` on projects with asymmetric signing keys. | `getUser` wrote 2,604 bytes per call; `getClaims` wrote 27 bytes per call (2 rows per 100 calls). | LV01h, LV01i |
+| Cache in the client or app; do not rely on the Storage CDN to cut logs. | 99 CDN cache hits of 100 still produced 90-99 `edge_logs` rows; client and app caching not measured. | LV01j |
+| Gate Edge Function `console.log` behind a debug flag. | Each ~100-character line added about 520-540 bytes; a silent call wrote about 3,019. | LV01e-g |
+| Count Edge Function rows by `function_id`, not by time window. | Shutdown rows landed up to about 3.5 minutes late; in `run2` the windowed count was 0.98 `function_logs` rows per call against 1.9 by id. | LV01e, `run2` |
+| Check `authenticator` role settings when `postgres_logs` are large. | `log_statement=all` there added 4,405 bytes per request; the same on `anon` added nothing. | [LV02](https://github.com/erfianugrah/supabase-lab/blob/e1fa570/experiments/logs-volume/tests/lv02-postgres-knobs.ts) c, d, f |
+| Reset each role setting by name; `reset all` clears nothing. | On `authenticator`, `reset all` returned OK and left `log_statement=all` in place in three runs; other roles not tested. | LV02j |
+| Expect pooled sessions to keep an old role setting for a while. | Pooled sessions reported the pre-change value with backend ages of 75-453 s; new direct sessions took the new one. | LV02b, e, g |
+| Use `RAISE LOG` only where every call should leave a row. | 1 row, 1,336 bytes per call; `RAISE NOTICE` wrote nothing at defaults. | LV02h, LV02i |
+| Read per-request row counts as 0.83-0.97 of the requests sent. | 84 and 92 of 100 marked REST GETs had an `edge_logs` row; LV01h `run1` had 83; unexplained. | LV01b, LV01h |
+
+---
+
+## Modules
+
+Each row links the redacted run artifacts published to `out/`, in run order. LV02 `run1` and `run2` ran earlier revisions of the test (no direct path in `run1`, a failed direct path in `run2`); the figures and that history are in the experiment's [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/e1fa570/experiments/logs-volume/RUNLOG.md).
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| LV01 | logs-volume | [`lv01-request-footprint.ts`](https://github.com/erfianugrah/supabase-lab/blob/e1fa570/experiments/logs-volume/tests/lv01-request-footprint.ts) | [`run-2026-10-15T00-48-12-600Z`](https://github.com/erfianugrah/supabase-lab/blob/e1fa570/experiments/logs-volume/out/2026-10-15/run-2026-10-15T00-48-12-600Z.facts.md), [`run-2026-10-15T01-20-10-706Z`](https://github.com/erfianugrah/supabase-lab/blob/e1fa570/experiments/logs-volume/out/2026-10-15/run-2026-10-15T01-20-10-706Z.facts.md) |
+| LV02 | logs-volume | [`lv02-postgres-knobs.ts`](https://github.com/erfianugrah/supabase-lab/blob/e1fa570/experiments/logs-volume/tests/lv02-postgres-knobs.ts) | [`run-2026-10-15T00-48-17-483Z`](https://github.com/erfianugrah/supabase-lab/blob/e1fa570/experiments/logs-volume/out/2026-10-15/run-2026-10-15T00-48-17-483Z.facts.md), [`run-2026-10-15T01-03-02-840Z`](https://github.com/erfianugrah/supabase-lab/blob/e1fa570/experiments/logs-volume/out/2026-10-15/run-2026-10-15T01-03-02-840Z.facts.md), [`run-2026-10-15T01-20-48-490Z`](https://github.com/erfianugrah/supabase-lab/blob/e1fa570/experiments/logs-volume/out/2026-10-15/run-2026-10-15T01-20-48-490Z.facts.md) |
+
+## Related docs
+
+- [Supabase observability surface](/reference/supabase-observability-surface/): the log sources, ingestion lag and the 401 on the usage route that make the size here a proxy.
+- [Query Supabase project logs through the Management API](/guides/supabase-management-api-logs-endpoint/): the query shape used to count rows by `source` and `function_id`.
+- [Per-project cost attribution](/guides/supabase-per-project-cost-attribution/): where a logs line fits in a per-project cost breakdown.
+- [Edge Function limits, one ceiling at a time](/reference/supabase-edge-function-limits/): the worker lifecycle behind the Boot and Shutdown rows.
+
+[^sb-logs-ingest]: Supabase, "Manage Logs Ingest usage," Supabase Docs. https://supabase.com/docs/guides/platform/manage-your-usage/logs-ingest
+[^sb-custom-pg-config]: Supabase, "Customizing Postgres configs," Supabase Docs. https://supabase.com/docs/guides/database/custom-postgres-config
+[^sb-server-client]: Supabase, "Creating a Supabase client for SSR," Supabase Docs. https://supabase.com/docs/guides/auth/server-side/creating-a-client
+[^pgrst-config]: PostgREST, "Configuration," PostgREST Docs. https://docs.postgrest.org/en/stable/references/configuration.html
