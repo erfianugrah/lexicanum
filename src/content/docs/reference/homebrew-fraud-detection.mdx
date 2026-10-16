@@ -14,6 +14,14 @@ How **forminator** and **markov-mail** (private repos) implement multi-layer fra
 
 This is a reference template for building similar systems. All patterns are derived from production code.
 
+**TL;DR:**
+
+- Two Workers carry the system: the form Worker runs the submission pipeline and the 10-component risk scoring, and the ML Worker runs a 48-feature Random Forest email classifier. They talk over a Worker-to-Worker RPC service binding, which executes on the same thread of the same server.
+- Detection runs in layers: a local D1 blacklist fast path skips the Turnstile API call for identifiers already known bad, then the ML email check, the ephemeral-ID signals and the JA4 TLS fingerprint analysis each contribute one score component.
+- Component failures fail open - an unavailable ML Worker scores 0 risk for its component and its weight is redistributed to the remaining active signals - while token replay and Turnstile validation stay fail-secure.
+- Weights, thresholds and detection parameters live in a mergeable config and are auto-normalised to sum to 1.0 after any override; block/allow comes from deterministic floors and a corroboration bonus on top of the weighted score.
+- Decisions are written to a `ScoringDecision` audit trail, and the model behind them is a 20-tree Random Forest serialised as JSON in KV, guarded before deploy on accuracy, KV's 25 MB value limit and feature alignment.
+
 ---
 
 ## Architecture overview
@@ -158,7 +166,7 @@ async function checkPreValidationBlock(
 }
 ```
 
-<Aside type="tip" title="Why a fast path matters">
+<Aside type="tip" title="The fast path avoids one API call">
   Turnstile validation costs an external API call. If you've already determined
   an identifier is fraudulent, checking a local D1 table first avoids that cost
   entirely. In practice, this can eliminate the API call for the majority of
@@ -369,7 +377,7 @@ All signals feed into a 10-component weighted score. The architecture ensures ev
 | TLS Anomaly          | 0.04   | D1 + Bot Mgmt       | Fingerprint baseline deviation                    |
 | Latency Mismatch     | 0.02   | Request timing      | Geo vs network latency inconsistency              |
 
-Weights must sum to 1.0. The system auto-normalizes after config overrides.
+Weights must sum to 1.0. The system auto-normalises after config overrides.
 
 The IP Rate Limit component is a composite of two sub-signals - submission frequency per IP and email diversity per IP - combined via `Math.max()`. The email diversity signal detects form spam with unique emails from the same address:
 
@@ -542,19 +550,20 @@ The escalation happens because the blacklist tracks duplicate attempts per email
 
 ---
 
-## Input validation and sanitization
+## Input validation and sanitisation
+<a id="input-validation-and-sanitization"></a>
 
-All form inputs pass through Zod schema validation and HTML sanitization before entering the fraud detection pipeline.
+All form inputs pass through Zod schema validation and HTML sanitisation before entering the fraud detection pipeline.
 
 **Schema validation** (Zod):
 
 - Names: 1-50 chars, Unicode-aware pattern (`\p{L}\s'-`)
 - Email: max 100 chars, standard format
-- Phone: optional, normalized to E.164 format (strip non-digits, add `+1` prefix), validated against `^\+[1-9]\d{1,14}$`
+- Phone: optional, normalised to E.164 format (strip non-digits, add `+1` prefix), validated against `^\+[1-9]\d{1,14}$`
 - Address: optional, country required if any address field present
 - Date of birth: optional, `YYYY-MM-DD`, must be 18-120 years old
 
-**HTML sanitization** applied to all text inputs:
+**HTML sanitisation** applied to all text inputs:
 
 ```typescript
 function sanitizeString(input: string): string {
@@ -568,9 +577,9 @@ function sanitizeString(input: string): string {
 }
 ```
 
-<Aside type="tip" title="Sanitize before fraud detection">
-  Run sanitization before the fraud pipeline so detection signals operate on
-  clean input. The Turnstile token is explicitly excluded from sanitization.
+<Aside type="tip" title="Sanitise before fraud detection">
+  Run sanitisation before the fraud pipeline so detection signals operate on
+  clean input. The Turnstile token is explicitly excluded from sanitisation.
 </Aside>
 
 ---
@@ -634,7 +643,7 @@ digraph {
 
 ### Detectors
 
-The 48 features are produced by specialized detector modules. Each operates independently and returns structured results.
+The 48 features are produced by specialised detector modules. Each operates independently and returns structured results.
 
 #### Sequential pattern detection
 
@@ -676,7 +685,7 @@ Three feature groups measuring how "natural" an email local part looks:
 
 #### N-gram naturalness
 
-Bigram and trigram frequency analysis across 8 language groups (English, Spanish, French, German, Italian, Portuguese, Romanized, and a universal/mixed set). Input is NFD-normalized (Unicode Normalization Form D) to strip diacritics while preserving base characters, reducing false positives on international names. Scores how likely a character sequence is to appear in natural text for each language, taking the best match. Language detection uses suffix-based heuristics (e.g., `-ez` for Spanish, `-stein` for German, `-ovich` for Russian). Higher naturalness = lower fraud risk.
+Bigram and trigram frequency analysis across 8 language groups (English, Spanish, French, German, Italian, Portuguese, Romanised, and a universal/mixed set). Input is NFD-normalised (Unicode Normalization Form D) to strip diacritics while preserving base characters, reducing false positives on international names. Scores how likely a character sequence is to appear in natural text for each language, taking the best match. Language detection uses suffix-based heuristics (e.g., `-ez` for Spanish, `-stein` for German, `-ovich` for Russian). Higher naturalness = lower fraud risk.
 
 #### Benford's Law analysis
 
@@ -716,7 +725,7 @@ The ML Worker's behavior is controlled by a config loaded from KV:
 }
 ```
 
-- **`actionOverride`**: Set to `"allow"` for monitoring mode - runs all detection and logs decisions but never blocks. Needed for a safe rollout of a new model or config change.
+- **`actionOverride`**: Set to `"allow"` for monitoring mode - runs all detection and logs decisions but never blocks. Required for a safe rollout of a new model or config change.
 - **`adjustments`**: Professional email patterns (name-based addresses at reputable domains) get their risk score multiplied by these factors, reducing false positives on legitimate business emails.
 - **`ood` (out-of-distribution)**: When the model encounters feature vectors outside its training distribution, risk is capped at `maxRisk` (0.85) and flagged if above `warnZoneMin` (0.6). Prevents overconfident predictions on novel patterns.
 
@@ -746,7 +755,7 @@ interface HeuristicRule {
 
 ### Random Forest inference at the edge
 
-The model (20 decision trees of the classification-and-regression (CART) kind, trained both offline via scikit-learn and online via a container-based TypeScript implementation) is serialized as JSON and stored in KV. The Worker evaluates it using iterative tree traversal (not recursive, to avoid stack limits on the edge runtime).
+The model (20 decision trees of the classification-and-regression (CART) kind, trained both offline via scikit-learn and online via a container-based TypeScript implementation) is serialised as JSON and stored in KV. The Worker evaluates it using iterative tree traversal (not recursive, to avoid stack limits on the edge runtime).
 
 ```typescript
 type CompactTreeNode =
@@ -982,7 +991,7 @@ digraph {
 
 ## Configuration
 
-All thresholds, weights, and detection parameters live in a centralized config with environment overrides. The override is deep-merged with defaults at every nesting level.
+All thresholds, weights, and detection parameters live in a centralised config with environment overrides. The override is deep-merged with defaults at every nesting level.
 
 ```typescript
 const DEFAULT_CONFIG = {
@@ -1040,7 +1049,7 @@ Override via `FRAUD_CONFIG` environment variable (partial objects merge with def
 }
 ```
 
-After merging, weights are auto-normalized to sum to 1.0 if the override creates an imbalance.
+After merging, weights are auto-normalised to sum to 1.0 if the override creates an imbalance.
 
 ---
 
@@ -1209,7 +1218,7 @@ A weekly cron (Sundays 3AM UTC) triggers the `TrainerContainer` Durable Object, 
 
 1. Fetches the current training dataset from the Worker's D1 database (auto-collected feature vectors from every `/validate` call)
 2. Trains a new Random Forest using a TypeScript CART implementation with Gini impurity, random feature subsampling, and conflict-zone weighting
-3. Applies Platt calibration via Newton-Raphson optimization on OOB predictions
+3. Applies Platt calibration via Newton-Raphson optimisation on OOB predictions
 4. Runs guardrails (`recall >= 95%`, `FPR <= 5%`, `FNR <= 5%`)
 5. Uploads the validated model to KV (propagates globally within 60 seconds)
 6. Prunes training samples older than 14 days
@@ -1312,7 +1321,7 @@ Key training parameters:
 
 ### Production model artifact
 
-The serialized model contains metadata for runtime validation:
+The serialised model contains metadata for runtime validation:
 
 ```json
 {
@@ -1440,7 +1449,7 @@ Authentication uses HMAC-signed session cookies (SHA-256 derived signing key) wi
 | **Weight redistribution**       | Inactive signals don't suppress the score - their weight shifts to active ones                           |
 | **Transparent decisions**       | Every score stores a full `ScoringDecision` audit trail with each adjustment step                         |
 | **Per-request tracing**         | A unique request ID generated at entry threads through all DB writes for forensic correlation             |
-| **Config-driven thresholds**    | All magic numbers live in a mergeable config with auto-normalization for weights                          |
+| **Config-driven thresholds**    | All magic numbers live in a mergeable config with auto-normalisation for weights                          |
 | **Progressive mitigation**      | Escalating timeouts instead of permanent bans - reduces false positive impact                            |
 | **Single code path**            | RPC entrypoint constructs a synthetic HTTP request through the same Hono handler as direct API calls      |
 | **Monitoring mode**             | Action override flag runs all detection and logs decisions without blocking - safe rollout for new rules |
@@ -1451,7 +1460,7 @@ Authentication uses HMAC-signed session cookies (SHA-256 derived signing key) wi
 
 | Task                      | Steps                                                                                                                                                                                                                    |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Add a detection layer** | 1. Implement signal collection function (return baseline on error) 2. Add score component + weight to config 3. Wire into Phase 2 of submission pipeline 4. Add normalization function in scoring module                 |
+| **Add a detection layer** | 1. Implement signal collection function (return baseline on error) 2. Add score component + weight to config 3. Wire into Phase 2 of submission pipeline 4. Add normalisation function in scoring module                 |
 | **Add an ML feature**     | 1. Implement extractor in detector module 2. Add to `buildFeatureVector()` in `feature-vector.ts` 3. Run `features:export` to regenerate CSV 4. Retrain with `train_forest.py` (offline) or trigger container retraining 5. Run guardrails 6. Deploy model JSON to KV (no Worker redeploy) |
 | **Tune thresholds**       | 1. Set `mode: 'additive'` to disable deterministic overrides 2. Analyze score distributions from stored breakdowns via dashboard 3. Adjust `FRAUD_CONFIG` in wrangler vars 4. Switch back to `mode: 'defensive'`         |
 | **Run an A/B test**       | 1. `ab:create` with hypothesis, traffic split, and variant config overrides 2. Monitor via dashboard model comparison view 3. `ab:analyze` to compare variant metrics 4. `ab:stop` and promote winner                    |
@@ -1503,6 +1512,10 @@ path alone. The analyst queue around them takes far more effort to build and run
 fills it, so ship the log-only signal first and add the operator UI once the signal is
 producing useful labels.
 </Aside>
+
+## Related docs
+
+- [Caching with Cloudflare Workers](/reference/caching/) - KV's 25 MB value limit and its eventual consistency, the two properties the serialised model artifact and the hot-reloaded config sit under.
 
 [^cf-service-bindings]: Cloudflare, "Service bindings," Cloudflare Docs. https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/
 [^cf-workers-rpc]: Cloudflare, "Workers RPC," Cloudflare Docs. https://developers.cloudflare.com/workers/runtime-apis/rpc/

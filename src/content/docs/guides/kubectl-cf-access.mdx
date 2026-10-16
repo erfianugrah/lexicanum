@@ -6,15 +6,19 @@ category: cloudflare
 group: connectivity
 ---
 
+import { Aside } from "@astrojs/starlight/components";
+
+<Aside type="caution" title="Historical since 2026-09-29">
+The architecture diagram below shows the network as it was when this was written: the VyOS edge, the Glory-Hole resolver and the k3s cluster are all retired, and the k3s repo was archived on 2026-09-29. The Access for SaaS, kubelogin and RBAC setup does not depend on any of them and still applies.
+</Aside>
+
+Cloudflare Access for SaaS fronts a Kubernetes API server with a self-hosted OIDC application, so `kubectl` authenticates against your identity provider and the cluster maps the token's claims onto RBAC instead of a shared client certificate. This guide sets up the identity provider, the Access application and its policy, the tunnel that publishes the API server, the cloudflared deployment, and the kubelogin kubeconfig on the client.
+
 :::tip[Prerequisites]
-
-Before we begin we need this set up: 
-1. https://github.com/int128/kubelogin
-2. Cloudflare Access
-3. k8s/k3s/minikube
+1. `kubelogin` installed on the client - https://github.com/int128/kubelogin
+2. A Cloudflare account with Access (Zero Trust) enabled
+3. A Kubernetes cluster (k3s, k8s or minikube) whose API server you can restart
 :::
-
----
 
 ## Cloudflare Access
 
@@ -132,13 +136,11 @@ output "kubectl_saas" {
 }
 ```
 
----
-
 ## k3s and Cloudflare Tunnel
 
 ### Step 3: Cloudflare Tunnel
 
-#### Cloudflare Tunnel Deployment (instead of side-car)
+#### Cloudflare Tunnel deployment (instead of side-car)
 DNS:
 
 ```hcl
@@ -402,8 +404,6 @@ resource "kubernetes_manifest" "cloudflared_keda" {
 ```
 :::
 
----
-
 ## OIDC, kubelogin and RBAC setup
 
 ### Step 5: setup RBAC
@@ -519,7 +519,7 @@ allow_pkce_without_client_secret = true
 
 For teams: You can share kubeconfig files safely since there are no embedded secrets - each team member generates their own proof keys dynamically during authentication.
 
-PKCE essentially replaces "something you know" (shared secret) with "something you generated" (unique proof key).
+PKCE replaces a shared secret you know with a proof key you generate per login.
 
 :::
 
@@ -555,11 +555,9 @@ refresh_token_options {
 This has implicit `offline_access` in the scopes. More details [here](https://developers.cloudflare.com/cloudflare-one/applications/configure-apps/saas-apps/generic-oidc-saas/#advanced-settings)
 :::
 
----
-
 ## Architecture diagram
 
-The diagram shows the network as it was when this was written: the VyOS edge, Glory-Hole resolver and k3s cluster in it are all retired (the k3s repo was archived on 2026-09-29). The Access for SaaS, kubelogin and RBAC setup above does not depend on them.
+Retired topology, kept for the routing detail it documents.
 
 ### Complete network architecture with VyOS, Magic WAN, and k3s
 
@@ -704,3 +702,42 @@ digraph {
 - `CF_IPsec`: Accept all from IPsec tunnel
 - `TPI`: Forward rules for k3s network
 - `podman-2`: Accept all for container network
+
+## Verification
+
+- `kubectl -n cloudflared get pods` shows the cloudflared pod `Ready`: its liveness probe reads `/ready` on port 50000, so a Ready pod is a tunnel that has registered with Cloudflare Edge.
+- The `cloudflared-metrics` Service exposes that same port 50000 inside the cluster, which is where the Prometheus trigger in the optional KEDA block reads `cloudflared_http_requests_total` from.
+- `kubectl oidc-login setup` prints the exec block for the kubeconfig; compare the issuer URL, client id and scopes against the complete `.kubeconfig` in step 6. The issuer URL carries the account's `cloudflareaccess.com` host and the OIDC client id as its path.
+- The Cloudflare Access audit log for the `kubectl` application records the sign-in, which is the check that the policy and the identity provider are wired to the right application.
+- The ClusterRoleBinding binds the `${EMAIL}` subject to `cluster-admin`, so the email claim in the issued token has to match that subject exactly.
+
+## Gotchas and lessons learned
+
+- `allow_pkce_without_client_secret = true` on the Access application is what lets the kubeconfig carry no secret, and the `--oidc-client-secret` line is commented out for that reason. Without PKCE, every kubeconfig copy holds a live secret.
+- `access_token_lifetime = "5m"` is short by design; the refresh token (24h) plus `grant_types = ["authorization_code_with_pkce", "refresh_tokens"]` is what keeps a session usable, and `offline_access` rides along implicitly.
+- The tunnel ingress points at `https://192.168.22.9:6443` with `no_tls_verify = true` and `http2_origin = true`, and sets `origin_server_name` to the in-cluster name, because the API server presents its own certificate rather than one the tunnel trusts.
+- `config_src = "cloudflare"` keeps the tunnel configuration on Cloudflare's side; the `cloudflare_zero_trust_tunnel_cloudflared_config` resource is what the deployment reads, not a local config file.
+- The k3s API server arguments live in `/etc/rancher/k3s/config.yaml` and only take effect after `sudo systemctl restart k3s`.
+- cloudflared has no load balancing across replicas and no graceful drain: down-scaling breaks the eyeball connections held by the replica being removed, so replicas are for HA only. Multiple discrete tunnels behind a load balancer give the scaling behaviour instead.
+- The liveness probe fails on the first failure (`failure_threshold = 1`) with a 10-second initial delay, so a slow tunnel registration restarts the pod rather than waiting.
+- The log volume is an NFS-backed `ReadWriteMany` PVC, which is what the `/etc/cloudflared` logfile mount writes to; a filesystem stall surfaces as a failed probe.
+
+## File reference
+
+| Path or object | What it is |
+| --- | --- |
+| `/etc/rancher/k3s/config.yaml` | The k3s API server arguments: `oidc-issuer-url`, `oidc-client-id`, `oidc-username-claim`, `oidc-groups-claim` |
+| `.kubeconfig` | The client config, with the `oidc-login get-token` exec block and its scopes |
+| `cloudflare_zero_trust_access_identity_provider.gmail`, `.authentik_oidc` | The two identity provider registrations |
+| `cloudflare_zero_trust_access_application.kubectl_saas` | The SaaS application, its redirect URIs, grant types and PKCE setting |
+| `cloudflare_zero_trust_access_policy.allow_erfi`, `cloudflare_zero_trust_access_group.erfi_corp` | The allow policy and the email group it includes |
+| `cloudflare_zero_trust_tunnel_cloudflared.k3s`, `cloudflare_zero_trust_tunnel_cloudflared_config.k3s`, `cloudflare_record.kubectl` | The tunnel, its ingress rules and the `kubectl` CNAME |
+| `random_string.tunnel_secret` | The 32-character secret encoded into the tunnel |
+| `kubernetes_deployment.cloudflared`, `kubernetes_secret.cloudflared_credentials` | The tunnel pod in the `cloudflared` namespace and the secret holding `TUNNEL_TOKEN` |
+| `kubernetes_service.cloudflared_metrics`, `kubernetes_persistent_volume_claim.cloudflared_logs` | The metrics Service on port 50000 and the 10Gi NFS log volume |
+| `output.kubectl_saas` | The sensitive output carrying the client id, client secret, public key and issuer details |
+
+## Related docs
+
+- [Magic WAN and its interoperability](/guides/magic-wan-interop/) - the VyOS end of the retired estate in the diagram: the GRE and IPsec tunnels, their MTU/MSS arithmetic and the routing that carried API server traffic.
+- [Traefik on k3s](/guides/k3s-traefik/) - the ingress in the same cluster that the tunnel's rules point at, including its own OpenTofu-managed tunnel config and DNS records.
