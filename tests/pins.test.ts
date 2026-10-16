@@ -744,6 +744,22 @@ const pins: Pin[] = [
     linksTo: ["guides/supabase-resilience-runbook", "reference/supabase-dr-tiers"],
   },
   {
+    // 2026-10-16 correction: the MG04 success-log lag is the winning round's
+    // promote phase waiting on the frozen cell; the ~20,250 ms recruits are
+    // the losing rounds'. The health-check flag the rig set is read by nothing.
+    doc: "reference/multigres-failover",
+    mustContain: [
+      "winning round's recruit took 128 ms (run a) and 111 ms (run b)",
+      "nothing reads it",
+      "`buffer-enabled` defaults to `false`",
+    ],
+    mustNotContain: [
+      "because the recruit RPC to the frozen cell had to time out first",
+      "`recovery-cycle-interval` and `pooler-health-check-interval` 500 ms |",
+    ],
+    sections: [/^## Why the windows are what they are$/m],
+  },
+  {
     // The commercial half (PITR / backups / Fair Use / cost), keyed on
     // RPO/RTO/spend. Every number below is doc-cited in footnotes; the pins
     // are the figures a pricing page change would silently invalidate.
