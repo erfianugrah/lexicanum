@@ -116,8 +116,18 @@ docker buildx prune -a -f    # separate cache, often the bigger one
 ```
 
 :::caution
-`--volumes` removes every unused volume. Drop the flag if you have anonymous volumes worth keeping. The build cache is safe to nuke.
+`--volumes` removes unused anonymous volumes only; named unused volumes survive it and need `docker volume prune --all`.[^docker-prune] Anonymous volumes are what a `docker run` of an image with a `VOLUME` line leaves behind - every throwaway Postgres container creates one. List them with `docker system df -v` before pruning if one might hold data you want. The build cache is safe to nuke.
 :::
+
+On the rig in October 2026, `docker volume prune -f` alone returned 53.54 GB: 104 anonymous volumes, eight of them 5.7-6.4 GB Postgres 18 data directories left by benchmark containers a month earlier. `docker builder prune -f` returned another 14.52 GB.
+
+Deleting inside Docker frees space in the Docker VM's filesystem, not in `docker_data.vhdx`. Docker Desktop's own distro has no `fstrim` (Gotchas), so trim from a privileged container that enters the VM's mount namespace:
+
+```bash
+docker run --rm --privileged --pid=host busybox:1.37 nsenter -t 1 -m -- fstrim -v /var/lib/docker
+```
+
+On the rig that reported `/var/lib/docker: 42.9 GiB (46062399488 bytes) trimmed` after the prunes above. As with the distro, the trimmed figure is not the reclaim; the compact in Part 5 is.
 
 Then mark the freed blocks as discarded so the host can see them:
 
@@ -139,6 +149,8 @@ Independent of WSL, but usually the same "C: is full" session. Elevated PowerShe
 | Chrome on-device model | `%LOCALAPPDATA%\Google\Chrome\User Data\OptGuideOnDeviceModel`, then `chrome://flags/#optimization-guide-on-device-model` -> Disabled | ~4 GB | Re-downloads unless the flag is disabled. |
 | Package caches | `%LOCALAPPDATA%\npm-cache`, `%LOCALAPPDATA%\pnpm\store`, `%LOCALAPPDATA%\Yarn\Cache`, `%LOCALAPPDATA%\pip\Cache` | varies | Regenerated on demand. |
 | WSL swap orphans | delete stale `%LOCALAPPDATA%\Temp\{guid}\swap.vhdx` (one per WSL launch; the guid is the VM ID) | GBs - 123 GB across 70 files observed on the rig | Orphaned when a WSL VM exits uncleanly. The running VM's swap is locked, so a delete attempt on it simply fails - skip anything locked or touched in the last 24 h. Prevention: `[wsl2] swap=0` or a fixed `swapFile=` path in `.wslconfig`.[^ms-wsl-config] |
+| Docker Scout scan leftovers | `%LOCALAPPDATA%\Temp\trivy-*` folders, each holding `cached-file-*` image-layer spills | 31.0 GB across 476 folders on the rig, October 2026 | Written by `docker-scout.exe` (it embeds trivy's scanner) when Docker Desktop's background SBOM indexing analyses a pulled or built image, and never removed. Docker Desktop 4.95.0 / docker-scout v1.26.0 still leaked them: a pull created a new folder within 20 s. Stop it under Settings -> General: untick "Enable background Scout SBOM indexing" (the docs list its default as off, but it was on here)[^docker-settings], then delete the folders. After Apply, `settings-store.json` showed `"UseBackgroundIndexing": false` and a test pull created none. |
+| Docker Desktop installer leftovers | `%LOCALAPPDATA%\Temp\DockerDesktop\*`, `%LOCALAPPDATA%\Temp\DockerDesktopUpdates` | 12.4 GB on the rig | One folder per update, back to the first install. Most are read-only and refuse a non-elevated delete; an elevated `takeown /R` + `icacls` grant + `attrib -R` clears them. Skip anything from the last day or two in case an update is mid-flight. |
 | WSL crash dumps | `%LOCALAPPDATA%\Temp\wsl-crashes\*.dmp` | ~10 GB per dump, 10 kept by default | Pure post-mortem artifacts. Cap or disable with `[wsl2] MaxCrashDumpCount` in `.wslconfig`.[^greengorych-wsl-clean] |
 
 For the WSL swap orphans row, the fixed-path fix, verified on the rig after the next `wsl --shutdown` (the file appeared on D: and no new `{guid}` folder appeared in Temp). Paths in `.wslconfig` need escaped backslashes:[^ms-wsl-config]
@@ -416,7 +428,7 @@ The end state, all reproduced on the rig:
 - **`compact` succeeded but the file is the same size** means the guest never issued discards. Boot, `sudo fstrim -av`, shut down, compact again.
 - **`compact` succeeded and the file shrank by only a few percent** usually means the guest is full, not that trim failed. Compare the vhdx size with `df -h /` in the guest; the difference is the most a compact can return.
 - **`fstrim -av` reporting a large number is not the reclaim.** On the September run it printed `112.9 GiB (121274744832 bytes) trimmed` with about 126 GB free in the filesystem - close to the whole free area, most of which was never allocated in the vhdx - and the compact then returned 29.52 GB. The before/after file size is the real figure.
-- **`execvpe(fstrim) failed: No such file or directory` for `docker-desktop`**: Docker Desktop's own distro has no `fstrim`, and `docker_data.vhdx` is not mounted there unless Docker Desktop is running. Skip it; prune inside Docker instead.
+- **`execvpe(fstrim) failed: No such file or directory` for `docker-desktop`**: Docker Desktop's own distro has no `fstrim`, and `docker_data.vhdx` is not mounted there unless Docker Desktop is running. Prune inside Docker, then trim from a privileged container with `nsenter` (Part 1) while Docker Desktop is still running.
 - **A distro that will not start after a scripted compact** can be a disk diskpart left attached: a failed `compact vdisk` aborts the script before its `detach vdisk`. Run a separate diskpart script with `select vdisk file="..."` and `detach vdisk noerr`; it reports `The virtual disk is already detached` when nothing was wrong.
 - **`Optimize-VHD: ... virtual disk system limitation ... must be uncompressed and unencrypted and must not be sparse`** is the NTFS compression flag almost every time.[^ms-wsl-troubleshoot] `compact /q` to confirm, `compact /u` to clear. A 1.0:1 ratio still blocks - the flag is sticky independent of actual compression.
 - **`Optimize-VHD: Failed to attach the virtual disk`** means something holds it open. `wsl --shutdown`; for the Docker disk, quit Docker Desktop and check `Get-Process *docker*`.
@@ -445,7 +457,9 @@ The end state, all reproduced on the rig:
 
 | Command | Purpose |
 |---|---|
-| `docker system prune -a --volumes` | Reclaim Docker images/cache/volumes |
+| `docker system prune -a --volumes` | Reclaim Docker images/cache/anonymous volumes |
+| `docker volume prune` / `docker volume prune --all` | Unused anonymous volumes / also unused named ones |
+| `docker run --rm --privileged --pid=host busybox:1.37 nsenter -t 1 -m -- fstrim -v /var/lib/docker` | Trim the Docker VM's filesystem before compacting `docker_data.vhdx` |
 | `sudo fstrim -av` | Issue discards for freed guest blocks |
 | `wsl --shutdown` | Stop all distros (also detaches bare mounts) |
 | `compact /q` / `compact /u <file>` | Check / clear NTFS compression flag |
@@ -485,4 +499,6 @@ The end state, all reproduced on the rig:
 [^wsl-sparse-broken]: microsoft/WSL, issue #12103, "WSL Sparse does not work at all." https://github.com/microsoft/WSL/issues/12103
 [^wsl-sparse-alpine]: microsoft/WSL, issue #10703, sparse vhdx reclamation failure on Alpine. https://github.com/microsoft/WSL/issues/10703
 [^wsl-automount]: microsoft/WSL, issue #11187, automount of vhdx at boot not supported. https://github.com/microsoft/WSL/issues/11187
+[^docker-prune]: Docker, "Prune unused Docker objects," Docker Docs. https://github.com/docker/docs/blob/HEAD/content/manuals/engine/manage-resources/pruning.md
+[^docker-settings]: Docker, "Change your Docker Desktop settings," Docker Docs. https://github.com/docker/docs/blob/HEAD/content/manuals/desktop/settings-and-maintenance/settings.md
 [^greengorych-wsl-clean]: Sergei Tilipin, "Keeping System Clean: Crash Dumps and Orphaned SWAPs." https://greengorych.io/blog/keeping-system-clean-crash-dumps-and-orphaned-swaps/
