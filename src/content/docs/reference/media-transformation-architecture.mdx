@@ -8,35 +8,19 @@ group: edge
 
 import { Aside, Card, CardGrid } from "@astrojs/starlight/components";
 
-How [**video-resizer-2**](https://github.com/erfianugrah/video-resizer-2) handles media transformation on Cloudflare Workers.
+How [video-resizer-2](https://github.com/erfianugrah/video-resizer-2) handles media transformation on Cloudflare Workers: a single endpoint for video resize, frame extraction, spritesheet generation, and audio extraction, with three-tier transform routing (Media binding for R2 sources, cdn-cgi/media for remote sources, FFmpeg container for oversized and advanced transforms), results stored persistently in R2 with an edge cache on top, and zero memory buffering - all streams flow through without loading into Worker memory.
 
-Single endpoint for video resize, frame extraction, spritesheet generation, and audio extraction. Three-tier transform routing: Media binding for R2 sources, cdn-cgi/media for remote sources, FFmpeg container for oversized/advanced transforms. Results stored persistently in R2 with edge cache on top. Zero memory buffering - all streams flow through without loading into Worker memory.
+The 725MB conversion figures are measured against the production deployment at `videos.erfi.io`, the same two sources the live examples use (rocky.mp4, 40MB, and Big Buck Bunny, 725MB). The tier latency ranges are stated, not benchmarked on this page, and the test-suite counts are what the repo's test commands report.
 
----
+## TL;DR
 
-Three transform tiers + four transformation modes:
+- One endpoint serves four modes - video, frame, spritesheet, audio - and routes every request to one of three tiers so no path loads video bytes into Worker memory.
+- R2 sources ≤100 MiB use the `env.MEDIA` binding (~2-10s); remote sources ≤100 MiB use `cdn-cgi/media` (~3-15s); 100-256 MiB uses a sync FFmpeg container (~30-120s); >256 MiB uses an async queue (~60-300s, 202 first).
+- Container-only params (fps, speed, rotate, crop, bitrate, h265/vp9/av1 codecs, duration >60s) route to the FFmpeg container regardless of file size.
+- Every result is stored in R2 under `_transformed/` and revalidated against the source etag/last-modified on every R2 HIT, so a new upload invalidates cached transforms; the edge cache on top serves with native range support.
+- Verified: 725MB .mov -> 31MB .mp4, served from edge cache in 0.1s with range requests.
 
-| Tier | Source          | Size Limit                        | Method                          | Latency            | Worker Memory |
-| ---- | --------------- | --------------------------------- | ------------------------------- | ------------------ | ------------- |
-| 1    | R2              | ≤100 MiB (configurable)           | `env.MEDIA.input(stream)`       | ~2-10s             | Stream only   |
-| 2    | Remote/Fallback | ≤100 MiB (configurable)           | `cdn-cgi/media` URL fetch       | ~3-15s             | Zero          |
-| 3a   | Any             | 100-256 MiB or container-only params | FFmpeg Container DO (sync)   | ~30-120s (sync)    | Zero          |
-| 3b   | Any             | >256 MiB or container-only params | FFmpeg Container DO (via Queue) | ~60-300s (async)   | Zero          |
-
-Transformation modes:
-
-- **Video**: Resize, compress, adjust quality/playback
-- **Frame**: Extract stills at timestamps (jpg/png)
-- **Spritesheet**: Grid previews for scrubbing UIs
-- **Audio**: Extract m4a audio tracks
-
-Container-only features (fps, speed, rotate, crop, bitrate, h265/vp9/av1 codecs, duration >60s) route to the FFmpeg container regardless of file size. All container paths check source size: ≤256 MiB uses sync container (streams through DO); >256 MiB uses async queue (container fetches directly via URL, returns 202 immediately). This prevents DO timeout on large files.
-
----
-
-## Core concepts
-
-### Request flow
+## Request flow
 
 ```dot
 digraph {
@@ -77,6 +61,37 @@ digraph {
   Store      -> Client     [label="cache.match (range OK)"];
 }
 ```
+
+1. Request hits the CF Edge Cache; a HIT serves the cached response, a MISS continues.
+2. Worker middleware runs: via check -> config -> cdnCgi passthrough -> nonVideo passthrough.
+3. Param resolution: Akamai translate -> imwidth breakpoint match -> parse (with warnings) -> derivative -> responsive.
+4. Origin matching: regex -> capture groups -> priority sources.
+5. R2 `_transformed/` check: a HIT serves via cache.put -> cache.match; a MISS continues to per-isolate coalescing (in-flight dedup, bounded FIFO + TTL + 60s timeout, 202 excluded).
+6. Route: R2 ≤100 MiB to the `env.MEDIA` binding, remote ≤100 MiB to `cdn-cgi/media`, >100 MiB or fps/speed/etc to the FFmpeg Container DO.
+7. The binding and cdn-cgi stream the transform into the store (R2 put -> R2 get -> cache.put -> cache.match, zero memory buffering); the container returns 202 Processing, and its async callback stores the result in R2.
+8. The final `cache.match` serves the client with range support.
+
+## Which tier for what
+
+Three transform tiers + four transformation modes:
+
+| Tier | Source          | Size Limit                        | Method                          | Latency            | Worker Memory |
+| ---- | --------------- | --------------------------------- | ------------------------------- | ------------------ | ------------- |
+| 1    | R2              | ≤100 MiB (configurable)           | `env.MEDIA.input(stream)`       | ~2-10s             | Stream only   |
+| 2    | Remote/Fallback | ≤100 MiB (configurable)           | `cdn-cgi/media` URL fetch       | ~3-15s             | Zero          |
+| 3a   | Any             | 100-256 MiB or container-only params | FFmpeg Container DO (sync)   | ~30-120s (sync)    | Zero          |
+| 3b   | Any             | >256 MiB or container-only params | FFmpeg Container DO (via Queue) | ~60-300s (async)   | Zero          |
+
+Transformation modes:
+
+- **Video**: Resize, compress, adjust quality/playback
+- **Frame**: Extract stills at timestamps (jpg/png)
+- **Spritesheet**: Grid previews for scrubbing UIs
+- **Audio**: Extract m4a audio tracks
+
+Container-only features (fps, speed, rotate, crop, bitrate, h265/vp9/av1 codecs, duration >60s) route to the FFmpeg container regardless of file size. All container paths check source size: ≤256 MiB uses sync container (streams through DO); >256 MiB uses async queue (container fetches directly via URL, returns 202 immediately). This prevents DO timeout on large files.
+
+## Core concepts
 
 ### Design patterns (v1 -> v2)
 
@@ -138,6 +153,19 @@ Every response includes:
 | **FPS/Speed/Rotate/Crop** | No                | No                              | No          | No       | Yes        |
 | **Bitrate control**       | No                | No                              | No          | No       | Yes        |
 | **Input size limit**      | 100 MiB (binding, configurable) | 100 MiB (cdn-cgi, configurable) | 100 MiB     | 100 MiB  | 20 GB disk |
+
+### Bindings
+
+| Binding            | Type          | Resource                                                                            |
+| ------------------ | ------------- | ----------------------------------------------------------------------------------- |
+| `MEDIA`            | Media         | Media Transformations binding                                                       |
+| `VIDEOS`           | R2            | Source videos + transform cache (`_transformed/`) + source cache (`_source-cache/`) |
+| `CONFIG`           | KV            | Worker config (hot-reload, 5-min TTL)                                               |
+| `CACHE_VERSIONS`   | KV            | Cache version management                                                            |
+| `ANALYTICS`        | D1            | Request analytics + job registry (`transform_log` + `transform_jobs`)               |
+| `FFMPEG_CONTAINER` | Container DO  | FFmpeg container instances (4 vCPU, 12GB, 20GB disk)                                |
+| `TRANSFORM_QUEUE`  | Queue         | Durable job dispatch (retry + DLQ)                                                  |
+| `ASSETS`           | Static Assets | Dashboard UI                                                                        |
 
 ---
 
@@ -236,6 +264,63 @@ Note: `av1` codec triggers container routing but the container currently encodes
 | low    | 28  | fast          |
 | medium | 23  | medium        |
 | high   | 18  | medium        |
+
+### Container async flow
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  req1         [label="Request 1 (oversized source)"];
+  worker1      [label="Worker"];
+  sizecheck    [label="Size > limit?", shape=diamond];
+  queue        [label="TRANSFORM_QUEUE"];
+  consumer     [label="Queue Consumer"];
+  container_do [label="Container DO"];
+  container    [label="FFmpeg Container"];
+  client1      [label="202 + jobId + SSE URL"];
+  download     [label="Download source"];
+  ffmpeg       [label="ffmpeg (4 vCPU)"];
+  outbound     [label="Outbound handler"];
+  r2store      [label="R2 put"];
+  d1           [label="D1 (status + percent)"];
+  req2         [label="Request 2 (same URL)"];
+  worker2      [label="Worker"];
+  r2check      [label="R2 check", shape=diamond];
+  cacheput     [label="cache.put"];
+  cachematch   [label="cache.match"];
+  client2      [label="200 video/mp4"];
+
+  req1         -> worker1      [label="imwidth=320"];
+  worker1      -> sizecheck;
+  sizecheck    -> queue        [label="yes (enqueue)"];
+  worker1      -> client1      [label="immediate 202"];
+  queue        -> consumer     [label="batch delivery"];
+  consumer     -> container_do [label="/transform-url"];
+  container_do -> container    [label="start"];
+  container    -> download     [label="fetch HTTPS"];
+  container    -> d1           [label="progress via /internal/job-progress"];
+  download     -> ffmpeg       [label="stream to disk"];
+  ffmpeg       -> outbound     [label="callback POST"];
+  outbound     -> r2store      [label="FixedLengthStream"];
+  outbound     -> d1           [label="complete"];
+  req2         -> worker2;
+  worker2      -> r2check;
+  r2check      -> cacheput     [label="HIT"];
+  cacheput     -> cachematch;
+  cachematch   -> client2;
+}
+```
+
+1. Request 1 (oversized source, e.g. `imwidth=320`) hits the Worker; the size check enqueues to `TRANSFORM_QUEUE`.
+2. The Worker returns immediately: 202 + jobId + SSE URL.
+3. The queue consumer (batch delivery) dispatches to the Container DO via `/transform-url`.
+4. The FFmpeg container fetches the source over HTTPS, streams to disk, runs ffmpeg (4 vCPU), and reports progress via `/internal/job-progress` to D1 (status + percent).
+5. The output goes to the outbound handler via callback POST, which does an R2 put (FixedLengthStream) and marks the D1 job complete.
+6. Request 2 (same URL): R2 check HIT -> cache.put -> cache.match -> 200 video/mp4.
 
 ### Queue-based async flow
 
@@ -377,6 +462,43 @@ On every R2 cache HIT, the Worker compares the stored R2 object's etag and last-
 - **Remote sources**: KV-backed version number - manual bust via `POST /admin/cache/bust`
 - **Purge by tag**: `Cache-Tag` header with derivative, origin, mode tags for CF purge API
 
+### Caching layers
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  Request    [label="Request"];
+  EdgeCache  [label="Edge Cache", shape=diamond];
+  Return1    [label="Serve (fastest)"];
+  R2         [label="R2 _transformed/", shape=diamond];
+  CachePut   [label="cache.put"];
+  Transform  [label="Transform (binding/cdn-cgi/container)"];
+  R2Store    [label="R2 put"];
+  R2Read     [label="R2 get"];
+  CacheMatch [label="cache.match"];
+  Return2    [label="Serve (with range support)"];
+
+  Request    -> EdgeCache;
+  EdgeCache  -> Return1    [label="HIT (cf-cache-status: HIT, X-R2-Stored: HIT)"];
+  EdgeCache  -> R2         [label="MISS"];
+  R2         -> CachePut   [label="HIT (X-R2-Stored: HIT)"];
+  R2         -> Transform  [label="MISS"];
+  Transform  -> R2Store    [label="stream (FixedLengthStream)"];
+  R2Store    -> R2Read     [label="R2 put complete"];
+  R2Read     -> CachePut   [label="stream from R2"];
+  CachePut   -> CacheMatch [label="cache.put"];
+  CacheMatch -> Return2    [label="cache.match (range OK)"];
+}
+```
+
+1. Request hits the edge cache; a HIT serves (cf-cache-status: HIT, X-R2-Stored: HIT) - fastest.
+2. MISS: R2 `_transformed/` check; a HIT (X-R2-Stored: HIT) goes to cache.put, then cache.match.
+3. R2 MISS: the transform (binding/cdn-cgi/container) streams to R2 put (FixedLengthStream), R2 get streams from R2 to cache.put, then cache.match (range OK) serves with range support.
+
 ### Storage flow (zero memory buffering)
 
 ```
@@ -426,6 +548,43 @@ Origins configured as an array with regex matcher, capture groups, and prioritis
 ```
 
 Sources tried in priority order. If one fails (404, 5xx, timeout), falls through to next. Last resort: raw passthrough from any source. Optional `cacheControl` per origin overrides the auto-generated `public, max-age={ttl}` headers, allowing fine-grained control with `s-maxage`, `stale-while-revalidate`, etc.
+
+### Origins resolution
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  Request     [label="Request"];
+  Match       [label="Origin Match?", shape=diamond];
+  Sources     [label="Sources by Priority"];
+  Source1     [label="Source (remote)", shape=diamond];
+  Source2     [label="Source (R2)", shape=diamond];
+  Source3     [label="Source (fallback)", shape=diamond];
+  Success     [label="Transform"];
+  Error404    [label="404 Not Found"];
+  Passthrough [label="Raw Passthrough"];
+
+  Request -> Match;
+  Match   -> Sources     [label="Yes"];
+  Match   -> Error404    [label="No"];
+  Sources -> Source1     [label="priority 0"];
+  Source1 -> Success     [label="OK"];
+  Source1 -> Source2     [label="404/5xx"];
+  Source2 -> Success     [label="OK"];
+  Source2 -> Source3     [label="404/5xx"];
+  Source3 -> Success     [label="OK"];
+  Source3 -> Passthrough [label="all failed"];
+}
+```
+
+1. Origin Match? No -> 404 Not Found.
+2. Yes -> sources tried in priority order (priority 0, then 1, then 2).
+3. A source that returns OK -> Transform; 404/5xx falls through to the next source.
+4. All sources failed -> Raw Passthrough.
 
 ### Auth types
 
@@ -544,53 +703,21 @@ Every request logged to D1 via `waitUntil`. Weekly cron drops + recreates for 7-
 src/
   index.ts                    # Hono app wiring (~95 lines)
   middleware/                  # via, config, passthrough, auth, error
-  handlers/                   # admin, internal, transform, jobs (SSE), dashboard
-  config/                     # Zod 4 schema, KV loader
-  params/                     # Canonical params, Akamai translation, derivatives, responsive
-  transform/                  # Media binding, cdn-cgi, FFmpeg container DO, job types
-  sources/                    # Origin routing, auth, presigned URLs
-  cache/                      # Cache key, version (KV), coalescing (signal pattern)
-  queue/                      # Queue consumer + DLQ, D1 job registry
-  analytics/                  # D1 middleware, aggregation queries, schema.sql (SSOT)
+  handlers/                    # admin, internal, transform, jobs (SSE), dashboard
+  config/                      # Zod 4 schema, KV loader
+  params/                      # Canonical params, Akamai translation, derivatives, responsive
+  transform/                   # Media binding, cdn-cgi, FFmpeg container DO, job types
+  sources/                     # Origin routing, auth, presigned URLs
+  cache/                       # Cache key, version (KV), coalescing (signal pattern)
+  queue/                       # Queue consumer + DLQ, D1 job registry
+  analytics/                   # D1 middleware, aggregation queries, schema.sql (SSOT)
 container/
-  Dockerfile                  # node:22-slim + ffmpeg
-  server.mjs                  # /transform, /transform-url, /health (with progress reporting)
+  Dockerfile                   # node:22-slim + ffmpeg
+  server.mjs                   # /transform, /transform-url, /health (with progress reporting)
 dashboard/
-  src/components/             # Dashboard, AnalyticsTab, JobsTab, DebugTab, shared
+  src/components/              # Dashboard, AnalyticsTab, JobsTab, DebugTab, shared
 scripts/
-  smoke.ts                    # 84 smoke tests with tail log capture
-```
-
-### Bindings
-
-| Binding            | Type          | Resource                                                                            |
-| ------------------ | ------------- | ----------------------------------------------------------------------------------- |
-| `MEDIA`            | Media         | Media Transformations binding                                                       |
-| `VIDEOS`           | R2            | Source videos + transform cache (`_transformed/`) + source cache (`_source-cache/`) |
-| `CONFIG`           | KV            | Worker config (hot-reload, 5-min TTL)                                               |
-| `CACHE_VERSIONS`   | KV            | Cache version management                                                            |
-| `ANALYTICS`        | D1            | Request analytics + job registry (`transform_log` + `transform_jobs`)               |
-| `FFMPEG_CONTAINER` | Container DO  | FFmpeg container instances (4 vCPU, 12GB, 20GB disk)                                |
-| `TRANSFORM_QUEUE`  | Queue         | Durable job dispatch (retry + DLQ)                                                  |
-| `ASSETS`           | Static Assets | Dashboard UI                                                                        |
-
-### Testing
-
-```bash
-npm run test:run              # 202 unit tests (vitest + workers pool)
-npm run test:e2e              # 92 E2E tests against live (vitest, 60s timeout)
-npx tsx scripts/smoke.ts      # 84 smoke tests against live
-npx tsx scripts/smoke.ts --container  # + container async polling (~10 min)
-npm run test:browser          # 49 Playwright browser tests (deploy first)
-npm run check                 # TypeScript strict
-```
-
-### Operations
-
-```bash
-npm run deploy                # deploy worker + container + dashboard
-npm run dashboard:build       # rebuild Astro dashboard
-npm run dev                   # local dev (requires Docker for containers)
+  smoke.ts                     # 84 smoke tests with tail log capture
 ```
 
 ---
@@ -735,164 +862,40 @@ curl -I "https://videos.erfi.io/big_buck_bunny_1080p.mov?imwidth=480"
 
 ---
 
-## Architecture diagrams
+## Reproducing
 
-### Request flow
+Test suites (from the repo):
 
-```dot
-digraph {
-  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
-  fontname="Helvetica,Arial,sans-serif";
-  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
-  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
-
-  Client     [label="Client"];
-  EdgeCache  [label="CF Edge Cache", shape=diamond];
-  Worker     [label="Worker Middleware + Params"];
-  R2Cache    [label="R2 _transformed/", shape=diamond];
-  Coalesce   [label="Coalesce + Route"];
-  Binding    [label="env.MEDIA binding"];
-  CdnCgi     [label="cdn-cgi/media"];
-  Container  [label="FFmpeg Container DO"];
-  R2Store    [label="R2 put (FixedLengthStream)"];
-  R2Async    [label="R2 put (via outbound handler)"];
-  CachePut   [label="cache.put"];
-  CacheMatch [label="cache.match"];
-
-  Client     -> EdgeCache  [label="request"];
-  EdgeCache  -> Client     [label="cache HIT"];
-  EdgeCache  -> Worker     [label="cache MISS"];
-  Worker     -> R2Cache    [label="check _transformed/"];
-  R2Cache    -> Worker     [label="R2 HIT"];
-  R2Cache    -> Coalesce   [label="R2 MISS"];
-  Worker     -> CachePut   [label="R2 HIT"];
-  Coalesce   -> Binding    [label="R2 source <=100 MiB"];
-  Coalesce   -> CdnCgi     [label="remote <=100 MiB"];
-  Coalesce   -> Container  [label=">100 MiB or fps/speed/etc"];
-  Binding    -> R2Store    [label="transform output"];
-  CdnCgi     -> R2Store    [label="transform output"];
-  Container  -> R2Async    [label="async (202)"];
-  R2Store    -> CachePut   [label="stream from R2"];
-  R2Async    -> R2Store    [label="callback stores in R2"];
-  CachePut   -> CacheMatch [label="cache.put"];
-  CacheMatch -> Client     [label="cache.match (range OK)"];
-}
+```bash
+npm run test:run              # 202 unit tests (vitest + workers pool)
+npm run test:e2e              # 92 E2E tests against live (vitest, 60s timeout)
+npx tsx scripts/smoke.ts      # 84 smoke tests against live
+npx tsx scripts/smoke.ts --container  # + container async polling (~10 min)
+npm run test:browser          # 49 Playwright browser tests (deploy first)
+npm run check                 # TypeScript strict
 ```
 
-### Container async flow
+Deploy and dev:
 
-```dot
-digraph {
-  rankdir=TB; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
-  fontname="Helvetica,Arial,sans-serif";
-  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
-  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
-
-  req1         [label="Request 1 (oversized source)"];
-  worker1      [label="Worker"];
-  sizecheck    [label="Size > limit?", shape=diamond];
-  queue        [label="TRANSFORM_QUEUE"];
-  consumer     [label="Queue Consumer"];
-  container_do [label="Container DO"];
-  container    [label="FFmpeg Container"];
-  client1      [label="202 + jobId + SSE URL"];
-  download     [label="Download source"];
-  ffmpeg       [label="ffmpeg (4 vCPU)"];
-  outbound     [label="Outbound handler"];
-  r2store      [label="R2 put"];
-  d1           [label="D1 (status + percent)"];
-  req2         [label="Request 2 (same URL)"];
-  worker2      [label="Worker"];
-  r2check      [label="R2 check", shape=diamond];
-  cacheput     [label="cache.put"];
-  cachematch   [label="cache.match"];
-  client2      [label="200 video/mp4"];
-
-  req1         -> worker1      [label="imwidth=320"];
-  worker1      -> sizecheck;
-  sizecheck    -> queue        [label="yes (enqueue)"];
-  worker1      -> client1      [label="immediate 202"];
-  queue        -> consumer     [label="batch delivery"];
-  consumer     -> container_do [label="/transform-url"];
-  container_do -> container    [label="start"];
-  container    -> download     [label="fetch HTTPS"];
-  container    -> d1           [label="progress via /internal/job-progress"];
-  download     -> ffmpeg       [label="stream to disk"];
-  ffmpeg       -> outbound     [label="callback POST"];
-  outbound     -> r2store      [label="FixedLengthStream"];
-  outbound     -> d1           [label="complete"];
-  req2         -> worker2;
-  worker2      -> r2check;
-  r2check      -> cacheput     [label="HIT"];
-  cacheput     -> cachematch;
-  cachematch   -> client2;
-}
+```bash
+npm run deploy                # deploy worker + container + dashboard
+npm run dashboard:build       # rebuild Astro dashboard
+npm run dev                   # local dev (requires Docker for containers)
 ```
 
-### Caching layers
+## Evidence
 
-```dot
-digraph {
-  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
-  fontname="Helvetica,Arial,sans-serif";
-  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
-  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+| Claim | How it was checked | Status |
+| --- | --- | --- |
+| Tier latencies: ~2-10s, ~3-15s, ~30-120s, ~60-300s | Stated ranges; the `curl` examples in [Live examples](#live-examples) exercise each tier on the public deployment | Not measured on this page |
+| 725MB .mov -> 31MB .mp4, edge cache in 0.1s with range requests | Marked "Verified" in the doc; Big Buck Bunny container path on `videos.erfi.io` | Measured |
+| `?imwidth=320` - 725MB -> 38MB via FFmpeg container -> R2 cache | Live example on `videos.erfi.io` | Measured |
+| 202 unit, 92 E2E, 84 smoke, 49 Playwright tests | Repo test commands in [Reproducing](#reproducing) | Reported by the repo's suites |
 
-  Request    [label="Request"];
-  EdgeCache  [label="Edge Cache", shape=diamond];
-  Return1    [label="Serve (fastest)"];
-  R2         [label="R2 _transformed/", shape=diamond];
-  CachePut   [label="cache.put"];
-  Transform  [label="Transform (binding/cdn-cgi/container)"];
-  R2Store    [label="R2 put"];
-  R2Read     [label="R2 get"];
-  CacheMatch [label="cache.match"];
-  Return2    [label="Serve (with range support)"];
+## Related docs
 
-  Request    -> EdgeCache;
-  EdgeCache  -> Return1    [label="HIT (cf-cache-status: HIT, X-R2-Stored: HIT)"];
-  EdgeCache  -> R2         [label="MISS"];
-  R2         -> CachePut   [label="HIT (X-R2-Stored: HIT)"];
-  R2         -> Transform  [label="MISS"];
-  Transform  -> R2Store    [label="stream (FixedLengthStream)"];
-  R2Store    -> R2Read     [label="R2 put complete"];
-  R2Read     -> CachePut   [label="stream from R2"];
-  CachePut   -> CacheMatch [label="cache.put"];
-  CacheMatch -> Return2    [label="cache.match (range OK)"];
-}
-```
-
-### Origins resolution
-
-```dot
-digraph {
-  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
-  fontname="Helvetica,Arial,sans-serif";
-  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
-  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
-
-  Request     [label="Request"];
-  Match       [label="Origin Match?", shape=diamond];
-  Sources     [label="Sources by Priority"];
-  Source1     [label="Source (remote)", shape=diamond];
-  Source2     [label="Source (R2)", shape=diamond];
-  Source3     [label="Source (fallback)", shape=diamond];
-  Success     [label="Transform"];
-  Error404    [label="404 Not Found"];
-  Passthrough [label="Raw Passthrough"];
-
-  Request -> Match;
-  Match   -> Sources     [label="Yes"];
-  Match   -> Error404    [label="No"];
-  Sources -> Source1     [label="priority 0"];
-  Source1 -> Success     [label="OK"];
-  Source1 -> Source2     [label="404/5xx"];
-  Source2 -> Success     [label="OK"];
-  Source2 -> Source3     [label="404/5xx"];
-  Source3 -> Success     [label="OK"];
-  Source3 -> Passthrough [label="all failed"];
-}
-```
+- [Caching](/reference/caching/): the edge cache and R2 retrieval semantics this doc's cache hierarchy builds on; its range-request section links back here.
+- [Cloudflare Workers + Supabase: an architecture reference](/reference/cloudflare-supabase-architecture/): the other Workers-on-the-edge architecture reference in the corpus, same platform stack (R2, D1, KV, Cache API).
 
 [^cf-media-transformations]: Cloudflare, "Transform videos (Media Transformations)," Cloudflare Docs. https://developers.cloudflare.com/stream/transform-videos/
 [^cf-containers]: Cloudflare, "Containers," Cloudflare Docs. https://developers.cloudflare.com/containers/
