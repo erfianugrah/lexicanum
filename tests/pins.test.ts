@@ -1764,6 +1764,7 @@ const practicePages: Array<[doc: string, heading: RegExp]> = [
   ["reference/postgres-entity-graphs", PRACTICES_HEADING],
   ["reference/postgres-redundant-writes", PRACTICES_HEADING],
   ["reference/rls-without-supabase-auth", PRACTICES_HEADING],
+  ["reference/sqlite-edge-vs-supabase-postgres", PRACTICES_HEADING],
   ["reference/stripe-sync-engine", PRACTICES_HEADING],
   ["reference/supabase-auth-end-to-end", PRACTICES_HEADING],
   ["reference/supabase-auth-users-locks", PRACTICES_HEADING],

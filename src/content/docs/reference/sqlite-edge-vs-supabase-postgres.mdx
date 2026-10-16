@@ -1,0 +1,471 @@
+---
+title: "Turso, D1 and Supabase Postgres from one Cloudflare Worker"
+description: Eight application shapes - database per tenant, point reads, job-state writes, write contention, an analytics log, search, transactions and a local replica - run against Turso (libSQL and the Turso engine), Cloudflare D1 and Supabase Postgres from one Worker and one local client, data in Sydney (D1 placed by a location hint), with what each one refused.
+author: Erfi Anugrah
+category: supabase
+group: architecture
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Which SQL store a Cloudflare Worker should talk to, for which kind of
+workload: Turso (libSQL, and the newer Turso engine), Cloudflare D1, or
+Supabase Postgres through Hyperdrive or PostgREST. The question became a
+practical one when Supabase announced it is acquiring Turso[^sb-turso]; this
+page answers it with measurements from one lab.
+
+Every figure without a footnote comes from the
+[sqlite-edge-compare](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare)
+experiment in supabase-lab: two batteries, 2026-10-15 and 2026-10-16 (UTC),
+one probe Worker on the Singapore (SIN) colo unless a row says otherwise, and
+one local client in Singapore, except the Turso usage figures read by hand
+from the Platform API, which the text labels. Supabase (`ap-southeast-2`,
+Micro) and Turso (`aws-ap-southeast-2`) sat in Sydney; D1 had location hint
+`oc` and reported `served_by_region` OC, `served_by_colo` MEL.
+Absolute latencies are therefore dominated by the round trip from
+Singapore; read them for their order and shape. A backend is called faster than
+another only where the two rows' p25-p75 ranges do not overlap. Documented
+limits are cited and marked as documented; they were not all tested.
+
+TL;DR:
+
+- Point reads from a Worker: Turso 184-190 ms p50, D1 221-227, Postgres
+  through Hyperdrive 250-257, PostgREST 307-324. The libSQL and Turso-engine
+  databases read at the same speed. Turso pays 729.5-740 ms on the first
+  query of each Worker invocation.
+- D1 refuses `BEGIN TRANSACTION` from a Worker; its transaction is `batch()`.
+  Turso and Postgres give a Worker interactive transactions.
+- At 64 concurrent single-statement writers, D1 and Postgres kept a per-op
+  p50 of 253 to 329 ms (2026-10-16) and gained throughput; Turso libSQL
+  queued (1690.5 to 2592.5 ms p50) in all three runs.
+- The Turso engine's `BEGIN CONCURRENT` beat libSQL on concurrent inserts at
+  4 writers (4.4 against 1.83 tx/s, local client over Hrana HTTP, one sample)
+  and retried hundreds of write-write conflicts on one hot row; on
+  Turso Cloud it had no FTS5 and the module ran it without a vector index.
+- Hyperdrive's cache returned the pre-write value on 29 of 30 reads after a
+  write.
+- A Turso embedded replica reads locally in 0.25-0.31 ms; the D1 binding and
+  the Postgres drivers used here offer no local replica (recorded, not
+  measured).
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  local [label="local client\n(Singapore)"];
+  subgraph cluster_cf {
+    label="Cloudflare (SIN colo)"; style=rounded; fontsize=12; margin=12;
+    worker [label="probe Worker\nPOST /run"];
+    hd [label="Hyperdrive\n(caching off / on)"];
+  }
+  d1 [label="D1\n(hint oc)", shape=cylinder];
+  subgraph cluster_turso {
+    label="Turso aws-ap-southeast-2"; style=rounded; fontsize=12; margin=12;
+    libsql [label="libSQL database", shape=cylinder];
+    tdb [label="Turso-engine database", shape=cylinder];
+  }
+  subgraph cluster_sb {
+    label="Supabase ap-southeast-2"; style=rounded; fontsize=12; margin=12;
+    rest [label="PostgREST"];
+    pg [label="Postgres", shape=cylinder];
+  }
+
+  local -> worker [label="HTTPS"];
+  worker -> d1 [label="binding"];
+  worker -> libsql [label="@libsql/client/web"];
+  worker -> tdb [label="@libsql/client/web"];
+  worker -> hd [label="pg"];
+  hd -> pg [label="direct :5432"];
+  worker -> rest [label="fetch"];
+  rest -> pg;
+  local -> libsql [label="HTTP, replica"];
+  local -> pg [label="pooler, direct"];
+}
+```
+
+The Worker is workload-generic: each module sends its own SQL per backend and
+the Worker times each driver call with `performance.now()`. A Worker's clock
+advances only across I/O, so an operation's time is its I/O wall time. The
+Postgres paths open their connection before the first timed operation; the
+others pay their setup inside it (see [Point reads](#point-reads)).
+
+## Which store for which workload
+
+| Workload | Measured lead (Worker in SIN unless the cell says local) | What decides it | Rests on |
+|---|---|---|---|
+| Key lookups, config, sessions | Turso, then D1, when an invocation makes several queries; D1 when it makes one (Turso first query 729.5-740 ms, D1 221-223.5) | Round trip and first-query cost; Hyperdrive caching only for data that tolerates 60 s staleness | TD02, TD07c |
+| A queue worker's job-state writes | Turso libSQL (1565 ms per 8-statement job, 2026-10-16), then D1 (1855) | Write latency per statement | TD03 |
+| Many concurrent writers on one database | D1 or Postgres, up to the 64 writers and 162.33-166.13 ops/s measured (2026-10-16) | Turso libSQL queued at 64 writers in three runs | TD04 |
+| Multi-statement transactions decided at runtime | Turso or Postgres | D1 has only `batch()` | TD07 |
+| Dashboard aggregates over a 100,000-row log | Postgres or D1 for window functions (Postgres led on 2026-10-16, D1 on 2026-10-15); Turso libSQL led by_hour and last_24h on 2026-10-16 | Query shape | TD05 |
+| Full-text search | D1 or Turso libSQL (FTS5); Postgres ranks with `ts_rank` (top-10 overlap with D1 0.1 to 0.5, relevance not tested) | FTS5 is refused on the Turso engine | TD06 |
+| Vector search | pgvector (recall 1 from SIN); Turso libSQL only after measuring recall at your index arguments (0.245 at the module's) | Recall at the chosen index arguments | TD06 |
+| A database per tenant | Postgres schema (1012.95 ms), D1 (2177.16 ms), Turso (4080.64-4651.5 ms) burst p50 to first query, from the local machine (2026-10-16) | Provisioning path, plan ceilings | TD01 |
+| Reads with no network | Turso embedded replica (local machine) | Turso's embedded replica; D1 and Postgres drivers used here recorded as having none (TD08e, not measured) | TD08 |
+
+The choice in each row holds for one colo, one region and one client; the
+absolute figures do not travel.
+
+## Point reads
+
+Primary-key read of one row from a 10,000-row table, n = 300 per row (hot-set
+row n = 100) after 20 warm-up iterations dropped, ms:
+
+| Path | 2026-10-15 p50 (p25-p75) | 2026-10-16 p50 (p25-p75) |
+|---|---|---|
+| Worker -> Turso libSQL | 190 (184-194.25) | 184 (180-189) |
+| Worker -> Turso engine | - | 186 (183-188) |
+| Worker -> D1 binding | 227 (224-232) | 221 (219-223.25) |
+| Worker -> Hyperdrive (caching off) -> Postgres | 257 (251-284) | 250 (249-282) |
+| Worker -> PostgREST | 307 (302-324) | 324 (290-327) |
+| Worker -> Hyperdrive (caching on), hot set of 10 ids | 5 (4-10.25) | 1 (1-2) |
+| local -> Supavisor transaction mode (6543) | 252.29 (244.47-259.13) | 255.57 (246.12-269.23) |
+| local -> Turso over HTTP | 257.9 (252.23-282.2) | 265 (256.51-306.06) |
+
+- Turso's first query in each Worker invocation cost 740 ms (2026-10-15) and
+  729.5 ms (2026-10-16) at p50 against 189 and 183 for the rest: the client
+  sets up its connection inside the first query. A Worker that serves one
+  query per request pays this every time.
+- From the Worker the Postgres connection through Hyperdrive opened in 7 ms
+  (2026-10-15) and 2 ms (2026-10-16), so excluding it from the operation
+  timings changes little. From the local machine the pooler connect took
+  1640.4 ms and the direct one 2197.86 ms (2026-10-15), 2015.81 and 2123.34 ms
+  (2026-10-16).
+- Both D1 and Turso refused the 10,001st query in one Worker invocation
+  (D1: `Too many API requests by single Worker invocation`; Turso:
+  `Too many subrequests by single Worker invocation`) after 10,000 succeeded,
+  on this account. The D1 limits page documents 1,000 queries per invocation
+  on Workers Paid[^d1-limits]; which plan figure applies to this account was
+  not settled.
+
+## Job-state writes
+
+A job: insert, three status updates, a read after each, 8 statements in all.
+Worker rows ran from SIN on 2026-10-16; n = 100 jobs after 10 warm-up:
+
+| Path | Insert p50 | Update p50 | Read p50 | Whole job p50 (p25-p75) |
+|---|---|---|---|---|
+| Worker -> Turso libSQL | 201 | 201 | 186 | 1565 (1540.5-1629.25) |
+| Worker -> D1 | 241 | 239 | 224 | 1855 (1844.75-1869.25) |
+| Worker -> Turso engine | 318.5 | 319 | 186 | 2002.5 (1981-2041.25) |
+| Worker -> Hyperdrive -> Postgres | 283 | 283 | 282 | 2262 (2002-2272) |
+| Worker -> PostgREST | 327 | 322 | 320 | 2541.5 (2469-2639.5) |
+
+Every read saw the preceding write on every backend. The Turso engine's
+insert and update p50 (318.5 and 319 ms) were about 1.6 times libSQL's (201 and
+201) on the same group and client; its reads matched (186). The PostgREST row lost 80 operations to client-side timeouts that
+day (one block, re-sent).
+
+## Write contention
+
+256 single-statement writes per cell, spread over parallel Worker
+invocations of up to 4 lanes. ops/s at 1 / 4 / 16 / 64 concurrent writers,
+2026-10-16 00:07 run (every cell from SIN):
+
+| Backend | Inserts ops/s | Hot-row increments ops/s | Per-op p50 at 64 (insert / increment) |
+|---|---|---|---|
+| D1 | 4.2 / 15.82 / 55.36 / 162.33 | 4.07 / 15.64 / 61.88 / 166.13 | 329 / 296 ms |
+| Turso libSQL | 4.77 / 18.48 / 50.77 / 24.4 | 4.74 / 18.25 / 49.42 / 24.1 | 2592.5 / 2502 ms |
+| Turso engine | 3.19 / 12.93 / 14.28 / 13.03 | 3.15 / 14.55 / 13.95 / 10.98 | 4575.5 / 5500 ms |
+| Postgres via Hyperdrive | failed cell / 14.75 / 56.78 / 152.47 | 3.51 / 14.48 / 53.55 / 155.25 | 253 / 280 ms |
+
+- No backend lost an update in any of three runs (2026-10-15 06:10,
+  2026-10-15 23:56, 2026-10-16 00:07). Two cells returned an error after their
+  rows had committed: D1 inserts at 1 writer in the 23:56 run (a Cloudflare
+  HTTP 502 after 29617 ms, 122 rows committed) and Postgres inserts at 1
+  writer in the 00:07 run (a client timeout, 256 rows committed).
+- Turso libSQL's drop at 64 writers repeated in all three runs (24.1 to
+  30.96 ops/s, per-op p50 1690.5 to 2592.5 ms); the last two ran entirely from
+  SIN, so it is not the colo mix. The run cannot tell libSQL's single writer
+  from a per-database limit in front of it.
+- D1 never answered with its documented overload error (`D1 DB is
+  overloaded. Too many requests queued.`[^d1-debug]); these cells are bounded
+  by the round trip and do not find where D1 starts refusing.
+
+### The Turso engine and `BEGIN CONCURRENT`
+
+The Turso engine is Turso's Rust rewrite of SQLite, "in early preview" on
+Turso Cloud[^turso-cloud], with MVCC concurrent writes opened by `BEGIN
+CONCURRENT`[^turso-concurrent]. Creating one through the Platform API needs
+an organization setting: with it off, `use_tursodb: true` answered HTTP 400
+`tursodb is not enabled for organization` (2026-10-15); with it on, the
+database was created in 1317 ms. On Cloud it reported `journal_mode`
+`mvcc` and refused `PRAGMA journal_mode = wal` (`SQL not allowed statement`).
+
+`@libsql/client` lists concurrent writes as not supported[^turso-sdk], so the
+module drove the transactions over Hrana HTTP itself, one statement per round
+trip from the local machine, 64 transactions per cell, up to 25 attempts:
+
+| Engine, begin | Inserts tx/s at 1 / 4 / 16 | One-row read-modify-write tx/s at 1 / 4 / 16 | Conflicts retried (rmw at 4 / 16) | Committed (rmw at 16) |
+|---|---|---|---|---|
+| Turso engine, `BEGIN CONCURRENT` | 1.08 / 4.4 / 1.73 | 0.9 / 1.13 / 1.24 | 189 / 713 | 53 of 64 |
+| libSQL, `BEGIN IMMEDIATE` | 1.31 / 1.83 / 1.82 | 0.99 / 1.26 / 1.24 | 0 / 0 | 64 of 64 |
+
+Concurrent inserts at 4 writers committed 2.4 times faster with `BEGIN
+CONCURRENT`; at 16 the advantage was gone (one sample per cell). On one hot
+row every conflict came back as `[SQLITE_ABORT] Tursodb error: Write-write
+conflict` and was retried; the final counter equalled the committed count,
+and 11 of 64 transactions ran out of attempts. libSQL serialised the same
+work with no conflicts. Over Hrana HTTP, Turso Cloud returned no baton after
+an autocommit statement on both engines, so a hand-rolled stream continues
+only inside a transaction; `@libsql/client` opens a new stream instead.
+
+## Transactions from a Worker
+
+| Behaviour | D1 | Turso (both engines) | Postgres via Hyperdrive |
+|---|---|---|---|
+| Interactive transaction | refused: `To execute a transaction, please use the state.storage.transaction() ...`; `batch()` committed in 247 ms (2026-10-15) and 244 ms (2026-10-16) | committed (libSQL 584 ms on 2026-10-15, 576 and Turso engine 634 on 2026-10-16) | committed, 1140 ms (2026-10-15), 1137 ms (2026-10-16) |
+| Rollback on a duplicate key | `batch` leaves 0 rows | `batch` and interactive leave 0 rows | `batch` and interactive leave 0 rows |
+| Read-your-write in the next request | 30/30 | 30/30 | 30/30; through the caching Hyperdrive config 1/30 fresh, 29 stale |
+| A second writer during an open transaction | batch: reads equal, slowest second write 261 ms (2026-10-16) | slowest write 1934 ms (libSQL) and 2107 ms (Turso engine) on 2026-10-16, consistent with waiting (inferred, n = 1), reads equal | READ COMMITTED saw the new commits; REPEATABLE READ failed with `40001` |
+
+D1 documents `batch()` as statements run in sequence and rolled back as a
+whole[^d1-api]. Hyperdrive documents that writes do not invalidate cached
+results and that the default `max_age` is 60 s[^hd-cache]; the 29 stale
+reads in 30 are consistent with that. `@libsql/client` 0.18.0 maps
+`transaction("write")` to `BEGIN IMMEDIATE` and has no `BEGIN CONCURRENT`
+mode (read from the library source, not measured), so a Worker gets the Turso
+engine's concurrency only through a client that sends the statement itself.
+
+## Analytics event log
+
+100,000 events, five dashboard queries, p50 ms from the Worker on 2026-10-16
+(query order rotated per iteration; n = 20):
+
+| Backend | Ingest, summed op time | by_hour | top_paths | status_by_country | p95_by_colo | last_24h |
+|---|---|---|---|---|---|---|
+| D1 | 36215 ms | 301 | 365 | 395 | 630.5 | 228 |
+| Turso libSQL | 33205 ms | 211.5 | 236.5 | 271.5 | 896.5 | 187 |
+| Turso engine | 43090 ms | 402.5 | 493.5 | 477 | 2413.5 | 195 |
+| Postgres via Hyperdrive | 64509 ms | 301 | 304 | 306 | 480 | 282 |
+
+Every aggregate that answered returned the correct answer; one Turso-engine
+last_24h read answered HTTP 520. On Turso libSQL, whichever query ran first
+in the invocation took 443.5 to 586 ms longer than when it did not (by_hour
+756.5 against 208.5): the same first-query cost as in point reads. With that
+removed (not-first p50 208.5, 220.5, 265.5 and 186.5 ms on libSQL against 301,
+275.5, 306 and 284 on Postgres), libSQL had the lowest p50 on the four light
+queries; by the p25-p75 rule it was faster than Postgres only on by_hour and
+last_24h. On p95_by_colo, Turso libSQL (896.5) was slower than D1 and
+Postgres, and the Turso engine (2413.5) slowest of all. On 2026-10-15 D1 was
+faster than Postgres on p95_by_colo (467, p25-p75 454.5-476.5, against 485,
+480.5-489).
+
+## Search
+
+10,000 documents for full-text, 10,000 x 384 vectors, n = 20 per query, from
+the Worker on 2026-10-16:
+
+| Backend | Full-text query p50 ms (4 shapes) | Vector load | ANN p50 ms, recall@10 | Exact top-10 p50 ms |
+|---|---|---|---|---|
+| D1 (FTS5) | 226-246.5 | no vector type: `no such function: vector32` | - | - |
+| Turso libSQL (FTS5; `libsql_vector_idx`) | 191-204 | 202908 ms, index maintained on insert | 201.5, 0.245 | 207.5 |
+| Turso engine | refused: `Virtual tables are not supported in MVCC mode` | 75052 ms, no index created | - | 211, recall 1 |
+| Postgres (`tsvector` + GIN; pgvector HNSW) | 269.5-283.5 | 95615 ms + 2728 ms HNSW build | 257, 1 | 259 |
+
+- Full-text match counts were identical on D1, Turso libSQL and Postgres, and
+  libSQL's top 10 equalled D1's on every query.
+- The libSQL recall of 0.245 (0.265 on 2026-10-15) belongs to the index
+  arguments the module chose (`compress_neighbors=float8, max_neighbors=16`),
+  picked because the default arguments took 48101 ms for 500 rows against
+  6056 ms for the chosen arguments' first 5 ops (2026-10-15); it does not rate
+  libSQL vector search in general.
+- pgvector's HNSW recall@10 over four full runs: 0.95 (2026-10-15, NRT colo),
+  1, 1, 1.
+- The Turso engine documents a Tantivy-backed `USING fts` index distinct from
+  FTS5[^turso-fts]. A standalone probe on a throwaway database (2026-10-16,
+  not a module row) found `USING fts` and `USING vector` both refused on
+  Cloud with `index method is an experimental feature`, and
+  `libsql_vector_idx` refused, which is why the module loaded the Turso
+  engine without a vector index.
+- Colo matters more than backend here: a superseded 2026-10-15 run that
+  landed in Tokyo (NRT) reversed the full-text order (Postgres 104-115 ms,
+  Turso 123.5-134.5, D1 201.5-212.5).
+
+## A database per tenant
+
+Create a database (or a Postgres schema), get credentials, run a first
+query; one single tenant, then a burst of 20 in parallel, from the local
+machine on 2026-10-16:
+
+| Backend | Single: create to first query | Burst of 20: create to first query p50 (max) |
+|---|---|---|
+| Postgres schema on one project | 987.94 ms | 1012.95 (1062.97) ms |
+| D1 (REST create + query) | 2087.22 ms | 2177.16 (2841.78) ms |
+| Turso libSQL (Platform API + database token) | 3727.39 ms | 4080.64 (4322.38) ms |
+| Turso engine | 3792.89 ms | 4651.5 (4934.59) ms |
+
+No create was refused and every tenant answered its first query. D1 was
+reached over REST; a Worker binding to a new database needs a redeploy, which
+was not measured. Documented
+ceilings, not reached here: Turso Free 100 databases[^turso-pricing], D1
+50,000 databases per account on Paid (raisable on request)[^d1-limits]. The
+schema-per-tenant row shares one project's resources; the cost and isolation
+side of that choice is in
+[Where should a tenant live](/reference/supabase-multi-tenant-placement/).
+
+## A local replica
+
+A Turso embedded replica is a local SQLite file that syncs from the
+database[^turso-embedded]. From the local machine: a replica read p50 0.25 ms
+(2026-10-15) and 0.31 ms (2026-10-16) against 244.53 and 252.24 ms over HTTP;
+a write at the primary became visible after one `sync()` at 913.28 ms p50
+(2026-10-15). Opening a fresh replica took 36143.833 ms on 2026-10-15 and
+79749.385 ms on 2026-10-16. The same replica pointed at a Turso-engine
+database did not open (`file is not a database`); Turso's docs recommend
+Turso Sync (`@tursodatabase/sync`) for new projects[^turso-sync], and its
+module rows failed on 2026-10-16 when the Turso organization refused writes
+(below).
+
+## Provider behaviour during the runs
+
+- Turso answered HTTP 520 on 7 rows on 2026-10-16 (none on 2026-10-15),
+  on both engines. The modules now re-send a lost batch once where a row
+  count or a duplicate key shows whether it landed.
+- The Turso organization (`plan_id starter`, taken as the Free plan) refused
+  every write during the
+  last module on 2026-10-16 (`SQL write operations are forbidden (writes are
+  blocked, do you need to upgrade your plan?)`). Read from the Platform API
+  afterwards (not in an artifact), its usage for the billing period showed
+  11,774,888 rows written against the documented 10 million per
+  month[^turso-pricing]. Of that, the Turso-engine database counted 9,639,906
+  and the libSQL one 900,317 over overlapping but not identical workloads;
+  why was not isolated.
+
+<Aside type="caution" title="Watch the write counter">
+On a Turso plan with a rows-written allowance, a write-heavy test can exhaust
+it within days and the block applies to every database in the organization.
+Read the organization's usage before and after a load test.
+</Aside>
+
+## Reading the numbers
+
+- One Worker colo (SIN), one region (Sydney), one local machine, one run per
+  row unless a row names more. The order between backends held from SIN;
+  from NRT it reversed for full-text search.
+- The Worker-to-Sydney round trip is most of every figure. D1's own
+  `sql_duration_ms` for the `last_24h` aggregate was 0.44 ms of a 225.5 ms
+  operation (2026-10-15).
+- First-query costs are not counted the same way on every path: Postgres
+  connects before the timed operation, Turso, PostgREST and D1 REST pay
+  setup inside the first one. The tables above give the first-query figure
+  wherever it changes the reading.
+- Throughput figures in the contention section are one sample per cell per
+  run; the libSQL drop at 64 writers is the claim that three runs support.
+- Not compared: cost per month, Auth and row-level security, Storage,
+  Realtime, backup and restore, read replicas (D1 read replication was left
+  at its default), and any Worker colo other than SIN and NRT.
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Expect one slow first Turso query per Worker invocation; group a request's reads. | First query p50 729.5-740 ms against 183-189 for the rest of the invocation. | TD02, TD05 |
+| Send D1 transactions as one `batch()`; use Turso or Postgres when steps depend on reads. | D1 refuses `BEGIN TRANSACTION` through the binding; `batch()` rolled back as a whole. | TD07 |
+| Keep Hyperdrive caching off for anything read right after it is written. | 29 of 30 reads through the caching config returned the pre-write value. | TD07c |
+| Spread writes over databases before 64 concurrent writers hit one Turso libSQL database. | 24.1 to 30.96 ops/s and 1690.5 to 2592.5 ms per-op p50 at 64 writers in three runs; at 16 the per-op p50 was 234 and 231 ms (2026-10-16). Between 16 and 64 was not measured; spreading over databases was not measured. | TD04 |
+| Retry `BEGIN CONCURRENT` transactions on write-write conflict, with a cap. | 713 conflicts retried at 16 writers on one row; 11 of 64 gave up after 25 attempts. | TD04m2 |
+| Use FTS5 on D1 or Turso libSQL, not on the Turso engine, for full-text search. | The Turso engine refused the FTS5 table on Cloud. | TD06 |
+| Measure recall at your index arguments before shipping libSQL vector search. | recall@10 0.245 and 0.265 with the arguments chosen for load speed; pgvector 1 from SIN (0.95 in the NRT run). | TD06 |
+| Use a Postgres schema or D1 when a new tenant must answer quickly after signup. | Burst p50 to first query from the local machine on 2026-10-16: 1012.95 ms (schema), 2177.16 ms (D1 REST), 4080.64 ms (Turso). A Worker binding to a new D1 database needs a redeploy; not measured. | TD01 |
+| Read Turso's organization usage before and after a load test on a capped plan. | TD08 writes refused with `SQL write operations are forbidden`; the period's usage, read by hand afterwards and not in an artifact, showed 11,774,888 rows written. | TD08 |
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="Do transaction steps depend\non reads made inside it?"];
+  q2 [label="Many concurrent writers\non one database?"];
+  q3 [label="Need reads with no network\n(app or device)?"];
+  q4 [label="pgvector or row-level\nsecurity?"];
+  pg [label="Supabase Postgres\n(Hyperdrive, caching off for fresh reads)"];
+  d1 [label="D1"];
+  turso [label="Turso libSQL\n(embedded replica)"];
+  ttx [label="Turso libSQL\n(interactive transactions)"];
+  t2 [label="Several queries per invocation: Turso libSQL\nOne query per invocation: D1"];
+
+  q1 -> q4 [label="yes"];
+  q1 -> q2 [label="no"];
+  q4 -> pg [label="yes"];
+  q4 -> ttx [label="no"];
+  q2 -> d1 [label="yes"];
+  q2 -> pg [label="yes"];
+  q2 -> q3 [label="no"];
+  q3 -> turso [label="yes"];
+  q3 -> t2 [label="no"];
+}
+```
+
+1. If transaction steps depend on reads made inside the transaction, D1 is
+   out (no interactive transactions). Pick Postgres when you also need
+   pgvector (recall 1) or row-level security (not compared here); otherwise
+   Turso.
+2. If many writers hit one database at once, prefer D1 or Postgres, up to the
+   64 writers measured; Turso libSQL queued at 64 writers.
+3. If the app must read with no network, Turso's embedded replica is the
+   option here; the D1 binding and the Postgres drivers used in this lab were
+   recorded as having no local replica (not measured).
+4. Otherwise pick on read latency from your colo: from SIN, Turso libSQL,
+   then D1, for invocations that make several queries; for one query per
+   invocation D1 (first query 221-223.5 ms against Turso's 729.5-740).
+
+## Evidence, by module
+
+Measured claims map to module ids in
+[experiments/sqlite-edge-compare](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare);
+the run record is its
+[RUNLOG.md](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/RUNLOG.md)
+and the results by use case its
+[README](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/README.md).
+Redacted artifacts with their measurement tables are under
+[out/2026-10-15/](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-15)
+and
+[out/2026-10-16/](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16).
+Every number in a measured row above was taken from those tables; the
+standalone probes and the hand-read Turso usage named in the text are not in
+an artifact.
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| TD01 | sqlite-edge-compare | [`td01-db-per-tenant.ts`](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/tests/td01-db-per-tenant.ts) | [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16) |
+| TD02 | sqlite-edge-compare | [`td02-point-reads.ts`](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/tests/td02-point-reads.ts) | [`out/2026-10-15`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-15), [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16) |
+| TD03 | sqlite-edge-compare | [`td03-job-state-writes.ts`](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/tests/td03-job-state-writes.ts) | [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16) |
+| TD04, TD04m2 | sqlite-edge-compare | [`td04-write-contention.ts`](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/tests/td04-write-contention.ts) | [`out/2026-10-15`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-15), [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16) |
+| TD05 | sqlite-edge-compare | [`td05-event-log.ts`](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/tests/td05-event-log.ts) | [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16) |
+| TD06 | sqlite-edge-compare | [`td06-search.ts`](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/tests/td06-search.ts) | [`out/2026-10-15`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-15), [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16) |
+| TD07, TD07c | sqlite-edge-compare | [`td07-tx-semantics.ts`](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/tests/td07-tx-semantics.ts) | [`out/2026-10-15`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-15), [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16) |
+| TD08 | sqlite-edge-compare | [`td08-embedded-replica.ts`](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/tests/td08-embedded-replica.ts) | [`out/2026-10-15`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-15), [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16) |
+
+## Related docs
+
+- [Cloudflare Workers + Supabase: an architecture reference](/reference/cloudflare-supabase-architecture/) -
+  every path a Worker uses to reach Supabase, including the Hyperdrive and
+  PostgREST paths measured here, and its "Edge SQL" row on when D1 fits next
+  to Postgres; this page adds Turso and the per-workload measurements.
+- [Where should a tenant live](/reference/supabase-multi-tenant-placement/) -
+  the cost and isolation side of the database-per-tenant rows above.
+
+[^sb-turso]: Supabase, "Supabase is acquiring Turso," Supabase Blog. https://supabase.com/blog/supabase-is-acquiring-turso
+[^turso-cloud]: Turso, "Turso Cloud," Turso Docs. https://docs.turso.tech/turso-cloud.md
+[^turso-concurrent]: Turso, "Concurrent writes," Turso Docs. https://docs.turso.tech/tursodb/concurrent-writes.md
+[^turso-sdk]: Turso, "TypeScript SDK reference," Turso Docs. https://docs.turso.tech/sdk/ts/reference.md
+[^turso-fts]: Turso, "Full-text search functions," Turso Docs. https://docs.turso.tech/sql-reference/functions/fts.md
+[^turso-embedded]: Turso, "Embedded replicas," Turso Docs. https://docs.turso.tech/features/embedded-replicas/introduction.md
+[^turso-sync]: Turso, "Turso Sync usage," Turso Docs. https://docs.turso.tech/sync/usage.md
+[^turso-pricing]: Turso, "Pricing," Turso. https://turso.tech/pricing
+[^d1-limits]: Cloudflare, "Limits," Cloudflare D1 Docs. https://developers.cloudflare.com/d1/platform/limits/
+[^d1-debug]: Cloudflare, "Debug D1," Cloudflare D1 Docs. https://developers.cloudflare.com/d1/observability/debug-d1/
+[^d1-api]: Cloudflare, "D1 Database," Cloudflare D1 Docs. https://developers.cloudflare.com/d1/worker-api/d1-database/
+[^hd-cache]: Cloudflare, "Query caching," Cloudflare Hyperdrive Docs. https://developers.cloudflare.com/hyperdrive/concepts/query-caching/
