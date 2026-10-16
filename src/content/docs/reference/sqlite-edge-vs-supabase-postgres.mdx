@@ -1,6 +1,6 @@
 ---
-title: "Turso, D1 and Supabase Postgres from one Cloudflare Worker"
-description: Eight application shapes - database per tenant, point reads, job-state writes, write contention, an analytics log, search, transactions and a local replica - run against Turso (libSQL and the Turso engine), Cloudflare D1 and Supabase Postgres from one Worker and one local client, data in Sydney (D1 placed by a location hint), with what each one refused.
+title: "Turso, D1, Durable Objects and Supabase Postgres from one Cloudflare Worker"
+description: Eight application shapes - database per tenant, point reads, job-state writes, write contention, an analytics log, search, transactions and a local replica - run against Turso (libSQL and the Turso engine), Cloudflare D1, a SQLite-backed Durable Object and Supabase Postgres from one Worker and one local client, data in Australia (D1 and the Durable Object placed by a location hint), with what each one refused and what the Turso engine counts as a write.
 author: Erfi Anugrah
 category: supabase
 group: architecture
@@ -9,19 +9,24 @@ group: architecture
 import { Aside } from "@astrojs/starlight/components";
 
 Which SQL store a Cloudflare Worker should talk to, for which kind of
-workload: Turso (libSQL, and the newer Turso engine), Cloudflare D1, or
-Supabase Postgres through Hyperdrive or PostgREST. The question became a
+workload: Turso (libSQL, and the newer Turso engine), Cloudflare D1, a
+SQLite-backed Durable Object, or Supabase Postgres through Hyperdrive or
+PostgREST. The question became a
 practical one when Supabase announced it is acquiring Turso[^sb-turso]; this
 page answers it with measurements from one lab.
 
 Every figure without a footnote comes from the
-[sqlite-edge-compare](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare)
-experiment in supabase-lab: two batteries, 2026-10-15 and 2026-10-16 (UTC),
-one probe Worker on the Singapore (SIN) colo unless a row says otherwise, and
-one local client in Singapore, except the Turso usage figures read by hand
+[sqlite-edge-compare](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare)
+experiment in supabase-lab: three batteries, 2026-10-15, 2026-10-16 and a third
+on 2026-10-16 marked r3 (UTC), one probe Worker on the Singapore (SIN) colo
+unless a row says otherwise (in r3 the colo moved per module: SIN, Osaka KIX
+or Hong Kong HKG, named on each r3 figure), and one local client in Singapore, except the Turso usage figures read by hand
 from the Platform API, which the text labels. Supabase (`ap-southeast-2`,
 Micro) and Turso (`aws-ap-southeast-2`) sat in Sydney; D1 had location hint
-`oc` and reported `served_by_region` OC, `served_by_colo` MEL.
+`oc` and reported `served_by_region` OC, `served_by_colo` MEL (2026-10-15 and
+the 2026-10-16 re-run) and BNE (r3); the Durable
+Object, hint `oc`, reported BNE at fixture setup (from an in-object
+`/cdn-cgi/trace`, not an artifact).
 Absolute latencies are therefore dominated by the round trip from
 Singapore; read them for their order and shape. A backend is called faster than
 another only where the two rows' p25-p75 ranges do not overlap. Documented
@@ -44,9 +49,20 @@ TL;DR:
   Turso Cloud it had no FTS5 and the module ran it without a vector index.
 - Hyperdrive's cache returned the pre-write value on 29 of 30 reads after a
   write.
-- A Turso embedded replica reads locally in 0.25-0.31 ms; the D1 binding and
+- A Turso embedded replica reads locally in 0.21-0.31 ms; the D1 binding and
   the Postgres drivers used here offer no local replica (recorded, not
-  measured).
+  measured). Turso Sync works on both engines; two clients that update one
+  row offline both push without an error and the second push wins.
+- A SQLite-backed Durable Object read like D1 from SIN (p50 221 against 230
+  ms, ranges touching) with no first-query cost, refused `BEGIN TRANSACTION`
+  as D1 does, ran FTS5, and at 64 writers reached 224.36 insert ops/s against
+  D1's 179.65 in the same run (r3, Worker colos KIX+HKG+SIN, one sample).
+- On the Turso engine a window-function query counted 4 rows written per
+  input row per execution, against none on libSQL; inserts and other reads
+  counted the same on both. On the first account that query accounts for
+  about 9,200,000 of the Turso-engine database's 9,639,906 rows written
+  (derived from the probe, not re-measured), most of the organization's
+  11,774,888 against the 10 million allowance.
 
 ## Topology
 
@@ -106,6 +122,7 @@ others pay their setup inside it (see [Point reads](#point-reads)).
 | Full-text search | D1 or Turso libSQL (FTS5); Postgres ranks with `ts_rank` (top-10 overlap with D1 0.1 to 0.5, relevance not tested) | FTS5 is refused on the Turso engine | TD06 |
 | Vector search | pgvector (recall 1 from SIN); Turso libSQL only after measuring recall at your index arguments (0.245 at the module's) | Recall at the chosen index arguments | TD06 |
 | A database per tenant | Postgres schema (1012.95 ms), D1 (2177.16 ms), Turso (4080.64-4651.5 ms) burst p50 to first query, from the local machine (2026-10-16) | Provisioning path, plan ceilings | TD01 |
+| State per entity (a tenant, a room, a user) that one Worker coordinates | A Durable Object: a named object per entity, created on first access (burst p50 to first query 1623.38 ms via the Worker, r3; D1 2289.56 in the same run) | One object handles requests one at a time (documented soft limit 1,000 requests per second per object[^do-limits], not measured); `BEGIN TRANSACTION` refused in `sql.exec`, transactions run inside the object via `transactionSync` | TD01, TD07 (r3) |
 | Reads with no network | Turso embedded replica (local machine) | Turso's embedded replica; D1 and Postgres drivers used here recorded as having none (TD08e, not measured) | TD08 |
 
 The choice in each row holds for one colo, one region and one client; the
@@ -116,21 +133,24 @@ absolute figures do not travel.
 Primary-key read of one row from a 10,000-row table, n = 300 per row (hot-set
 row n = 100) after 20 warm-up iterations dropped, ms:
 
-| Path | 2026-10-15 p50 (p25-p75) | 2026-10-16 p50 (p25-p75) |
-|---|---|---|
-| Worker -> Turso libSQL | 190 (184-194.25) | 184 (180-189) |
-| Worker -> Turso engine | - | 186 (183-188) |
-| Worker -> D1 binding | 227 (224-232) | 221 (219-223.25) |
-| Worker -> Hyperdrive (caching off) -> Postgres | 257 (251-284) | 250 (249-282) |
-| Worker -> PostgREST | 307 (302-324) | 324 (290-327) |
-| Worker -> Hyperdrive (caching on), hot set of 10 ids | 5 (4-10.25) | 1 (1-2) |
-| local -> Supavisor transaction mode (6543) | 252.29 (244.47-259.13) | 255.57 (246.12-269.23) |
-| local -> Turso over HTTP | 257.9 (252.23-282.2) | 265 (256.51-306.06) |
+| Path | 2026-10-15 p50 (p25-p75) | 2026-10-16 p50 (p25-p75) | r3 (SIN) p50 (p25-p75) |
+|---|---|---|---|
+| Worker -> Turso libSQL | 190 (184-194.25) | 184 (180-189) | 192 (188-199) |
+| Worker -> Turso engine | - | 186 (183-188) | 195 (192-201) |
+| Worker -> Durable Object | - | - | 221 (216-225) |
+| Worker -> D1 binding | 227 (224-232) | 221 (219-223.25) | 230 (225-234) |
+| Worker -> Hyperdrive (caching off) -> Postgres | 257 (251-284) | 250 (249-282) | 283 (257-287) |
+| Worker -> PostgREST | 307 (302-324) | 324 (290-327) | 370.5 (347-381.25) |
+| Worker -> Hyperdrive (caching on), hot set of 10 ids | 5 (4-10.25) | 1 (1-2) | 5 (3-8) |
+| local -> Supavisor transaction mode (6543) | 252.29 (244.47-259.13) | 255.57 (246.12-269.23) | 253.34 (245.03-265.59) |
+| local -> Turso over HTTP | 257.9 (252.23-282.2) | 265 (256.51-306.06) | 264.67 (256.47-299.95) |
 
 - Turso's first query in each Worker invocation cost 740 ms (2026-10-15) and
   729.5 ms (2026-10-16) at p50 against 189 and 183 for the rest: the client
-  sets up its connection inside the first query. A Worker that serves one
-  query per request pays this every time.
+  sets up its connection inside the first query (r3: 755 against 191). A
+  Worker that serves one query per request pays this every time. The Durable
+  Object showed no such cost (r3: 231.5 first against 220 for the rest); its
+  range touches D1's, so neither is faster by the p25-p75 rule.
 - From the Worker the Postgres connection through Hyperdrive opened in 7 ms
   (2026-10-15) and 2 ms (2026-10-16), so excluding it from the operation
   timings changes little. From the local machine the pooler connect took
@@ -318,14 +338,59 @@ a write at the primary became visible after one `sync()` at 913.28 ms p50
 (2026-10-15). Opening a fresh replica took 36143.833 ms on 2026-10-15 and
 79749.385 ms on 2026-10-16. The same replica pointed at a Turso-engine
 database did not open (`file is not a database`); Turso's docs recommend
-Turso Sync (`@tursodatabase/sync`) for new projects[^turso-sync], and its
-module rows failed on 2026-10-16 when the Turso organization refused writes
-(below).
+Turso Sync (`@tursodatabase/sync`) for new projects[^turso-sync]. Its module
+rows failed on the first account when the Turso organization refused writes
+(below) and ran in r3 on a second account (n = 30 after 3 warm-up; local read
+n = 300):
+
+| Engine | Push p50 | Pull p50 | Visible after one pull | Local read p50 | Same row updated offline on A and B, A pushes first |
+|---|---|---|---|---|---|
+| libSQL | 531.97 ms | 301.36 ms | 30/30 | 0.03 ms | B's push returned without error and both clients read B's value, 30 of 30 |
+| Turso engine | 644.36 ms | 395.07 ms | 30/30 | 0.03 ms | the same, 30 of 30 |
+
+A's update disappeared with no signal on either engine: the conflict rule
+is last push wins.
+
+## A Durable Object as the store
+
+A SQLite-backed Durable Object is one named object with its own SQLite
+database, reached from the Worker by RPC; the module placed it with
+`locationHint` `oc`, which the docs call "a best effort and not a
+guarantee"[^do-location]. Each operation below is one RPC. The r3 battery ran
+it next to the others; each figure names the Worker colo of its module, and
+figures from different colos are not compared.
+
+| Workload (r3) | Durable Object | D1 in the same run | Worker colo |
+|---|---|---|---|
+| Point read p50 (p25-p75) | 221 (216-225) ms | 230 (225-234) ms | SIN |
+| Job of 8 statements, p50 (p25-p75) | 1026 (1018-1085) ms | 1126.5 (1108-1164.75) ms | KIX |
+| Inserts ops/s at 1 / 4 / 16 / 64 writers | 5.22 / 20.65 / 74.46 / 224.36 | 4.95 / 19.63 / 72.34 / 179.65 | C1/C4 HKG, C16 HKG+KIX, C64 mixed |
+| 100,000-event ingest, summed op time | 28581 ms | 29592 ms | HKG |
+| Window-function aggregate (p95_by_colo) p50 | 426.5 ms | 484.5 ms | HKG |
+| Full-text query p50, 4 shapes | 174-195 ms, top 10 equal to D1's | 182.5-200 ms | HKG |
+| Tenant: burst of 20 to first query, p50 (max) | 1623.38 (1924.57) ms via the Worker | 2289.56 (3079) ms via REST | local; Worker at SIN on the single-tenant row (TD01k), not recorded for the burst |
+
+- Transactions: `sql.exec` refused `BEGIN TRANSACTION` (`To execute a
+  transaction, please use the state.storage.transaction() or
+  state.storage.transactionSync() APIs instead of the SQL BEGIN TRANSACTION
+  or SAVEPOINT statements`), as the docs say[^do-sql]; a batch run inside
+  `transactionSync` committed in 238 ms and rolled back as a whole.
+  Read-your-write held 30/30.
+- No `vector32` (`no such function: vector32`), and `sqlite_version()` is
+  refused, as on D1 (RUNLOG, not in an artifact).
+- In the job-state run (KIX) the job ordering was `pg < do ~ turso ~ d1 <
+  postgrest ~ tursodb (also do < d1)`; in the SIN
+  point-read run it tied D1. The colo, the hour and the fixture differ between
+  those runs.
+- The tenant row is not a like-for-like provisioning comparison: the Durable
+  Object path is one request to the Worker plus three RPCs with no create
+  call, D1's a REST create and REST queries.
 
 ## Provider behaviour during the runs
 
-- Turso answered HTTP 520 on 7 rows on 2026-10-16 (none on 2026-10-15),
-  on both engines. The modules now re-send a lost batch once where a row
+- Turso answered HTTP 520 on 7 rows in the 2026-10-16 re-run (both engines)
+  and on 4 more in r3 (libSQL only, one in a superseded artifact; none on
+  2026-10-15). The modules now re-send a lost batch once where a row
   count or a duplicate key shows whether it landed.
 - The Turso organization (`plan_id starter`, taken as the Free plan) refused
   every write during the
@@ -334,8 +399,21 @@ module rows failed on 2026-10-16 when the Turso organization refused writes
   afterwards (not in an artifact), its usage for the billing period showed
   11,774,888 rows written against the documented 10 million per
   month[^turso-pricing]. Of that, the Turso-engine database counted 9,639,906
-  and the libSQL one 900,317 over overlapping but not identical workloads;
-  why was not isolated.
+  and the libSQL one 900,317 over overlapping but not identical workloads.
+- r3 traced that gap on a second account. On one throwaway database per
+  engine and statement shape, inserts, GROUP BY and ORDER BY counted the same
+  on both engines (about 1 row written per row, plus 1 per index entry). The
+  window-function query in the analytics workload, `p95_by_colo` (a subquery
+  with `row_number()` and `count(*)` `OVER (PARTITION BY colo)`), counted
+  60,002 rows written on the
+  Turso engine for an ingest of 2,000 rows plus 7 executions, against 4,003
+  on libSQL for the same ingest and all five dashboard queries: 4 per input
+  row per execution, and none on libSQL. Applied to the first account's runs
+  this gives 100,000 rows x 23 passes x 4 = 9,200,000 (derived, not
+  re-measured). Whether other window functions or sorts do the same was not
+  measured. With that query skipped on the Turso
+  engine, the full TD05 run at 07:40 (100,000-event ingest plus the dashboard
+  queries, Worker at HKG) counted 200,002 (Turso engine) and 200,028 (libSQL).
 
 <Aside type="caution" title="Watch the write counter">
 On a Turso plan with a rows-written allowance, a write-heavy test can exhaust
@@ -357,9 +435,13 @@ Read the organization's usage before and after a load test.
   wherever it changes the reading.
 - Throughput figures in the contention section are one sample per cell per
   run; the libSQL drop at 64 writers is the claim that three runs support.
+- In r3 the Worker colo moved between modules (SIN, KIX, HKG) with nothing
+  changed on the client side; r3 figures are compared within one module's
+  run only.
 - Not compared: cost per month, Auth and row-level security, Storage,
   Realtime, backup and restore, read replicas (D1 read replication was left
-  at its default), and any Worker colo other than SIN and NRT.
+  at its default), Durable Object point-in-time recovery, and self-hosted
+  runtimes (workerd, celld).
 
 ## What to do about it
 
@@ -373,6 +455,9 @@ Read the organization's usage before and after a load test.
 | Use FTS5 on D1 or Turso libSQL, not on the Turso engine, for full-text search. | The Turso engine refused the FTS5 table on Cloud. | TD06 |
 | Measure recall at your index arguments before shipping libSQL vector search. | recall@10 0.245 and 0.265 with the arguments chosen for load speed; pgvector 1 from SIN (0.95 in the NRT run). | TD06 |
 | Use a Postgres schema or D1 when a new tenant must answer quickly after signup. | Burst p50 to first query from the local machine on 2026-10-16: 1012.95 ms (schema), 2177.16 ms (D1 REST), 4080.64 ms (Turso). A Worker binding to a new D1 database needs a redeploy; not measured. | TD01 |
+| Measure rows written by window-function queries on the Turso engine first. | `p95_by_colo` counted 4 rows written per input row per execution on the Turso engine, none on libSQL (probe, `rows-written-probe.txt`); TD05c small run: +300002 against +20029 for the same 10000 events. | TD05c; probe script |
+| Detect concurrent offline edits yourself when you sync with Turso Sync. | The second push won without an error in 30 of 30 trials on both engines. | TD08f |
+| Give each entity its own Durable Object when one Worker coordinates its state. | Created on first access, burst p50 to first query 1623.38 ms from the local machine via the Worker; `BEGIN TRANSACTION` refused, `transactionSync` batches committed and rolled back (r3). | TD01, TD07 |
 | Read Turso's organization usage before and after a load test on a capped plan. | TD08 writes refused with `SQL write operations are forbidden`; the period's usage, read by hand afterwards and not in an artifact, showed 11,774,888 rows written. | TD08 |
 
 ## Decision guide
@@ -422,31 +507,35 @@ digraph {
 ## Evidence, by module
 
 Measured claims map to module ids in
-[experiments/sqlite-edge-compare](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare);
+[experiments/sqlite-edge-compare](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare);
 the run record is its
-[RUNLOG.md](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/RUNLOG.md)
+[RUNLOG.md](https://github.com/erfianugrah/supabase-lab/blob/0b0a590/experiments/sqlite-edge-compare/RUNLOG.md)
 and the results by use case its
-[README](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/README.md).
+[README](https://github.com/erfianugrah/supabase-lab/blob/0b0a590/experiments/sqlite-edge-compare/README.md).
 Redacted artifacts with their measurement tables are under
-[out/2026-10-15/](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-15)
+[out/2026-10-15/](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare/out/2026-10-15)
 and
-[out/2026-10-16/](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16).
+[out/2026-10-16/](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare/out/2026-10-16).
 Every number in a measured row above was taken from those tables; the
-standalone probes and the hand-read Turso usage named in the text are not in
-an artifact.
+rows-written probe's printed output is
+[out/2026-10-16/rows-written-probe.txt](https://github.com/erfianugrah/supabase-lab/blob/0b0a590/experiments/sqlite-edge-compare/out/2026-10-16/rows-written-probe.txt)
+(script:
+[scripts/rows-written-probe.ts](https://github.com/erfianugrah/supabase-lab/blob/0b0a590/experiments/sqlite-edge-compare/scripts/rows-written-probe.ts));
+the other standalone probes and the hand-read Turso usage named in the text
+are not in an artifact.
 
 ## Modules
 
 | Module | Experiment | Test | Artifact |
 |---|---|---|---|
-| TD01 | sqlite-edge-compare | [`td01-db-per-tenant.ts`](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/tests/td01-db-per-tenant.ts) | [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16) |
-| TD02 | sqlite-edge-compare | [`td02-point-reads.ts`](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/tests/td02-point-reads.ts) | [`out/2026-10-15`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-15), [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16) |
-| TD03 | sqlite-edge-compare | [`td03-job-state-writes.ts`](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/tests/td03-job-state-writes.ts) | [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16) |
-| TD04, TD04m2 | sqlite-edge-compare | [`td04-write-contention.ts`](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/tests/td04-write-contention.ts) | [`out/2026-10-15`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-15), [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16) |
-| TD05 | sqlite-edge-compare | [`td05-event-log.ts`](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/tests/td05-event-log.ts) | [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16) |
-| TD06 | sqlite-edge-compare | [`td06-search.ts`](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/tests/td06-search.ts) | [`out/2026-10-15`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-15), [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16) |
-| TD07, TD07c | sqlite-edge-compare | [`td07-tx-semantics.ts`](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/tests/td07-tx-semantics.ts) | [`out/2026-10-15`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-15), [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16) |
-| TD08 | sqlite-edge-compare | [`td08-embedded-replica.ts`](https://github.com/erfianugrah/supabase-lab/blob/3848c08/experiments/sqlite-edge-compare/tests/td08-embedded-replica.ts) | [`out/2026-10-15`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-15), [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/3848c08/experiments/sqlite-edge-compare/out/2026-10-16) |
+| TD01 | sqlite-edge-compare | [`td01-db-per-tenant.ts`](https://github.com/erfianugrah/supabase-lab/blob/0b0a590/experiments/sqlite-edge-compare/tests/td01-db-per-tenant.ts) | [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare/out/2026-10-16) |
+| TD02 | sqlite-edge-compare | [`td02-point-reads.ts`](https://github.com/erfianugrah/supabase-lab/blob/0b0a590/experiments/sqlite-edge-compare/tests/td02-point-reads.ts) | [`out/2026-10-15`](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare/out/2026-10-15), [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare/out/2026-10-16) |
+| TD03 | sqlite-edge-compare | [`td03-job-state-writes.ts`](https://github.com/erfianugrah/supabase-lab/blob/0b0a590/experiments/sqlite-edge-compare/tests/td03-job-state-writes.ts) | [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare/out/2026-10-16) |
+| TD04, TD04m2 | sqlite-edge-compare | [`td04-write-contention.ts`](https://github.com/erfianugrah/supabase-lab/blob/0b0a590/experiments/sqlite-edge-compare/tests/td04-write-contention.ts) | [`out/2026-10-15`](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare/out/2026-10-15), [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare/out/2026-10-16) |
+| TD05 | sqlite-edge-compare | [`td05-event-log.ts`](https://github.com/erfianugrah/supabase-lab/blob/0b0a590/experiments/sqlite-edge-compare/tests/td05-event-log.ts) | [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare/out/2026-10-16) |
+| TD06 | sqlite-edge-compare | [`td06-search.ts`](https://github.com/erfianugrah/supabase-lab/blob/0b0a590/experiments/sqlite-edge-compare/tests/td06-search.ts) | [`out/2026-10-15`](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare/out/2026-10-15), [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare/out/2026-10-16) |
+| TD07, TD07c | sqlite-edge-compare | [`td07-tx-semantics.ts`](https://github.com/erfianugrah/supabase-lab/blob/0b0a590/experiments/sqlite-edge-compare/tests/td07-tx-semantics.ts) | [`out/2026-10-15`](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare/out/2026-10-15), [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare/out/2026-10-16) |
+| TD08 | sqlite-edge-compare | [`td08-embedded-replica.ts`](https://github.com/erfianugrah/supabase-lab/blob/0b0a590/experiments/sqlite-edge-compare/tests/td08-embedded-replica.ts) | [`out/2026-10-15`](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare/out/2026-10-15), [`out/2026-10-16`](https://github.com/erfianugrah/supabase-lab/tree/0b0a590/experiments/sqlite-edge-compare/out/2026-10-16) |
 
 ## Related docs
 
@@ -468,4 +557,7 @@ an artifact.
 [^d1-limits]: Cloudflare, "Limits," Cloudflare D1 Docs. https://developers.cloudflare.com/d1/platform/limits/
 [^d1-debug]: Cloudflare, "Debug D1," Cloudflare D1 Docs. https://developers.cloudflare.com/d1/observability/debug-d1/
 [^d1-api]: Cloudflare, "D1 Database," Cloudflare D1 Docs. https://developers.cloudflare.com/d1/worker-api/d1-database/
+[^do-sql]: Cloudflare, "SQLite-backed Durable Object Storage," Cloudflare Durable Objects Docs. https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/
+[^do-limits]: Cloudflare, "Limits," Cloudflare Durable Objects Docs. https://developers.cloudflare.com/durable-objects/platform/limits/
+[^do-location]: Cloudflare, "Data location," Cloudflare Durable Objects Docs. https://developers.cloudflare.com/durable-objects/reference/data-location/
 [^hd-cache]: Cloudflare, "Query caching," Cloudflare Hyperdrive Docs. https://developers.cloudflare.com/hyperdrive/concepts/query-caching/
