@@ -1,0 +1,213 @@
+---
+title: "CipherStash EQL on Supabase: install, grants, PostgREST operands"
+description: What CipherStash's Encrypt Query Language (EQL v3) needs from a Supabase database, measured on a local supabase/postgres 17.11 and PostgREST 14.17 rig with real EQL ciphertext and no CipherStash account - the installer as the non-superuser postgres role, the grants a role reading a table with an EQL index needs (plaintext columns included), which PostgREST filter operand works under RLS, a data key held in a storage-only encrypted column, and what EQL does not cover for large objects.
+author: Erfi Anugrah
+category: supabase
+group: architecture
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+What CipherStash's Encrypt Query Language (EQL) needs from a Supabase database before its searchable ciphertext can sit in a table that the Data API serves under RLS, and where it fits next to client-side encryption of large objects in Storage. For anyone adding field-level encryption to a Supabase schema, or deciding which part of a customer-held-key design EQL can carry.
+
+Everything marked measured comes from the [cipherstash-eql](https://github.com/erfianugrah/supabase-lab/tree/b062d10/experiments/cipherstash-eql) experiment in [supabase-lab](https://github.com/erfianugrah/supabase-lab), run on 2026-10-19 on a local Docker rig: `supabase/postgres:17.11.0.004`, whose `postgres` role is not a superuser, and `postgrest/postgrest:v14.17`. Managed Supabase was not tested. The ciphertext is real EQL v3, produced by CipherStash's own Rust engine (`stack-encrypt`, cipherstash/stack commit `66092fe`) over an in-memory test key source (`FakeDataKeySource`), so no CipherStash account and no ZeroKMS, CipherStash's key service, took part; nothing here measures ZeroKMS. One run of each check (n = 1); results and the run notes are in the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/b062d10/experiments/cipherstash-eql/RUNLOG.md). Statements cited to CipherStash or Supabase documentation were not run, and source-read means read from code, not measured.
+
+TL;DR:
+
+- EQL 3.0.6 installed from its release SQL as `postgres` (`superuser=false`, psql exit 0). The installer skipped the ORE operator class, which needs a superuser, and reported 20 ORE-backed domains disabled; the equality domain worked.
+- The installer grants nothing, per its permissions doc,[^eql-permissions] and both EQL schemas had no privileges for other roles after the install. With an EQL functional index on a table, `authenticated` without the EQL grants failed even plaintext-only SELECTs on that table in a fresh connection: `permission denied for schema eql_v3_internal`, context `SQL function "eq_term" during inlining`. Granting USAGE on `eql_v3` and `eql_v3_internal` plus EXECUTE on all their functions fixed it.
+- The same plaintext reads succeeded without any grant in a connection where `postgres` had planned against the table first, so a grant check in a reused connection can pass while fresh connections fail.
+- Through PostgREST, equality worked with a full stored envelope as the `eq.` operand, and RLS still scoped rows per owner (A `[1]`, B `[3]`). The term-only query envelope failed the column's domain check (`400`, `23514`). The operand sits in the GET query string, ciphertext and index terms included.
+- A 32-byte data key in a storage-only `eql_v3_text` column round-tripped through PostgREST (one row).
+- The installer created 52 EQL domains in 11 families, none of them binary, and CipherStash's docs say it does not replace object encryption, so large objects stay with client-side encryption in Storage. EQL covers the catalogue fields; whether ZeroKMS can hold the key for each object was not tested.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  app [label="Application\n(Stack SDK or encryptedSupabase)\nencrypts values and query terms", style=rounded];
+  kms [label="ZeroKMS\nauthority key\n(not in this rig)"];
+  ck [label="Client key\n(application side)", shape=note];
+
+  subgraph cluster_sb {
+    label="Supabase project"; style=rounded; fontsize=12; margin=12;
+    rest [label="Data API\n(PostgREST)"];
+    pg [label="Postgres\nEQL domains, eql_v3 functions,\nfunctional indexes, RLS", shape=cylinder];
+  }
+
+  app -> kms [label="key ID out, key seed back", dir=both];
+  ck -> app;
+  app -> rest [label="GET ?col=eq.<stored envelope>"];
+  rest -> pg [label="as authenticated\n(needs EQL grants)"];
+}
+```
+
+1. The application encrypts each value, and each query term, before it leaves; CipherStash's docs describe ZeroKMS returning a key seed that only the application's client key turns into a data key.[^cs-key-mgmt] In this rig the in-memory test key source stands in for both halves.
+2. Postgres stores EQL payloads (JSON with ciphertext and index terms) in EQL domains and compares index terms, never plaintext.
+3. PostgREST runs the query as the caller's role, so that role needs the EQL schema grants, and RLS applies as usual.
+
+---
+
+## Which do I pick
+
+| You need | Use | Why |
+|---|---|---|
+| Encrypted columns that stay searchable by equality | An `_eq` EQL domain plus a functional index on `eql_v3.eq_term(col)` | Equality over SQL and PostgREST returned A `[1]`, B `[3]` (CE03); EXPLAIN can use the index (CE05) |
+| Ordering or ranges on Supabase | `_ord` or `_ord_ope` domains (both OPE),[^eql-core] not `_ord_ore` | The installer disabled 20 ORE-backed domains without a superuser; OPE ordering not run here |
+| Equality through PostgREST (supabase-js per CipherStash's guide, not run) | A full stored envelope as the filter operand | The term-only query envelope failed the domain check, `400` `23514` (CE03); CipherStash's supabase-js guide sends a stored envelope[^cs-supabase-js] |
+| A per-object data key stored with the catalogue row | A storage-only `eql_v3_text` column | One 32-byte key round-tripped through PostgREST (CE04); key custody depends on ZeroKMS, not tested |
+| The large objects themselves encrypted under your key | Client-side chunked encryption in Storage, as in [one envelope-encrypted app](/reference/supabase-client-keyed-objects/) | None of the 11 installed domain families is binary; CipherStash's docs say it does not replace object encryption[^cs-vs-kms] |
+
+---
+
+## Install as the non-superuser role
+
+The release ships one SQL file, `cipherstash-encrypt.sql`, and there is no separate Supabase build;[^eql-supabase] it needs pgcrypto in `extensions` or `public` and a superuser only for the optional block-ORE operator class.[^eql-permissions] On the rig, psql as `postgres` installed 3.0.6 with exit 0; pgcrypto was already in `extensions` from the image. It created 52 EQL domains in `public`, in 11 families: `bigint`, `boolean`, `date`, `double`, `integer`, `json`, `numeric`, `real`, `smallint`, `text`, `timestamp`.
+
+The installer printed two notices (`install-notices.txt`): it skipped `eql_v3_internal.ore_block_256_operator_class` ("requires superuser") and reported "20 ORE-backed domains disabled and will raise on use", pointing to the `_ord_ope` (ordering) and `_eq` (equality) domains, with OPE ordering domains unaffected. Neither the disabled ORE domains nor the OPE domains were exercised.
+
+CipherStash's `stash init --supabase` installs EQL with the grants Supabase's `anon`, `authenticated` and `service_role` roles need, per its quickstart;[^cs-quickstart] this rig used the raw SQL file, which grants nothing (`eql_schema_acl` null on both schemas after the install), to see what the grants do.
+
+## The grants, and what fails without them
+
+The installer issues no GRANT, per CipherStash's permissions page, which lists the opt-in grants: USAGE on `eql_v3` and `eql_v3_internal`, EXECUTE on all functions in both, USAGE on `extensions`.[^eql-permissions] CE03 applied the first four, not USAGE on `extensions`. Every SQL check below ran in its own new connection as `authenticated`. The first result column is the installer's state with the EQL functional index on `app.assets` (CE02), the second the same with the index dropped inside a rolled-back transaction (CE02), the third after the four grants (CE03):
+
+| Query as `authenticated` | No grants | No grants, index dropped | After four grants |
+|---|---|---|---|
+| Equality on the encrypted column | `permission denied for schema eql_v3` | not run | A `[1]`, B `[3]` |
+| `SELECT count(*)` (plaintext only) | `permission denied for schema eql_v3_internal` | 2 | 2 |
+| `... WHERE id = 1` (plaintext only) | `permission denied for schema eql_v3_internal` | 1 | 1 |
+| `... ORDER BY id` (plaintext only) | `permission denied for schema eql_v3_internal` | 2 | 2 |
+| PostgREST `select=id&order=id` | `403` `42501` `permission denied for schema eql_v3_internal` | not run | `[1, 2]` |
+
+The plaintext failures carry the context `SQL function "eq_term" during inlining`. The planner inlines the index expression `eql_v3.eq_term`, whose body calls `eql_v3_internal.hmac_256`, and the permission check on that schema fails while the query is planned, before any column is read (EQL 3.0.6 SQL, source-read). A role that can SELECT the table and holds no EQL grant, `eql_probe_reader`, failed the same three plaintext queries the same way after `authenticated` had its grants (CE03). By that mechanism `anon`, `service_role` or a reporting role would fail the same way without the grants; those roles, and writes, were not run.
+
+<Aside type="caution" title="A reused connection can pass without the grants">
+In a new connection where `postgres` first ran `SELECT ... WHERE id = 1` on the table, the same three plaintext reads as `authenticated` returned 2, 1 and 2 rows before any grant (CE02). The likely mechanism, recalled and not measured beyond that row: Postgres caches a table's index expressions per backend, so the inlining and its permission check happen once per backend, as whichever role plans first. Test grants in a fresh connection; through a pool, whether a request fails can depend on which backend serves it (reasoned from these rows, not measured through a pooler).
+</Aside>
+
+## Equality through PostgREST under RLS
+
+The catalogue was `app.assets (id, owner uuid, subject_ref eql_v3_text_eq, wrapped_dek eql_v3_text)` with RLS `owner = auth.uid()` for `authenticated`. Owner A held rows 1 (`S-001`) and 2 (`S-002`), owner B rows 3 (`S-001`) and 4 (`S-003`). After the grants (CE03):
+
+| Request | Result |
+|---|---|
+| SQL, `subject_ref = <term-only query envelope>::eql_v3.query_text_eq`, as A / as B | `[1]` / `[3]` |
+| PostgREST `subject_ref=eq.<freshly encrypted full stored envelope of S-001>`, as A / as B | `[1]` (200) / `[3]` (200) |
+| PostgREST `subject_ref=eq.<term-only query envelope>`, as A | `400` `23514` `value for domain eql_v3_text_eq violates check constraint "eql_v3_text_eq_check"` |
+| PostgREST unfiltered, as A | `[1, 2]` (200) |
+
+The term-only query envelope was 116 bytes, the full stored envelope 275 bytes, and the percent-encoded PostgREST path and query string carrying it 427 bytes (419 to 435 in earlier, unarchived runs on 2026-10-19, as the ciphertext changes). CipherStash's supabase-js guide describes the same constraint ("PostgREST cannot cast a term-only query envelope") and asks for application and proxy logs not to keep query strings, since the operand carries ciphertext and every index term for the value.[^cs-supabase-js] In the final run PostgREST 14.17 at its default log level wrote one request line, the rig's start-up check (`GET /`, `503`), and none for the 200, 400 or 403 responses; in an earlier, unarchived run the same day it logged requests carrying the operand, full query string included, when it answered them `503` (schema cache not loaded). What the managed API gateway keeps in its logs was not tested.
+
+The guide, written for EQL 3.0.4 (the rig ran 3.0.6), also lists what the wrapper cannot do through PostgREST: encrypted free-text and encrypted JSON queries, and `.csv()`.[^cs-supabase-js] None of those were run here.
+
+<Aside type="note" title="auth.uid() in the bare image">
+In an earlier, unarchived run the `supabase/postgres` image's own `auth.uid()` read only `request.jwt.claim.sub`; PostgREST 14 sets the claims as JSON in `request.jwt.claims`,[^pgrst-auth] so RLS on `auth.uid()` matched no rows for either owner. GoTrue's migrations replace the function with one that reads both;[^gotrue-uid] the rig installs that definition first. A Supabase project or the full compose stack runs GoTrue's migrations; a rig of bare Postgres plus PostgREST does not.
+</Aside>
+
+## A data key in an encrypted column
+
+Each row's `wrapped_dek` held a 32-byte key read from `/dev/urandom`, base64, encrypted as a storage-only `eql_v3_text`. The 4 rows were inserted over SQL as `postgres`; the stored column text contained none of the four keys (base64 form) and none of the subject references (CE01), and row 1 as PostgREST returned it to A decrypted to the original key, 32 bytes, and to `S-001` (CE04). `stack-encrypt` at commit `66092fe` derives no `EncryptFrom` for the storage-only domain, so the probe sealed natively and wrapped the payload, as CipherStash's own tests do for the equality domain (source-read).
+
+That shows the column holds the key and Supabase returns it as ciphertext. It does not show key custody: with ZeroKMS each value gets its own derived data key, the client key stays with the application and ZeroKMS holds the authority key, per CipherStash's docs,[^cs-key-mgmt] and the rig replaced both with an in-memory fake. ZeroKMS regions, availability and latency were not tested; its docs list seven AWS regions[^cs-residency] and state that applications cannot encrypt or decrypt while it is unavailable.[^cs-dr]
+
+## What EQL does not cover
+
+The 11 domain families the installer created on the rig are integers of three sizes, numerics, two float types, dates, timestamps, text, booleans and JSON, which matches CipherStash's core concepts page;[^eql-core] the TypeScript SDK's plaintext types are string, number, boolean, bigint, date and JSON, with no bytes type ([`js_plaintext.rs`](https://github.com/cipherstash/stack/blob/66092fe450b555353a138d0d104f204cfcf255b1/languages/typescript/packages/protect-ffi/crates/protect-ffi/src/js_plaintext.rs#L36-L59), source-read). CipherStash's comparison with AWS KMS states that it "does not replace disk, volume, object, or backup encryption".[^cs-vs-kms] For an object store holding large binary records under a customer-held key, the objects stay with client-side encryption in Storage, as measured on the [envelope-encrypted app page](/reference/supabase-client-keyed-objects/); EQL can carry the searchable fields of the catalogue and, as above, a ciphertext copy of each object's data key.
+
+---
+
+## Reading the numbers
+
+- Every result is one run on one local rig. The rig's Postgres server version, 17.11, matches the version managed reported on 2026-10-12 (17.11 on the [envelope-encrypted app page](/reference/supabase-client-keyed-objects/)), but managed was not tested, and managed's `postgres` role, grants and gateway can differ from the image.
+- The ciphertext is real EQL v3, so the SQL, domain and PostgREST results should transfer to payloads ZeroKMS produces (inferred: the payload format does not depend on the key source; not tested). The key handling does not transfer, because the test key source models none of ZeroKMS's authorisation.
+- The plaintext-read failure depends on a functional index existing and on the connection being fresh: with the index dropped, the same reads returned 2, 1 and 2 rows before any grant (CE02). Equality on a table with EQL columns and no index was not tested.
+
+---
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Grant readers USAGE on both EQL schemas and EXECUTE on their functions. | Without the grants, `authenticated` and a SELECT-only role failed plaintext-only reads (`permission denied for schema eql_v3_internal`); after the grants `authenticated` counted 2, 1 and 2 rows. | CE02, CE03 |
+| Check EQL grants from a fresh connection, not a reused one. | A connection where `postgres` planned first let the same reads pass before any grant. | CE02 |
+| Use `_eq`, `_ord` or `_ord_ope` domains on Supabase, not `_ord_ore`. | Without a superuser the installer disabled 20 ORE-backed domains; OPE ordering not run. | install |
+| Send a full stored envelope as the PostgREST `eq.` operand. | The term-only query envelope failed the domain check, `400` `23514`; the stored envelope returned A `[1]`, B `[3]`. | CE03 |
+| Keep query strings out of application, proxy and gateway logs. | The operand carries ciphertext and index terms in the GET query string; managed gateway logging not tested. | CE03 |
+| Keep RLS predicates on plaintext ownership columns. | `owner = auth.uid()` scoped encrypted-column reads per owner; CipherStash's docs give the same advice.[^cs-supabase] | CE03 |
+| Encrypt large objects client-side; use EQL for catalogue fields. | None of the 11 installed EQL domain families is binary; a 32-byte key in `eql_v3_text` round-tripped. | install, CE04 |
+| Install GoTrue's `auth.uid()` on a bare Postgres plus PostgREST test rig. | The image's version reads only `request.jwt.claim.sub`; earlier, unarchived run: RLS matched no rows. | RUNLOG |
+
+---
+
+## Not measured
+
+- Managed Supabase and the self-hosted compose stack: the rig was bare `supabase/postgres` plus PostgREST.
+- ZeroKMS: key derivation, authorisation, regions, availability, latency and cost.
+- The TypeScript `encryptedSupabase` wrapper; this rig built requests by hand.
+- OPE ordering and range filters, free-text match, encrypted JSON, and the disabled ORE domains.
+- Any write through PostgREST (the 4 rows were inserted over SQL as `postgres`), writes by a role without the EQL grants, and the roles `anon` and `service_role`.
+- Any connection pool, any timing, and the managed API gateway's logs.
+
+---
+
+## Evidence, by module
+
+| Claim | How it was checked | Module |
+|---|---|---|
+| Installs as `postgres`; grants nothing; ORE class skipped; 20 ORE domains disabled; 52 domains in 11 families | psql of the release SQL; exit status, notices, EQL schema ACLs and the installed domains recorded | [`install.txt`](https://github.com/erfianugrah/supabase-lab/blob/b062d10/experiments/cipherstash-eql/out/2026-10-19/install.txt), [`install-notices.txt`](https://github.com/erfianugrah/supabase-lab/blob/b062d10/experiments/cipherstash-eql/out/2026-10-19/install-notices.txt) |
+| CipherStash's own store, query, index and decrypt test passes on this database | `tests/text_eq.rs` with its ignored database test, as `postgres`: 9 passed | [`vendor-text_eq.txt`](https://github.com/erfianugrah/supabase-lab/blob/b062d10/experiments/cipherstash-eql/out/2026-10-19/vendor-text_eq.txt) |
+| No plaintext in stored rows | 4 rows counted; stored column text searched for each reference and key | CE01 |
+| Grants: what fails without them, a warm connection, the index | three plaintext SQL shapes per state, each in a new connection; PostgREST plaintext read | CE02, CE03 |
+| PostgREST operands under RLS | stored and term-only envelopes as `eq.` operands, per owner | CE03 |
+| Data key round trip | decrypt of the PostgREST response for row 1 | CE04 |
+| Index usable | EXPLAIN as `postgres`, `enable_seqscan = off`: Bitmap Index Scan on `assets_subject_ref_idx` | CE05 |
+
+The result object for CE01-CE05 is [`ce-local.json`](https://github.com/erfianugrah/supabase-lab/blob/b062d10/experiments/cipherstash-eql/out/2026-10-19/ce-local.json); the PostgREST log is [`pgrst.log`](https://github.com/erfianugrah/supabase-lab/blob/b062d10/experiments/cipherstash-eql/out/2026-10-19/pgrst.log).
+
+---
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| CE01 | cipherstash-eql | [`supabase_probe.rs`](https://github.com/erfianugrah/supabase-lab/blob/b062d10/experiments/cipherstash-eql/probe/supabase_probe.rs) | [`out/2026-10-19`](https://github.com/erfianugrah/supabase-lab/tree/b062d10/experiments/cipherstash-eql/out/2026-10-19) |
+| CE02 | cipherstash-eql | [`supabase_probe.rs`](https://github.com/erfianugrah/supabase-lab/blob/b062d10/experiments/cipherstash-eql/probe/supabase_probe.rs) | [`out/2026-10-19`](https://github.com/erfianugrah/supabase-lab/tree/b062d10/experiments/cipherstash-eql/out/2026-10-19) |
+| CE03 | cipherstash-eql | [`supabase_probe.rs`](https://github.com/erfianugrah/supabase-lab/blob/b062d10/experiments/cipherstash-eql/probe/supabase_probe.rs) | [`out/2026-10-19`](https://github.com/erfianugrah/supabase-lab/tree/b062d10/experiments/cipherstash-eql/out/2026-10-19) |
+| CE04 | cipherstash-eql | [`supabase_probe.rs`](https://github.com/erfianugrah/supabase-lab/blob/b062d10/experiments/cipherstash-eql/probe/supabase_probe.rs) | [`out/2026-10-19`](https://github.com/erfianugrah/supabase-lab/tree/b062d10/experiments/cipherstash-eql/out/2026-10-19) |
+| CE05 | cipherstash-eql | [`supabase_probe.rs`](https://github.com/erfianugrah/supabase-lab/blob/b062d10/experiments/cipherstash-eql/probe/supabase_probe.rs) | [`out/2026-10-19`](https://github.com/erfianugrah/supabase-lab/tree/b062d10/experiments/cipherstash-eql/out/2026-10-19) |
+| install | cipherstash-eql | [`run-local.sh`](https://github.com/erfianugrah/supabase-lab/blob/b062d10/experiments/cipherstash-eql/run-local.sh) | [`out/2026-10-19`](https://github.com/erfianugrah/supabase-lab/tree/b062d10/experiments/cipherstash-eql/out/2026-10-19) |
+| RUNLOG | cipherstash-eql | the earlier, unarchived run, recorded in the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/b062d10/experiments/cipherstash-eql/RUNLOG.md) only | none published |
+
+The probe runs outside the lab's test harness (pvlab), from a checkout of cipherstash/stack at commit `66092fe` (the GitHub source archive of that commit); `run-local.sh` copies it in and writes the artifacts.
+
+## Related docs
+
+- [One envelope-encrypted app on managed and self-hosted Supabase](/reference/supabase-client-keyed-objects/) -
+  the client-side encryption of large objects and the operator key service that EQL would sit beside for the catalogue.
+- [Supabase Storage large objects](/reference/supabase-storage-large-objects/) -
+  SSE-C headers accepted and ignored, and the Management API key surface, the reasons objects are encrypted on the client.
+- [Self-hosted Supabase Docker defaults in 2026](/reference/supabase-self-hosted-defaults/) -
+  the compose stack this rig stands in for, which runs GoTrue's migrations.
+- [Supabase Auth end to end](/reference/supabase-auth-end-to-end/) -
+  where the JWT claims that `auth.uid()` reads come from.
+
+[^cs-key-mgmt]: CipherStash, "Key management," CipherStash Docs. https://cipherstash.com/docs/concepts/key-management
+[^cs-vs-kms]: CipherStash, "CipherStash vs AWS KMS," CipherStash Docs. https://cipherstash.com/docs/concepts/compare/aws-kms
+[^eql-supabase]: CipherStash, "SUPABASE.md," encrypt-query-language on GitHub. https://github.com/cipherstash/encrypt-query-language/blob/9f45c275c4531cabe70321018533c74b66bd1f16/SUPABASE.md
+[^eql-permissions]: CipherStash, "EQL permissions & grants," encrypt-query-language on GitHub. https://github.com/cipherstash/encrypt-query-language/blob/9f45c275c4531cabe70321018533c74b66bd1f16/docs/reference/permissions.md
+[^cs-quickstart]: CipherStash, "Quickstart," CipherStash Docs (Supabase integration). https://cipherstash.com/docs/integrations/supabase/quickstart
+[^cs-supabase-js]: CipherStash, "supabase-js," CipherStash Docs (Supabase integration). https://cipherstash.com/docs/integrations/supabase/supabase-js
+[^cs-supabase]: CipherStash, "Overview," CipherStash Docs (Supabase integration). https://cipherstash.com/docs/integrations/supabase
+[^gotrue-uid]: Supabase, "20220224000811_update_auth_functions.up.sql," supabase/auth on GitHub. https://github.com/supabase/auth/blob/e062eeae0079a6b1a70d5d5da9e5ac5cb8c21194/migrations/20220224000811_update_auth_functions.up.sql
+[^pgrst-auth]: PostgREST, "Authentication," PostgREST 14 documentation. https://docs.postgrest.org/en/v14/references/auth.html
+[^cs-residency]: CipherStash, "Data residency," CipherStash Docs. https://cipherstash.com/docs/solutions/data-residency
+[^cs-dr]: CipherStash, "Disaster recovery," CipherStash Docs. https://cipherstash.com/docs/stack/cipherstash/kms/disaster-recovery
+[^eql-core]: CipherStash, "EQL core concepts," CipherStash Docs. https://cipherstash.com/docs/reference/eql/core-concepts
