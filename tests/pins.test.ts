@@ -775,9 +775,14 @@ const pins: Pin[] = [
       "projects paused, databases switched to read-only, new launches blocked",
       // The SLA section is the canonical contract text (plan axis + credits).
       "The uptime SLA is Enterprise-only",
+      // 2026-10-20: the rollback route refuses production; Team has no API daily-backup restore.
+      "`400` `You cannot rollback a production branch.`",
+      "`backup.retention_days` read 14 on",
     ],
     sections: [
       /^## The tiers on one axis$/m,
+      /^## A bad release$/m,
+      /^## The upgrades a tier depends on$/m,
       /^## Class zero: your own billing state$/m,
       /^## Which do I pick$/m,
     ],
