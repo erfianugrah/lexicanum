@@ -1,0 +1,273 @@
+---
+title: "Which model runs which agent work: model routing in a coding-agent harness"
+description: "How a coding-agent harness that can reach both a metered cloud API and a local GPU decides which model serves each request: a default per kind of caller, rules that override it (effort for deploys, vision for images), and guards on each provider path. Worked example: the pi harness, with a cloud default, a single-GPU local engine and cheapest-first loop ladders."
+author: Erfi Anugrah
+category: workstations
+---
+
+A coding agent that can reach both a metered cloud API and a local GPU has to decide, for every request, which model serves it. A wrong choice costs money (a long background job on a metered API), time (a local model evicted in the middle of a session), or correctness (a weak model running a deploy, a text-only model handed an image). This page describes how one harness makes that decision: a default for each kind of caller, rules that override the default, and guards on each provider path.
+
+The worked example is the pi harness, the subject of the series whose hub is [The pi harness journey](/reference/pi-harness-journey/). Its setup: a cloud default on OpenRouter, a local engine on one GPU behind the llmc proxy (covered in [Scheduling one GPU between LLM, image and training work](/reference/llmc-single-gpu-stack/)), and frontier models as the top rungs of some loop ladders. The workers this page routes are covered in [Subagents, worktrees, and parallel agent work](/reference/agent-subagents-and-worktrees/). The [last section](#what-carries-over-to-another-harness) lists what applies to a different setup.
+
+Every mechanism below is read from the harness source as of 2026-10-20. Ladder counts are measured from the 24 loop manifests across the repos on the dev box on the same day. Incidents are drawn from session history and cited by date.
+
+**TL;DR:**
+
+- Route by caller, not by session. Here the interactive session and `task` workers start on the cloud default (`openrouter/deepseek/deepseek-v4-pro`, thinking `high`); `bg_task` workers start on the local engine (`PI_BG_DEFAULT_MODEL='llmc/qwen38-swift-ninfer-xhigh'`).
+- A local default needs a fail-fast path. If the llmc proxy is down, a `bg_task` spawn errors at once instead of falling back to the cloud silently.
+- Loops climb a `models` ladder, cheapest rung first. 11 of the 24 ladders on the box start on a local rung, 5 on OpenRouter, 7 on Anthropic, and 1 on pi's default.
+- Effort follows blast radius. Deploys and infra mutations never run on the local 27B model at medium effort; they use an `-xhigh` preset or a cloud model. The rule follows a 2026-09-20 incident in which a medium-effort local session deployed a stack to the wrong host and its repair took a live service stack down.
+- A text-only default needs an image path. `vision-fallback.ts` replaces each image with a text description from the loaded local model, if it has vision, or from the whisper service's image endpoint.
+- Each provider path has its own guards: cloud requests get a 131072-token output cap and spend warnings; local sessions get an automatic preset lock and a context-budget nudge.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.9;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_callers {
+    label="who sends the request"; style=rounded; fontsize=12; margin=12;
+    session [label="interactive session"];
+    task [label="task worker"];
+    loop [label="loop iteration"];
+    bg [label="bg_task worker"];
+    gate [label="pre-push review\n(public targets)"];
+    vision [label="vision-fallback\n(image in context)"];
+  }
+  subgraph cluster_cloud {
+    label="cloud (metered)"; style=rounded; fontsize=12; margin=12;
+    openrouter [label="OpenRouter\ndeepseek-v4-pro (default)"];
+    anthropic [label="Anthropic"];
+  }
+  subgraph cluster_local {
+    label="local (one GPU)"; style=rounded; fontsize=12; margin=12;
+    llmc [label="llmc proxy\nloaded preset"];
+    whisper [label="whisper\n/api/image"];
+  }
+
+  session -> openrouter [label="settings.json default"];
+  task -> openrouter [label="no model param:\nstartup default"];
+  loop -> openrouter [label="cloud rung"];
+  loop -> anthropic [label="frontier rung"];
+  loop -> llmc [label="local rung\n(11 of 24 ladders start here)"];
+  bg -> llmc [label="PI_BG_DEFAULT_MODEL"];
+  gate -> llmc [label="loaded model only,\nskipped if none"];
+  vision -> llmc [label="if the loaded model\nhas vision"];
+  vision -> whisper [label="otherwise"];
+}
+```
+
+The same thing as text:
+
+1. The interactive session sends to OpenRouter (`deepseek-v4-pro`) unless the user switches models with `/model`.
+2. A `task` worker spawned without a `model` parameter gets no `--model` flag, so it starts on pi's startup default, which is OpenRouter.
+3. A loop iteration runs on the current rung of its manifest's `models` ladder: local, OpenRouter or Anthropic. 11 of the 24 ladders start on a local rung.
+4. A `bg_task` worker sends to the llmc proxy through `PI_BG_DEFAULT_MODEL`.
+5. The pre-push review asks whichever model llmc has loaded, and is skipped when none is.
+6. `vision-fallback.ts` describes images with the loaded llmc model if it has vision, and with the whisper service's `/api/image` otherwise.
+
+---
+
+## Which model for which job
+
+| Work | Model | Set by | Why |
+|---|---|---|---|
+| Interactive session | `openrouter/deepseek/deepseek-v4-pro`, thinking `high` | `settings.json` `defaultProvider`, `defaultModel`, `defaultThinkingLevel` | Default for daily work. Text input only. |
+| Side question (`/btw`) | Same model as the session | `btw.ts` forks the session with `ctx.model` | The fork carries the full history, so it answers from the same context. |
+| `task` worker, no `model` given | pi's startup default | no `--model` flag | Inline work the parent reads before continuing. |
+| `task` worker for a review | A different model family per reviewer | `model` parameter | Reviewers from one family share blind spots. |
+| `bg_task` worker | `llmc/qwen38-swift-ninfer-xhigh` | `PI_BG_DEFAULT_MODEL` in `.zshrc` | Long background work runs on the local engine instead of a metered API. |
+| `bg_task` with `minimal: true` | pi's startup default | `minimal` strips extensions, including llmc model registration | The env default would name a model the worker cannot resolve. |
+| Loop iteration | Current rung of the `models` ladder | `.pi/harness.json` | Cheapest rung first; climb after `stallPatience` no-progress iterations. |
+| Deploy, infra mutation, production-touching work | `-xhigh` local preset or a cloud model | rule in `tool-routing.md` | 2026-09-20 incident (below). |
+| Image-dependent work | A vision-capable model, or a parent that reads the image and writes a description into the worker prompt | rule in `tool-routing.md`, `vision-fallback.ts` | `deepseek-v4-pro` has `input: ["text"]` in pi's model registry. |
+| Pre-push leak review | Whatever llmc has loaded | `prepush-gate.ts` | Never triggers a model swap. |
+
+---
+
+## Interactive sessions
+
+The session starts on `openrouter/deepseek/deepseek-v4-pro` at thinking level `high`. The model registry lists it with a 1048576-token context window and text-only input. `/model` switches for the rest of the session; nothing switches it automatically except `llmc-failover.ts` when a fallback is configured (see [Local-engine guards](#local-engine-guards)).
+
+`local-model-rules.ts` prepends a correction block to the system prompt for every model whose provider is not Anthropic: no LaTeX in prose, batch independent tool calls, do not loop on a retry, prefer the native tools over bash. Until 2026-09-28 it applied only to llmc and to model ids matching `gemma` or `qwen`, so the default OpenRouter model received none of it. Before 2026-08-25 it reached no model at all: it returned a system-role message from the `context` event, and pi's message union has no system role, so the message was dropped before the provider request. It now uses the same `before_agent_start` prepend as `tool-routing.ts`.
+
+## Workers
+
+### task
+
+`task.ts` adds `--model` only when the caller passes a `model` parameter. Without one the worker starts on pi's startup default, the same model a fresh `pi` would start on. Neither preset changes the model: `explore` restricts the tools and loads only a few extensions, and `general` keeps the full tool set and every extension.
+
+The `model` parameter exists for two cases: a worker that needs a capability the default lacks (vision), and a multi-model review, where each reviewer runs on a different model family.
+
+**Incident (2026-10-12):** three parallel workers on `openrouter/~deepseek/deepseek-flash-latest` printed DSML tool-call markup as plain text and ran zero tools. The rules now name that model as unfit for workers and say to check a worker's tool count in `bg_status` before trusting a quiet result.
+
+### bg_task
+
+`bg-tasks.ts` resolves the model as: the `model` parameter if given; otherwise `PI_BG_DEFAULT_MODEL`, unless `minimal` is set; otherwise no flag. `.zshrc` sets `PI_BG_DEFAULT_MODEL='llmc/qwen38-swift-ninfer-xhigh'`.
+
+The env default exists because omitting `model` used to inherit the cloud model. Two delegations on 2026-09-25 that were meant for the local engine ran on the cloud that way.
+
+Two behaviours follow from the local default:
+
+- **Fail fast when llmc is down.** Before spawning an `llmc/` worker, the extension checks that the proxy is reachable and returns an error if it is not. Before this check the spawned pi died about 16 s later with only a connection-refused banner. There is no silent fallback to a cloud model: that was the author's stated preference on 2026-09-25.
+- **Lean tool list.** The local engine serves one request at a time and keeps one prompt-cache context. A worker's first request used to carry about 77.5k prompt tokens (139 tool schemas, including every MCP server, plus the system prompt) before doing any work, and each cache miss re-prefilled all of it at about 4.3k tokens/s. `llmc/` workers now get a 20-tool allowlist (`LLMC_DEFAULT_TOOLS`) and no MCP servers. An explicit `tools` parameter overrides it, and `PI_BG_LLMC_TOOLS=all` turns it off.
+
+### Loops
+
+A loop manifest (`.pi/harness.json`) declares a `models` ladder, cheapest rung first; `""` means pi's default. The governor climbs one rung after `stallPatience` iterations with no progress. Each iteration is a fresh `pi -p` on the current rung, so a climb costs no context. The loop itself is covered in [Loop or graph: a sensor-gated coding-agent loop](/reference/self-correcting-agent-loop/).
+
+The 24 manifests on the dev box on 2026-10-20:
+
+| Ladder property | Count |
+|---|---|
+| First rung local (`llmc/` or `llama-server/`, both served by the llmc proxy) | 11 |
+| First rung OpenRouter | 5 |
+| First rung Anthropic | 7 |
+| First rung `""` (pi's default) | 1 |
+| Local rungs only | 4 |
+| Contains an Anthropic rung | 12 |
+| Length 1 / 2 / 3 rungs | 6 / 15 / 3 |
+
+A local-only ladder has no rung to climb to when the local model stalls: the governor stays on the top rung, so the loop keeps iterating on the same model until the sensors pass or the iteration budget runs out. A loop on a local rung and an interactive session on a different local preset fight over the one GPU: on 2026-09-19 that swap war ran 13 minutes, with time to first token at 40-90 s per turn as each swap wiped the context cache. Loops and sessions share one preset, or the loop queues for the lock with `llmc lock --wait`; the interactive session never waits, and runs unlocked when another owner holds the preset.
+
+## Effort for high-stakes work
+
+Deploys, infra mutations and production-touching operations do not run on the local 27B model at medium effort. Interactive deploy work on llmc uses an `-xhigh` preset (`qwen38-swift-ninfer-xhigh` or `qwen38-ninfer-xhigh`), or moves to a cloud model. Medium effort stays for loops, unattended workers and quick questions, where its shorter reasoning traces cost nothing.
+
+**Incident (2026-09-20):** a session on the local model at medium effort created a stack through the compose management API without naming a host. The API defaulted to the wrong one. The repair attempts then collided with a live service stack on the intended host and took it down. The root cause had two parts: no host check on the deploy call, and a model too weak for a mutation with that blast radius. The deploy tooling now names the host explicitly, and this rule covers the model half.
+
+Two related rules for long local sessions:
+
+- Lock the preset for the session (`llmc-session-guard.ts` does this automatically, below).
+- Treat a compaction on a weak local model as unrecoverable. The summary is written by the same model and its errors carry into every later turn. Write working state to a file and start a fresh session instead.
+
+## Vision routing
+
+`deepseek-v4-pro` cannot read images, so a pasted screenshot, a `read` of a PNG, or a tool that returns a contact sheet would be invisible to it. `vision-fallback.ts` hooks the `context` event and, when the current model lacks image input, replaces each image block in the outgoing request with a text description. Backends, in order:
+
+1. The model llmc has loaded, if its preset declares vision. Only the loaded model id is requested; naming any other id would trigger a model swap and evict another session's preset.
+2. The whisper service's `/api/image` endpoint, which takes raw image bytes and returns a description plus OCR text.
+3. A one-line placeholder, so the model at least knows an image was there.
+
+The transform is request-local: the original images stay in the session, so switching to a vision model later shows the real pixels. Descriptions are cached by image hash in memory and on disk; placeholders are not cached, so a backend that comes back is used on the next request.
+
+For a worker, the rule is to route image work to a vision-capable model, or have a vision-capable parent read the image and put a text description in the worker prompt.
+
+## Provider-path guards
+
+### Cloud guards
+
+| Guard | What it does | Why |
+|---|---|---|
+| `max-tokens-cap.ts` | Clamps `max_tokens` / `max_completion_tokens` on OpenRouter requests to 131072 by default; an env variable moves the ceiling or turns the guard off | From pi 1.2.0, pi requests output up to the remaining context: 873436 tokens on deepseek v4 on 2026-10-13. OpenRouter reserves credit for the whole `max_tokens` before generating, so on a modest balance every request failed with a 402 even when the real cost was cents. |
+| `cost-guard.ts` | Warns at cumulative spend crossings (`PI_COST_WARN_LADDER`, default `5,10,20,35,50,75,100` dollars), on a single turn above 1 dollar, and when context passes 150000 tokens on a model priced at 3 dollars per million input tokens or more, listing cheaper models that fit the context | Sessions on 2026-08-10/11 grew to 30M-140M input tokens and cost 45-370 dollars before the first signal, a 402 that killed the session mid-task. Warn-only: blocking an explicit `/model` choice is worse than the spend. |
+| `degenerate-stream-guard.ts` | Aborts a turn whose output collapses into one short unit repeated, on one line or as a cycle of lines | `moonshotai/kimi-k3` on OpenRouter streamed rows of `!` twice on 2026-08-19, and a newline-separated loop for about 10 minutes, twice, on 2026-08-27. No auto-retry, because the same provider node may serve the same stream again. |
+| Worker cap and resume | At most 4 concurrent workers; transient errors (a 402 on the in-flight credit budget, 429, 5xx) are retried with backoff | One of six parallel workers hit the in-flight credit budget on 2026-10-19. Covered in [Subagents, worktrees, and parallel agent work](/reference/agent-subagents-and-worktrees/). |
+
+### Local-engine guards
+
+| Guard | What it does | Why |
+|---|---|---|
+| `llmc-session-guard.ts` | Locks the session's preset with owner `pi-<sessionId>`, renews the 900 s lock every turn, unlocks on model change, shutdown or a termination signal. Warns once per crossing at 60% context that a written checkpoint beats compaction. | Any other client's request can otherwise evict the model mid-session; the eviction wipes the context cache and the next turn re-prefills everything (2026-09-18/19: 40-90 s time to first token at about 200k context). Contention is a warning, never a fight: the session runs unlocked. |
+| `llmc-dynamic.ts` | Registers the local model list from the proxy's live `/v1/models` at startup, with context window, reasoning flag, output cap and vision capability per preset | A hand-maintained list drifted by 2026-08-27: 6 deleted presets still listed, 6 missing, and a context window listed at 196608 for a preset serving 262144. The static list is the fallback when the proxy is down. |
+| `llmc-failover.ts` | On a transport error after pi's own retries (connection refused, 502/503/504, a swap in progress), reads the proxy's `/mode` and names the state and the recovery step. Switches to `PI_LLMC_FAILOVER_FALLBACK` for the turn, with a 300 s cooldown, only if that variable is set. | The fallback variable is unset on the dev box, so a local failure is reported, not rerouted to the cloud. |
+| `local-provider-hints.ts` | Names the provider and URL when a local provider refuses the connection | On 2026-08-26 the proxy had been dead for about 12 hours and pi showed only `Connection error.` four times. |
+
+## Checks that call a model
+
+The client-side pre-push gate asks a model whether a push to a public remote carries internal context. It reads the proxy's `/mode`, and sends to whichever model is loaded only when the proxy is in LLM mode with no swap in progress. With no model loaded it prints `skipped` and the push continues on the mechanical checks (gitleaks, blocked terms, sensitive files, identifier shapes). It never asks for a specific model, so a push never evicts a running session's preset. The gate is covered in [Agent leak gates](/guides/agent-leak-gates/).
+
+---
+
+## What carries over to another harness
+
+The model names, the ladder counts and the 131072 ceiling are specific to this setup. These properties are not:
+
+1. **Route by caller, not by session.** Interactive work, inline sub-tasks, background jobs and loops have different cost and latency budgets, so each gets its own default. One session-wide model means either paying cloud rates for background work or running interactive work on a weaker model.
+2. **A local default needs a fail-fast path.** When the local engine is down, a silent fallback to the cloud turns a free job into a metered one without anyone choosing it. Error at spawn time instead.
+3. **Shrink the prompt for a single-lane local engine.** Tool schemas and MCP servers the worker will not use are prefilled on every cache miss, so a smaller tool list for local workers shortens every cold start.
+4. **Tie effort to blast radius, not to task size.** A short deploy is a high-stakes task; a long refactor on a branch is not. The effort rule keys on what the work can break.
+5. **Cap requested output on gateways that reserve credit up front.** The reservation is for the requested maximum, not the expected output, so an uncapped request can fail on a balance that would cover the real cost many times over.
+6. **A text-only default needs an image path.** Either describe images before the request or route image work to a model that can see them; otherwise screenshots are silently dropped from the model's view.
+7. **A model-backed check must not cause a model swap.** A gate that names a specific model can evict a running session on a single-GPU engine. Use what is loaded, and skip when nothing is.
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=diamond, margin="0.1,0.05"];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  start [label="New piece of agent work", shape=box, style=rounded];
+  q_img [label="Needs to\nsee images?"];
+  q_mut [label="Deploy or\ninfra mutation?"];
+  q_bg [label="Long, and the parent\nneed not wait?"];
+  q_loop [label="Objective sensors\ndecide done?"];
+
+  r_vision [label="vision-capable model,\nor parent describes the image", shape=box, style=rounded];
+  r_xhigh [label="-xhigh local preset\nor cloud model", shape=box, style=rounded];
+  r_bg [label="bg_task on the local default\n(PI_BG_DEFAULT_MODEL)", shape=box, style=rounded];
+  r_loop [label="loop: ladder cheapest first,\nwith a cloud rung above local", shape=box, style=rounded];
+  r_task [label="task on the startup default;\nother families for review", shape=box, style=rounded];
+
+  start -> q_img;
+  q_img -> r_vision [label="yes"];
+  q_img -> q_mut [label="no"];
+  q_mut -> r_xhigh [label="yes"];
+  q_mut -> q_bg [label="no"];
+  q_bg -> q_loop [label="yes"];
+  q_bg -> r_task [label="no"];
+  q_loop -> r_loop [label="yes"];
+  q_loop -> r_bg [label="no"];
+}
+```
+
+The same decision as text:
+
+1. Work that must see images goes to a vision-capable model, or the parent reads the image and writes a description into the worker prompt.
+2. A deploy or infra mutation runs on an `-xhigh` local preset or a cloud model, never at medium effort on the local model.
+3. Work the parent reads before continuing runs as a `task` on the startup default; a review uses a different model family per reviewer.
+4. Long work with objective pass/fail sensors runs as a loop, with a ladder that starts cheap and has a cloud rung above any local one.
+5. Other long work runs as a `bg_task` on the local default.
+
+---
+
+## Evidence
+
+| Claim | How it was checked | Status |
+|---|---|---|
+| Session default `openrouter/deepseek/deepseek-v4-pro`, thinking `high` | `settings.json`, 2026-10-20 | read from config |
+| `deepseek-v4-pro` input is text only, 1048576-token context | pi's model registry (`models-store.json`), 2026-10-20 | read from config |
+| `task` passes `--model` only when given | `task.ts` spawn flags | read from source |
+| `bg_task` model resolution, llmc fail-fast, `LLMC_DEFAULT_TOOLS` | `bg-tasks.ts`; `PI_BG_DEFAULT_MODEL` in `.zshrc` | read from source |
+| 77.5k-token first request, 4.3k tokens/s re-prefill | comment in `bg-tasks.ts` recording the measurement | measured, recorded in source |
+| Ladder counts (11 / 5 / 7 / 1 first rungs, 24 manifests) | every `.pi/harness.json` in the repo checkouts on the dev box, parsed and classified by first rung, 2026-10-20 | measured |
+| 2026-09-20 wrong-host incident | session history and the incident audit of 2026-10-16 | incident record |
+| 2026-10-12 DSML worker failure | rule text in `tool-routing.md` | incident record |
+| 873436-token `max_tokens` request, 402 on low balance | `max-tokens-cap.ts` header, 2026-10-13 | incident record |
+| Vision backends and request-local transform | `vision-fallback.ts` | read from source |
+| Session lock, 900 s TTL, 60% context nudge | `llmc-session-guard.ts` | read from source |
+| Failover reroute is off on the dev box | `PI_LLMC_FAILOVER_FALLBACK` absent from the shell config | read from config |
+| Pre-push review uses the loaded model and skips without one | `prepush-gate.ts`; a push on 2026-10-20 printed `skipped (llmc unreachable ...)` | read from source, observed |
+| `llmc-failover.ts` reroute behaviour | unit tests of the pure helpers; not exercised live, because the fallback is unset | design-only |
+
+---
+
+## Related docs
+
+- [The pi harness journey](/reference/pi-harness-journey/) - the series hub and the extension catalogue these guards come from
+- [Scheduling one GPU between LLM, image and training work](/reference/llmc-single-gpu-stack/) - presets, route aliases, locks and what an eviction costs
+- [Subagents, worktrees, and parallel agent work](/reference/agent-subagents-and-worktrees/) - the worker kinds routed here, the worker cap and transient-error resume
+- [Loop or graph: a sensor-gated coding-agent loop](/reference/self-correcting-agent-loop/) - the ladder's governor and run measurements
+- [Context, prompt cache, and compaction in a coding-agent harness](/reference/agent-context-and-prompt-cache/) - which compaction suits which provider
+- [Diagnosing a reasoning cliff in an agentic model](/guides/diagnosing-llm-reasoning-cliffs/) - how a judge model that stopped thinking was found
