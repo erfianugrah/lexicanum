@@ -1,0 +1,209 @@
+---
+title: "Context, prompt cache, and compaction in a coding-agent harness"
+description: "What one request to the provider carries and why the system prompt is the first byte of the prefix cache, the measured cache break and its fix, pruning with hysteresis instead of per-turn mutation, spilling oversized outputs, and the two compaction paths with the trial numbers that decide which provider gets each."
+author: "Erfi Anugrah"
+category: workstations
+---
+
+Every request a coding-agent harness sends to its model provider is the system prompt, then the tool definitions, then the conversation so far. Providers charge by the token and reuse work across requests through a prefix cache that only survives until the first byte that changed. This page is about how the harness spends that window and keeps the cache warm: what each request carries, what breaks the cache, how stale tool output is reclaimed without breaking it, and how compaction works once the window is full.
+
+The measurements are from one harness - pi, extended with a stack of context and cache extensions, running against `openrouter/deepseek/deepseek-v4-pro` and a local engine. The cache-break and compaction-trial numbers are measured; the pruning and spilling thresholds are the design values in the extension sources. Where a claim is documented rather than measured, the evidence table at the end says so.
+
+## TL;DR
+
+- A fresh session sends a 193.6 KB system prompt and 114.4 KB of tool definitions (139 tools) before the conversation starts. The system prompt is position 0 of the request, so any change to it is a full cache miss.
+- The system prompt should stay byte-identical across a session. Six extensions return a whole `systemPrompt` from `before_agent_start`; any change in one of those strings misses the cache. One measured instance - a one-shot semantic-inject block that appeared on one prompt and vanished on the next - changed the prompt at offset 40,224 bytes and cost two misses per session until it was moved out of the prompt and into a message.
+- Pruning old tool output used to mutate an earlier message almost every turn, which re-prefills the whole prompt on a local engine (~35 s at 150k tokens). Hysteresis fixes it: prune only once a batch crosses the threshold, down to a low watermark, and never un-prune.
+- Oversized fresh output is spilled to disk, not kept inline: a 51,200-byte preview plus a locator replaces the full text the moment a tool result lands.
+- Compaction has two paths. pi's default re-serialises the history under a new system prompt - cold, but it always works. Prefix replay re-sends the last real request with one summarise instruction appended, so the cache serves the history. On a local engine it is slower than the default because the engine only reuses byte-identical prompts, and a replay appends an instruction to the previous request. Prefix compaction is off by default for every provider.
+
+## Anatomy of a request
+
+The `/context` inspector splits every provider request into three parts and reports their sizes plus where the request stopped matching the previous one. The split is a system prompt (sections delimited by markdown headings and XML blocks), a tool set, and the message history.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_request {
+    label="one provider request"; style=rounded; fontsize=12; margin=12;
+    sys [label="system prompt\n193.6 KB (position 0)"];
+    tools [label="tool definitions\n114.4 KB, 139 tools"];
+    msgs [label="messages\n(conversation)"];
+  }
+  cache [label="provider prefix cache\nreuses up to first diff"];
+
+  sys -> cache [label="first byte"];
+  tools -> cache;
+  msgs -> cache;
+}
+```
+
+A fresh TUI session, two prompts in, measured: system prompt 193.6 KB, 139 tools at 114.4 KB. Those two are fixed cost per session - they are sent before a single byte of the conversation, and they are the same on every request, which is exactly what makes them the part of the request a cache can serve. The message history grows from zero; the prompt and the tools do not.
+
+The inspector derives the sections by splitting the system prompt at top-level `# ` / `## ` headings and at XML block openers, so the report shows which section moved, not just that something moved. It fingerprints each section, each tool definition and each message, and compares against the previous request. Three comparison results matter: the system prompt changed (and which sections), the tool set changed, or an earlier message was rewritten (pruning or compaction) - a miss from that message onward.
+
+## Why the system prompt is the cache's first byte
+
+A provider prefix cache (Anthropic, DeepSeek, OpenRouter pass-through, and a local engine's KV reuse) serves bytes from the start of the request up to the first byte that differs from the previous request. The system prompt is the start of the request, so it is the first thing that has to stay identical.
+
+pi has a mechanism for exactly this. It records the initial prompt and tool set in the transcript's first system message, then appends prompt and tool changes before the next model request rather than editing earlier bytes.[^pi] The extension docs put the rule plainly: prefer changing prompt sections, selected tools, or guidelines so pi can append a transcript delta; returning `systemPrompt` (or setting `forceSystemPrompt`) replaces the whole prompt for that run.[^pi]
+
+The harness config repo has six extensions that return a full `systemPrompt` from `before_agent_start`: the memory block, the session ledger, the style toggle, the local-model rules, `veans-prime.ts` (Vikunja workflow priming), and the tool-routing prepend. Each one is a string whose change is a cache miss, because it is injected at the front of the prompt. Most of these are stable within a session; the two that were not are the memory block (a save mid-session changes it) and a semantic one-shot.
+
+## The measured break and the fix
+
+The semantic one-shot was the clean measured case. A semantic retrieval block - prior sessions matched by embedding against the user's first substantive prompt - was injected into the system prompt once per session: it appeared on the prompt that first qualified and was absent from the next, so the prompt changed twice per session.
+
+`/context` showed it: the system prompt changed on prompt 2, with the block inserted about 200 lines in, so the cached prefix ended there. The block landed at offset 40,224 bytes into the prompt - a full miss on the prompt it fired, and a second full miss on the prompt where it vanished.
+
+The fix moved the block out of the system prompt and into a message. A message appended to the conversation and kept in history does not touch the cached prefix. Verified in a TUI session after the change: 3 requests, 0 system-prompt changes, where the same prompts before the change produced 1 change at offset 40,224.
+
+The general form of the lesson: a one-shot that fires mid-session belongs in a message, not in the prompt. The prompt is for the fixed scaffolding - tool-routing rules, the documentation preamble, the local-model rules - that is identical on every request. Anything that appears once and disappears is a message.
+
+## Pruning: hysteresis over per-turn mutation
+
+Tool results are the largest and fastest-ageing part of the context - reads, `bash` output, search results - and they are typically 80% or more of the bloat in a long session. The harness reclaims them by walking the message stream backwards and replacing old tool-result content with a short marker, keeping conversation flow and decisions intact. The question is when to run that replacement.
+
+The first version pruned down to a fixed protect window every time new output pushed one more old result past it. That moved the boundary almost every turn, and the newest-result exemption sometimes shrank the pruned set - 11 results collapsed to 4 - un-pruning content that had already been collapsed. On a local engine every edit to an earlier message is a full re-prefill, about 35 s at 150k tokens, so a per-turn prune was a per-turn re-prefill.
+
+Hysteresis fixes it (design note dated 2026-10-10 in the extension header). Pruning fires only when the bytes beyond the protect window reach a trigger floor; when it fires it prunes down to a low watermark, not to the window edge, so the boundary jumps once per batch and then stays still until the next trigger worth of output accumulates. The pruned set is monotone - a result that was pruned never comes back. Below the trigger floor, the per-request layer decides on a clone of the messages, so sub-floor turns leave the prefix byte-identical.
+
+The hysteresis design uses three constants to decide when the prune fires and how far down it goes:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| Protect window | 160,000 bytes | ~40,000 tokens of recent tool output preserved verbatim |
+| Trigger floor | 80,000 bytes | do not prune unless bytes beyond the window would reclaim at least this |
+| Low watermark | 80,000 bytes (window / 2) | on fire, prune down to here so the boundary stays still |
+
+Each is overridable (`PI_PRUNE_PROTECT_BYTES`, `PI_PRUNE_MIN_BYTES`, `PI_PRUNE_LOW_BYTES`). The newest non-pruned result is always kept verbatim; protected tools (`skill`, `memory`, `todowrite`, `question`, `session-search`, `bookmark`) are never pruned; image-bearing results are exempt because a single image read is ~290 KB of base64, and pruning it forces a re-read that gets pruned again.
+
+Two layers make the identical decision. The persisted layer runs at `turn_end` and writes `context_edit` entries to the session file, so a prune decision survives restarts and compaction without recomputation. The per-request layer runs on the `context` event as a within-turn safety net for a long agentic turn that accumulates many large outputs between turn ends, and short-circuits on already-pruned markers.
+
+A package-catalog survey had two workers rank "pruning mutates old messages every turn and breaks the prefix cache" as their top finding and propose porting another package's commit-epoch design. That is already shipped: the hysteresis header is the commit epoch in all but name.
+
+## Spilling oversized output
+
+Pruning reclaims old results. Spilling bounds a fresh oversized result the moment it lands. The spill extension watches `tool_result` and, for an all-text result over 51,200 bytes, writes the full text to disk and replaces the inline content with a bounded preview plus a locator.
+
+It targets the extension tools without provider-side caps - `webfetch` (5 MB), `codesearch` and `context7_query_docs` (50k tokens), the subagent and dossier tools. Built-in `read` and `bash` self-cap at 50 KB / 2,000 lines, so they rarely trigger it. `read` is skipped deliberately: spilling a read result would force a read - spill - read-again loop. Persistence is best-effort - a failed write leaves the original inline, and a spill failure never turns a success into an error.
+
+The split is pruning for old, spilling for new. Pruning is batch-driven and cache-aware; spilling is per-result and instant, and its replacement is small enough that it does not move the prefix in any way that matters.
+
+## Compaction: two paths
+
+When the window is actually full, the harness compacts - it summarises the older turns and replaces them with a summary. There are two ways to run that summary.
+
+pi's default triggers when context tokens cross `contextWindow - reserveTokens` (default 16,384), keeps the most recent `keepRecentTokens` (default 20,000) and summarises the rest.[^pi-compaction] It serialises the history to text - `[User]: ...`, `[Assistant]: ...`, `[Tool result]: ...` - with tool results truncated to 2,000 characters, and sends that serialised transcript under a new system prompt. Summarisation requests disable prompt-cache writes, because a one-off summary prompt is unlikely to be reused.[^pi-compaction]
+
+Prefix replay is the alternative. On `session_before_compact`, it re-sends the last real provider request byte-for-byte with one summarise instruction appended.[^pkg] The provider's prefix cache serves the history, and the summariser sees the full untruncated context instead of the 2,000-character tool results. Any failure falls back to pi's default.
+
+| Aspect | pi default | Prefix replay |
+|---|---|---|
+| What it sends | re-serialised transcript as text, new system prompt | the last real request byte-for-byte + one instruction |
+| Tool results in the summary | truncated to 2,000 chars | full, untruncated |
+| Cache behaviour | cold; cache writes disabled | prefix cache serves the history |
+| Failure mode | none (always works) | context-length 400, low cache hit on routed providers |
+| Providers | all | local engine only by default |
+
+The trigger is shared: the auto-compact extension fires at 0.85 of the context window (crossing detection, not a level, so a successful compaction does not immediately re-trigger). Small windows are skipped - pi's compaction refuses to run when the whole branch fits inside `keepRecentTokens`, so firing at 0.85 of an 8,192-token window produces a failed compaction rather than a summary. A companion extension resumes a headless run that dead-stops after a clean-turn compaction, because in `pi -p` mode there is no user to type `/continue`.
+
+## The trials
+
+Two trial rounds pinned `openrouter/deepseek/deepseek-v4-pro`, with the tool-output prune off, driving pi's RPC `compact` command. Arm A is pi's default compaction; arm B is prefix replay (first the upstream package, then the harness's own port). Wall times include OpenRouter routing variance. The raw rows are `results.jsonl` and `results-ours.jsonl`.
+
+The upstream package as arm B:
+
+| Session | tokensBefore | A wall | A input tok | A cost | B |
+| --- | --- | --- | --- | --- | --- |
+| synthetic (6 big file reads) | 141,737 | 19.1s | 4,157 | \$0.009 | 26.4s (19s summary + 7s re-warm), 141,696 cached |
+| real 1 | 147,713 | 17.9s | 49,454 | \$0.028 | failed 3/3 |
+| real 2 | 181,826 | 25.2s | 66,626 | \$0.036 | failed 3/3 |
+| real 3 | 221,454 | 23.3s | 100,127 | \$0.052 | failed 3/3 |
+
+One out-of-driver debug run of real 1 under arm B succeeded: 12 s summary plus 3 s re-warm, with 147,456 prompt tokens served from cache. The scripted failures (9/9 in the final run, 3/3 in the previous one) were OpenRouter 400s - the endpoint's 16,384-token context limit rejected a request whose size matched pi's default summarisation prompt, with a max-output-1 request that is the package's warm-up shape.
+
+The harness's own port, on the same three sessions, succeeded 3/3 where the package failed:
+
+| Session | A wall / cost | A cached | B wall / cost | B cached |
+| --- | --- | --- | --- | --- |
+| real 1 (147k) | 24.1s / \$0.012 | 49,408 | 50.1s / \$0.072 | 10,368 |
+| real 2 (181k) | 28.8s / \$0.014 | 66,560 | 32.7s / \$0.086 | 8,192 |
+| real 3 (222k) | 25.8s / \$0.053 | 0 | 58.7s / \$0.109 | 2,176 |
+
+The port worked, but OpenRouter served only 2,000-10,000 of the replayed 137k-223k-token prefix from cache - requests are not pinned to the upstream endpoint that holds the session's cache, so a replay lands on a different backend with a cold cache. Arm A's cache hits are flattered: they come from identical summarisation requests sent by earlier trial runs, not from the session's own prefix; in normal use arm A's request is cold. Net result: on OpenRouter, prefix replay cost 2-8x pi's default and up to 2x the time.
+
+The package's published win is on a local engine: 132 compactions on Qwen3.8-27B under vLLM went from a median 229 s to 86 s, with the first turn after compaction 69 s to 1.8 s with a warm-up, and a DeepSeek API run serving 56,192 of 56,216 prompt tokens from cache. Those are the package's own numbers, fetched from its README, not this harness's rig.
+
+One incidental cost: a seed run resumed a copied session on its original model before the model was pinned, a \$1.08 cache write.
+
+## llmc: the local-engine outcome
+
+The trial's llmc sessions (qwen38-ninfer-uncensored on the local ninfer engine) gave the real result:
+
+| Session | A (pi default) | B (prefix replay) |
+| --- | --- | --- |
+| real 1 (146k) | 18.7 s, 49,970 in, 0 cached | 58.3 s, 146,610 in, 0 cached |
+| real 2 | failed both arms: "Nothing to compact (session too small)" after the seed turn | |
+| real 3 (89k) | 17.8 s, 12,559 in, 0 cached | 30.8 s, 88,973 in, 0 cached |
+
+Prefix replay was slower on the local engine, not faster. A probe into the engine explains it: an identical 45,285-token prompt repeated is 6.8 s -> 0.1 s with 45,285 cached; the same prompt plus one user message is 6.8 s with 0 cached. The engine reuses byte-identical prompts only, so prefix replay - which appends a summarise instruction to the previous request - cannot hit its cache at all.
+
+**Decision**: `prefix-compaction.ts` is off by default for every provider. When a provider has a working prefix cache (one that matches by key, not by exact byte comparison), the extension can be opted in. Open question for llmc itself: if multi-turn continuations also miss the cache, every llmc turn re-prefills the whole context.
+
+## Which compaction for which provider
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  fire [label="compaction fires", shape=diamond];
+  keyCache [label="provider has key-based\nprefix cache?", shape=diamond];
+  prefix [label="prefix replay\ncache serves the history"];
+  cold [label="pi default\ncold serialised summary"];
+
+  fire -> keyCache;
+  keyCache -> prefix [label="yes (opt-in\nvia provider list)"];
+  keyCache -> cold [label="no (default)\nllmc, openrouter,
+deepseek"];
+}
+```
+
+1. Provider has a prefix cache that matches by key (not byte-exact comparison): enable prefix replay via `PI_PREFIX_COMPACTION_PROVIDERS`. No provider in the harness's current set meets this.
+2. Otherwise: pi's default cold serialised summary. This covers OpenRouter, deepseek, and the local engine (`llmc`), all of which the trial measured.
+
+Pruning stays on regardless: it reclaims context before compaction is needed, and with hysteresis it does not itself break the cache.
+
+## How it was checked
+
+| Claim | Source | Measured vs design-only |
+|---|---|---|
+| System prompt 193.6 KB, 139 tools 114.4 KB in a fresh session | `/context` inspector, first measurement commit | measured |
+| Semantic one-shot changed the prompt at offset 40,224, two misses per session | `/context`, before/after the fix | measured |
+| After the fix, 3 requests with 0 system-prompt changes | TUI session, fix commit message | measured |
+| Prune hysteresis design, ~35 s re-prefill at 150k, monotone pruned set | extension header, dated 2026-10-10 | design-only |
+| Spill threshold 51,200 bytes, `read` skipped, best-effort | extension header | design-only |
+| Compaction defaults: reserve 16,384, keep 20,000, tool results 2,000 chars, cache writes disabled | installed pi docs `docs/compaction.md` | documented |
+| Prompt sections vs `systemPrompt` replacement rule | installed pi docs `docs/extensions.md` | documented |
+| Prefix-cache trial tables (walls, costs, cache-hit counts) | `run.py`, `results.jsonl` / `results-ours.jsonl` | measured |
+| Package vLLM 229s -> 86s, DeepSeek cache 56,192/56,216 | package README, fetched | reported by package, not this rig |
+| llmc compaction trial: default (18.7 s) vs replay (58.3 s) at 146k, engine byte-exact cache only (trial README, direct probe) | `README.md`, llmc section | measured |
+
+## Related docs
+
+- [A cross-client memory store for coding agents](/reference/agent-memory-store/) - the store the semantic one-shot queries.
+- [Benchmarking local models for agent work](/reference/local-model-bench/) and [Scheduling one GPU between LLM, image and training work](/reference/llmc-single-gpu-stack/) - the local engine whose KV cache makes prefix replay reliable.
+- [Loop or graph: a sensor-gated coding-agent loop](/reference/self-correcting-agent-loop/) - the headless runs that need resume-after-compact.
+- [Guard extensions](/reference/agent-guard-extensions/) - the guard stack that runs alongside the context extensions here.
+- The series hub `/reference/pi-harness-journey/` and the worker page `/reference/agent-subagents-and-worktrees/` sit alongside this page; they are written by other pages in the same series.
+
+[^pi]: pi repository, https://github.com/earendil-works/pi
+[^pi-compaction]: pi compaction source, https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts
+[^pkg]: pi-prefix-cache-compaction, https://pi.dev/packages/pi-prefix-cache-compaction

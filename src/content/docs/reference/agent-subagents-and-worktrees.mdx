@@ -1,0 +1,365 @@
+---
+title: "Subagents, worktrees, and parallel agent work"
+description: "How the pi harness runs work in parallel: task and background workers, the agent view, steering a running worker with a typed message, worktree isolation, and the rule that only the main session touches git."
+author: Erfi Anugrah
+category: workstations
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+An agent that can only do one thing at a time slows to the slowest step. The pi harness runs work in parallel through four worker kinds that share a lifecycle - streaming progress into a shared panel, surviving provider failures, and never touching git themselves - while the main session splits its attention with side questions and undoes its own file changes. This page is the reference for that parallel surface.
+
+It is the sibling of [Loop or graph: a sensor-gated coding-agent loop](/reference/self-correcting-agent-loop/), which owns the loop agents spawned through this surface, and of [The guard extensions that police agent tool calls](/reference/agent-guard-extensions/), which own the gates that block workers from running git.
+
+All mechanisms below are read from the harness source; a mechanism exercised only by a scripted agent is marked design-only. Incidents are drawn from session history and cited by date.
+
+**TL;DR:**
+
+- Four worker kinds cover every parallel need: **task** (inline, blocks parent, returns result), **bg\_task** (detached `pi -p`, returns immediately), **bg\_bash** (detached shell command), and **loop agents** (self-correcting loops in the background). All stream progress into the agent view panel under the editor.
+- Worker count is capped at 4 concurrent (PI\_TASK\_MAX\_PARALLEL, default 4). A provider 402 on in-flight credit budget killed one of six workers on 2026-10-19; the cap shipped the next day (commit d5fb627, 2026-10-20) together with transient-error resume (up to 2 retries, 30 s backoff doubling to 180 s).
+- Workers never run git (dotfiles#140, 2026-10-20). They edit files in a git worktree created by the main session; the main session reviews, commits, merges, and pushes.
+- The pattern underlying this doc series is exactly that flow: one worktree per writer, writer never commits, parent reviews and merges. A writer that ran git directly would bypass review and pollute the index.
+- Side questions (`/btw`) fork the session into a read-only background worker that answers from the conversation without interrupting the running turn.
+- File-level undo (`/undo`) snapshots the bytes before and after every file-tool call, then restores them on undo - so the conversation AND the files revert together.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; compound=true; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_parent {
+    label="main session"; style=rounded; fontsize=12; margin=12;
+    parent [label="parent agent\n(pi, interactive)"];
+    panel [label="agent view panel", shape=component];
+    git [label="git operations\n(commit, merge, push)", shape=note];
+    parent -> panel;
+    parent -> git;
+  }
+  subgraph cluster_workers {
+    label="workers (one worktree each)"; style=rounded; fontsize=12; margin=12;
+    task [label="task\npi -p (blocks)"];
+    bg [label="bg_task\npi -p (detached)"];
+    bash [label="bg_bash\nshell command"];
+    loop [label="bg_loop\nloop run / graph"];
+    btw [label="/btw\nsession fork\n(read-only)"];
+  }
+  parent -> task [label="spawn, wait for result"];
+  parent -> bg [label="spawn, return handle"];
+  parent -> bash [label="spawn, return handle"];
+  parent -> loop [label="spawn, return handle"];
+  parent -> btw [label="fork session + question"];
+  task -> parent [label="final output", dir=back];
+  bg -> parent [label="completion nudge", dir=back, style=dashed];
+  bash -> parent [label="completion nudge", dir=back, style=dashed];
+  loop -> parent [label="completion nudge", dir=back, style=dashed];
+  btw -> parent [label="answer in agent view", dir=back, style=dashed];
+  task -> panel [style=dashed, color=gray];
+  bg -> panel [style=dashed, color=gray];
+  bash -> panel [style=dashed, color=gray];
+  loop -> panel [style=dashed, color=gray];
+  btw -> panel [style=dashed, color=gray];
+}
+```
+
+The same thing as text:
+
+1. The parent agent (interactive pi session) runs in the main tree and owns all git operations.
+2. Workers run in their own worktrees; they never touch git. They edit files and report what is ready.
+3. All five worker kinds stream progress into the agent view panel, a list under the editor.
+4. **task** blocks the parent until the worker finishes and returns its final output directly.
+5. **bg\_task**, **bg\_bash** and **bg\_loop** return immediately with a session handle; a completion nudge with the result is pushed to the parent when they finish.
+6. **/btw** forks the current session into a read-only worker that answers the question from the conversation; the answer lands in the agent view. The parent does not wait for it.
+
+---
+
+## Which worker for which job
+
+| You need | Use | Why |
+|---|---|---|
+| A sub-task whose result the parent must read before continuing | **task** | Blocks parent, returns output in the same turn. Parallelise by dispatching several in one message. |
+| Long-running work (research, audit, deep refactor) that should not block you | **bg\_task** | Detached `pi -p` in tmux; returns immediately, pushes a completion nudge when done. |
+| A polling loop, slow download, or long build - a shell command past the 30 s bash-tool timeout | **bg\_bash** | Detached shell in tmux; no pi overhead. |
+| An unattended self-correcting loop (build/lint/test gate with model ladder) | **bg\_loop** | `loop run` with live per-iteration progress in the agent view. `loop graph run` for multi-node graphs. |
+| A quick lookup that should not interrupt the running turn | **/btw** | Forks the session into a read-only worker; answer lands in the agent view. |
+| A read-only deep dive that must finish before continuing | **task** (explore) | Cheaper (no full extension load). Returns result inline. |
+| Two or more independent research angles | **task** x N in one turn | Parallel dispatch in a single message; each worker writes results, parent synthesises. |
+
+The first three columns above are the ask; the fourth column explains the choice in terms of the mechanism - blocking vs detached, pi overhead vs raw shell, and the completion signal that carries the result back.
+
+---
+
+## The worker kinds
+
+### task - inline subagent
+
+`task` spawns a fresh `pi -p` process, feeds it the prompt, parses its JSON event stream for live progress, and returns the final assistant text. The parent blocks until the worker exits.
+
+Source: `task.ts` (headers, subagent types, semaphore). The file defines two subagent presets:
+
+- **explore**: read-only (read, grep, glob, docs\_search, docs\_read, docs\_grep, docs\_find, docs\_summary, docs\_sources; no bash, no writes, no web search). Cheap - runs with `--no-extensions --no-skills --no-prompt-templates` plus `-e docs.ts -e glob.ts -e worker-inbox.ts`.
+- **general**: full tool access. Inherits the parent's model.
+
+Workers are one-shot: they exit after producing output. There is no multi-turn conversation with a task subagent.
+
+**Parallel dispatch**: the parent can launch multiple `task` calls in a single turn. Each becomes a separate subprocess. A counting semaphore caps concurrent workers at PI\_TASK\_MAX\_PARALLEL (default 4), queuing extras until a slot frees (`task-limits-core.ts`).
+
+**Incident**: on 2026-10-12, three parallel workers running `openrouter/deepseek/deepseek-flash-latest` all printed DSML tool-call markup as text and ran zero tools. The model was removed from the subagent model choices the same day; the rule now says to check a worker's `bg_status` stream line for tool count before trusting silence (`tool-routing.md`).
+
+### bg\_task - detached pi worker
+
+`bg_task` is the same `pi -p` subprocess, but spawned inside a detached tmux session. The tool returns the session handle within ~100 ms; the parent keeps working. When the worker finishes, the tmux wrapper updates a state JSON file and a completion watcher pushes the result as a steer to the parent session.
+
+Source: `bg-tasks.ts` (module header, lifecycle). State lives at `~/.pi/agent/bg-tasks/<name>.json`. Workers inherit the parent's extensions, skills, and model unless `minimal: true` is set.
+
+**Lean toolset for local models**: a worker running on the local llmc stack gets a reduced tool allowlist (read, bash, edit, write, grep, glob, docs, web - no MCP servers) so the single-lane engine's prompt-cache prefill stays small. The full set with MCP schema descriptions was ~77.5k prompt tokens before the first tool ran (`bg-tasks.ts`).
+
+**Headless contract**: every bg\_task worker gets a preamble instructing it that nobody reads its messages until it finishes, git is blocked, and the question tool has no UI. It must finish or stop with a precise blocker (`bg-tasks.ts`).
+
+### bg\_bash - detached shell command
+
+`bg_bash` runs an arbitrary bash command in a detached tmux session. Same lifecycle as bg\_task but with no pi overhead - the command text is written to a tempfile and executed in a fresh `bash <tempfile>` subshell. Use for polling loops (`for i in $(seq 1 N); do ... sleep ...; done`), long builds, slow downloads - anything past pi's `bash` tool 30 s timeout.
+
+Source: `bg-tasks.ts` (bg\_bash section). Output streams live to both the tmux pane and a persistent `.log` file at `~/.pi/agent/bg-tasks/<name>.log`, which survives the 30 s tmux grace period after exit.
+
+### bg\_loop - self-correcting loop in the background
+
+`bg_loop` runs `loop run --events <file>` inside tmux. The JSON event stream (run\_start, sensor, iteration\_start, iteration, run\_end) drives a live agent view row showing iteration count, model, phase, and failing sensors. When the loop finishes, the completion nudge carries the result instead of a raw log tail.
+
+Source: `bg-tasks.ts` (bg\_loop section). For multi-node graphs, `bg_loop graph=<graph.json>` runs `loop graph run`, which orders several loop manifests and shell `cmd` nodes as a dependency graph with no approval prompts and the governor owning git. The mechanism is described fully in the [self-correcting loop reference](/reference/self-correcting-agent-loop/).
+
+---
+
+## Lifecycle and the agent view
+
+Every worker kind registers with a process-wide registry (`lib/agent-view-core.ts`), which the `agent-view` extension renders as a list under the editor - Claude Code's agent list, ported to pi (dotfiles#56).
+
+Source: `agent-view.ts` (module header, plan reference: `docs/plans/2026-10-12-pi-agent-view.md`).
+
+**The panel**: press down-arrow on an empty editor to enter the list. Up/down move; Enter or a click opens a live transcript overlay; `x` stops the worker; Esc or left-arrow leaves. Finished rows linger for 30 s (LINGER\_MS), then drop.
+
+**Streaming**: task subagents and bg\_task workers both output `pi --mode json` event streams. A shared parser (`lib/bg-stream.ts`) extracts tool calls, assistant text, token counts, and errors into a transcript. The agent view panel renders one line per worker: a status glyph, elapsed time, turns, tool count, and the last tool label.
+
+**Completion nudge**: when a bg\_task, bg\_bash, or bg\_loop finishes, the completion watcher pushes the worker's final output as a steer into the parent session, keyed on the parent's session id so it survives `--session` resume. PI\_BG\_NOTIFY=0 disables it (`bg-tasks.ts`). A running `bg_wait` breaks out early when another task finishes so the steer can be delivered.
+
+**bg\_wait**: blocks server-side until a pattern matches a bg worker's output, it exits, or timeout elapses - replaces the loop of `bg_status` -> "check again" -> `bg_status` across successive turns.
+
+---
+
+## Steering a running worker
+
+The agent view overlay has an input line at the bottom. Typing a message and pressing Enter sends it to the viewed running agent as a steer. The mechanism:
+
+1. The parent (task.ts or bg-tasks.ts) appends a JSON line to a per-worker inbox file named by PI\_WORKER\_INBOX (`lib/worker-inbox-core.ts`).
+2. `worker-inbox.ts` inside the worker polls that file every 300 ms, reads new messages, records each with `pi.appendEntry` (so the parent's transcript shows `> typed message`), and delivers it with `pi.sendUserMessage(..., {deliverAs: "steer"})`.
+3. The model sees the steer after its current tool calls finish.
+
+Workers stay one-shot: nothing reaches them after they settle. Rows whose provider `canSend` is false (finished, or spawned without an inbox) show a read-only line instead of the input.
+
+Source: `worker-inbox.ts` (worker side), `worker-inbox-core.ts` (protocol), `agent-view.ts` (plan phase reference).
+
+---
+
+## Provider errors and the concurrency cap
+
+### The 402 incident (2026-10-19)
+
+Six parallel deepseek workers were dispatched in one turn. OpenRouter returned a 402 on one of them with the reason `in_flight_budget_exhausted`: the account's credit reservation was consumed by the six concurrent in-flight requests. That one worker died on the 402 and its work was lost.
+
+An earlier incident on 2026-10-11 killed 4 of 6 workers on the same failure mode. The cap shipped the next day (commit d5fb627, 2026-10-20) as dotfiles#132.
+
+### The fix: semaphore + retry
+
+`task-limits-core.ts` adds two mechanisms:
+
+**Concurrency cap**: a FIFO counting semaphore gated on PI\_TASK\_MAX\_PARALLEL (default 4). The `maxParallel` function reads the env var; if unset or non-numeric, it uses 4.
+
+**Transient-error resume**: when a worker hits a retryable provider error - 402 with in-flight wording, 429, 5xx, connection resets, timeouts - the spawner waits on a backoff (30 s, 60 s, capped at 180 s) and relaunches the worker from its persisted session with the resume prompt: "Continue the task from where you left off." Up to MAX\_RESUMES (2) retries. Auth errors (401/403), bad requests (400), and hard out-of-credits 402s (no in-flight wording) are not retried - they fail immediately.
+
+### Error surfacing in the stream
+
+The shared stream parser (`lib/bg-stream.ts`) extracts the `errorMessage` from assistant messages whose `stopReason` is `"error"` and stores it as `lastError`. Before this, provider failures arrived as assistant messages with empty content and `stopReason: "error"` - no text, so the old `extractAssistantText` function dropped them entirely (dotfiles#126). The fix: `noteOutcome` runs on every assistant message, records the error when present, and pushes it as a `[error]` transcript entry.
+
+The final text extraction then falls through: if no assistant text was ever received (all messages errored), the result is `"[subagent produced no output]"` - the caller knows the worker failed and can inspect `lastError` for the reason.
+
+---
+
+## Worktree isolation
+
+Two agents in one working directory share one index, one working tree, and one set of untracked files. A concurrent session that runs `git add -A` stages the other's in-progress files; a loop that reverts its write scope deletes the other's new file outright. A worktree gives each agent its own index and working tree.
+
+Source: `git-worktrees` skill, `tool-routing.md` (worktree rules).
+
+### The hazard, concretely
+
+| Mechanism | What it does to the other session |
+|---|---|
+| Checkpoint `git add -A` | Stages the other session's in-progress files; if the human then commits, unrelated work rides along |
+| Scope revert | An untracked file outside `writeScope` is deleted - the other session's new file is simply gone |
+| Rollback to checkpoint | Restores files from the checkpoint index; files created after that checkpoint were never in it |
+
+An untracked file deleted by scope revert was never committed, so `git fsck --unreachable` finds no blob - the only copy was the authoring session's context.
+
+### The worktree flow
+
+A worktree shares the object store and refs with the main tree, making the merge free. The recipe:
+
+1. The main session runs `git worktree add .worktrees/<card>-<slug> -b agent/<card>-<slug> main` in the repo root (routine under the git tiers, so no prompt).
+2. Symlink `node_modules` rather than reinstalling.
+3. Append `node_modules` and `.worktrees/` to the shared git exclude file so both trees stay clean.
+4. Copy gitignored config (harness manifests, `.env` files) into the worktree.
+
+While working: the worker edits files in its worktree and runs the tests there; it never commits, because mutating git is blocked in a session without a UI. Keep the main tree clean.
+
+Finish (main session):
+
+1. Review the worker's diff (`git -C .worktrees/<card>-<slug> diff`), then `git add` and `git commit` in the worktree.
+2. `cd` to the main repo root, `git merge --ff-only agent/<card>-<slug>` (or `git cherry-pick` when main moved on).
+3. `git worktree remove .worktrees/<card>-<slug>`, then `git branch -d agent/<card>-<slug>`.
+
+Never `rm -rf` a worktree directory: it leaves a stale entry in `.git/worktrees/` that confuses later `git worktree` calls. Use `git worktree prune` if you already did.
+
+<Aside type="note">
+This doc series is being written exactly this way: one worktree per writer page,
+the writer never commits, and a parent session reviews the diff, merges it, and
+removes the worktree. The writer in this worktree has no git permissions - the
+harness blocks it (see next section).
+</Aside>
+
+---
+
+## Main-session-only git
+
+On 2026-10-20, the decision was made: subagents and background workers never run mutating git. The data that motivated it: the previous 30 days saw 3,833 approval prompts for git commands, of which the human denied 4 (two of them misclicks) (`docs/plans/2026-10-20-command-git-safety.md`, decision log). The approval prompt was not catching leaks - the guard extensions were.
+
+**The rule (dotfiles#140)**: workers edit files in the worktree the main session gave them; the main session commits, merges, and pushes. This is enforced by `git-gh-gate.ts`.
+
+```
+// Workers (pi -p subagents, bg workers, loop agents: no UI) never run
+// mutating git, routine or not: they edit files in the worktree the
+// main session gave them, and the main session commits, merges and
+// pushes (user decision 2026-10-20, dotfiles#140).
+if (!ctx.hasUI) {
+  return {
+    block: true,
+    reason:
+      "Mutating git/gh is main-session only (dotfiles#140): subagents and background workers edit files in the " +
+      "worktree they were given and leave committing, merging and pushing to the main session. Finish the file " +
+      "changes and report what is ready to commit.",
+  };
+}
+```
+
+The same gate also blocks writes to `.git` internals (no-UI write/edit/apply\_patch targeting `.git/` paths) and is mirrored in the `HEADLESS_WORKER_PREAMBLE` injected into every bg\_task worker's prompt: "Mutating git ... is blocked here: leave all git operations to the parent and describe what to commit in your final message."
+
+**What runs unprompted**: routine local git in the main session - commit, push (no force/delete), worktree add/remove, merge, switch, cherry-pick, revert, stash pop - runs without an approval prompt when the global git hooks are active and the pre-push gate passes. The gate runs gitleaks, blocked terms, and sensitive-file checks on every push; on public targets it adds identifier shapes, provenance wording, and an llmc review. Every auto-allowed command is logged to an audit trail. These gates are detailed in the leak gate guide (forthcoming in this series).
+
+---
+
+## /btw: side questions without interrupting
+
+`/btw <question>` forks the current session into a read-only background worker that answers from the full conversation history plus read-only lookups (read, grep, glob, docs, web, session search). The answer lands in the agent view as a `btw` row. The main turn keeps running.
+
+Source: `btw.ts` (module header, rework from dotfiles#63 to dotfiles#134).
+
+The old `/btw` (pre-2026-10-20) opened an overlay with no tools, no context, and no path into the conversation. The rewrite replaced it with a session fork: the worker gets the parent's full history and the same model. On a provider with prompt caching, the shared prefix is served from cache - the first request on a 2026-10-20 probe showed 520k cached input tokens.
+
+The fork runs with restricted tools: `BTW_TOOLS` (`lib/btw-core.ts:60`) = read, grep, glob, docs, web, session search - no bash, no writes, no edits. The worker session persists under the parent's `subagents/` directory like task workers, so memledger ingests it.
+
+`/btw` alone lists this session's side questions. `/btw add [n]` adds answer n (default: the latest) to the main conversation as a user message, so the main agent sees it.
+
+The btw row in the agent view shows the question text and the answer when it arrives. The transcript is openable like any other worker row.
+
+---
+
+## /undo: file-level undo
+
+`/undo` restores both the conversation AND the files the agent changed. Without file-level undo, restoring only the conversation leaves the files in the half-state the agent just edited - the next turn starts on broken files.
+
+Source: `session-undo.ts` (module header, design).
+
+**Mechanism**: lazy pre-image capture.
+
+1. On `tool_call` for write / edit / write\_stream / apply\_patch, the extension records the bytes on disk BEFORE the tool runs (the pre-image), the first time a path is touched in a turn.
+2. On `tool_result`, it records the bytes after (the post-image).
+3. Pre-images live in a content-addressed shadow store outside the project: `~/.local/state/pi-undo/<session-id>/objects/<sha256>`. Never inside the project's `.git`.
+4. On `/undo`, the extension builds a restore plan: compare each touched file's current bytes against the post-image. If unchanged (the agent was the last to touch it), restore the pre-image. If changed after the agent's edit (a human or another session touched it), skip with a warning.
+5. Then fork the conversation before the most recent user message, restoring that prompt into the editor.
+
+**Limits**: bash writes are not snapshot (only the four file tools are). `.gitignored` files, `node_modules`, `.git`, build dirs, files over 5 MiB, and anything outside the session cwd are skipped. File-undo does not survive a pi restart: the in-memory index is empty on resume and `/undo` degrades to conversation-only fork. With no UI (headless), `/undo` refuses rather than restore files silently.
+
+Disable via PI\_NO\_SESSION\_UNDO=1 (whole extension) or PI\_FILE\_UNDO\_OFF=1 (conversation fork only, no file restore).
+
+---
+
+## Decision diagram: which worker for which job
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=diamond, margin="0.1,0.05"];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q [label="Need parallel work?", shape=box, style=rounded];
+
+  q_block [label="Must parent wait\nfor result?"];
+  q_long  [label="Expected >5 min\nor >30s bash?"];
+  q_shell [label="Shell command,\nnot an agent?"];
+  q_loop  [label="Self-correcting\nloop / graph?"];
+  q_side  [label="Side question,\nmain turn runs?"];
+  q_readonly [label="Read-only\ndeep dive?"];
+  q_multi [label="2+ independent\nresearch angles?"];
+
+  res_task [label="task\n(general / explore)", shape=box, style=rounded];
+  res_bg_task [label="bg_task", shape=box, style=rounded];
+  res_bg_bash [label="bg_bash", shape=box, style=rounded];
+  res_bg_loop [label="bg_loop", shape=box, style=rounded];
+  res_btw [label="/btw\n(read-only fork)", shape=box, style=rounded];
+  res_parallel [label="N x task\nin one turn", shape=box, style=rounded];
+
+  q -> q_block;
+  q_block -> res_task [label="yes"];
+  q_block -> q_side [label="no"];
+
+  q_side -> res_btw [label="yes"];
+  q_side -> q_long [label="no"];
+
+  q_long -> q_shell [label="yes"];
+  q_shell -> res_bg_bash [label="yes (poll,\nbuild,\ndownload)"];
+  q_shell -> q_loop [label="no"];
+  q_loop -> res_bg_loop [label="yes"];
+  q_loop -> res_bg_task [label="no"];
+
+  q_long:e -> q_readonly:e [label="no\n(quick)"];
+  q_readonly -> q_multi;
+  q_multi -> res_parallel [label="yes"];
+  q_multi -> res_task [label="no\n(explore)"];
+}
+```
+
+The same thing as text:
+
+1. **Must the parent wait for the result before continuing?** Yes -> `task`. The parent blocks until the worker returns its final output. Use `explore` for read-only deep dives; `general` for work that needs full tools.
+2. **Is it a side question while the main turn is running?** Yes -> `/btw`. Forks the session into a read-only worker; answer lands in the agent view without interrupting the main agent.
+3. **Expected to run longer than 5 minutes, or a shell command past the 30 s timeout?** Yes -> background worker.
+   1. **Is it a plain shell command (polling, build, download)?** Yes -> `bg_bash`. No pi overhead.
+   2. **Is it a self-correcting loop or loop graph?** Yes -> `bg_loop`. Live per-iteration progress in the agent view.
+   3. **Otherwise** -> `bg_task`. Detached pi worker; returns immediately, nudges on completion.
+4. **Quick task (under ~5 min) that is read-only exploration?**
+   1. **Two or more independent research angles?** -> dispatch N `task` calls in one turn for parallel execution.
+   2. **Single angle** -> one `task` (explore).
+
+---
+
+## Related docs
+
+- [Loop or graph: a sensor-gated coding-agent loop](/reference/self-correcting-agent-loop/) - the loop agents spawned through the bg\_loop surface
+- [The guard extensions that police agent tool calls](/reference/agent-guard-extensions/) - the gates that block workers from running git
+- [Agent memory: how memledger remembers what the session search forgot](/reference/agent-memory-store/) - worker session persistence and memledger ingestion
+- [The secret guard: keeping credentials out of agent transcripts](/reference/agent-secret-guard/) - the other half of the gate system that blocks secret values in tool arguments

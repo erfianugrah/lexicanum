@@ -1,0 +1,582 @@
+---
+title: Leak gates that let coding agents push without approval prompts
+description: Build two leak gates that let coding agents push without approval prompts - a client pre-push gate and a server-side pre-receive hook on a self-hosted Forgejo forge - plus a repo-visibility map and GitHub push protection. Every layer is reproducible from scratch.
+author: "Erfi Anugrah"
+category: workstations
+---
+
+A coding agent that pushes on its own needs a gate that catches leaks because no human is reading every commit message and diff. Two layers: a pre-push hook on the client (the agent can skip it with `--no-verify` but the agent's own gate requires user approval for that), and a server pre-receive hook (the agent cannot skip it). Together they run scanners over the exact bytes leaving the machine and arriving at the forge.
+
+This guide builds both gates plus a daily repo-visibility map and GitHub push protection. Every scanner runs gitleaks for secrets plus a blocked-terms list for confidential identifiers. On public repos the client gate adds identifier-shape detection and provenance-framing detection, plus an optional local-model review. The server gate mirrors the gitleaks + blocked-terms scan and fails closed on every error. Every component here is running in production on a [self-hosted Forgejo 16 instance](/reference/self-hosted-forgejo-router/), gating the 10 repos that mirror to public GitHub, plus a private canary.
+
+Prerequisites: a git config tree with a global `core.hooksPath`, gitleaks installed (`gitleaks version`), bun (for the TypeScript gate; a bash fallback covers hosts without it), a self-hosted Forgejo instance, and `gh` with admin scope for GitHub push protection. The architecture below is independent of any particular agent harness. The hook is a git hook, not an agent extension. For the decisions that led here, see the companion reference page on agent git without approval prompts.
+
+## Constants
+
+One table: what each layer scans, and whether it fails open (misses a leak on tooling errors) or fails closed (blocks the push).
+
+| Layer | Scanner | Gitleaks | Blocked terms | Identifier shapes | Provenance framing | LLM review | Fail mode |
+|---|---|---|---|---|---|---|---|
+| Client pre-push (bash fallback) | bash + gitleaks | on every repo | on every repo | no | no | no | open (tool missing = warn) |
+| Client pre-push (bun gate) | TypeScript + gitleaks | fail closed on public repos, warn on private | on every repo | on public repos | on public repos | on public repos, only when a model is already loaded | open on missing tools for private repos only |
+| Server pre-receive | bash + gitleaks | fail closed | fail closed | no | no | no | closed |
+| GitHub push protection | SaaS | closed | closed (against GitHub's own pattern set) | no | no | no | closed |
+
+"Public repos" means any repo whose content reaches a public GitHub URL, either directly (a GitHub remote) or via a Forgejo push mirror. The visibility map (Part 1) decides this.
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box, style=rounded];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  subgraph cluster_client {
+    label="Dev box"; style=dashed; fontsize=10;
+    agent [label="Agent\ngit push"];
+    hook [label="pre-push hook\n(bash -> bun)"];
+    gitleaks_c [label="gitleaks"];
+    terms_c [label="blocked\ndotfiles"];
+    shapes [label="identifier +\nprovenance\nscanner"];
+    llmc [label="local model\n(llmc, optional)", style=dashed];
+    agent -> hook;
+    hook -> gitleaks_c;
+    hook -> terms_c;
+    hook -> shapes;
+    shapes -> llmc;
+  }
+  subgraph cluster_server {
+    label="Forgejo host"; style=dashed; fontsize=10;
+    forgejo [label="Forgejo 16"];
+    prereceive [label="pre-receive\nhook"];
+    gitleaks_s [label="gitleaks"];
+    terms_s [label="blocked\nterms.txt"];
+    forgejo -> prereceive;
+    prereceive -> gitleaks_s;
+    prereceive -> terms_s;
+  }
+  github [label="GitHub\npush protection"];
+  hook -> forgejo [label="push"];
+  forgejo -> github [label="push mirror"];
+}
+```
+
+1. The agent runs `git push`, which triggers the local `pre-push` hook under the global `core.hooksPath`.
+2. On hosts with bun, the hook delegates to a TypeScript gate that runs gitleaks, a blocked-terms scanner, and on public repos an identifier/provenance scanner plus an optional local-model review.
+3. On hosts without bun, a bash fallback runs gitleaks + blocked terms only.
+4. The push arrives at Forgejo. For repos whose content is mirrored to public GitHub, a `pre-receive` hook runs gitleaks and a blocked-terms scan. An agent cannot skip this hook from the client.
+5. After the Forgejo push mirror syncs, GitHub's own push protection scans the new commits against its secret-pattern database.
+
+## Part 1: repo-visibility map
+
+The gates need to know which repos are public. A daily-refreshed cache maps every known repo and its Forgejo push-mirror destinations. The plan doc that designed this records the reason: before the cache, the "public" rule was "any remote on GitHub/GitLab/Codeberg", which matched 128 local repos while only 12 GitHub repos were actually public, and Forgejo's server-side push mirrors were invisible to local `git config`[^plan-vis].
+
+### 1.1 The pure core
+
+The core module at `lib/repo-visibility-core.ts` normalises remote URLs to `host/owner/name` keys and checks whether a target is public. It has no dependencies and is imported by both the pi extension and the git hook.
+
+```typescript
+// lib/repo-visibility-core.ts (excerpt, shortened)
+export const PUBLIC_FORGE = /^(github\.com|gitlab\.com|codeberg\.org)\//;
+export const STALE_MS = 7 * 24 * 3600 * 1000;
+
+export function normalizeRemote(url: string): string {
+  let u = (url ?? "").trim();
+  if (!u) return "";
+  // scp-like: git@github.com:o/r.git
+  const scp = u.match(/^(?:[\w.-]+@)?([\w.-]+):(?!\/\/)(.+)$/);
+  // full: https://host/o/r.git
+  const full = u.match(/^[a-z+]+:\/\/(?:[^@/]+@)?([^/:]+)(?::\d+)?\/(.+)$/i);
+  // ... extract host + path, lowercase, strip .git suffix
+  return `${host}/${parts.slice(-2).join("/")}`.toLowerCase();
+}
+
+export function isPublicTarget(
+  urls: string[], cache: VisibilityCache | null, now: number = Date.now()
+): boolean {
+  const fresh = cache !== null && now - cache.generated < STALE_MS;
+  if (!fresh) return urls.some(k => PUBLIC_FORGE.test(k)); // fallback: any public forge
+  const pub = new Set(cache.public);
+  const known = new Set(cache.known);
+  for (const k of keys) {
+    if (pub.has(k)) return true;
+    // mirrors: Forgejo key -> GitHub key that is public
+    if ((cache.mirrors[k] ?? []).some(m => pub.has(m) ||
+      (PUBLIC_FORGE.test(m) && !known.has(m)))) return true;
+    // unknown public-forge URL: treat as public
+    if (PUBLIC_FORGE.test(k) && !known.has(k)) return true;
+  }
+  return false;
+}
+```
+
+### 1.2 The daily refresh
+
+`bin/repo-visibility-refresh` queries the GitHub API for every repo's visibility, the Forgejo API for repos and their push mirrors, then writes `~/.cache/repo-visibility.json` atomically. A failed source exits non-zero without touching the old cache, so a network blip never turns "public" into "unknown".
+
+```bash
+# bin/repo-visibility-refresh (excerpt, shortened)
+# GitHub: user + orgs
+owners="$(gh api user --jq .login)"
+owners="$owners $(gh api user/orgs --jq '.[].login' | tr '\n' ' ')"
+for o in $owners; do
+  gh repo list "$o" --limit 2000 --json nameWithOwner,visibility \
+    --jq '.[] | "github.com/\(.nameWithOwner|ascii_downcase)\t\(.visibility)"'
+done > "$work/gh.tsv"
+
+# Forgejo: repos + push mirrors
+sx FORGEJO_API_TOKEN -- bash -c '
+  p=1; while :; do
+    page="$(fjctl api "repos/search?limit=50&page=$p" | jq -r ".data[].full_name")"
+    [ -n "$page" ] || break
+    printf "%s\n" "$page"; p=$((p+1))
+  done' > "$work/fj.txt"
+
+# Writes ~/.cache/repo-visibility.json atomically:
+# {"generated": <epochMs>, "public": [...], "known": [...], "mirrors": {...}}
+```
+
+A systemd user timer runs it daily at 05:15 with a 20-minute random delay:
+
+```ini
+# .config/systemd/user/repo-visibility.timer
+[Timer]
+OnCalendar=*-*-* 05:15:00
+RandomizedDelaySec=20min
+Persistent=true
+```
+
+The generated JSON lists every public repo key and every Forgejo-key-to-GitHub-key mirror mapping. A stale cache (>7 days) makes the gate fall back to "any public-forge URL is public", which is safe (over-guards) but noisy.
+
+### 1.3 Blocked-terms sync to the server
+
+The server hook needs the same blocked-terms list. `bin/leak-gate-terms-sync` collects every repo's `confidential-terms.json` store, unions their `blocked` arrays, NUL-separates and base64-encodes them, and writes the result into the forgejo-compose SOPS `.env` as `LEAK_GATE_BLOCKED_B64`. The seed container (Part 3) decodes it at deploy time.
+
+```bash
+# bin/leak-gate-terms-sync (excerpt)
+files=("$HOME/.pi/agent/confidential-terms.local.json")
+# plus every repo's .git/info/confidential-terms.json
+LEAK_GATE_BLOCKED_B64="$(jq -r '.blocked // [] | .[]' "${files[@]}" 2>/dev/null |
+  sort -u | grep -v '^$' | tr '\n' '\0' | base64 -w0)"
+secretctl set "sops:$ENVF#LEAK_GATE_BLOCKED_B64" --from env:LEAK_GATE_BLOCKED_B64
+```
+
+After running it, commit and push forgejo-compose so the seed redeploys.
+
+## Part 2: client pre-push gate
+
+### 2.1 The bash hook
+
+`.config/git/hooks/pre-push` is the entry point. It receives the standard pre-push stdin (one line per ref: `<local ref> <local sha> <remote ref> <remote sha>`) and, on hosts with bun, delegates to the TypeScript gate at `lib/prepush-gate.ts`. When bun is absent, a bash fallback runs the same two scanners: gitleaks over the exact push range, and a blocked-terms scan using the same JSON stores the pi guard uses.
+
+```bash
+# .config/git/hooks/pre-push (excerpt, shortened)
+gate="$(dirname "$(readlink -f "$0")")/lib/prepush-gate.ts"
+if command -v bun >/dev/null 2>&1 && [ -f "$gate" ]; then
+  printf '%s\n' "$push_lines" | bun "$gate" "$@" || exit 1
+  chain_local "$@"
+fi
+
+# bash fallback: gitleaks + blocked terms over the same range
+while read -r localref localsha remoteref remotesha; do
+  # ... resolve rev range, build commit list, scan blob
+  gitleaks git --no-banner --redact --log-opts="$logopts" . >/dev/null 2>&1 || fail=1
+  # blocked-term scan (terms never echoed, only masked context)
+done <<< "$push_lines"
+```
+
+The hook never prints a blocked term. Matches are shown as masked context: `...before[REDACTED]after...`.
+
+:::note
+Both paths chain to a repo-local `pre-push` hook afterwards (if one exists and is different from this hook). Under a global `core.hooksPath`, `git rev-parse --git-path hooks/pre-push` points back at the global hook, so the chain resolves the repo-local hook via the git dir explicitly.
+:::
+
+### 2.2 The bun gate
+
+`lib/prepush-gate.ts` is the TypeScript gate that runs on bun hosts. It reads the pre-push stdin, resolves the rev range, loads the visibility cache, and runs every scanner through a pure core at `lib/prepush-gate-core.ts`.
+
+```typescript
+// lib/prepush-gate.ts (excerpt, shortened)
+const pub = process.env.PREPUSH_FORCE_PUBLIC === "1" ||
+  isPublicTarget([url], loadVisibilityCache());
+
+for (const line of lines) {
+  const [ , localSha, , remoteSha] = line.split(" ");
+  const revArgs = remoteSha === Z
+    ? [localSha, "--not", `--remotes=${remoteName}`]
+    : [`${remoteSha}..${localSha}`];
+  const { commits, base } = loadCommits(revArgs);
+  if (termsOn) {
+    const { findings, taintHints } = scanPush({
+      commits, public: pub, blocked, allowed, ownDomains,
+      taint: pub ? readTaint() : [],
+      published: publishedAt(base),
+    });
+    if (findings.length) { report(findings); fail = true; }
+  }
+  // gitleaks: fail closed on public targets
+  const g = gitleaks(logOpts);
+  if (g === "leak" || (g === "missing" && pub)) fail = true;
+}
+
+// LLM review: public targets only, only when a model is already loaded
+if (pub && !fail && termsOn && allCommits.length) {
+  const r = await llmReview(allCommits, [...hints]);
+  if (r.status === "leak") fail = true;
+}
+```
+
+Three knobs skip layers: `PI_CONFIDENTIAL_GUARD_OFF=1` (term/provenance scan), `PI_PREPUSH_GITLEAKS=0` (gitleaks), and `PREPUSH_LLM=0` (local-model review). The agent's tiered git gate requires user approval before setting any of them, and `--no-verify` is always gated.
+
+### 2.3 The pure core: what gets scanned
+
+`lib/prepush-gate-core.ts` exports `scanPush()`, a pure function that takes parsed commits and returns findings and taint hints. Every finding carries a rule tag, a location string, and masked context. It never contains the matched text.
+
+```typescript
+// lib/prepush-gate-core.ts (excerpt, shortened)
+export interface Finding {
+  rule: "blocked-term" | "sensitive-file" | "identifier" | "provenance";
+  where: string;
+  masked: string;
+}
+
+export function scanPush(input: ScanInput): ScanResult {
+  // 1. blocked terms: every repo
+  for (const c of input.commits) {
+    scanText(c.message, `${short} message`, true, false);
+    for (const f of c.files) {
+      if (f.status === "D") continue;
+      scanText(body, `${short} ${f.path}`, PROSE.test(f.path), isCodeFile(f.path));
+    }
+  }
+  // ...
+}
+
+function scanText(text: string, where: string, prose: boolean, code: boolean) {
+  const b = scanForBlocked(text, input.blocked);
+  if (b) out.push({ rule: "blocked-term", where, masked: b.masked });
+  if (!input.public) return;
+  // identifier shapes: emails (not the author's own), project refs, etc.
+  const s = scanStructural(text, input.allowed);
+  if (s) out.push({ rule: "identifier", where, masked: `${s.masked} (${s.kind})` });
+  // provenance framing: prose files + commit messages only
+  if (prose) {
+    const p = scanProvenance(text);
+    if (p) out.push({ rule: "provenance", where, masked: p });
+  }
+}
+```
+
+**Sensitive files.** A path that matches `.env`, `.pem`, `id_rsa`, `id_ed25519`, `.netrc`, `.pgpass`, `credentials.json`, or `.ssh/` is blocked, unless the content passes a SOPS-encrypted-content check (`ENC[AES256_GCM,` or `sops:`). The exceptions are `.env.example`, `.env.sample`, `.env.template`, `.env.dist`, `.env.defaults`, and `.pub` files.
+
+```typescript
+// lib/prepush-gate-core.ts (excerpt)
+const SENSITIVE_FILE: RegExp[] = [
+  /(^|\/)\.env(\.[^/]*)?$/,
+  /\.(pem|p12|pfx|kdbx|keystore|jks)$/i,
+  /(^|\/)id_(rsa|dsa|ecdsa|ed25519)(\.[^/]*)?$/,
+  /(^|\/)\.(viminfo|netrc|pgpass|git-credentials|htpasswd)$/,
+  /(^|\/)[^/]*credentials[^/]*\.(json|ya?ml|toml|ini)$/i,
+  /(^|\/)\.ssh\//,
+];
+```
+
+**Provenance framing.** On public repos, commit messages and prose files are scanned for wording that reveals where something came from. The pattern is a customer/prospect/team noun plus a channel word in the same sentence, or a fixed phrase like "sales thread", "pen-test thread", "one of our customers", "a customer of ours", "under NDA", "from a customer". Code files skip this scan: identifiers like "client" and "customer" are ordinary code-docs vocabulary.
+
+```typescript
+// lib/prepush-gate-core.ts (excerpt)
+const PARTY = /\b(customers?|prospects?|users? of ours|
+  our (?:ae|csm|sales(?: team)?|support(?: team)?|
+  account (?:team|manager)))\b/i;
+const CHANNEL = /\b(raised|reported|asked|complained|requested|
+  escalat\w*|threads?|tickets?|meetings?|emailed|slack|
+  told (?:us|me)|pen-?tests?|poc|pov|deals?|renewals?|
+  churn\w*|rfp)\b/i;
+const PHRASES = /\b(sales thread|pen-?test thread|
+  one of our (?:customers|clients|users)|
+  a customer of ours|under (?:an? )?nda|
+  customer(?:'s)? (?:call|escalation|ticket|thread|
+    meeting|primary|database|project|org)|
+  from a (?:customer|prospect))\b/i;
+
+export function scanProvenance(text: string): string | null {
+  // fixed phrase match, or party + channel in one sentence
+}
+```
+
+**Tainted terms.** Terms that appeared in the author's internal sources (chat, CRM, internal docs) in the last 30 days are tainted. They are NOT blocked: replaying 590 commits across 6 public repos, every taint hit was a product name, UI label or code identifier because the taint store sweeps every capitalised word. Instead, unpublished tainted terms are collected as hints and passed to the LLM review, which judges whether any identifies a customer, prospect, or person.
+
+**Gitleaks on public targets.** When the push target is public and gitleaks is not installed, the gate blocks the push (fail closed). On private repos, a missing gitleaks prints a warning and continues.
+
+### 2.4 Local-model review (optional)
+
+On public targets only, the gate asks the local LLM whether the added text reveals internal or customer context. This catches framing that a regex cannot, such as naming an internal project or who asked for a change. It runs only when a model is already loaded (no swap, no eviction), with a 180-second timeout. The prompt asks for a JSON verdict and nothing else; the model's system prompt is explicit about what to flag and what to ignore.
+
+```typescript
+// lib/prepush-llm-core.ts (excerpt, shortened)
+export const REVIEW_SYSTEM = `You review a git push to a PUBLIC repository
+  for confidential business context.
+  ... Flag ONLY text that reveals:
+  - a specific customer, prospect, partner, employer-internal team or person
+  - that something came from a customer interaction
+  - internal-only plans, pricing, roadmap, incidents, or credentials
+  Do NOT flag: generic technical content, public products and companies
+  in a public technical context, example/placeholder data,
+  the author's own homelab, open-source project names.
+  Answer with ONE JSON object and nothing else:
+  {"leak": true|false, "lines": [<numbers>], "why": "<one sentence>"}`;
+```
+
+When the model is unavailable, the gate prints "LLM review skipped" and relies on the deterministic scanners. If tainted terms were present and not reviewed, a warning is printed.
+
+When the model flags a leak, the push is blocked with the model's reason printed verbatim. The author then rewrites the commit(s) to remove the flagged text.
+
+### 2.5 Measurement
+
+On 2026-10-20, the gate was replayed against 909 real commits across 6 public repos. Result: 14 blocks - 2 true positives (secrets in commit messages), 5 identifier-shaped refs in test fixtures and plan docs (unconfirmed), and 7 generic-wording false positives from the provenance scanner[^plan-measure].
+
+## Part 3: server pre-receive hook (Forgejo)
+
+A client pre-push hook can be skipped with `--no-verify`. The server hook cannot be skipped from the client. Only a push option (`git push -o leak-gate.skip`) bypasses it, and the agent's tier gate requires user approval for any push option. The Forgejo stack itself is deployed via [GitOps webhooks](/guides/forgejo-webhooks-composer-gitops/); each deploy refreshes the seed container that installs these hooks.
+
+Forgejo 16 centralises required hooks (`DISABLE_GIT_HOOKS=true` by default, which stops users from editing hooks in the web UI; admins can still place files in the bare repository's `hooks/` directory). In this deployment, Forgejo 16's central pre-receive chains to `./hooks/pre-receive.d/*` from each bare repo[^forgejo-hooks].
+
+### 3.1 The hook
+
+`leak-gate/leak-gate.sh` runs as a pre-receive hook in each repo listed in `leak-gate/repos.txt`. It receives the standard pre-receive stdin (old sha, new sha, ref), resolves the rev range, and runs gitleaks followed by a blocked-terms scan.
+
+```bash
+# leak-gate/leak-gate.sh (excerpt, shortened)
+#!/bin/bash
+set -u
+G="${LEAK_GATE_DIR:-/var/lib/gitea/custom/leak-gate}"
+Z=0000000000000000000000000000000000000000
+repo="$(basename "$(pwd)")"
+
+# push-option bypass
+for ((i = 0; i < ${GIT_PUSH_OPTION_COUNT:-0}; i++)); do
+  v="GIT_PUSH_OPTION_$i"
+  if [ "${!v}" = "leak-gate.skip" ]; then
+    echo "leak-gate: SKIPPED by push option for $repo" >&2
+    exit 0
+  fi
+done
+
+fail=0
+while read -r old new ref; do
+  [ "$new" = "$Z" ] && continue
+  if [ "$old" = "$Z" ]; then
+    range=("$new" --not --all)
+    opts="$new --not --all"
+  else
+    range=("$old..$new")
+    opts="$old..$new"
+  fi
+  n=$(git rev-list --count "${range[@]}" 2>/dev/null || echo "?")
+  [ "$n" = "0" ] && continue
+
+  # Gitleaks: fail closed on missing binary or timeout
+  if [ ! -x "$G/bin/gitleaks" ]; then
+    echo "leak-gate: BLOCKED - gitleaks missing on the server ($ref)" >&2
+    fail=1; continue
+  fi
+  timeout 120 "$G/bin/gitleaks" git --no-banner --redact --no-color \
+    --log-level=error --log-opts="$opts" . >&2
+  rc=$?
+  if [ "$rc" -eq 1 ]; then
+    echo "leak-gate: BLOCKED - secret in $ref ($n commit(s)); findings above are redacted" >&2
+    fail=1
+  elif [ "$rc" -ne 0 ]; then
+    echo "leak-gate: BLOCKED - secret scan failed (exit $rc) on $ref; failing closed" >&2
+    fail=1
+  fi
+
+  # Blocked terms: NUL-separated list from SOPS .env, never printed
+  if [ -s "$G/terms.txt" ]; then
+    hits=$(git log -p -U0 --no-color --format='%H%n%B' "${range[@]}" 2>/dev/null \
+      | grep -v -e '^-' -e '^+++ ' -e '^--- ' | grep -c -i -F -w -f "$G/terms.txt")
+    if [ "${hits:-0}" -gt 0 ]; then
+      echo "leak-gate: BLOCKED - $hits line(s) in $ref contain a blocked confidential term (term not shown)" >&2
+      fail=1
+    fi
+  fi
+done
+
+[ "$fail" -eq 0 ] && echo "leak-gate: ok ($repo)" >&2
+exit "$fail"
+```
+
+The hook scans only added lines (`grep -v '^-'`). The terms file is written `0600` by the seed container. Every scanner error or timeout (120 seconds per ref) blocks the push. The hook fails closed.
+
+### 3.2 The seed container
+
+A one-shot Docker Compose service, `leak_gate_seed`, runs on every deploy. It copies the gitleaks binary, the hook script, and the decoded terms file into the Forgejo data volume, then symlinks the hook into each listed repo's `hooks/pre-receive.d/` directory. It also removes the symlink from repos dropped from the list.
+
+```bash
+# leak-gate/seed.sh (excerpt, shortened)
+#!/bin/sh
+set -eu
+S="${SEED_DIR:-/seed}"
+G=/data/custom/leak-gate
+mkdir -p "$G/bin"
+cp /usr/bin/gitleaks "$G/bin/gitleaks"
+cp "$S/leak-gate.sh" "$G/leak-gate.sh" && chmod 755 "$G/leak-gate.sh"
+
+# Write terms file 0600: base64-decoded blocked terms + canary term
+umask 077
+{ printf '%s' "${LEAK_GATE_BLOCKED_B64:-}" | base64 -d | tr '\0' '\n'
+  echo <canary-term>; } \
+  | grep -v '^$' > "$G/terms.txt"
+
+# Symlink into each listed repo
+R=/data/git/repositories
+for r in $want; do
+  d="$R/$r.git"
+  mkdir -p "$d/hooks/pre-receive.d"
+  ln -sfn /var/lib/gitea/custom/leak-gate/leak-gate.sh \
+    "$d/hooks/pre-receive.d/leak-gate"
+done
+```
+
+The seed uses the `zricethezav/gitleaks:v8.30.1` image. It runs as UID 1000:1000 to match Forgejo's rootless image, and has `network_mode: none` plus `cap_drop: ALL`. It writes to the data volume and exits.
+
+The seed's `command:` is generated by `leak-gate/render.py`, which inlines the three source files (seed.sh, leak-gate.sh, repos.txt) into the Docker Compose service definition. This is necessary because the deploy tool runs `docker compose` inside its own container, where a relative bind mount resolves to a path on the host that is an empty directory. Inlining the files eliminates the host-path dependency.
+
+```python
+# leak-gate/render.py (excerpt, shortened)
+"""Embed leak-gate/* into the seed's command in docker-compose.router.yml."""
+lg = ["set -eu", "mkdir -p /tmp/seed"]
+for name in ("leak-gate.sh", "repos.txt", "seed.sh"):
+    lg.append(f"cat > /tmp/seed/{name} <<'LGEOF'\n{esc(content, 'LGEOF')}LGEOF")
+lg.append("SEED_DIR=/tmp/seed exec sh /tmp/seed/seed.sh")
+```
+
+Run `python3 leak-gate/render.py` after any edit to the leak-gate files, then deploy with `baton deploy forgejo`. Run `render.py --check` in CI to fail when the compose file is stale.
+
+### 3.3 The repo list
+
+`leak-gate/repos.txt` lists the repos that get the hook: every repo whose content reaches a public GitHub repo via a Forgejo push mirror. Regenerate it from the dev box:
+
+```bash
+repo-visibility-refresh
+jq -r '. as $c | .mirrors | to_entries[] |
+  select(any(.value[]; . as $m | $c.public | index($m))) | .key' \
+  ~/.cache/repo-visibility.json | sed 's#^git.erfi.io/##' | sort
+```
+
+Add a private canary repo to the list (here `leak-gate-selftest`) so the hook can be verified without touching a real repo. The seed appends a canary term (a fixed nonsense token, shown here as `<canary-term>`) to `terms.txt`. The literal is not printed on this page: the page itself is pushed through the same gate, and the first push of this guide was rejected for quoting it.
+
+## Part 4: GitHub push protection
+
+GitHub's own secret scanning push protection is the last line of defence. It runs on every push and is enabled per-repo via the REST API.
+
+```bash
+# Enable secret scanning + push protection on a public repo
+gh api -X PATCH "/repos/$OWNER/$REPO" \
+  -f security_and_analysis='{
+    "secret_scanning": {"status": "enabled"},
+    "secret_scanning_push_protection": {"status": "enabled"}
+  }'
+```
+
+The `security_and_analysis` object on `PATCH /repos/{owner}/{repo}` accepts these sub-objects, each with a `status` field of `"enabled"` or `"disabled"`[^github-sa]. The call requires admin permissions on the repo or organization.
+
+For public repos, GitHub's push protection runs for free. It blocks pushes containing known secret patterns (GitHub tokens, AWS keys, Cloudflare API tokens, and hundreds more) with a message naming the secret type and the file:line location.
+
+This layer is not a substitute for the client or server gates. It only covers the secret patterns GitHub knows about, and it only runs on the GitHub side (after the Forgejo push mirror syncs). The server gate catches secrets before they leave the forge.
+
+## Verification
+
+### Canary repo test
+
+Push a commit containing a generated `ghp_` token to the canary repo. The server hook must reject it:
+
+```bash
+# On the dev box: generate a fake token, push to canary
+TOKEN="ghp_$(openssl rand -hex 18)"
+echo "test: $TOKEN" > canary.txt
+git add canary.txt && git commit -m "canary: secret test"
+git push origin main   # expected: rejected by server pre-receive hook
+```
+
+The rejection message reads `leak-gate: BLOCKED - secret in refs/heads/main (1 commit(s)); findings above are redacted`.
+
+### Blocked-term test
+
+Push a commit containing the canary term:
+
+```bash
+echo "<canary-term>" > canary.txt
+git add canary.txt && git commit -m "canary: term test"
+git push origin main   # expected: rejected
+```
+
+The rejection message reads `leak-gate: BLOCKED - 1 line(s) in refs/heads/main contain a blocked confidential term (term not shown)`.
+
+### Replay measurement
+
+The pre-push gate was replayed against 909 real commits across 6 public repos on 2026-10-20: 14 blocks (2 true positives, 5 identifier-shaped refs unconfirmed, 7 generic-wording false positives)[^plan-measure]. The measurement command:
+
+```bash
+bun .config/git/hooks/lib/prepush-gate.ts --replay <rev-range> --public
+```
+
+## Gotchas and lessons learned
+
+### Empty bind-mount directories
+
+The first deploy of the seed container used a relative bind mount (`./leak-gate:/seed`). The deploy tool runs compose inside its own container, where that path resolves to `/opt/stacks/forgejo/leak-gate` on the host, an empty directory Docker creates on the first `docker compose up`. The seed ran with an empty `/seed` and installed nothing. The fix: inline the source files into the service's `command` field (Part 3.2).
+
+This class of bug applies to any compose stack deployed by a containerised orchestrator. If a relative bind mount resolves to a path that is only populated inside a git checkout, that path is empty on the host.
+
+### `--no-verify` needs a prompt
+
+A client pre-push hook is trivially skipped with `git push --no-verify`. The gate that matters is the agent's own tiered command gate, which must always require user approval for `--no-verify`. Without that, an agent that guessed or hallucinated a term could push around the hook.
+
+### Hooks that fail open get disabled
+
+An earlier version of the bash fallback printed "warning: gitleaks not installed" and exited 0 on every push. Because it never blocked anything, it was invisible until a session pushed commits carrying confidential text to a public mirror. Every scanner in the final design either blocks the push or, on private repos only, warns and continues.
+
+### The terms are never printed
+
+Both hooks show only masked context and counts. Printing a matched term to stderr during a push would re-propagate the leak: the blocked term would appear in the terminal, in the agent's context window, and in session logs. The `[REDACTED]` convention is the correct escape.
+
+### The server hook's gitleaks config is the server's own
+
+A bare git repository has no worktree, so the hook reads no `.gitleaks.toml` or `.gitleaksignore` from the repo. The gitleaks config is whatever ships with the gitleaks binary. Adding a repo-level gitleaks config would require a separate bind mount path in the seed.
+
+### Local-model review never swaps models
+
+The LLM review checks whether a model is already loaded and skips if one is not. A pre-push hook that triggered a model swap (unloading the current engine, loading a different one) would disrupt the active chat session. The review runs only when it is free.
+
+## File reference
+
+Paths are relative to the dotfiles repo root unless stated otherwise.
+
+| File | Purpose |
+|---|---|
+| `.config/git/hooks/pre-push` | Entry-point bash hook; delegates to bun or falls back to bash |
+| `.config/git/hooks/lib/prepush-gate.ts` | TypeScript gate: reads pre-push stdin, runs core + gitleaks + LLM |
+| `.pi/agent/extensions/lib/prepush-gate-core.ts` | Pure scanner: blocked terms, sensitive files, identifier shapes, provenance framing |
+| `.pi/agent/extensions/lib/prepush-llm-core.ts` | Prompt builder + verdict parser for the local-model review |
+| `.pi/agent/extensions/lib/repo-visibility-core.ts` | Remote normalisation + public-target check |
+| `bin/repo-visibility-refresh` | Daily cache refresh: GitHub + Forgejo APIs |
+| `.config/systemd/user/repo-visibility.service` | systemd oneshot service for the refresh |
+| `.config/systemd/user/repo-visibility.timer` | Daily timer, 05:15 + 20min jitter |
+| `bin/leak-gate-terms-sync` | Collects blocked terms into the forgejo-compose SOPS .env |
+| `infra/forgejo-compose/leak-gate/leak-gate.sh` | Server-side pre-receive hook |
+| `infra/forgejo-compose/leak-gate/seed.sh` | One-shot seed container script |
+| `infra/forgejo-compose/leak-gate/repos.txt` | Repos that get the hook |
+| `infra/forgejo-compose/leak-gate/render.py` | Inlines the leak-gate files into docker-compose.router.yml |
+| `infra/forgejo-compose/docker-compose.router.yml` `leak_gate_seed` | Compose service definition (generated) |
+
+## References
+
+[^plan-vis]: The dotfiles repo, `docs/plans/2026-10-20-command-git-safety.md`, Phase 1.
+
+[^plan-measure]: The dotfiles repo, `docs/plans/2026-10-20-command-git-safety.md`, Phase 8: "replay 909 public commits -> 14 blocks".
+
+[^forgejo-hooks]: Forgejo docs, "Upgrade from Gitea," [admin/upgrade](https://codeberg.org/forgejo/docs/src/branch/next/docs/admin/upgrade/index.md). "Custom, user defined Git hooks are disabled by default in Forgejo ... However, admins have the ability to place files manually inside the Git repository's folders." And the config cheat-sheet: `DISABLE_GIT_HOOKS`: **true**: Set to `false` to enable users with Git Hook privilege to create custom Git Hooks.
+
+[^github-sa]: GitHub REST API, [Repositories - Update a repository](https://docs.github.com/rest/repos/repos#update-a-repository). The `security_and_analysis` object contains `secret_scanning`, `secret_scanning_push_protection`, `advanced_security`, and `code_security`, each with a `status` of `enabled` or `disabled`.
