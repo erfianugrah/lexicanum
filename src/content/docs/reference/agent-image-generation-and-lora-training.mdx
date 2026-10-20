@@ -1,0 +1,306 @@
+---
+title: "Agent image generation and LoRA training"
+description: "How to expose Stable Diffusion generation and kohya-based LoRA training to a coding agent as MCP tools - the tool shape, workflow defaults, SDXL vs Flux training divergences, captioning engines matched to the model family, dataset prep, deploying a trained LoRA to the generator, and sharing one GPU with the LLM."
+author: Erfi Anugrah
+category: workstations
+---
+
+A coding agent that can generate images and train its own fine-tunes needs three things: a generation server, a training service, and a scheduling layer that keeps them from fighting the LLM for the GPU. This page describes how one workstation exposes both as MCP tools so the agent can prompt, audit, train, caption and deploy without leaving the harness.
+
+The worked example is the same single-GPU setup covered in [Scheduling one GPU between LLM, image and training work](/reference/llmc-single-gpu-stack/): a ComfyUI server for image generation, a kohya sd-scripts container for LoRA training, and a mode-switching proxy that owns the GPU and runs exactly one workload at a time. Every tool shape and default below is read from the MCP server source and the skill files as of 2026-10-20. Incident lessons are drawn from session history and cited by date. No figure was measured for this page; the throughput numbers that justify the GPU-sharing rules live in [the bench page](/reference/local-model-bench/).
+
+**TL;DR:**
+
+- Three ComfyUI tools: `comfyui_generate` (prompt -> image, with checkpoint/sampler/ratio overrides), `comfyui_status` (GPU mode and queue), `comfyui_history` (past results). Seven training tools: `train_start`, `train_status`, `train_logs`, `train_cancel`, `train_list`, `train_datasets`, `train_deploy`.
+- The agent must never read generated images back into context. The MCP server returns file paths, and the model's input limit is exceeded by the base64 inline of a single output PNG.
+- SDXL training: LoRA rank 32, alpha at parity, clip skip 2 for anime bases and 1 for photo-realistic ones, 4 epochs default. Flux: rank 16, alpha 16, fp8 base mandatory on 32 GB VRAM, T5 attention mask on, 8 epochs for face LoRAs. The differences follow from the base-model architecture: T5-XXL text encoding vs CLIP, flux-dev being a distilled model, and VRAM budget.
+- BLIP-2 captions (natural language) for Flux, which encodes through T5-XXL. WD14 tags (Danbooru vocabulary) for SDXL and anime bases, which encode through CLIP.
+- Generation and training coexist with the LLM through the GPU proxy described in the linked page - one workload at a time, a drain-before-swap sequence, a lock for unattended work. Calling `comfyui_generate` or `train_start` stops the LLM engine, runs the job, and the LLM restarts on the next chat request.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_agent {
+    label="agent harness (pi)"; style=rounded; fontsize=12; margin=12;
+    harness [label="MCP client"];
+    comfy_tools [label="comfyui_generate\ncomfyui_status\ncomfyui_history"];
+    train_tools [label="train_start / train_status\n train_logs / train_cancel\ntrain_list / train_datasets\ntrain_deploy"];
+  }
+  subgraph cluster_proxy {
+    label="GPU proxy :11434"; style=rounded; fontsize=12; margin=12;
+    proxy [label="scheduler\none workload at a time"];
+  }
+  subgraph cluster_gpu {
+    label="GPU services (one active)"; style=rounded; fontsize=12; margin=12;
+    comfy [label="ComfyUI :8188\ngeneration"];
+    train [label="lora-train :8787\nkohya sd-scripts"];
+    llm [label="LLM engine :8080\n(not covered here)"];
+  }
+  subgraph cluster_storage {
+    label="storage"; style=rounded; fontsize=12; margin=12;
+    datasets [label="dataset store\nimage/caption pairs"];
+    output [label="output store\nimages + LoRAs"];
+  }
+
+  harness -> comfy_tools [style=dashed];
+  harness -> train_tools [style=dashed];
+  comfy_tools -> proxy [label="MCP stdio ->\n /comfyui/*"];
+  train_tools -> proxy [label="MCP stdio ->\n /train/*"];
+  proxy -> comfy [label="mode comfyui"];
+  proxy -> train [label="mode train"];
+  proxy -> llm [label="mode llm\n(default)"];
+  train -> datasets [label="reads"];
+  train -> output [label="writes LoRAs"];
+  comfy -> output [label="writes images"];
+}
+```
+
+The same thing as text:
+
+1. The agent harness loads two MCP servers, `comfyui` and `lora-train`, as stdio Python processes that talk to the GPU proxy at `localhost:11434`.
+2. The proxy runs exactly one GPU workload at a time (LLM, ComfyUI, or the trainer).
+3. On a `comfyui_generate` or `train_start` call, the proxy drains in-flight LLM requests, stops the LLM engine, starts the target service, and forwards the call. The LLM engine restarts on the next chat request.
+4. Generation output (PNG files) lands in a shared output directory. Training output (`.safetensors` LoRA files) lands in a training output directory and is copied to ComfyUI's LoRA directory on `train_deploy`.
+5. Training data (image/caption pairs) lives in a dataset store the trainer container mounts read-only.
+
+---
+
+## Which tool for what
+
+### Generation
+
+| Tool | What it does | When the agent calls it |
+|---|---|---|
+| `comfyui_generate` | Submits a txt2img workflow and waits for the output PNG. The prompt, negative prompt, dimensions, steps, CFG, seed and checkpoint are all overridable; a full ComfyUI workflow JSON can be passed instead. | The user asks for an image, or a workflow step needs one. |
+| `comfyui_status` | Reports the GPU mode, the ComfyUI queue state, and whether a swap is in progress. | Before generation, to confirm the GPU is not locked by an unattended loop. |
+| `comfyui_history` | Returns output file paths and metadata for recent generations, or for one by its prompt id. | The user asks what was generated earlier in the session. |
+
+The default workflow is a minimal txt2img graph: `CheckpointLoaderSimple` -> `CLIPTextEncode` (positive + negative) -> `KSampler` -> `VAEDecode` -> `SaveImage`. Every parameter has a built-in default, and a local config file (`comfyui.local.env`) can override them per machine.
+
+| Default | Value | Rationale |
+|---|---|---|
+| Checkpoint | `sd_xl_base_1.0.safetensors` | Safe base; swapped per generation for Illustrious, Flux, or custom checkpoints. |
+| Dimensions | 832 x 1216 (portrait) | Good SDXL ratio. Other SDXL ratios: 1024x1024, 1216x832, 768x1344. |
+| Steps | 30 | Enough for convergence on most checkpoints. |
+| Sampler | Euler | Sane default for SDXL. |
+| CFG | 5 | Lower than the common 7; reduces burnt highlights on SDXL. |
+| Positive prefix | `masterpiece, best quality` | Standard quality tags. |
+
+The agent never reads the output PNG. The MCP server returns local file paths; the human user views the image in their viewer. If the agent calls `read` on a generated PNG, the base64 inline exceeds the model's input limit and the turn fails with an "Input is too long" error. This rule is in the tool description so every model sees it on every call.
+
+The MCP server tool description carries an explicit warning on every call to prevent this.
+
+### Training
+
+| Tool | What it does | When the agent calls it |
+|---|---|---|
+| `train_start` | Starts a kohya sd-scripts training job with the given dataset config, base model, and hyperparameters. Returns the effective config and a warning that the LLM backend is stopped. | The user asks to train a LoRA on a prepared dataset. |
+| `train_status` | Reports state (training/completed/failed/idle), step count, loss, epoch, elapsed and ETA. | The agent polls progress, or the user asks how the run is going. |
+| `train_logs` | Returns the last N lines of training output. | The agent needs the raw loss curve or error text. |
+| `train_cancel` | Kills the current training job. | The user changes their mind, or the loss has diverged. |
+| `train_list` | Lists completed LoRA files with sizes. | Before deploying, or the user asks what has been trained. |
+| `train_datasets` | Lists available datasets under the trainer's data root. | The user asks what can be trained on, or the agent is about to start a run. |
+| `train_deploy` | Copies a trained `.safetensors` LoRA from the output directory to ComfyUI's `models/loras/`. | After training completes, so the LoRA is available in `comfyui_generate` workflows. |
+
+Training is long-running (10-60+ minutes). The MCP server's `train_start` submits the job and returns immediately; `train_status` polls the training container's HTTP endpoint. The trainer container itself wraps kohya sd-scripts with a stdlib Python HTTP server - no separate ML framework dependencies beyond what kohya already pulls in.
+
+---
+
+## SDXL vs Flux: the divergences that stick
+
+The two model families differ in architecture, text encoding and VRAM budget, so the training defaults differ. The table below records the choices that have held across several runs on a 32 GB card.
+
+| Parameter | SDXL (Illustrious / NoobAI / Pony) | SDXL (JuggernautXL / photo-realistic) | Flux (flux1-dev) | Why |
+|---|---|---|---|---|
+| LoRA rank | 32 | 32 | 16 | Flux at rank 16 matches the distilled model's capacity; higher ranks overfit faces at the batch sizes this card runs. |
+| Alpha | 32 | 32 | 16 | Alpha at parity so the LoRA scale is 1.0; Flux alpha tracks the lower rank. |
+| Epochs | 4 | 4 | 8 (face), 4 (style) | Tool default is 4 for all types. Skill recommends 8 for Flux face LoRAs at rank 16. Style LoRAs converge faster. |
+| Clip skip | 2 | 1 | N/A | SDXL only. Illustrious/NoobAI/Pony bases were trained with CLIP skip 2; JuggernautXL and photo-realistic bases use skip 1. Flux uses T5-XXL, not CLIP. |
+| FP8 base | N/A | N/A | true | Mandatory on 32 GB VRAM for Flux - full precision allocates past the VRAM budget and the trainer container fails to start. |
+| T5 attention mask | N/A | N/A | true | Prevents padding tokens in the T5-XXL text encoder from influencing the loss. No reason to disable. |
+| Learning rate | 1e-4 (UNet), 5e-5 (TE) | 1e-4 (UNet), 5e-5 (TE) | 1e-4 | SDXL can train the text encoder; Flux keeps the T5 encoder frozen, so the UNet rate applies alone. |
+| Gradient checkpointing | true | true | true | Always on. Slower per step but needed to fit batch size 2-4 on a 32 GB card. |
+| Batch size | 2 | 2 | 4 | Flux can run batch 4 at rank 16 with fp8 base on 32 GB; SDXL typically runs batch 2 at 1024 resolution. |
+| V-parameterisation | false (except NoobAI-v-pred) | false | false | NoobAI's v-prediction variant needs `v_parameterization=true`. |
+
+`model_type` is auto-detected from the `base_model` filename (anything matching `flux*` -> `flux`, otherwise `sdxl`), so the agent rarely needs to set it. The defaults for each type are applied server-side; an explicit parameter overrides.
+
+The Flux fp8 requirement is the one unskippable rule. On a 32 GB card, training `flux1-dev` in full precision allocates past the VRAM budget and the trainer container fails to start. The `train_start` tool's `fp8_base` defaults to `true` for Flux and is ignored for SDXL.
+
+---
+
+## Captioning: matching the engine to the text encoder
+
+Before training, every image in the dataset needs a text caption file alongside it. Two engines serve two model families for a reason that follows from the text encoder each base model uses.
+
+| Engine | Output | Model family | Why |
+|---|---|---|---|
+| BLIP-2 | Natural language sentences. Roughly 1 image/s on 32 GB VRAM. | Flux | Flux encodes prompts through T5-XXL, a text-to-text transformer trained on natural language. BLIP-2 captions match the encoder's training distribution. |
+| WD14 | Danbooru tags (comma-separated, e.g. `1girl, solo, looking at viewer, smile`). | SDXL / Illustrious | SDXL encodes prompts through CLIP, which was trained on alt-text and image-tag pairs. The Danbooru tag vocabulary matches what Illustrious and NoobAI were fine-tuned on. |
+
+WD14 is fast and the tags are predictable, but they under-represent scenes, lighting and composition - information Flux's T5-XXL encoder can use. BLIP-2 captions are richer but noisy; the trigger word prepended by the captioning tool (`trigger_word` parameter) keeps the subject token consistent across images.
+
+The captioning workflow: `llmc dataset audit <name>` checks existing captions for sanity (e.g. WD14 tags that should be present for an anime dataset), `llmc dataset filter <src> <dst>` copies only good images to a clean directory, and `llmc dataset caption <name>` with the chosen engine runs the captioning pass over the clean set. Captioning is async: the call returns immediately and a status poll tracks progress.
+
+A third engine, Florence-2, is still wired in the server (`caption_florence.py`) but the MCP tool description marks it broken on transformers >= 4.54. Only BLIP-2 and WD14 are listed.
+
+---
+
+## Dataset prep: the audit-filter-caption pipeline
+
+Training data lives as image/caption pairs in named directories under the training data root. Each dataset gets a TOML config that declares resolution, batch size, bucketing and repeat count:
+
+```toml
+[general]
+shuffle_caption = false
+caption_extension = ".txt"
+keep_tokens = 0
+
+[[datasets]]
+resolution = 1024
+batch_size = 2
+enable_bucket = true
+
+  [[datasets.subsets]]
+  image_dir = "/data/datasets/my-dataset"
+  num_repeats = 1
+```
+
+The agent runs a three-step prep sequence before `train_start`:
+
+1. **Audit** - checks the raw image set for duplicates, size outliers, and (with `--expected tags`) missing WD14 tags for an anime dataset. Returns counts and a rejection list.
+2. **Filter** - copies images whose stems are not on the rejection list into a clean directory. The raw set is preserved.
+3. **Caption** - runs the chosen engine (BLIP-2 or WD14) over the clean directory, writing one `.txt` file per image. Does not overwrite existing captions unless asked.
+
+`keep_tokens` in the dataset config pins the first N caption tokens (the trigger word) during `shuffle_caption`. When `shuffle_caption = true`, the trainer randomly drops caption tokens to improve generalisation; `keep_tokens = 1` ensures the trigger word is never dropped, so the LoRA remains triggerable.
+
+---
+
+## Deploying a trained LoRA
+
+After training completes, `train_list` shows the output files. `train_deploy <name>` copies the `.safetensors` file from the training output directory to ComfyUI's `models/loras/` directory. From then on, any `comfyui_generate` workflow can load it by adding a `LoraLoader` node that references the filename.
+
+The deploy step exists because the training output directory is separate from ComfyUI's model tree - the trainer writes to its own volume, and the generator reads from a different one. `train_deploy` is the bridge.
+
+If the ComfyUI model store was archived to cold storage (as this workstation's was on 2026-09-26 - the model tree was moved to a NAS share and the local directory emptied), the generator fails on a missing checkpoint until the files it needs are restored. The same applies to LoRAs: a deployed LoRA is local, but the base checkpoint it depends on must also be present.
+
+---
+
+## Coexisting with the LLM on one GPU
+
+All of this runs on one GPU. The proxy described in [Scheduling one GPU between LLM, image and training work](/reference/llmc-single-gpu-stack/) owns container lifecycle: exactly one of the LLM engine, ComfyUI or the trainer is active at a time.
+
+What the agent experiences:
+
+- **Generation (20-60 s).** On `comfyui_generate`, the proxy drains in-flight LLM requests, stops the LLM engine, starts ComfyUI, and forwards the workflow. The LLM backend is down for the duration. The agent harness waits for the tool call to return; when the model needs to respond, the proxy restarts the LLM engine on the next chat request. This is invisible to the user for a single generation because tool calls are synchronous - the model waits for the result, and by the time it speaks again the LLM is back up.
+- **Training (10-60+ min).** On `train_start`, the same sequence runs but the job is long. The LLM backend is down for the entire training run. The agent polls `train_status` during training; each poll reaches the trainer container through the proxy, not the LLM. After training, the proxy restarts the LLM engine on the next chat request. The user experiences an idle period: the LLM engine is down, so the agent cannot call the model. Non-LLM tools (train_status, etc.) still work through the proxy.
+- **Lock contention.** If an unattended loop has pinned the LLM preset with a lock, calling `comfyui_generate` or `train_start` returns a 503 "model lock active". The lock rule is in the llmc page - the agent must not unlock it without asking. The correct path is to wait, or to ask the user whether the lock should be released.
+
+The proxy's drain-before-swap rule means in-flight LLM requests finish before the engine is killed, up to a 60 s grace deadline. A generation or training call does not interrupt a mid-response LLM turn - the swap waits. Past the deadline the swap proceeds anyway.
+
+Two practical rules for delegating work:
+
+- A short generation (one image) is fine inline: the agent calls `comfyui_generate`, waits for the PNG path, and the user sees the result. The LLM gap is seconds.
+- A training run is a background task. The agent calls `train_start`, returns the estimated duration, and polls `train_status` on the user's next prompt. The LLM is unavailable until training finishes, so the agent should tell the user the ETA and not attempt other work on the same machine.
+
+---
+
+## What carries over to another setup
+
+The tool shapes and the MCP wiring are specific to this harness and its proxy. These properties are not:
+
+1. **The agent must never read generated images back into context.** A single base64-encoded PNG exceeds most models' input limits, and an image the model cannot see is useless to it. Return file paths; let the human view the image.
+2. **SDXL vs Flux training defaults follow from the base model, not from the trainer.** LoRA rank, alpha, clip skip, FP8 requirement, T5 attention mask and epoch count are all architecture-driven. The same divergences hold for any kohya-based training setup.
+3. **Captioning engine matches the text encoder, not the image.** BLIP-2 for T5-XXL (Flux), WD14 for CLIP (SDXL). A dataset captioned for the wrong encoder works but underperforms - the model cannot use information the encoder never learned to represent.
+4. **Audit before caption, caption before train.** A bad image in the dataset (duplicate, wrong resolution, missing the subject) wastes a training run. The audit-filter-caption sequence catches these before the GPU hours are spent.
+5. **Training output and generation input are separate directories.** Deploy is an explicit step because the trainer and generator read from different trees. Without it, a newly trained LoRA is invisible to generation.
+6. **One GPU means one workload at a time.** A training run of 10-60 minutes blocks everything else on that card. Either accept the idle period or run the trainer on a second GPU. A proxy that handles the swap is simpler than asking the agent to schedule GPU time.
+7. **Check the VRAM budget before the run.** Flux fp8 training on 32 GB is tight but works; full precision does not start, so a run that does not fit fails at launch.
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=diamond, margin="0.1,0.05"];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  start [label="Agent needs to\nproduce an image\nor train a LoRA", shape=box, style=rounded];
+  q_train [label="Training or\ngeneration?"];
+  q_flux [label="Flux or SDXL\nbase model?"];
+  q_lock [label="GPU locked by\nan unattended\nloop?"];
+  q_cap [label="Dataset already\ncaptioned?"];
+
+  r_gen [label="comfyui_generate\nwith prompt + checkpoint.\nNever read the output PNG.", shape=box, style=rounded];
+  r_train_flux [label="Flux: dim=16, alpha=16,\nfp8_base=true, epochs=8,\ncaption with BLIP-2", shape=box, style=rounded];
+  r_train_sdxl [label="SDXL: dim=32, alpha=32,\nclip_skip=2 (anime) or 1 (photo),\nepochs=4, caption with WD14", shape=box, style=rounded];
+  r_lock [label="Wait, or ask user\nif the lock should\nbe released", shape=box, style=rounded];
+  r_cap [label="Audit, filter,\ncaption first.\nBLIP-2 for Flux,\nWD14 for SDXL.", shape=box, style=rounded];
+  r_deploy [label="train_deploy to\nComfyUI models/loras/, then\ngenerate with a LoraLoader node", shape=box, style=rounded];
+
+  start -> q_train;
+  q_train -> q_lock [label="generation"];
+  q_train -> q_flux [label="training"];
+  q_lock -> r_gen [label="no"];
+  q_lock -> r_lock [label="yes"];
+  q_flux -> q_cap [label="either"];
+  q_cap -> r_train_sdxl [label="SDXL,\ncaptioned"];
+  q_cap -> r_train_flux [label="Flux,\ncaptioned"];
+  q_cap -> r_cap [label="no"];
+  r_train_flux -> r_deploy [style=dotted, label="after training"];
+  r_train_sdxl -> r_deploy [style=dotted, label="after training"];
+}
+```
+
+The same decision as text:
+
+1. For generation: call `comfyui_generate` with a prompt and an optional checkpoint. Accept the returned file path; never read the PNG back into context. If the GPU is locked by a loop, wait or ask the user.
+2. For training: determine the base model family (Flux or SDXL). Flux gets rank 16, alpha 16, fp8 base, 8 epochs, BLIP-2 captions. SDXL gets rank 32, alpha 32, clip skip 2 for anime bases or 1 for photo-realistic, 4 epochs, WD14 tags.
+3. If the dataset has no captions, audit, filter and caption it first - BLIP-2 for Flux, WD14 for SDXL.
+4. After training, run `train_deploy` to copy the LoRA to ComfyUI's model tree. Then it is available in generation workflows through a `LoraLoader` node.
+
+---
+
+## Evidence
+
+| Claim | How it was checked | Status |
+|---|---|---|
+| `comfyui_generate` tool shape: prompt, negative_prompt, dimensions, steps, cfg, seed, checkpoint, workflow overrides | `comfyui-server.py` tool description and `tool_generate` function, 2026-10-20 | read from source |
+| Default workflow: CheckpointLoaderSimple, CLIPTextEncode, KSampler, VAEDecode, SaveImage | `comfyui-server.py` `DEFAULT_WORKFLOW` dict, 2026-10-20 | read from source |
+| Default checkpoint `sd_xl_base_1.0.safetensors`, 832x1216, 30 steps, Euler, CFG 5 | `comfyui-server.py` `DEFAULT_CHECKPOINT` etc., 2026-10-20 | read from source |
+| Agent must not read generated PNG - base64 exceeds input limit | tool description in `comfyui-server.py`, 2026-10-20 | read from source |
+| `train_start` tool and its seven-training-tool surface | `train-server.py` MCP schema and `tool_*` functions, 2026-10-20 | read from source |
+| SDXL defaults: dim=32, alpha=32, clip_skip=2 or 1, epochs=4 | `lora-train` skill SKILL.md, 2026-10-20 | read from source |
+| Flux defaults: dim=16, alpha=16, fp8_base=true, apply_t5_attn_mask=true, epochs=8 | `lora-train` skill SKILL.md, 2026-10-20 | read from source |
+| `model_type` auto-detected from `base_model` filename (flux* -> flux, else sdxl) | `train-server.py` header comment and `tool_start` implementation, 2026-10-20 | read from source |
+| BLIP-2 recommended for Flux (aligns with T5-XXL), WD14 for SDXL/anime | `lora-train` skill SKILL.md captioning section, 2026-10-20 | read from source |
+| BLIP-2 at ~1 image/s on 32 GB VRAM | `lora-train` skill SKILL.md, 2026-10-20 | read from source |
+| Florence-2 marked broken on transformers >= 4.54 | `mcp/train-server.py` caption_start tool description, 2026-10-20 | read from source |
+| Captioning workflow: audit, filter, caption (`llmc dataset` subcommands) | `lora-train` skill SKILL.md, 2026-10-20 | read from source |
+| `train_deploy` copies LoRA from training output to ComfyUI `models/loras/` | `train-server.py` `tool_deploy` function, `lora-train` skill SKILL.md, 2026-10-20 | read from source |
+| TOML dataset config shape: resolution, batch_size, enable_bucket, subsets | `lora-train` skill SKILL.md, 2026-10-20 | read from source |
+| GPU proxy: one workload at a time, drain-before-swap, 60 s grace, lock TTL | `llmc-single-gpu-stack.mdx`, proxy-go source referenced there, 2026-10-20 | design-read |
+| ComfyUI model store archived to NAS on 2026-09-26 | `comfyui` skill SKILL.md, 2026-10-20 | read from source |
+| Flux fp8 mandatory on 32 GB: full precision fails to allocate | `train/server.py` line 448 (`fp8_base = config.get("fp8_base", True)`) and `lora-train` skill SKILL.md, 2026-10-20 | read from source |
+| Swap latency: 20-60 s for generation (30-60 s cold), training 30-60 s cold start | `llmc-single-gpu-stack.mdx` swap section, 2026-10-20 | design-read |
+
+---
+
+## Related docs
+
+- [Scheduling one GPU between LLM, image and training work](/reference/llmc-single-gpu-stack/) - the proxy, presets, locks, swap mechanics and what an eviction costs
+- [Which model runs which agent work](/reference/agent-model-routing/) - how the harness decides which model serves each request, including vision routing
+- [The pi harness journey](/reference/pi-harness-journey/) - the extension catalogue these MCP servers plug into
+- [Subagents, worktrees, and parallel agent work](/reference/agent-subagents-and-worktrees/) - the background task that wraps a training run
+- [Benchmarking local models for agent work](/reference/local-model-bench/) - throughput numbers that justify the one-workload-at-a-time rule

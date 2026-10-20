@@ -1,0 +1,390 @@
+---
+title: "One rule set, two agent harnesses: sharing guards and tools between coding agents"
+description: "When one person runs two coding-agent harnesses that touch the same repos, the same secrets and the same infrastructure, one guard and tool layer can serve both: pure shared cores in a lib directory, thin per-harness adapters, a hand-synced rules file, per-skill symlink promotion as an allowlist, and a settings fragment merge for machine-mutated state. Worked example from a live dual-harness setup with 81 shared cores, 26 MCP tools, 22 hook scripts, 74 promoted skills, and 3 MCP servers registered from one definition."
+author: Erfi Anugrah
+category: workstations
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+You run two coding-agent harnesses that touch the same repos, the same secrets and the same infrastructure. The first harness got its guard layer built first - extensions that block leaked credentials, reject AI-generated prose tells, gate git commands, mask secret values in output, and enforce tool-choice rules. Now the second harness needs the same layer, and the question is whether to port it or duplicate it. This page describes the shared-core pattern that makes the answer "neither": one copy of the logic, thin per-harness adapters, and a set of rules for what lives where.
+
+Everything below was read from the dotfiles repo that is the source of truth for the two harnesses as of 2026-10-20. Counts are from `ls` and `wc -l` on the same files on the same day. The harnesses are pi and Claude Code, but the pattern applies to any pair where one exposes an in-process extension API and the other splits the same surface across separate mechanisms.
+
+**TL;DR:**
+
+- **81 shared cores** in a `lib/` directory keep every guard and tool's logic in one file. pi adapters import them as in-process extensions; Claude Code adapters import them into MCP servers and hook scripts. A guard rule changes once.
+- **26 MCP tools** in one stdio server expose CLI wrappers, service clients, and research tools to Claude Code over the same shared cores pi uses for its built-in tools.
+- **22 hook scripts** mirror pi's tool_call interceptors under Claude Code's event model. The mapping is not 1:1: some guards gain capabilities (auto-rewrite via `updatedInput` instead of block-only), others lose them (no mid-turn abort, no output masking of the model's own reply).
+- **Hand-synced rules**: two prose files (`tool-routing.md` and `APPEND_SYSTEM.md`) shape every turn for both harnesses. They are mirrored into one file (`CLAUDE.md`) for the second harness. A change to a mirrored rule lands in both copies.
+- **74 skills promoted** via per-skill symlinks into the second harness's skills directory. The directory contents are the allowlist; a private-corpus skill that should not reach the second harness stays out.
+- **Settings fragment merge**: the second harness's settings file is machine-mutated state (the harness writes its own plugin registrations into it). A tracked fragment carrying the hooks wiring is jq-merged in at install time, never symlinked whole.
+- **3 MCP servers** registered in both harnesses from a single definition in one `mcp.json`, with a stored list of which servers are eligible for the second harness.
+- **One LSP binary set** serves both harnesses: the same `bash-language-server`, `yaml-language-server`, `typescript-language-server` and 9 other servers run under TypeScript LSP for pi and under a `.lsp.json` skills plugin for Claude Code.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=10, shape=box, style=rounded];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=8];
+
+  subgraph cluster_cores {
+    label="shared cores (one copy of the logic)"; style=rounded; fontsize=11; margin=12;
+    lib [label="lib/\n81 TypeScript files\n68 *-core.ts"];
+  }
+
+  subgraph cluster_pi {
+    label="harness A (in-process API)"; style=rounded; fontsize=11; margin=12;
+    pi_ext [label="93 top-level\nextensions\n(import lib/)", shape=box];
+    pi_skills [label="84 skills"];
+    pi_mcp [label="mcp.json\nMCP server\ndefinitions"];
+  }
+
+  subgraph cluster_cc {
+    label="harness B (separate mechanisms)"; style=rounded; fontsize=11; margin=12;
+    cc_tools [label="MCP toolkit server\n26 tools -> lib/", shape=box];
+    cc_hooks [label="hooks/\n22 hook scripts\n-> lib/", shape=box];
+    cc_skills [label="skills/\n74 symlinks", shape=box];
+    cc_lsp [label="skills/lsp-servers/\n.lsp.json", shape=box];
+  }
+
+  lib -> pi_ext [style=dashed, label="import"];
+  lib -> cc_tools [style=dashed, label="import"];
+  lib -> cc_hooks [style=dashed, label="import"];
+
+  pi_skills -> cc_skills [style=dashed, label="per-skill symlinks\n(allowlist)"];
+
+  subgraph cluster_rules {
+    label="hand-synced rules"; style=rounded; fontsize=11; margin=12;
+    rules_pi [label="tool-routing.md\nAPPEND_SYSTEM.md\n(prepended/appended\nevery turn)"];
+    rules_cc [label="CLAUDE.md\n(mirrored subset)"];
+  }
+  rules_pi -> rules_cc [style=dashed, label="hand-synced"];
+}
+```
+
+The same thing as text:
+
+1. 81 files in `lib/` hold every guard, tool, parser core and shared helper. 68 are `*-core.ts`. They import nothing from either harness.
+2. Harness A (pi) loads 93 top-level extensions that import from `lib/`. Each extension hooks one event (tool call, context injection, TUI) in a single in-process TypeScript runtime.
+3. Harness B (Claude Code) reaches the same cores through two separate mechanisms: a 26-tool stdio MCP server for LLM-callable tools, and 22 hook scripts for guard events (PreToolUse, PostToolUse, Stop, etc.).
+4. 74 of the 84 skills are promoted to harness B via per-skill symlinks. The skills directory is the allowlist.
+5. LSP binaries serve both harnesses: harness A loads them through its `lsp/` extension, harness B through a `.lsp.json` skills plugin.
+6. Rules files are hand-synced: two files shape every turn for harness A, and their content is mirrored into one file for harness B.
+
+---
+
+## Early decision: what to share, what to keep per-harness
+
+| What | Share or keep? | How |
+|---|---|---|
+| Guard logic (credential blocking, prose enforcement, secret masking, anti-patterns, provenance) | Share | One `lib/<name>-core.ts` per guard, imported by both harness adapters |
+| LLM-callable tools (CLI wrappers, service clients, renderers) | Share | One MCP server importing the same `lib/` cores |
+| Tool-choice rules (when to search, how to escalate) | Share | Hand-synced prose file, mirrored verbatim |
+| Skills (methodology, infrastructure, operations) | Share (curated) | Per-skill symlinks; directory contents are the allowlist |
+| MCP server definitions | Share | One `mcp.json`, registered in both harnesses; a list of eligible server names gates the second harness |
+| LSP server binaries | Share | Same binaries on PATH; different config format per harness |
+| TUI / session internals (status line, compaction, session store) | Per-harness | Each harness has its own equivalent or the surface does not exist |
+| Machine-mutated config (plugin registrations, enabled plugins) | Per-harness | Harness B's live settings file is mutated by the harness itself; a tracked fragment is merged in at install time, never symlinked |
+| Cost / provider guards (output caps, spend warnings, model-swap guards) | Per-harness | Different providers, different guard surfaces |
+| Streaming / mid-turn guards (degenerate stream, runaway turn, thinking deltas) | Per-harness | Harness B's hook model lacks Streaming deltas and mid-turn abort |
+
+The split is: **logic in `lib/`, rules in prose, config per-harness.** A guard's detection stays in the shared core; the mechanism that acts on the detection (blocking a tool call in harness A, returning `permissionDecision: deny` from a hook in harness B) is the adapter's job.
+
+---
+
+## The architectural mismatch
+
+Harness A (pi) runs one in-process TypeScript runtime. A single `.ts` file registers an LLM-callable tool, hooks the tool call to block or annotate, injects context into the system prompt, and paints the TUI - all in one file, all through one API.
+
+Harness B (Claude Code) splits the same surface across five separate mechanisms:
+
+| pi capability | Claude Code home | Notes |
+|---|---|---|
+| `defineTool(...)` LLM tool | MCP server (stdio/http/sse), separate process | Full tool shape, but out-of-process |
+| `tool_call` hook -> `{block, reason}` | hook `PreToolUse` (permissionDecision: deny) | Superset: can also rewite input via `updatedInput` |
+| `tool_call` result annotation | hook `PostToolUse` (updatedToolOutput) | Superset: can rewite output, not just annotate |
+| `context` event injection | hook `additionalContext` (Pre/PostToolUse, SessionStart, Stop, UserPromptSubmit) | Partial: advisory context, not raw message injection |
+| `ctx.ui.setWorkingMessage` / footer / toasts | statusline (read-only JSON -> stdout) | No mid-tool progress equivalent |
+| Slash prompt templates | `.claude/commands/*.md` or skill | Near 1:1 |
+| Subagent spawn | native subagents (`.claude/agents/*.md`) | Richer native support |
+
+The practical upshot: a pi extension that only blocks tool calls ports to a PreToolUse hook with `permissionDecision: deny`. A pi extension that only annotates tool results ports to a PostToolUse hook with `additionalContext`. But a pi extension that does both, or one that updates the TUI mid-tool, has no direct equivalent.
+
+Several guards that pi can only **block-and-ask-for-resubmit** (its `tool_call` hook cannot rewite input) become **auto-fixes** under harness B. The ASCII punctuation guard is the clearest example: on pi it blocks and hands back the folded form for the model to resubmit; under harness B the hook returns the folded form as `updatedInput` and the model never sees the rejection.
+
+---
+
+## The shared-core pattern
+
+One copy of the logic, thin adapters. The core file imports nothing from either harness:
+
+```
+lib/<name>-core.ts          pure logic, zero harness imports
+extensions/<name>.ts        harness A adapter (defineTool / tool_call)
+.claude/hooks/<name>.ts     harness B adapter (hook script, same core)
+.claude/mcp/toolkit.ts      harness B adapter (MCP tool, same core)
+```
+
+The 81 files in `lib/` cover every guard (epistemic, confidential-write, ascii, ai-tell, secret-output, dangerous-cmd, untrusted-content), the git gate and pre-push scan, tool-output spill/prune, context inspection, the agent view, worker inbox, worker session persistence, skill-guard, task limits, and more.
+
+When a guard rule changes, it changes in the core and both harness adapters pick up the change. The existing bun unit tests cover the core regardless of harness:
+
+```
+bun test ./.pi/agent/extensions/tests/
+```
+
+A harness B hook script is a self-contained TypeScript file run by `bun`. It reads a JSON payload from stdin (including `session_id`, `transcript_path`, `cwd`, `hook_event_name`, and the tool input/output), runs the shared-core detection, and prints JSON to stdout:
+
+```typescript
+#!/usr/bin/env bun
+import { scan, foldToAscii } from "../../.pi/agent/extensions/lib/ascii-core.ts";
+
+const payload = JSON.parse(await Bun.stdin.text());
+const detections = scan(payload.tool_input.content);
+if (detections.length > 0) {
+  process.stdout.write(JSON.stringify({
+    permissionDecision: "deny",
+    permissionDecisionReason: detections.map(d => d.reason).join("; "),
+  }) + "\n");
+}
+```
+
+The MCP toolkit server is a single stdio process that registers every shared tool:
+
+```typescript
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { queryOciTags } from "../../.pi/agent/extensions/lib/oci-tags-core.ts";
+import { scanOsv } from "../../.pi/agent/extensions/lib/osv-core.ts";
+// ... 26 tools total
+```
+
+It runs from the repo checkout (not the stow symlink) so both the SDK (`node_modules` in `.claude/mcp/`) and the `../../.pi/agent` cores resolve. Registration:
+
+```
+claude mcp add --scope user erfi-toolkit -- bun \$HOME/dotfiles/.claude/mcp/toolkit.ts
+```
+
+The 26 tools span CLI wrappers (`oci_tags`, `osv_scan`, `secret_scan`, `hurl_test`, `go_test`, `bench`, `pg_analyser`), service clients (`docs` over SSH with 6 sub-tools, `memledger` with 7 search tools, `web_research`, `exa` web/code search, `osint` with 9 sub-tools, `video_review`, `context7` query + resolve), and renderers (`render_diagram`, `pdf`, `build_favicon_set`). `confidential_terms` completes the set.
+
+---
+
+## Guard hooks: the event-model mismatch
+
+22 hook scripts mirror pi's tool_call interceptors under harness B's event model. The mapping is not 1:1. What changes:
+
+### Gains: auto-rewrite via updatedInput
+
+On pi, a guard that detects a problem in the tool input can only block and hand back a reason. The model must read the reason and resubmit. Under harness B's `PreToolUse` hook, the same detection can return `updatedInput` with the fix already applied plus `additionalContext` naming what changed. The model never sees the block. The ASCII punctuation guard uses this for prose files (`.md`, `.txt`, anything under `docs/`): guillemets, em-dashes and smart quotes are folded to ASCII in the input before it reaches the tool. Code files and Bash commands are still denied, because folding a command can change what it does.
+
+### Gains: output masking via updatedToolOutput
+
+On pi, the secret-output guard masks registered secret values in tool results by hooking the `tool_result` event in-process and replacing the values before they enter the model's context. Under harness B, the same core runs in a `PostToolUse` hook that returns `updatedToolOutput` with every string leaf redacted. This is the only PostToolUse hook that rewites output - harness B runs PostToolUse hooks in parallel on the original output and keeps one rewite, so this hook must be the sole output-rewriter.
+
+<Aside type="caution">
+Harness B has no equivalent of pi's `message_end` hook, which masks secret values the model types into its own reply before the session is saved. Its `MessageDisplay` hook rewites only the screen display; the transcript and the model keep the original. A credential the model echoes in its reply reaches the transcript on disk unmasked.
+</Aside>
+
+### Losses: no mid-turn abort, no Streaming guard
+
+pi's `runaway-turn-guard.ts` and `degenerate-stream-guard.ts` need Streaming deltas and the ability to abort a turn mid-stream. Harness B's hooks fire before and after tool calls, never during them. The Streaming and runaway guards stay pi-only.
+
+### Losses: advisory vs blocking context
+
+pi's `context` event can inject raw messages into the system prompt. Harness B's `additionalContext` is advisory - the model sees it but it does not sit in the same position as the system prompt. The practical difference is small for most guards (the model reads the additional context and acts on it), but a context injection that depends on exact position in the prompt (the tool-routing rules at a fixed offset) cannot be replicated.
+
+---
+
+## Hand-synced rules: one prose file, two harnesses
+
+Two prose files shape every turn for harness A:
+
+- **`tool-routing.md`** (prepended by `tool-routing.ts` each turn): the search-family pipeline, web research escalation, docs.erfi.io workflow, LSP-for-code-intel rule, subagent delegation policy, memory and session-search triggers, bash discipline, and the bg-tasks family rules. About 40 KB.
+- **`APPEND_SYSTEM.md`** (appended every turn): commit/PR authorship rules, safety rules, epistemic calibration, confidential identifiers in tracked files, output surface formatting, and AI prose tells.
+
+Both are mirrored into one file for harness B: `CLAUDE.md`. The mirror is manual - the source files have no include mechanism, so a shared file with includes would be a sync hazard where an edit to the included fragment silently changes what one harness sees.
+
+**The rule for where a change lands:** a change to a mirrored rule lands in both copies. A new rule that only makes sense for one harness (a pi-specific API reference, a harness-B-specific hook contract) stays in that harness's file only.
+
+A third file, `local-model-rules.md`, is injected only when a local model is in use. It has no harness B equivalent and stays pi-only.
+
+---
+
+## Per-skill symlink promotion: the skills allowlist
+
+74 of the 84 skills are promoted to harness B via per-skill symlinks in `.claude/skills/`. Each symlink points back into the shared skills tree:
+
+```
+.claude/skills/systematic-debugging -> ../../.pi/agent/skills/systematic-debugging
+.claude/skills/writing-plans -> ../../.pi/agent/skills/writing-plans
+```
+
+The directory contents are the allowlist. A skill that should not reach harness B - a private-corpus tool, a tool that only makes sense in harness A's context - stays out of the directory. No configuration file, no denylist; the filesystem is the policy.
+
+Skills that ship as upstream plugin bundles (vendor content installed directly into `.claude/skills/` by harness B's plugin system) coexist with the symlinks. GNU stow nests the symlinks alongside the real directories.
+
+A lint script (`scripts/skills-lint.py`) checks frontmatter shape, ASCII punctuation, dead paths, retired terms, and freshness. It runs as a pre-commit hook and weekly in a `garden` loop.
+
+---
+
+## Settings fragment merge: when the file is mutated by the harness
+
+Harness B's live settings file (`~/.claude/settings.json`) is machine-mutated state: the harness writes its own plugin registrations, enabled plugins, and per-project overrides into it. Symlinking the whole file from the dotfiles repo would lose those mutations on every install.
+
+Instead, the repo tracks a **fragment** - `settings.hooks.json` - carrying only the hooks wiring (22 hook scripts across 7 events: PreToolUse, PostToolUse, Stop, UserPromptSubmit, Notification, SessionStart, SubagentStop). At install time, `install.sh do_claude()` jq-merges the fragment's `hooks` object into the live file:
+
+- Per-event arrays are concatenated, order preserved
+- Duplicate entries (same `command` and `matcher`) are deduplicated first-seen
+- The live file's `permissions` and other keys are left untouched
+- The merge is idempotent: running it again produces the same file
+
+The fragment file is the sole source of truth for hooks wiring. When a new guard is ported, the fragment gains an entry and `install.sh` is re-run. The old hooks stay in place; only the new one is added.
+
+---
+
+## MCP servers: one definition, two harnesses
+
+Since 2026-09-29, harness A loads MCP servers from a native `.pi/agent/mcp.json`. Servers support `command` (local subprocess), `url` (remote HTTP), and OAuth. Secrets go in `${VAR}` env refs or `!command` substitution, never literal values.
+
+Three of those servers are also registered in harness B (`research`, `terraform`, `shadcn`). The mechanism: a stored list in `install.sh` (`CC_MCP_FROM_PI`) names which servers are eligible. `do_claude()` iterates the list, reads each server's definition from `.pi/agent/mcp.json`, and registers it in harness B at user scope:
+
+```
+claude mcp add --scope user research -- env RESEARCH_BASE_URL=... \
+  bun \$HOME/infra/research/mcp/server.ts
+```
+
+The registration is probed against `~/.claude.json` (the user-scope MCP store) and re-registered when the definition changes. A server that moves from `command` to `url` or gains an env var is re-registered; one that stays identical is skipped.
+
+Project-scoped MCP lives in `<repo>/.pi/mcp.json` for trusted repos. A global server one project needs sits in the global file with `"enabled": false`, and that project carries a bare override `{"enabled": true}`.
+
+---
+
+## LSP servers: same binaries, different config
+
+The same LSP binaries serve both harnesses:
+
+| Language | Binary |
+|---|---|
+| Shell | `bash-language-server` |
+| YAML | `yaml-language-server` |
+| JSON | `vscode-json-language-server` |
+| CSS / S[Cc]SS / Less | `vscode-css-language-server` |
+| HTML | `vscode-html-language-server` |
+| TOML | `taplo` |
+| Terrraform | `terraform-ls` |
+| Astro | `astro-ls` |
+| Markdown | `markdown-oxide` |
+| Dockerfile | `docker-langserver` |
+| SQL | `sql-language-server` |
+| GraphQL | `graphql-lsp` |
+
+Harness A loads them through its `lsp/` extension, which spawns the right server per file extension. Harness B loads them through a skills-directory plugin: `.claude/skills/lsp-servers/.lsp.json`, which maps file extensions to language IDs and declares the binary, args, and optional startup timeout per server.
+
+TypeScript, Go, Python, Rust, Lua and C/C++ come from the official `*-lsp@claude-plugins-official` plugins in harness B; harness A uses the same TypeScript, Go and Rust binaries from PATH. They are not duplicated between the two config formats - each harness registers them in its own way.
+
+---
+
+## What carries over to another pair of harnesses
+
+The 81 cores, 26 tools, 22 hooks and 74 promoted skills are specific to this setup. These properties are not:
+
+1. **Share the detection; adapter the mechanism.** A guard's decision logic (does this text contain a secret? is this punctuation mojibake-prone?) stays in a zero-dependency file. The mechanism that acts on the decision (block a tool call in harness A, return `permissionDecision: deny` in harness B, rewite the output in harness B but only annotate in harness A) lives in the adapter. When the logic changes, it changes once.
+2. **A hand-synced rules file works if the sync rule is simple.** "A change to a mirrored rule lands in both copies" is a one-sentence policy. The alternative - a shared include fragment - breaks silently when one harness's parser treats the fragment differently from the other.
+3. **Symlinks as an allowlist beat configuration files.** The filesystem is self-documenting: `ls` shows what is promoted. There is no config drift between a denylist and the actual files.
+4. **A settings fragment merge beats symlinking the whole file.** When a harness mutates its own config at runtime (plugin registrations, enabled plugins), symlinking overwrites those mutations. A tracked fragment that is jq-merged in preserves them.
+5. **MCP server definitions registered from one source need a stored allowlist.** Not every server that makes sense in harness A belongs in harness B. A one-line list of server names, read at install time, keeps the two registrations from drifting.
+6. **LSP binaries are the cheapest share.** They are already on PATH. Each harness needs only its own config format mapping extensions to language IDs.
+7. **The event-model mismatch is permanent.** Harness A's in-process runtime can block, rewite and inject at any point in the request lifecycle. Harness B's hook model is event-granular: PreToolUse, PostToolUse, Stop, SessionStart. Guards that depend on Streaming deltas or mid-turn state have no analogue, and guards that run on output may not be able to mask the model's own reply. Port the guards that fit; skip the ones that do not.
+8. **`stow-drift` before every claim that config works.** A guard written, tested and committed but never symlinked into the live tree is dead config. The drift check exits 1 on any live-tree file with no symlink, and verification runs out-of-band: `timeout -s KILL 120 <harness> -p '<text that should trip the guard>' </dev/null`.
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=diamond, margin="0.1,0.05"];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  start [label="New piece of agent\ninfrastructure", shape=box, style=rounded];
+
+  q_harness [label="Harness-specific\n(TUI, session,\nstreaming)?"];
+  q_config [label="Machine-mutated\nconfig file?"];
+  q_tool [label="LLM-callable\ntool?"];
+  q_guard [label="Guard that\nblocks/rewites?"];
+  q_skill [label="Skill or\nslash command?"];
+  q_rules [label="Prose rule or\npolicy?"];
+
+  r_skip [label="Keep per-harness", shape=box, style=rounded];
+  r_fragment [label="Tracked fragment,\njq-merge at install", shape=box, style=rounded];
+  r_core [label="lib/<name>-core.ts\n+ MCP tool wrapper", shape=box, style=rounded];
+  r_hook [label="lib/<name>-core.ts\n+ hook script", shape=box, style=rounded];
+  r_symlink [label="Per-skill symlink\nif eligible", shape=box, style=rounded];
+  r_sync [label="Hand-synced to\nboth rules files", shape=box, style=rounded];
+
+  start -> q_harness;
+  q_harness -> r_skip [label="yes"];
+  q_harness -> q_config [label="no"];
+  q_config -> r_fragment [label="yes"];
+  q_config -> q_tool [label="no"];
+  q_tool -> r_core [label="yes"];
+  q_tool -> q_guard [label="no"];
+  q_guard -> r_hook [label="yes"];
+  q_guard -> q_skill [label="no"];
+  q_skill -> r_symlink [label="yes"];
+  q_skill -> q_rules [label="no"];
+  q_rules -> r_sync [label="yes"];
+}
+```
+
+The same decision as text:
+
+1. Harness-specific internals (TUI, session store, compaction, Streaming guards) stay per-harness. Do not port.
+2. Machine-mutated config files are tracked as fragments and jq-merged at install time. Never symlink the whole file.
+3. LLM-callable tools go in `lib/<name>-core.ts` with an MCP wrapper for harness B.
+4. Guards that block or rewite go in `lib/<name>-core.ts` with a hook script for harness B. If the guard needs capabilities harness B's event model lacks (mid-turn abort, reply-output masking), keep it per-harness.
+5. Skills are promoted via per-skill symlinks. The directory contents are the allowlist.
+6. Prose rules and policies are hand-synced to both rules files.
+
+---
+
+## Evidence
+
+| Claim | How it was checked | Status |
+|---|---|---|
+| 81 files in `lib/` | `ls lib/*.ts | wc -l`, 2026-10-20 | measured |
+| 68 of them are `*-core.ts` | `ls lib/*-core.ts | wc -l`, 2026-10-20 | measured |
+| 26 tools in the MCP toolkit server | `grep -c 'server.registerTool' toolkit.ts`, 2026-10-20 | measured |
+| 22 hook scripts wired in `settings.hooks.json` | 22 non-smoke `.ts` files under hooks/ matched to 22 unique script refs in settings.hooks.json, 2026-10-20 | measured |
+| 74 skills promoted to harness B via symlinks | `find skills/ -type l | wc -l` = 74, 2026-10-20 | measured |
+| 3 MCP servers in `CC_MCP_FROM_PI` | `install.sh` line 30: `research terraform shadcn`, 2026-10-20 | read from source |
+| `settings.hooks.json` fragment jq-merged in `do_claude()` | `install.sh` `do_claude()` lines 371-401, jq-merge of hooks into live settings.json | read from source |
+| LSP config: 12 servers in `.lsp.json` | `.lsp.json` top-level keys count, 2026-10-20 | measured |
+| `updatedInput` auto-rewrite probed on CC 2.1.292 | `pi-to-claude-code-port.md` Phase 0 checkbox, 2026-10-15 | live-verified |
+| `updatedToolOutput` secret masking live-verified on CC 2.1.304 | `pi-to-claude-code-port.md` secret-output-guard row, 2026-10-20 | live-verified |
+| `MessageDisplay` rewites only the screen, not the transcript | CC hooks docs, read 2026-10-20, recorded in the port doc's secret-output-guard row | design-only (verified from docs; not empirically probed) |
+| Skills lint script: pre-commit hook + weekly garden loop | dotfiles repo `scripts/skills-lint.py` + `garden` skill, 2026-10-20 | read from source |
+| `stow-drift` exits 1 on UNLINKED live-tree files | dotfiles repo `bin/stow-drift.go`, `liveTrees` and `liveFiles` lists, 2026-10-20 | read from source |
+
+---
+
+## Related docs
+
+- [The pi harness journey: a coding-agent harness built from one](/reference/pi-harness-journey/) - the series hub and the extension catalogue these guards come from
+- [Guard extensions that enforce prose and process rules in a coding agent](/reference/agent-guard-extensions) - the six core guard extensions and the stow-link incident
+- [Keeping credentials out of coding-agent transcripts](/reference/agent-secret-guard) - the known-value secret guard design, shared across both harnesses
+- [Running agent git commands without per-command approval prompts](/reference/agent-git-without-prompts) - the tiered git gate and pre-push leak gate, both ported
+- [Leak gates that let coding agents push without approval prompts](/guides/agent-leak-gates/) - building the pre-push and server pre-receive leak gates
+- [Which model runs which agent work: model routing in a coding-agent harness](/reference/agent-model-routing/) - the per-caller model routing that the hand-synced rules govern
+- [Subagents, worktrees, and parallel agent work](/reference/agent-subagents-and-worktrees/) - the worker kinds and the main-session-only git rule
+- [A cross-client memory store for coding agents](/reference/agent-memory-store) - the memledger store that both harnesses query
+- [A self-hosted web research stack for coding agents](/reference/self-hosted-research-stack) - the research MCP server registered in both harnesses
+- [Loop or graph: a sensor-gated coding-agent loop measured against the 2026 harnesses](/reference/self-correcting-agent-loop) - the loop harness, runnable from either harness
