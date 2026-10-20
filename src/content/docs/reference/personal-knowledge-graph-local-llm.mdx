@@ -1,0 +1,501 @@
+---
+title: "A personal knowledge graph with a local LLM"
+description: "Scanning a personal document archive, extracting entities and relations with a local model, and querying the graph from a coding agent - all without sending data to a cloud model. Design decisions, throughput, the large-backlog drain, and an extraction model that shipped before it was evaluated."
+author: Erfi Anugrah
+category: workstations
+---
+
+A knowledge graph over a personal document archive built entirely on local hardware. The pipeline walks a
+mounted archive, extracts text from documents, mines entities and relations
+with a local LLM under constrained JSON output, stores the graph in Postgres,
+and exposes it to a coding agent through read-only MCP tools. Nothing leaves
+the machine.
+
+Everything below is read from the system source as of 2026-10-20. The pipeline
+was measured on a local GPU (RTX 5090, 32 GB VRAM, one model at a time). The
+chat-history lane (structured ingest only, no LLM) is described at the end;
+the extraction pipeline and the privacy design are the body of the page.
+
+The [agent session-memory store](/reference/agent-memory-store/)
+and the [Vikunja kanban board](/reference/kanban-board-for-coding-agents/) run as separate Postgres clusters on the same storage host, not databases inside the graph's cluster. The graph queries
+below do not use the memory store's vector or full-text search indexes.
+
+**TL;DR:**
+
+- The archive is a network-mounted SMB share with ~470k files, of which ~12.6k
+  are documents; a file-extension allowlist plus a sensitive-filename exclusion
+  regex form the ingest gate.
+- Text extraction is per file type (PDF, docx, EPUB, email, plaintext, and
+  others), sha256-cached so each file is extracted exactly once.
+- Entity extraction runs on the local llmc engine at `reasoning_effort: none`
+  and `temperature: 0`, with a `json_schema` response format on
+  llama-server-based presets, or no response format on NInfer presets (which
+  return empty extractions with any response format - per-item validation is
+  then the only schema guard).
+- The graph is a single Postgres database: entities (`type, key, name`) with
+  identity by `(type, canonical_key)`, mentions linking entities to source
+  documents, and relations between entities. Entity identity is case- and
+  whitespace-normalised so "Jane Doe" across forty documents is one node.
+- An MCP server exposes 10 read-only tools: status, entity search, entity dossier,
+  cross-document entities, related entities with hub-safe level-set traversal,
+  document timeline, document details, full-text chat message search, and
+  conversation and person-history views.
+- The extraction model was picked for continuity on 2026-10-04, ran 719 documents
+  by 2026-10-14, and had never been compared to any alternative. That gap is
+  [recorded below](#the-extraction-model-was-not-evaluated) with the bake-off
+  that closed it.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_source {
+    label="source"; style=rounded; fontsize=12; margin=12;
+    archive [label="document archive\n(SMB share, 470k files)"];
+  }
+  subgraph cluster_pipeline {
+    label="pipeline (local dev box)"; style=rounded; fontsize=12; margin=12;
+    scan [label="scan\n(walk + hash)"];
+    extract [label="extract\n(per-type, sha256-cached)"];
+    chunk [label="chunk\n(6000-char, paragraph-boundary)"];
+    llm [label="local LLM\n(qwen38-swift-ninfer)"];
+  }
+  subgraph cluster_store {
+    label="Postgres (servarr)"; style=rounded; fontsize=12; margin=12;
+    ledger [label="document ledger\n(stage, mtime, error)"];
+    graphdb [label="graph\n(entities, mentions, relations)"];
+  }
+  subgraph cluster_access {
+    label="agent access"; style=rounded; fontsize=12; margin=12;
+    mcp [label="MCP server\n(stdio, read-only)"];
+    agent [label="coding agent\n(pi)"];
+  }
+
+  archive -> scan [label="os.walk + directory prune"];
+  scan -> extract [label="new/changed docs"];
+  extract -> chunk [label="cached text"];
+  chunk -> llm [label="2 in flight"];
+  llm -> graphdb [label="entities + relations"];
+  llm -> ledger [label="stage: extracted -> graphed"];
+  graphdb -> mcp [label="read-only SQL"];
+  ledger -> mcp;
+  mcp -> agent [label="10 tools"];
+}
+```
+
+The same thing as text:
+
+1. The document archive lives on a network-mounted share, read over WSL drvfs (9p). The walker uses `os.walk` with directory pruning to avoid materialising all 470k paths at once.
+2. Text extraction is per file type - PDF, docx, EPUB, email, plaintext, legacy Office formats via LibreOffice headless - cached by sha256 so downstream stages never re-read the slow network mount.
+3. Chunking splits extracted text at 6,000 characters with a 400-character overlap, preferring paragraph boundaries.
+4. The local LLM extracts entities and relations from each chunk, 2 requests in flight, at temperature 0 with thinking disabled.
+5. The Postgres database holds a document ledger (scan/extract/graph stages, timestamps, errors) and the graph (entities keyed by type plus canonical name, mentions linking entities to documents, relations between entities).
+6. An MCP server exposes read-only tools to the coding agent: entity search, dossier, cross-document entities, level-set neighbourhood traversal, timeline, and full-text chat message search.
+7. The Postgres cluster runs on a separate machine; extraction runs on the dev box and writes across the tailnet.
+
+---
+
+## Which decision to make
+
+| Decision | Recommendation | Why |
+|---|---|---|
+| Scan scope: allowlist or denylist? | Extension allowlist | The archive is 470k files; photos, app bundles and code are most of it and would dominate a denylist. 17 extensions cover ~12.6k documents. |
+| Extraction: local or cloud model? | Local only | Medical, tax and identity documents are in scope. A cloud model is an explicit opt-in per folder, not a default. |
+| Text caching | sha256-keyed file cache | A 9p mount is slow. A cache means re-running any stage on unchanged files does no work, and a NAS outage blocks only new files. |
+| Chunking strategy | Character-based, paragraph-boundary preference | Semantic chunking matters for RAG retrieval, not for per-chunk entity extraction. |
+| Entity identity | `(type, canonical_key)` | Case- and whitespace-normalised. "Jane Doe" and "JANE DOE" are one node; the type partition prevents "Apple" the org and "Apple" the topic from colliding. |
+| LLM output format | `json_schema` on llama-server; none on NInfer | NInfer presets return empty extractions with any response format. Per-item validation drops malformed items rather than crashing the batch. |
+| Graph traversal | Level-set UNION, not path-enumerating UNION ALL | The archive owner appears in every document, creating a mega-hub. Path enumeration exploded to 65,721 ms on a degree-917 hub where level-set answered in 155-159 ms (measured in that demo and recorded in the source notes). |
+| Concurrent extraction | 2 workers sharing one DB connection | One GPU, so 2 in flight keeps the queue shallow; psycopg is safe here because no DB call spans an await. |
+| Agent access | MCP over stdio, read-only | `default_transaction_read_only=on` at the session level. Connect per call so a tailnet link flap only fails one call. |
+
+---
+
+## The archive and the scan stage
+
+The source is a personal document archive on a network share, mounted read-only
+on the dev box. An `os.walk` pass records every file, hashes it with sha256, and
+compares against the document ledger. New and changed files enter the pipeline;
+unchanged files skip every downstream stage.
+
+A file-extension allowlist (`ALLOWED_EXTENSIONS`) selects 17 document types:
+pdf, docx, doc, pptx, ppt, xlsx, xls, xlsm, txt, md, html, htm, rtf, odt, csv,
+epub, and eml. Everything else is skipped - photos, application bundles, code
+repositories, and database files. An exclusion list catches files that match
+a document extension but must never be ingested: KeePass databases, PKCS#12
+certificate bundles, private keys, BitLocker recovery keys, and filenames
+matching a sensitive-name regex (`password`, `credential`, `secret`, `api key`,
+`private key`). The exclusions are a security boundary, not a filter -
+over-exclusion is the safe direction.
+
+The walker streams results via `os.walk` with directory pruning rather than
+materialising a `sorted(rglob())` over the network mount, which would
+materialise 470k paths before yielding the first one.
+
+## Text extraction
+
+One extractor per file type, dispatched by extension through a registry. Each
+extractor writes to the text cache keyed by sha256, so downstream stages never
+re-read the slow network mount. The cache lives on local NVMe storage; after
+the first full scan, a re-scan of unchanged files hits the cache on every stage.
+
+Extractors handle failure by raising `ExtractionError`; the CLI marks the file
+`failed` in the document ledger and moves on. A scanned PDF (below 270
+characters per page of extracted text) raises `ScannedPDFError` and is routed
+to an `ocr_pending` lane for a future OCR pass with tesseract. Legacy Office
+formats (.doc, .ppt, .xls) go through LibreOffice headless with a 120-second
+timeout - these are slow (~1-2 seconds per file) and occasional files hang the
+process.
+
+The junk gate runs before the LLM sees a document. Documents above 10,000
+characters whose lines are more than 90% delimiter-dense (three or more commas,
+tabs, semicolons or pipes) are marked `skipped` - these are marketing recipient
+spreadsheets and lead-list CSVs that would otherwise generate hundreds of LLM
+calls for zero knowledge. The 10,000-character floor keeps small real tables
+(grade sheets, address books) in the pipeline; below it a document costs at
+most two chunks.
+
+## Entity and relation extraction
+
+Each document's cached text is split into chunks of 6,000 characters with a
+400-character overlap, preferring paragraph boundaries. The chunker is
+deliberately simple: semantic chunking matters for retrieval-augmented
+generation, not for per-chunk named entity recognition.
+
+Each chunk goes to the local LLM at temperature 0 with thinking disabled
+(`reasoning_effort: none`, `chat_template_kwargs: {enable_thinking: false}`).
+Strict-JSON entity extraction gains nothing from chain-of-thought, and thinking
+traces cost 5-10x latency on the default preset. The prompt asks for five
+entity types (Person, Org, Place, Topic, Date) and relations as
+`{subject, predicate, object}` triples, with both subject and object required
+to appear in the entities list. It instructs the model to use canonical names
+for the same entity across chunks, to emit relations only when both entities
+appear in the same chunk's entity list, and to return an empty extraction
+for chunks with no extractable knowledge. The type vocabulary is kept small
+deliberately; exotic types create resolution debt later.
+
+The output contract is a `json_schema` response format derived from the
+pydantic model, with `additionalProperties: false` and both `entities` and
+`relations` required (so the grammar cannot let the model answer `{}` and
+skip). An exception applies to NInfer presets, which return empty extractions
+with any response format when `reasoning_effort: none` is also set - a
+behaviour confirmed by live probe on 2026-10-16. On those presets the
+`response_format` field is omitted and per-item validation in the client
+is the only schema guard.
+
+Per-item validation drops malformed items rather than crashing the batch.
+At temperature 0 every retry would return the same malformed item, so one
+bad relation cannot sink the chunk. The LLM output is parsed by finding the
+outermost `{...}` in the response - models sometimes wrap JSON in prose or
+Markdown fences - and then each entity and relation is validated individually.
+A chunk that produces no valid items is not an error; it is normal for a
+prose passage with no named entities. A chunk whose LLM call fails after
+four attempts (5/15/45-second backoff) triggers a 1-token probe: if the probe
+succeeds, the document's chunk is marked `failed`; if it fails, the endpoint
+is down and the whole graph run aborts, leaving documents at `extracted` for
+the next run.
+
+The extraction pipeline runs two requests in flight, sharing one database
+connection. This is safe because no database call spans an await within a
+worker, so psycopg connections are never shared across concurrent tasks.
+
+## Storage
+
+The graph lives in a single Postgres database alongside the document ledger
+and the chat history. All three are separate tables in the same database.
+
+The document ledger (`documents`) records every scanned file: relative path,
+extension, size in bytes, sha256, modification time in nanoseconds, the current
+pipeline stage (`new` / `extracted` / `graphed` / `failed` / `skipped` /
+`ocr_pending`), and an error column. Each pipeline stage writes its outcome
+back to the same row, so the drain is resumable: re-running any stage on an
+unchanged file does no work.
+
+The graph has three tables:
+
+- **entities**: `(id, type, key, name)`, with a unique constraint on
+  `(type, key)` where `key = canonical_key(name)` - case- and whitespace-normalised.
+  A re-mention upserts the name and returns the existing id.
+- **mentions**: `(document, entity_id, role)`, with a unique constraint on
+  `(document, entity_id)`. Links an entity to the document it was found in,
+  with an optional role.
+- **relations**: `(subject_id, predicate, object_id, source)`. Currently stores
+  only Person-to-Person relations; the free-text predicate vocabulary from the
+  LLM is not yet canonicalised, so widening to other entity types waits for
+  that resolution pass.
+
+The owner entity is seeded once and linked from chat identities across sources;
+every other entity comes from document extraction. The graph is reset whenever
+the extraction model changes - mixing models in one graph produces inconsistent
+relations, and the 719 documents graphed under the previous model were reset
+to `extracted` before the current model ran.
+
+Traversal uses level-set recursive CTEs with `UNION` deduplication on
+`(id, depth)`, never `UNION ALL`. The owner entity appears in every document,
+making it a degree-N hub where N is the document count. Path enumeration
+exploded to 65,721 ms on a degree-917 hub in the earlier demo corpus; level-set
+answered in 155-159 ms (measured in that demo and recorded in the source
+notes). The same pattern applies here by construction: every document mentions
+the owner, so any depth-2 neighbourhood from the owner reaches every other
+entity and would enumerate every path if the CTE did not deduplicate.
+
+## Agent access: MCP server
+
+A read-only MCP server over stdio exposes the graph to the coding agent. It
+connects per call with `default_transaction_read_only=on`, so no write path
+exists at the server level (schema application lives in the main pipeline, which
+this server never calls). Connecting per call means a Postgres connection flap
+only fails one tool invocation rather than wedging the MCP session.
+
+Ten tools:
+
+| Tool | What it returns |
+|---|---|
+| Status | Pipeline stage counts, entity/mention/relation totals |
+| Search entities | Entities matching a name substring, with type filter and mention counts |
+| Dossier | One entity's type, mentions across documents (dated), relations in/out |
+| Cross-document entities | Entities appearing in N or more documents, with the corpus bridging rate |
+| Related entities | One-hop edges or two-hop level-set neighbourhood (hub-safe) |
+| Timeline | One entity's mentions ordered by document modification time |
+| Document | One ledger row: stage, size, modification time, error, extracted entities |
+| Search messages | Full-text search over chat history |
+| Conversation | One conversation by id or title substring, oldest first |
+| Person history | Chat identities matching a name across all sources |
+
+The MCP server is registered in the coding agent's configuration with deferred
+exposure: its tools appear only when the agent searches for them, keeping the
+per-turn prompt smaller. The database password is injected through a
+`sops -d --extract` environment substitution at process start, so the
+password never appears in a tracked configuration file.
+
+## Chat history lane
+
+A separate ingestion path, structured only - no LLM extraction. Chat-history
+exports are parsed into a source-neutral model and written to the same
+database. The tables are `identities` (one row per handle per source),
+`conversations` (one per chat), `participants` (join table), and
+`messages` (with a generated `search_tsv` column and a GIN index for
+`websearch_to_tsquery`).
+
+Chat ingestion is idempotent: re-running the same source deduplicates on a
+hash of the raw source values, or on per-message ids where the source
+provides them. The owner's
+identity across sources links to the same Person entity in the document graph,
+so a person who appears in both chat history and documents is resolvable
+through one entity id.
+
+## Privacy: nothing leaves the machine
+
+Every stage of the pipeline runs on the dev box. The LLM endpoint is the local
+llmc proxy at `127.0.0.1:11434` - an OpenAI-compatible HTTP API backed by
+the llama-server engine on the local GPU. The extraction model is
+Qwen3.8 27B dense, loaded as a preset on
+the llmc proxy.
+
+No hosted LLM endpoint (OpenRouter, Anthropic, or any cloud API) is ever
+called with document content by default. The configuration points at the local
+proxy; a cloud endpoint is an explicit, documented opt-in per folder set, not
+a config switch. Agent work that touches document content runs in local-model
+background workers, never in a cloud-model parent session. The parent sees
+aggregates only: pipeline status, counts, and error classes with the model's
+output stripped.
+
+The text-extraction cache and the Postgres database both live on the local
+network; the database port is tailnet-only with no public exposure. The
+document archive itself is read-only over a network mount - the pipeline never
+writes to it.
+
+## Throughput and the drain
+
+The extraction pipeline was measured on a local RTX 5090 (32 GB VRAM) with
+two requests in flight. The extraction model is `qwen38-swift-ninfer` (Qwen3.8
+27B dense, NVFP4 on NInfer), picked by measurement on 2026-10-16 in a
+three-model bake-off (see below). Throughput under the production chunking and
+junk gate:
+
+| Model | Documents per hour |
+|---|---|
+| qwen38-swift-ninfer (Qwen 27B) | 485 |
+| summarizer (Gemma 4 26B-A4B) | 409 |
+| gemma4 | 107 |
+
+These are end-to-end figures including extraction, chunking, and graph writes.
+The August 2026 partial drain ran ~45 docs/hr with one request in flight. The
+current pipeline runs two requests in flight rather than one - the original
+implementation used a semaphore that never admitted a second request, leaving
+the preset's second slot idle. The bake-off measured 485 docs/hr with the
+current model, though the model changed as well as the concurrency, so the
+number is not a clean before/after.
+
+The archive holds ~12.6k documents, making the full drain roughly 26 hours
+at 485 docs/hr. The drain script (`drain.sh`) is resumable: it runs scan,
+extract, and then a `while` loop on the graph stage under an llmc preset lock
+(renewed every 5 minutes, released on exit). A crash or Ctrl-C re-runs from
+where it stopped. The preprocessing stages (scan and extract) are essentially
+cache hits after the first run.
+
+Two operational constraints:
+
+- **One GPU, shared.** The extraction preset must be locked during the drain
+  or another llmc client can evict it mid-run, wiping the prompt cache and
+  forcing a full re-prefill on the next request. The drain script locks the
+  preset with an owner tag and releases it on exit.
+- **LLM outages are recoverable.** A 1-token probe after a chunk exhausts its
+  retries decides whether the endpoint is down (abort the run, documents stay
+  at `extracted`) or the document is unparseable (mark it `failed`, continue).
+  The `until` loop in the drain script retries the graph stage on any
+  non-zero exit.
+
+## The extraction model was not evaluated
+
+The first extraction model, `summarizer` (Gemma 4 26B-A4B Q4_K_M), was
+chosen on 2026-10-04 as a continuity pick. It
+ran 719 documents by 2026-10-14 without a quality test. Nothing in the
+session history, the plan documents, or the agent memory records had ever
+compared it against any alternative.
+
+On 2026-10-16, a three-model bake-off measured 29 stratified documents
+under each model at production settings. Both a Qwen judge and a Gemma judge
+ranked the models:
+
+| | summarizer (old) | qwen38-swift-ninfer | gemma4 |
+|---|---|---|---|
+| Entities per document | 38.4 | 25.6 | 36.7 |
+| Relations per document | 20.4 | 14.8 | 18.5 |
+| Entity names grounded in text | 0.87 | 0.75 | 0.86 |
+| Relation correctness (Qwen judge / Gemma judge) | 0.27 / 0.24 | 0.51 / 0.44 | 0.30 / 0.28 |
+| Relations with reversed direction | 0.25 / 0.25 | 0.00 / 0.00 | 0.17 / 0.08 |
+| Documents per hour | 409 | 485 | 107 |
+
+Both judges agreed: the Qwen model had the most correct relations and zero
+reversals, while `summarizer` reversed a quarter of its relations. `summarizer`
+had better entity coverage and grounding (0.87 vs 0.75), and Qwen produced
+four empty extractions out of 29 documents. On the numbers, the user picked
+relation correctness - and replaced the old model, resetting the 719 graphed
+documents to `extracted` so the graph comes from one model.
+
+The gap is now closed, but the sequence - pick for continuity, drain ~720
+documents without evaluation, then measure and find a quarter of relations
+reversed - is recorded here as a standing warning. The same pattern appears in
+the [agent model routing page](/reference/agent-model-routing/) under "Effort
+for high-stakes work" for deploy safety, and in the
+[agent guard extensions page](/reference/agent-guard-extensions/) where the
+epistemic guard enforces exactly this: "a recorded choice is not an evaluated
+one." The form here is the same: a config
+value, a commit, and a plan document all record a choice; none of them
+prove it was compared.
+
+---
+
+## What carries over
+
+The archive size, the specific model and the GPU are particular to this
+setup. These design choices are not:
+
+1. **An extension allowlist, not a denylist.** A personal archive is mostly
+   non-document files. An allowlist on extensions is explicit and auditable; a
+   denylist grows with every new file type found in the corpus.
+2. **The extraction prompt vocabulary stays small.** Five entity types and
+   free-text relation predicates keep the model's output predictable. Exotic
+   types are resolution debt that compounds with corpus size.
+3. **A sha256-keyed cache pays for itself on the first re-run.** Extraction and
+   chunking are the slow stages; caching them means a pipeline restart or a
+   model change only re-runs what changed.
+4. **Entity identity by `(type, canonical_key)`.** The type partition prevents
+   "Apple" the organisation and "Apple" the topic from colliding, and the
+   canonical key handles case and whitespace variation.
+5. **Per-item validation over batch rejection.** At temperature 0, a malformed
+   item in an otherwise good chunk would retry identically and fail identically.
+   Drop the bad item; keep the rest.
+6. **Level-set traversal, never path enumeration, on a hub-dense graph.**
+   If one entity appears in every document, a `UNION ALL` walk explodes.
+   `UNION` deduplication on `(id, depth)` keeps depth-N queries proportional
+   to the entity count.
+7. **Read-only MCP, connect-per-call.** `default_transaction_read_only=on`
+   enforced at the session level. A connection flap only fails one tool call.
+8. **Evaluate the extraction model before draining the corpus.** A model picked
+   for continuity is a guess. A 29-document sample and a judge from a
+   different model family settled the question.
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=diamond, margin="0.1,0.05"];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  start [label="Personal document archive\nto query from an agent", shape=box, style=round];
+  q_priv [label="Does the archive contain\nmedical, tax, or identity\ndocuments?"];
+  q_gpu [label="Is a local GPU with\n>16 GB VRAM available?"];
+
+  r_local [label="Run extraction on the\nlocal LLM only", shape=box, style=round];
+  r_nogpu [label="Use a CPU model\nor regex + dictionary NER;\nthe recall ceiling is lower\nbut the cost is zero after\nauthoring", shape=box, style=round];
+
+  start -> q_priv;
+  q_priv -> r_local [label="yes"];
+  q_priv -> q_gpu [label="no or depends on\nrisk tolerance"];
+  q_gpu -> r_local [label="yes"];
+  q_gpu -> r_nogpu [label="no"];
+}
+```
+
+The same decision as text:
+
+1. The archive contains sensitive documents -> local extraction only. No cloud model sees document content.
+2. Risk tolerance permits cloud extraction on some folders -> opt-in per folder, with a document-count gate that prevents accidental full-corpus sends.
+3. A local GPU with more than 16 GB VRAM is available -> run extraction on the local LLM.
+4. No GPU -> use a CPU embedding model or a regex-plus-dictionary NER approach. The recall ceiling is lower but the cost is zero after authoring, and the graph queries work the same way.
+
+---
+
+## Evidence
+
+| Claim | How it was checked | Status |
+|---|---|---|
+| Archive is 470k files, ~12.6k documents | Counts in `scan/rules.py` comments and the AGENTS.md walker note | read from source |
+| 17 allowed extensions, directory pruning in `os.walk` | `scan/rules.py` `ALLOWED_EXTENSIONS` and `_EXCLUDED_DIRS`; walker design in `scan/walker.py` | read from source |
+| Exclusion regex catches password/credential/secret/api key/private key filenames | `scan/rules.py` `_SENSITIVE_NAME_RE` | read from source |
+| Extraction is sha256-cached, text cache on local NVMe | `extract/__init__.py` registry design; cache path in `config.py` `text_dir` | read from source |
+| Scanned-PDF threshold 270 chars/page | `extract/pdf.py` and the postgres-entity-graphs lab G09 measurement recorded in TODO.md | read from source |
+| Junk gate at 10,000 chars, 0.9 tabular density | `nlp/chunk.py` `tabular_density`; threshold in `config.py` `junk_min_chars` | read from source |
+| Chunk size 6,000 chars, 400 overlap, paragraph-boundary preference | `config.py` `chunk_chars`, `chunk_overlap`; `nlp/chunk.py` `chunk_text` | read from source |
+| `json_schema` response format, pydantic-derived, per-item validation | `nlp/llm.py` `_build_response_format`, `Extraction`, `_valid_items` | read from source |
+| NInfer preset returns empty extractions with any response format when reasoning_effort is none | `config.py` `llm_structured_output` comment recording the 2026-10-16 live probe | read from source |
+| Temperature 0, thinking disabled, reasoning_effort none | `nlp/llm.py` `extract_entities` body fields | read from source |
+| 2 requests in flight, one DB connection | `config.py` `llm_concurrency`; design note in AGENTS.md | read from source |
+| Entity identity by `(type, canonical_key)` | `graph/store.py` `canonical_key` and `_entity_id` ON CONFLICT upsert | read from source |
+| Only Person-Person relations stored | `graph/store.py` `merge_extraction` type check in the relation loop | read from source |
+| Level-set UNION traversal, 65,721 ms -> 155-159 ms on degree-917 hub | `mcp/mnemo-server.py` `tool_related` hops=2 CTE; measurement from the earlier demo recorded in TODO.md and the MCP module docstring | read from source, design-note from earlier measurement |
+| 10 read-only MCP tools, connect-per-call, read-only session | `mcp/mnemo-server.py` `TOOLS` list and `db()` connect function | read from source |
+| LLM endpoint is localhost:11434 (llmc proxy) | `config.py` `llm_base_url` default | read from source |
+| `scripts/mnemo` decrypts sops .env per run; bare `uv run mnemo` reads ciphertext | README.md pipeline example and AGENTS.md gotcha | read from source |
+| Drain script locks preset with an owner tag, renewed every 5 min | `scripts/drain.sh` lock/unlock/heartbeat pattern | read from source |
+| 1-token probe after retry exhaustion distinguishes outage from document failure | AGENTS.md architecture section on `nlp/`; test in `tests/test_graph_outage.py` | read from source |
+| Throughput matrix (485/409/107 docs/hr) | `docs/research/2026-10-16-extraction-model-bakeoff.md` results table | measured |
+| Bake-off: 29 documents, stratified, seed 7, two judges from different families | `docs/research/2026-10-16-extraction-model-bakeoff.md` method section | measured |
+| `summarizer` ran 719 documents before evaluation; picked 2026-10-04 for continuity | `docs/research/2026-10-16-extraction-model-bakeoff.md` preamble; `config.py` `llm_model` comment; the epistemics rule in `~/.pi/agent/APPEND_SYSTEM.md` | read from source |
+| 719 documents reset to `extracted` after model change | AGENTS.md extraction-model note and TODO.md v1.5 done log | read from source |
+| Chat history has no LLM pass; three sources, structured only | README.md chat section; AGENTS.md architecture `chat/` context; TODO.md memory bank section | read from source |
+
+---
+
+## Related docs
+
+- [A cross-client memory store for coding agents](/reference/agent-memory-store/) - the session-history store, with the lessons from seeding 640k messages
+- [Scheduling one GPU between LLM, image and training work](/reference/llmc-single-gpu-stack/) - the llmc proxy that serves the extraction model, and what happens when another client evicts it
+- [Which model runs which agent work](/reference/agent-model-routing/) - the rule that extraction and document-content work stays on the local model
+- [Entity graphs on managed Postgres](/reference/postgres-entity-graphs/) - the earlier demo that proved the graph query patterns on Supabase before this pipeline moved them to local hardware
+- [Declarative homelab backups](/reference/declarative-homelab-backups/) - the servarr Postgres cluster (Nix `pg_dump` timer + ZFS snapshots) that this system's database runs on
+- [Appdata tiering on ZFS](/reference/appdata-tiering-zfs/) - which tier the Postgres data directory lives on, and why
+- [The pi harness journey](/reference/pi-harness-journey/) - the coding agent that queries the graph through the MCP server
