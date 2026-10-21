@@ -234,6 +234,18 @@ describe("internal links", () => {
     expect(doc.internalLinks.sort()).toEqual(["/guides/foo", "/reference/bar"]);
   });
 
+  test("a link to an anchor still links the doc", () => {
+    // 52 links in the corpus carry a #fragment. They were invisible to the
+    // broken-link check and would be missing from every page's backlinks.
+    const doc = parseMdx("t.mdx", fm("see [x](/guides/foo/#part-2) and [y](/reference/bar#tldr)\n"));
+    expect(doc.internalLinks.sort()).toEqual(["/guides/foo", "/reference/bar"]);
+  });
+
+  test("links inside fences and MDX comments are not links", () => {
+    const doc = parseMdx("t.mdx", fm("```md\n[x](/guides/foo/)\n```\n\n{/* [y](/reference/bar/) */}\n"));
+    expect(doc.internalLinks).toEqual([]);
+  });
+
   test("external links are ignored", () => {
     expect(parseMdx("t.mdx", fm("[x](https://example.com/guides/foo)\n")).internalLinks).toEqual([]);
   });
