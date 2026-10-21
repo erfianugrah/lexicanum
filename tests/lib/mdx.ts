@@ -228,7 +228,7 @@ export function parseMdx(path: string, raw: string): Doc {
   const internalLinks = new Set<string>();
   for (const l of lines) {
     if (l.kind === "fence" || l.kind === "comment") continue;
-    for (const m of l.raw.matchAll(/\]\((\/(?:guides|reference)\/[a-z0-9-]+)\/?\)/g)) {
+    for (const m of l.raw.matchAll(/\]\((\/(?:guides|reference)\/[a-z0-9-]+)\/?(?:#[^)\s]*)?\)/g)) {
       internalLinks.add(m[1]!);
     }
   }

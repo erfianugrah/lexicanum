@@ -66,6 +66,15 @@ the build/test gate only, no deploy.
   when a doc's frontmatter block changes (prose edits keep hot reload).
   Adding a CATEGORY is a deliberate edit to `TAXONOMY`, not something a doc
   can invent.
+- Every doc page ends with a "Linked from" list of the docs that link to
+  it, rendered by the `MarkdownContent` override
+  (`src/components/MarkdownContent.astro` over `src/lib/links.mjs`). A link
+  counts when it is a `](/guides/...)` or `](/reference/...)` link outside
+  fences and MDX comments, with or without a `#fragment`. A new doc must be
+  linked from at least one other doc: `tests/docs.test.ts` fails otherwise,
+  except for the docs frozen in `tests/no-inbound-baseline.json` (16 at
+  2026-10-21). Link one of those and remove it from the baseline in the same
+  commit - a stale entry fails too.
 
 ## Two traps in this repo
 
@@ -306,8 +315,9 @@ rewrite just for style is not required.
 Cross-reference the corpus: before drafting a new doc, grep `src/content/docs`
 for the systems it touches and read the matches (often the older human-written
 docs), then link them inline or in a closing "Related docs" list. The build
-verifies that links resolve; it does not verify that a new doc established any -
-that check is on the author.
+verifies that links resolve and that some other doc links TO a new doc; it does
+not verify that the new doc links out to the docs it depends on - that check is
+on the author.
 
 ## Verify before done
 
@@ -326,7 +336,9 @@ Run `bun run build` and confirm:
   - `tests/docs.test.ts` - corpus-wide structure: split tables, footnote balance,
     smart punctuation, math-risk dollars, internal links, draft links, dot-fence
     style, built-page assertions, and the taxonomy checks (every doc in the
-    generated sidebar, every alias emitting a redirect stub, no dead blurb).
+    generated sidebar, every alias emitting a redirect stub, no dead blurb),
+    the inbound-link ratchet, and a built-page check that each "Linked from"
+    list matches the backlinks the test parser derives from source.
   - `tests/pins.test.ts` - per-doc pins: corrections that must not regress, claims
     that must not creep back, required sections, and the anchors other docs link to.
     Adding a pin is a row in the table.
