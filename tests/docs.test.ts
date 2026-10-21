@@ -11,7 +11,8 @@
  * than being noticed on the published page.
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { gunzipSync } from "node:zlib";
 import {
   headlessTableRuns,
   markerLines,
@@ -330,6 +331,42 @@ describe.skipIf(!CHECK_BUILT)("built output", () => {
     expect(wrong).toEqual([]);
     // Guards against both sides being empty: most of the corpus is linked.
     expect(sections).toBeGreaterThan(docs.length / 2);
+  });
+
+  test("every page's link graph holds exactly its inbound and outbound docs", () => {
+    // Same two-extractor cross-check as the list, for the graph: node links
+    // in the rendered SVG against the test parser's links in and out.
+    const wrong: string[] = [];
+    let graphs = 0;
+    for (const p of pages) {
+      if (!existsSync(p.html)) continue;
+      const html = readFileSync(p.html, "utf8");
+      const graph = html.match(/<details class="link-graph[\s\S]*?<\/details>/)?.[0];
+      if (graph) graphs++;
+      const rendered = [...new Set([...(graph ?? "").matchAll(/xlink:href="\/((?:guides|reference)\/[a-z0-9-]+)\/"/g)].map((m) => m[1]!))].sort();
+      const self = slugOf(p.doc);
+      const out = p.doc.internalLinks.map((h) => h.slice(1)).filter((t) => t !== self && live.includes(t));
+      const expected = [...new Set([...(inbound.get(self) ?? []), ...out])].sort();
+      if (rendered.join() !== expected.join()) {
+        wrong.push(`${p.doc.path}: rendered [${rendered}] expected [${expected}]`);
+      }
+    }
+    expect(wrong).toEqual([]);
+    expect(graphs).toBeGreaterThan(docs.length / 2);
+  });
+
+  test("search does not index the link list or the link graph", () => {
+    // Both repeat other pages' titles; indexed, every page matches searches
+    // for its neighbours (138 of 155 fragments did, in the first deploy).
+    // Pagefind fragments are gzip, prefixed "pagefind_dcd".
+    const dir = join(DIST, "pagefind", "fragment");
+    const files = readdirSync(dir);
+    expect(files.length).toBeGreaterThan(docs.length / 2);
+    const leaked = files.filter((f) => {
+      const text = gunzipSync(readFileSync(join(dir, f))).toString("utf8");
+      return text.includes("Linked from") || text.includes("Link graph:");
+    });
+    expect(leaked).toEqual([]);
   });
 
   test("only docs that opt in render KaTeX", () => {

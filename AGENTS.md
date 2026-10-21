@@ -67,12 +67,15 @@ the build/test gate only, no deploy.
   Adding a CATEGORY is a deliberate edit to `TAXONOMY`, not something a doc
   can invent.
 - Every doc page ends with a "Linked from" list of the docs that link to
-  it, rendered by the `MarkdownContent` override
-  (`src/components/MarkdownContent.astro` over `src/lib/links.mjs`). A link
+  it and a collapsed link graph (docs in, the page, docs out; inline SVG
+  rendered at build time with `@hpcc-js/wasm`), both from the
+  `MarkdownContent` override (`src/components/MarkdownContent.astro` over
+  `src/lib/links.mjs`). Both carry `data-pagefind-ignore`: indexed, every
+  page matched searches for its neighbours' titles. A link
   counts when it is a `](/guides/...)` or `](/reference/...)` link outside
   fences and MDX comments, with or without a `#fragment`. A new doc must be
   linked from at least one other doc: `tests/docs.test.ts` fails otherwise,
-  except for the docs frozen in `tests/no-inbound-baseline.json` (16 at
+  except for the docs frozen in `tests/no-inbound-baseline.json` (4 at
   2026-10-21). Link one of those and remove it from the baseline in the same
   commit - a stale entry fails too.
 
@@ -337,8 +340,10 @@ Run `bun run build` and confirm:
     smart punctuation, math-risk dollars, internal links, draft links, dot-fence
     style, built-page assertions, and the taxonomy checks (every doc in the
     generated sidebar, every alias emitting a redirect stub, no dead blurb),
-    the inbound-link ratchet, and a built-page check that each "Linked from"
-    list matches the backlinks the test parser derives from source.
+    the inbound-link ratchet, built-page checks that each "Linked from" list
+    and link graph match the links the test parser derives from source, and
+    that neither reaches the search index. `tests/site-links.test.ts` unit-
+    tests `src/lib/links.mjs`, including a real Graphviz render.
   - `tests/pins.test.ts` - per-doc pins: corrections that must not regress, claims
     that must not creep back, required sections, and the anchors other docs link to.
     Adding a pin is a row in the table.
