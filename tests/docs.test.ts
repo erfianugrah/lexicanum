@@ -144,6 +144,27 @@ describe.each(docs.map((d) => [d.path, d] as const))("%s", (_path, doc) => {
   });
 });
 
+/**
+ * Doc -> docs linking to it, from the test parser. The built "Linked from"
+ * sections are rendered by src/lib/links.mjs, a separate extractor; the
+ * built-output check below requires the two to agree.
+ */
+const slugOf = (d: { path: string }) => d.path.replace(/\.(mdx|md)$/, "");
+const live = docs.filter((d) => !d.isDraft).map(slugOf);
+const inbound = new Map<string, Set<string>>();
+for (const d of docs) {
+  if (d.isDraft) continue;
+  for (const href of d.internalLinks) {
+    const target = href.slice(1);
+    if (target === slugOf(d) || !live.includes(target)) continue;
+    if (!inbound.has(target)) inbound.set(target, new Set());
+    inbound.get(target)!.add(slugOf(d));
+  }
+}
+const noInboundBaseline: string[] = JSON.parse(
+  readFileSync(join(import.meta.dir, "no-inbound-baseline.json"), "utf8"),
+);
+
 describe("cross-document", () => {
   const slugs = new Set(docs.map((d) => `/${d.path.replace(/\.(mdx|md)$/, "")}`));
   const drafts = new Set(
@@ -192,6 +213,23 @@ describe("cross-document", () => {
       .map((d) => d.path.replace(/\.(mdx|md)$/, ""));
     expect(expected.filter((slug) => !listed.includes(slug))).toEqual([]);
     expect(listed.length).toBe(expected.length);
+  });
+
+  test("every doc is linked from another doc, or is in the baseline", () => {
+    // AGENTS.md: a guide that rests on a reference doc links it, and the
+    // reference doc links back. A doc nothing links to is reachable only from
+    // the sidebar and search, and its page renders no "Linked from" section.
+    // Ratcheted: docs that predate this check are frozen in the baseline; a
+    // NEW doc with no inbound link fails.
+    const unlinked = live.filter((slug) => !(inbound.get(slug)?.size));
+    expect(unlinked.filter((slug) => !noInboundBaseline.includes(slug))).toEqual([]);
+  });
+
+  test("the no-inbound baseline holds no stale entries", () => {
+    // The ratchet only tightens if fixed docs leave the baseline. An entry
+    // that has gained an inbound link, or no longer exists, must be removed.
+    const stale = noInboundBaseline.filter((slug) => !live.includes(slug) || inbound.get(slug)?.size);
+    expect(stale).toEqual([]);
   });
 });
 
@@ -268,6 +306,30 @@ describe.skipIf(!CHECK_BUILT)("built output", () => {
       if (found) leaks.push(`${p.doc.path}: ${found.slice(0, 3).join(" ")}`);
     }
     expect(leaks).toEqual([]);
+  });
+
+  test("every page lists exactly the docs that link to it", () => {
+    // Two extractors, one per side: the page renders src/lib/links.mjs over
+    // the content collection, this compares against the test parser over the
+    // source files. A link one sees and the other misses fails here.
+    const wrong: string[] = [];
+    let sections = 0;
+    for (const p of pages) {
+      if (!existsSync(p.html)) continue;
+      const html = readFileSync(p.html, "utf8");
+      const section = html.match(/<section class="backlinks"[\s\S]*?<\/section>/)?.[0];
+      if (section) sections++;
+      const rendered = [...(section ?? "").matchAll(/href="\/((?:guides|reference)\/[a-z0-9-]+)\/"/g)]
+        .map((m) => m[1]!)
+        .sort();
+      const expected = [...(inbound.get(slugOf(p.doc)) ?? [])].sort();
+      if (rendered.join() !== expected.join()) {
+        wrong.push(`${p.doc.path}: rendered [${rendered}] expected [${expected}]`);
+      }
+    }
+    expect(wrong).toEqual([]);
+    // Guards against both sides being empty: most of the corpus is linked.
+    expect(sections).toBeGreaterThan(docs.length / 2);
   });
 
   test("only docs that opt in render KaTeX", () => {
