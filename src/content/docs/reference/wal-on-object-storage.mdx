@@ -1,0 +1,240 @@
+---
+title: "WAL on object storage: OrioleDB's S3 mode against Turso Cloud"
+description: "Two designs that put the write-ahead log on S3 and keep local disk as a cache, and the one thing that separates them - whether a commit waits for the object store. OrioleDB's experimental S3 mode measured on a local rig (OrioleDB beta 19, PostgreSQL 17.11, RustFS): what reaches the bucket, what a restore returns after losing the instance, eviction and cold reads, commit rate with S3 on and off; the S3-mode settings read on a hosted Supabase OrioleDB project; Turso Cloud's S3 Express commit path from its own documentation, not measured. 2026-10-21."
+author: Erfi Anugrah
+category: supabase
+group: architecture
+---
+
+OrioleDB's experimental S3 mode and Turso Cloud both describe themselves as putting the write-ahead log (WAL) on S3 with local disk as a cache. This page records what OrioleDB's S3 mode did when measured, what Turso documents about its own, and why the two give different answers when a node is lost. For anyone weighing object storage under a transactional database, or asked whether these two are converging.
+
+The OrioleDB figures were measured on 2026-10-21 by the [supabase-lab](https://github.com/erfianugrah/supabase-lab) harness, [experiments/wal-on-s3](https://github.com/erfianugrah/supabase-lab/tree/6964c07/experiments/wal-on-s3), module WS01, two runs (`run-2026-10-21T05-42-10-259Z` and `run-2026-10-21T06-06-20-830Z`), on one laptop with Docker: the public image `orioledb/orioledb:beta19-pg17` (PostgreSQL 17.11, OrioleDB beta 19) and RustFS 1.0.3 as the S3 server on the same Docker network, so every S3 latency below is local, not AWS. Each case starts a new S3 server, bucket and cluster. The hosted read is module OR11 of [experiments/orioledb](https://github.com/erfianugrah/supabase-lab/tree/6964c07/experiments/orioledb), one OrioleDB project in `ap-southeast-1` the same day. Turso Cloud was not measured: the lab's Turso account could not create a database on its plan. Everything about Turso below is cited to Turso's or AWS's documentation.
+
+TL;DR:
+
+- Turso Cloud acknowledges a commit after the WAL is written to S3 Express One Zone, batched across databases and in time.[^turso-durability][^aws-turso] OrioleDB's S3 mode acknowledges after the local WAL flush and syncs to S3 asynchronously;[^oriole-decoupled] with S3 mode on and off, a single-row INSERT pgbench ran at 24186.209406 and 24175.451334 transactions a second in run 1 (WS01e).
+- OrioleDB puts each checkpoint's data files and whole 16 MB WAL segments in the bucket. The first bucket listing after `CHECKPOINT` returned (921 and 867 ms) already held objects under the new checkpoint (WS01a).
+- A restore after losing the instance and its disk returned the last checkpoint and nothing after it: 100,000 of 100,000 rows from before the checkpoint, 0 of 1,000 committed after it, in both runs (WS01f). It needed two steps the docs do not describe: deleting the dead instance's lock object from the bucket, and a one-line fix to the restore script.
+- Without a clean shutdown since setup, no restore started: the restored directory lacked Postgres catalog files, which the loader's checksum lists did not mention either (WS01b, WS01c).
+- With local data capped at 20 MB and the server restarted, the first point read took 15049.6 and 17111.1 ms and the next six 91.6 to 132.8 ms; the same reads repeated took 0.6 to 1.2 ms after the first (WS01d).
+- A hosted Supabase OrioleDB project (public beta 14) has the S3-mode settings, off, and the `postgres` role cannot set them (OR11). Since beta17, OrioleDB also ignores S3 mode in builds without `IS_DEV=1`.[^oriole-isdev]
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.4; ranksep=0.6;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_o {
+    label="OrioleDB S3 mode"; fontsize=11;
+    oc [label="client"];
+    ol [label="local WAL + data\n(primary, and cache)"];
+    os3 [label="S3 bucket\ncheckpoints, 16 MB WAL segments,\nlock object"];
+    oc -> ol [label="commit acked\nafter local flush"];
+    ol -> os3 [label="async: checkpoint,\nsegment archive", style=dashed];
+  }
+
+  subgraph cluster_t {
+    label="Turso Cloud (documented)"; fontsize=11;
+    tc [label="client"];
+    tn [label="compute node\nNVMe cache"];
+    tx [label="S3 Express One Zone\nWAL"];
+    ts [label="S3 Standard\ndatabase file"];
+    tc -> tn;
+    tn -> tx [label="commit acked\nafter batched PUT"];
+    tx -> ts [label="checkpoint", style=dashed];
+  }
+}
+```
+
+## Which design answers which question
+
+| Question | OrioleDB S3 mode | Turso Cloud | Measured or documented |
+|---|---|---|---|
+| Does a commit wait for S3? | No; commit rates within 1.5% with S3 on and off, two runs | Yes, after the S3 Express write | OrioleDB measured (WS01e); Turso documented[^turso-durability] |
+| What survives losing the node? | The last checkpoint; later commits lost | Every acknowledged commit, per the docs | OrioleDB measured (WS01f); Turso documented[^aws-turso] |
+| Can a new node take over unaided? | Not after a crash: the lock blocks it | A replacement serves reads from S3 Express while it warms | OrioleDB measured (WS01b); Turso documented[^aws-turso] |
+| Is it available on hosted Supabase? | No; settings present and off | Not applicable | measured (OR11) |
+| Status | Experimental, development builds only | Out of beta on Turso's AWS regions | documented[^oriole-isdev][^turso-aws] |
+
+---
+
+## What reaches the bucket
+
+WS01a writes 200,000 rows of about 200 B to one OrioleDB table (54,624,256 B locally), then runs `CHECKPOINT`.
+
+| Measurement | Run 1 | Run 2 |
+|---|---|---|
+| Objects after start, before any table | 143 | 143 |
+| `CHECKPOINT` time | 921 ms | 867 ms |
+| Highest checkpoint listed right after `CHECKPOINT` returned | 2 | 2 |
+| Objects and bytes 10 s later | 270, 148,206,023 B | same |
+| `data/` (Postgres files) | 144 objects, 26,053,239 B | same |
+| `orioledb_data/` (OrioleDB files) | 122 objects, 55,043,920 B | same |
+| `wal/` (archived segments) | 4 objects, 67,108,864 B | same |
+
+The module records the highest checkpoint number at that first listing, not its object count, so whether the whole checkpoint had arrived is not measured. WAL goes up as whole 16 MB segments through Postgres's archiver, so a segment still being written is not in the bucket. S3 mode is fixed when the cluster is initialised: a cluster created with it off refused to start with it on (`OrioleDB was initialized with S3 mode off`), so each case here starts in S3 mode from its first boot.
+
+## Losing the instance and its disk
+
+Each case commits 100,000 rows marked A, runs `CHECKPOINT`, commits 1,000 rows marked B, then kills the server with SIGKILL and removes its container and volume. Each restore runs the upstream `orioledb_s3_loader.py` at tag beta19 into a new volume and starts a server on it with the same S3 settings. WS01c also switches the WAL segment after B and waits until it is in the bucket (found at the first listing, 0.5 s after the switch, in both runs). WS01f stops and starts the server cleanly after the checkpoint, before B. The restores run in the table's order on one bucket.
+
+| Restore | WS01b (crash) | WS01c (crash, B's segment archived) | WS01f (clean restart, then crash) |
+|---|---|---|---|
+| As documented | refused: `A lock file from a different OrioleDB instance already exists on the S3 bucket` | same | the loader failed: `ValueError: too many values to unpack (expected 2)` |
+| Dead instance's lock copied into the restored directory | `could not open file "global/2672"` | one run timed out, one `could not open file "global/2672"` | the loader failed |
+| Lock object deleted from the bucket | `could not open file "global/2672"` | same | the loader failed |
+| Lock deleted, loader with a one-line fix (patched) | not run | not run | started; A 100,000 of 100,000, B 0 of 1,000 |
+
+Every cell held in both runs unless it says otherwise.
+
+- After a crash the dead instance's lock stays in the bucket and a new instance gets a different lock identifier, so the documented restore stops at the lock check. Deleting the lock object gets past it. Do that only when the old instance cannot come back, because the lock is what stops two instances writing one bucket.
+- Without a clean shutdown since setup, every restore that reached a start failed on `global/2672` (`pg_database`). A debug restore (operator note, not an artifact) found seven files of Postgres's `global/` directory missing from the restored copy and from both checksum lists the loader reads. The patched loader was not tried on those buckets.
+- After a clean stop and start, the stock loader fails on its path for files unchanged across several checkpoints. The fix is a missing `.items()` on a dict loop, proposed in PR #1271 and closed without merging.[^oriole-pr1271] With the fix and the lock deleted, the restore returned the checkpoint state: none of the 1,000 rows committed after it.
+- The loader fetches the last checkpoint and the one WAL segment that checkpoint's redo starts from; nothing configures `restore_command`, so an archived segment after it is not replayed.[^oriole-loader] The documentation says as much: "the state of the last PostgreSQL checkpoint".[^oriole-decoupled]
+
+None of these three behaviours has an open upstream issue as of 2026-10-21, and none has been filed from this lab.
+
+## Eviction and cold reads
+
+WS01d sets `orioledb.s3_desired_size = 20MB`, writes 50,000 rows of 2,500 B, runs `CHECKPOINT`, waits until the local OrioleDB data is under 20 MB, restarts the server and reads.
+
+| Measurement | Run 1 | Run 2 |
+|---|---|---|
+| Local OrioleDB data after the checkpoint, after eviction | 134,416 kB, 676 kB | 134,416 kB, 700 kB |
+| Eviction wait | 14 s | 6 s |
+| Eight point reads after the restart, ms | 17111.1, 125.3, 125.9, 131.2, 122.1, 113.5, 128.0, 1.3 | 15049.6, 91.6, 126.7, 127.0, 127.3, 132.8, 127.1, 0.6 |
+| The same eight reads again, ms | 52.0, 0.7, 0.7, 0.6, 0.6, 0.6, 0.6, 0.6 | 108.0, 1.2, 1.2, 1.0, 0.6, 0.6, 0.7, 0.6 |
+| Three full `count(*)` in a row, ms | 40541, 12174, 10301 | 43205, 247730, 10962 |
+
+In the source, a read of an evicted part waits while that 1 MB part is fetched from S3. Whether reads two to seven here did so was not measured: by the first count, local data was back at 134,208 and 134,280 kB. On AWS a fetch would add S3's own latency (not measured). The full counts do not separate cold from warm: local size swung between about 3,000 kB and 134,000 kB between counts as data was evicted and loaded back, and one count took 247730 ms for a reason not isolated.
+
+## Commit rate
+
+WS01e runs pgbench for 15 s with 4 clients, one single-row INSERT per transaction, inside the container.
+
+| | Run 1 | Run 2 |
+|---|---|---|
+| S3 mode on | 24186.209406 tps, 0.165 ms | 23706.629666 tps, 0.169 ms |
+| S3 mode off | 24175.451334 tps, 0.165 ms | 24042.922573 tps, 0.166 ms |
+
+The rates are within 1.5% of each other in both runs, which fits commits not waiting for S3; the local S3 server's write latency was not measured, and one of three unpublished earlier runs was 6.8% lower with S3 mode on.
+
+## On a hosted Supabase OrioleDB project
+
+OR11 created one OrioleDB project (PostgreSQL 17.6, `OrioleDB public beta 14`) and read its settings through the session pooler.
+
+| Read | Value |
+|---|---|
+| `orioledb.s3_mode` | `off`, postmaster context |
+| `orioledb.s3_host`, `s3_prefix`, `s3_region`, `s3_accesskey`, `s3_secretkey` | empty |
+| `archive_mode`, `archive_library` | `off`, empty |
+| `ALTER SYSTEM SET orioledb.s3_mode = on` as `postgres` | `permission denied to set parameter "orioledb.s3_mode"` |
+| Management API Postgres config | no S3, archive or OrioleDB key |
+
+This project ran public beta 14, which predates OrioleDB's beta17 change that ignores `s3_mode` in builds without `IS_DEV=1`,[^oriole-isdev] so the refusal is a role permission, not that gate. The Management API's GET returned no keys at all; its update endpoint was not tried. For durability on a hosted project, the [OrioleDB page](/reference/supabase-orioledb/) records that the PITR add-on was refused on an OrioleDB project.
+
+## Turso Cloud's commit path (documented, not measured)
+
+Turso's durability page: "Commits are only acknowledged once data is safely stored in either S3 or S3-express. Compute nodes can come and go at any time, and local disks act as a local cache."[^turso-durability] New commits go to S3 Express One Zone first, and the WAL is periodically folded into the database file on S3 Standard. Commits are "batched across many databases to amortize this cost" and "batched in time", and the page tabulates a ceiling of added commit latency per plan. AWS's write-up of the design gives a 6.4 ms average for a 4 KB S3 Express PUT in the same Availability Zone, against about 2 ms for a local fsync, and describes a failed pod's replacement serving reads from S3 Express while it fills its cache.[^aws-turso] Turso announced on 2026-10-02 that it is joining Supabase.[^turso-joining]
+
+What a client could check when a Turso database is available: the gap between write and read round trips (about the S3 Express PUT plus up to the plan's ceiling), whether consecutive autocommits each pay that gap while one multi-row transaction pays it once, and whether the gap stays the same from a nearer or farther client. None of these was run.
+
+---
+
+## Reading the numbers
+
+- Two runs of one module on one laptop; the status rows (refusals, row counts, objects in the bucket) agreed in both. The timings are single samples per read.
+- Every S3 latency here is a local RustFS server. Cold-read times on AWS would add S3's own latency; this rig cannot say how much.
+- The restore results describe OrioleDB beta 19 on PostgreSQL 17 and the beta19 loader. S3 mode is experimental, and any later release can move a row.
+- The Turso column rests on Turso's and AWS's documentation.
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Treat OrioleDB's S3 copy as the last checkpoint, not as committed data. | Restore returned A 100,000 of 100,000 and B 0 of 1,000, both runs. | WS01f |
+| Test a restore from the bucket before relying on it. | Without a clean shutdown since setup, no restore started; each failed on `global/2672`. | WS01b, WS01c |
+| Delete a dead instance's lock only once that instance cannot return. | The documented restore was refused on the stale lock; deleting the object got past it. | WS01b, WS01f |
+| Use a loader with the `.items()` fix on buckets with several checkpoints. | Stock loader `ValueError` in both runs; the patched copy restored. | WS01f |
+| Size `s3_desired_size` to the working set. | After eviction and a restart: first read 15049.6-17111.1 ms, next six 91.6-132.8 ms, repeats 0.6-1.2 ms. | WS01d |
+| Do not plan on S3 mode on a hosted Supabase project. | `s3_mode` off; `ALTER SYSTEM` refused; no Management API setting. | OR11 |
+| Where each commit must survive the node, pick a design that waits for the store. | Turso acknowledges after S3 Express; OrioleDB S3 mode does not wait (commit rate equal on and off). | WS01e; Turso documented, not measured |
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.35; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q [label="Must every acknowledged commit\nsurvive losing the node?", shape=diamond];
+  a [label="A design that acknowledges\nafter durable storage or a quorum\n(Turso Cloud per its docs; replicas)"];
+  b [label="Is the S3 copy a backup\nof checkpoints only?", shape=diamond];
+  c [label="OrioleDB S3 mode can serve,\nself-hosted, development build,\nrestore tested in advance"];
+  d [label="Not on hosted Supabase:\nsettings off, not settable"];
+
+  q -> a [label="yes"];
+  q -> b [label="no"];
+  b -> c [label="self-hosted"];
+  b -> d [label="hosted"];
+}
+```
+
+---
+
+## Evidence
+
+| Claim | How it was checked | Module |
+|---|---|---|
+| Bucket contents after a checkpoint; checkpoint listed when `CHECKPOINT` returned | `aws s3 ls` before and after, 200,000 rows | [WS01](https://github.com/erfianugrah/supabase-lab/blob/6964c07/experiments/wal-on-s3/tests/ws01-oriole-s3.ts) (WS01a) |
+| Restore after losing the instance, four ways | SIGKILL, container and volume removed, upstream loader at beta19, server started on the restored volume, rows counted | [WS01](https://github.com/erfianugrah/supabase-lab/blob/6964c07/experiments/wal-on-s3/tests/ws01-oriole-s3.ts) (WS01b, WS01c, WS01f) |
+| Seven catalog files missing from the restored copy and the checksum lists | a debug restore compared with the crashed instance's directory and the loader's checksum lists | operator note in the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/6964c07/experiments/wal-on-s3/RUNLOG.md) |
+| Eviction and cold reads | `s3_desired_size` 20MB, local size polled, restart, timed point reads and counts | [WS01](https://github.com/erfianugrah/supabase-lab/blob/6964c07/experiments/wal-on-s3/tests/ws01-oriole-s3.ts) (WS01d) |
+| Commit rate with S3 mode on and off | pgbench, 4 clients, 15 s, single-row INSERT | [WS01](https://github.com/erfianugrah/supabase-lab/blob/6964c07/experiments/wal-on-s3/tests/ws01-oriole-s3.ts) (WS01e) |
+| Hosted S3-mode settings | `pg_settings`, `ALTER SYSTEM`, Management API Postgres config | [OR11](https://github.com/erfianugrah/supabase-lab/blob/6964c07/experiments/orioledb/tests/or11-s3-surface.ts) |
+| Turso's commit path, batching, recovery | Turso and AWS documentation, fetched 2026-10-21 | documented, not measured |
+
+Artifacts: [`wal-on-s3/out/2026-10-21`](https://github.com/erfianugrah/supabase-lab/tree/6964c07/experiments/wal-on-s3/out/2026-10-21) and [`orioledb/out/2026-10-21`](https://github.com/erfianugrah/supabase-lab/tree/6964c07/experiments/orioledb/out/2026-10-21).
+
+## Reproducing
+
+```sh
+make -C experiments/wal-on-s3 probe ONLY=WS01        # Docker only, 14 to 24 min
+make -C experiments/wal-on-s3 clean
+# hosted read, needs SUPABASE_ACCESS_TOKEN and a Pro org slug
+PVLAB_ORG_PRO=<slug> make -C experiments/orioledb probe ONLY=OR11
+```
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| WS01 | wal-on-s3 | [`ws01-oriole-s3.ts`](https://github.com/erfianugrah/supabase-lab/blob/6964c07/experiments/wal-on-s3/tests/ws01-oriole-s3.ts) | [`out/2026-10-21`](https://github.com/erfianugrah/supabase-lab/tree/6964c07/experiments/wal-on-s3/out/2026-10-21) |
+| OR11 | orioledb | [`or11-s3-surface.ts`](https://github.com/erfianugrah/supabase-lab/blob/6964c07/experiments/orioledb/tests/or11-s3-surface.ts) | [`out/2026-10-21`](https://github.com/erfianugrah/supabase-lab/tree/6964c07/experiments/orioledb/out/2026-10-21) |
+
+Ids with a letter suffix (WS01b, WS01f) are result rows inside the module.
+
+## Related docs
+
+- [OrioleDB on Supabase](/reference/supabase-orioledb/) - what a hosted OrioleDB project does differently from a heap project, including the refused PITR add-on.
+- [Turso, D1, Durable Objects and Supabase Postgres from one Cloudflare Worker](/reference/sqlite-edge-vs-supabase-postgres/) - Turso's latency and write behaviour measured from a Worker.
+- [Postgres redundant writes](/reference/postgres-redundant-writes/) - the WAL volume an OrioleDB table saves on unchanged-row writes.
+
+{/* References: cited inline as [^slug]; the numbered list renders below under "References". */}
+
+[^oriole-decoupled]: OrioleDB, "Decoupled storage and compute," OrioleDB Docs (fetched 2026-10-21). https://orioledb.com/docs/usage/decoupled-storage
+[^oriole-loader]: OrioleDB, "orioledb_s3_loader.py," orioledb/orioledb, GitHub, at tag beta19. https://github.com/orioledb/orioledb/blob/beta19/orioledb_s3_loader.py
+[^oriole-pr1271]: orioledb/orioledb, pull request #1271 (closed without merging). https://github.com/orioledb/orioledb/pull/1271
+[^oriole-isdev]: orioledb/orioledb, "Disable s3_mode and enable_rewind in production builds," commit 60b7e631. https://github.com/orioledb/orioledb/commit/60b7e6310ed69d7684f2f8e5c283e9e99de8d30f
+[^turso-durability]: Turso, "Durability Guarantees," Turso Docs (fetched 2026-10-21). https://docs.turso.tech/cloud/durability
+[^aws-turso]: AWS, "How Turso built a transactional database using Amazon S3 Express One Zone," AWS Storage Blog, 2026-07-23. https://aws.amazon.com/blogs/storage/how-turso-built-a-transactional-database-using-amazon-s3-express-one-zone/
+[^turso-aws]: Turso, "Turso Cloud on AWS is now available for everybody," Turso Blog, 2025-03-17. https://turso.tech/blog/turso-aws-out-of-beta
+[^turso-joining]: Turso, "Turso is joining Supabase," Turso Blog, 2026-10-02. https://turso.tech/blog/turso-is-joining-supabase
