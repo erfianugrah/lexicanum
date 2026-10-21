@@ -1,0 +1,241 @@
+---
+title: Resuming any coding-agent session from any directory
+description: "A small Go CLI that lists every pi and Claude Code session on a machine newest first and resumes the chosen one in the directory it started in: where each harness stores its sessions, an incremental index that keeps a warm run at a stat per file, an fzf picker with an optional vim keymap built from bind/unbind, shell completion in recency order, and launching through the user's shell so wrapper functions still run. Measured on 686 sessions."
+author: Erfi Anugrah
+category: workstations
+---
+
+Both coding-agent harnesses on this workstation resume per directory: `pi -c` and `claude -c` open the newest session for the current directory, and each harness's picker lists only its own sessions. This page describes `resume`, a CLI that indexes the session files of both harnesses, lists them newest first from any directory, and starts the chosen one in the directory it started in. It is for anyone running more than one harness, or one harness across many repos, who has typed `pi -c` in the wrong directory.
+
+Everything below was read from the `resume` source at v0.3.0 (commit `920a7e6`, 2026-10-21) and measured on the same day on the WSL2 dev box (16 threads, Go 1.27.2, fzf 0.74.5, pi 1.3.0, Claude Code 2.1.304). The repo is private, so file names are cited as text rather than links. Harness behaviour is cited from each harness's docs; where a claim was observed rather than documented, the evidence table at the end says so.
+
+**TL;DR:**
+
+- The machine held 686 session files (634 pi, 52 Claude Code) under 98 directories, 1.22 GiB in total. The default list shows 445 of them, from 47 directories. The other 241 are pi workers (147), one-shot `pi -p` runs (90) and Claude Code SDK sessions (4); `--all` shows them.
+- Both harnesses append to one JSONL file per session, so the index stores size, mtime and a byte offset per file. A run where nothing changed only stats the files: 28-54 ms in-process, 28-64 ms end to end for `resume ls` or a completion. An index built from scratch took 0.76-1.29 s with the files in the page cache, and 6.3 s on the first run of the day.
+- Resuming means `cd` into the session's original directory, then `pi --session <file>` or `claude --resume <id>`. The shell integration writes that command to a temp file and runs it in a subshell, so a shell function named `pi` or `claude` (one that injects API keys, for example) still runs.
+- fzf has no modal keymap. The optional vim mode is built from `unbind`/`rebind` and `change-prompt`, and keys that mean different things in each mode read the current mode back from `$FZF_PROMPT`.
+- Search is not resume. The cross-client memory store finds a session's text on any machine, but resuming needs the session's `.jsonl` file on this machine.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  shell   [label="zsh / bash\nresume function"];
+  bin     [label="resume binary"];
+  cache   [label="index.json\nsize, mtime, offset per file"];
+  pi      [label="~/.pi/agent/sessions\n<cwd>/<ts>_<id>.jsonl"];
+  cc      [label="~/.claude/projects\n<cwd>/<id>.jsonl"];
+  fzf     [label="fzf\npicker / completion list"];
+  emit    [label="temp file\ncd DIR && CMD"];
+  harness [label="pi --session FILE\nclaude --resume ID"];
+
+  shell -> bin     [label="RESUME_EMIT_FILE"];
+  bin   -> cache   [label="read / write"];
+  bin   -> pi      [label="stat, parse new lines"];
+  bin   -> cc      [label="stat, parse new lines"];
+  bin   -> fzf     [label="id + display rows"];
+  bin   -> emit    [label="launch command"];
+  shell -> harness [label="( eval ) in a subshell"];
+}
+```
+
+The binary never talks to a harness. It reads session files, writes an index, and prints or hands back one command line. The shell function in `completion/resume.zsh` and `completion/resume.bash` runs that line.
+
+## Which tool for which lookup
+
+| You want | Use | Scope |
+|---|---|---|
+| The newest session in this directory | `pi -c`, `claude -c` | One harness, this directory[^pi-sessions][^cc-cli] |
+| Any session of one harness | pi `/resume` then Tab; Claude Code picker then Ctrl+A | One harness, every directory[^cc-picker] |
+| Any session of either harness, from the shell, searching prompt text, with tab completion | `resume` | Both harnesses, this machine |
+| A session whose file is gone from this machine, or text from another host | memledger search | Every client, every host; search only |
+
+pi's picker has a Current Folder / All toggle on Tab (observed in the pi 1.3.0 picker; the docs describe its search, sort and named-only filters but not the scope toggle)[^pi-sessions]. Claude Code's picker shows the current worktree by default; Ctrl+W widens it to every worktree of the repo and Ctrl+A to every project on the machine[^cc-picker]. Each picker still lists only its own harness, opens only from inside that harness, and searches titles rather than the text of every prompt. The memory store is covered in [A cross-client memory store for coding agents](/reference/agent-memory-store/); it holds the text of sessions older than the 30-day local retention, but neither harness can resume from it.
+
+## Where each harness keeps sessions
+
+Read from live files on 2026-10-21; neither format is a documented interface, so the parsers are written against what the files contain.
+
+| | pi | Claude Code |
+|---|---|---|
+| Root | `$PI_CODING_AGENT_SESSION_DIR`, else `~/.pi/agent/sessions` | `$RESUME_CLAUDE_DIRS` (colon list), else `$CLAUDE_CONFIG_DIR`, else `~/.claude`; then `projects/` |
+| File | `<encoded-cwd>/<timestamp>_<id>.jsonl` | `<encoded-cwd>/<id>.jsonl` |
+| Working directory | `cwd` in the first line, `{"type":"session",...}` | The first `cwd` seen on a user line. Later lines change when the user changes directory; the file stays under the launch directory |
+| Title | Latest `session_info.name` | `custom-title`, else `ai-title`, else legacy `summary` |
+| User turn | `type:message` with `message.role:user` | A line with `"type":"user"` that is not meta, sidechain or a tool result |
+| Headless | Workers under `<encoded-cwd>/<parent-id>/subagents/` | `entrypoint:"sdk-cli"` |
+| Resume command | `cd <cwd> && pi --session <file>` | `cd <cwd> && claude --resume <id>` |
+
+Three details in that table shaped the parser in `internal/session/parse.go`:
+
+- pi writes `"type"` as the first key of every line. Claude Code writes it first only on metadata lines (`ai-title`, `custom-title`, `summary`, `last-prompt`); user lines put it after `parentUuid`, `cwd` and others. The parser checks the first 96 bytes for metadata types and the whole line for `"type":"user"`. Nested JSON inside message content is escaped (`\"type\"`), so a raw byte match on the unescaped key only finds the top-level one.
+- Claude Code tool results are user lines too, and can be megabytes. Once the working directory is known they carry nothing the index needs, and the parser skips them before decoding.
+- Claude Code's `subagents/agent-*.jsonl` files are sidechain transcripts that `claude --resume` does not open, so they are not indexed at all. pi workers (since 2026-10-19 they persist under the parent's `subagents/` directory, see [Subagents, worktrees, and parallel agent work](/reference/agent-subagents-and-worktrees/)) are resumable and are indexed as headless.
+
+`resume` starts both harnesses in the original directory. For pi this matters beyond convenience: pi's `--session` accepts a path or an ID and searches the current project first, offering to fork a match from another project[^pi-cli]. Claude Code since v2.1.223 searches every project for a session ID passed to `--resume`[^cc-cli], so it would find the session from anywhere; `resume` still changes directory first so both harnesses behave the same way.
+
+## What the default list hides
+
+| Hidden by default | Count on 2026-10-21 | Rule |
+|---|---|---|
+| pi workers (`task`, `bg_task`) | 147 | File under a `subagents/` directory |
+| One-shot `pi -p` runs | 90 | pi session with one prompt and no name |
+| Claude Code SDK sessions | 4 | `entrypoint:"sdk-cli"` |
+| Sessions with no prompt | 0 | No user turn parsed |
+
+The pi rule is a heuristic, marked `simplify:` in `session.go`. pi records nothing in the session file that separates print mode from interactive mode. Interactive sessions on this harness get a name from the `session-auto-title` extension after the first turn; print-mode runs never do. So "one prompt, no name" is treated as a probe. An interactive session abandoned after one prompt, before the title arrived, is hidden too, and `--all` brings it back. Claude Code draws the same line itself: `claude --continue` and the picker skip `-p` and Agent SDK sessions[^cc-cli].
+
+## The index
+
+`internal/session/index.go` globs the session roots, then for each file:
+
+1. Cached size and mtime unchanged: reuse the cached entry without opening the file.
+2. File grew: seek to the cached byte offset and parse only the new lines.
+3. File shrank or was rewritten: parse from byte 0.
+4. File gone: drop the entry.
+
+Files that need parsing go to a worker pool sized to `GOMAXPROCS`. The parser consumes only complete lines and returns the offset just past the last newline, so a harness caught mid-write leaves its partial last line for the next run, and incremental parsing never sees half a JSON object. Prompt text is clipped to 400 characters per prompt, since the index keeps a label and a preview, not the conversation. The cache is written atomically (temp file and rename) with mode 0600, because it holds first and last prompts. A failed write costs only a slower next run. A `cacheVersion` constant discards caches written by an older parser.
+
+This is the same checkpoint idea as the memory store's ingest, which keeps a byte offset per log so it does not re-read a 30 MB file to find four new lines. Here the checkpoint serves a CLI that has to answer before the user notices a delay.
+
+| Measured 2026-10-21 | Value | How |
+|---|---|---|
+| Session files | 686 (634 pi, 52 Claude Code), 98 directories | `resume ls --all -n 0 --json` piped to `jq` |
+| Bytes on disk | 887 MiB pi, 363 MiB Claude Code | `du -sh` on both roots |
+| Index file | 645,568 bytes | `ls -la` on `~/.cache/resume/index.json` |
+| Build from scratch | 6.28 s first run, then 1.29 s and 0.76 s | `make smoke` (`TestLiveIndex`), 3 runs, temp cache each time |
+| Nothing changed | 54 ms, 28 ms, 43 ms | Same test, second `Load` against the cache it just wrote |
+| `resume ls -n 5` end to end | 37-60 ms | 6 runs, wall clock around the process |
+| `resume __complete -- dotf` end to end | 28-64 ms | 6 runs, wall clock around the process |
+
+## Naming a session
+
+`internal/session/filter.go` resolves the one argument `resume` takes, in this order:
+
+1. A path ending in `.jsonl` that matches an indexed file.
+2. A full session ID.
+3. An ID prefix of at least 4 characters that matches exactly one session. Two or more is an error asking for more characters.
+4. Anything else is a query: every word must appear in the session's directory, title, prompts, branch or ID. One match resumes it; several open the picker with the query filled in.
+
+Listings show each ID cut to its shortest unique prefix, at least 8 characters. A fixed 8-character cut collides because pi IDs are UUIDv7: the first 48 bits are a Unix timestamp in milliseconds[^uuidv7], so the first 8 hex digits (32 bits) change about once every 65 seconds, and two sessions started within that window share them.
+
+## Launching through the user's shell
+
+The first version exec'd the harness binary found on `PATH`. On this machine `claude` is also a zsh function that fetches API keys from the password manager before running the real binary, and the exec skipped it. v0.2.0 moved the launch into the shell:
+
+```zsh
+resume() {
+  local f rc cmd
+  f=$(mktemp "${TMPDIR:-/tmp}/resume.XXXXXX") || return 1
+  RESUME_EMIT_FILE=$f command resume "$@"
+  rc=$?
+  cmd=$(<"$f")
+  command rm -f -- "$f"
+  [[ $rc -eq 0 && -n $cmd ]] || return $rc
+  ( eval "$cmd" )
+}
+```
+
+With `RESUME_EMIT_FILE` set, the binary writes `cd <dir> && <argv>` (each word shell-quoted) to that file instead of calling `syscall.Exec`. The function runs it in a subshell, so shell functions and aliases resolve, the harness gets the terminal, and the calling shell's directory does not change. The picker and `ls`/`show`/`-p` output go straight to the terminal; only the launch command goes through the file. Without the integration, `resume` still works and execs the binary directly.
+
+## Completion in recency order
+
+Completion lists sessions newest first, and a typed word narrows by ID prefix when it is one, otherwise by text, so `resume dotfiles<TAB>` offers the sessions started in the dotfiles repo and inserts the chosen ID. Both shells ask the binary for the list (`resume __complete -- <word>`), which returns `<id>\t<display>` rows in recency order. Getting a shell to keep that order took more code than producing it:
+
+| Problem | Fix |
+|---|---|
+| zsh replaced a text query with the longest common prefix of the matching IDs (`01a1`), losing the query | `compstate[insert]=menu` when the word is not an ID prefix and there are several hits |
+| fzf-tab sorts every list unless the `sort` style is false[^fzf-tab]; in testing it also ignored the unsorted group from `compadd -V` | `zstyle ':completion:*:resume:*' sort false` |
+| fzf re-ranks by match score | `--no-sort` in the fzf-tab flags, read from `resume __fzf-flags tab` at TAB time so a config edit applies without a new shell |
+| zsh-autosuggestions' completion strategy suggested a second session ID after the first | Once a bare word is on the line, completion offers nothing more: `resume` takes one ID or query |
+| bash has no menu completion | With several hits, the completion function runs fzf itself (`resume __pick`), then prints `\e[5n`; the terminal's `\e[0n` reply is bound to `redraw-current-line`, the trick fzf's own bash completion uses |
+
+## A vim keymap from fzf bind and unbind
+
+fzf has one keymap. Typed letters go into the query unless bound to an action, and its man page lists `unbind(...)`, `rebind(...)`, `change-prompt(...)`, `transform(...)` and the `FZF_PROMPT` variable that a transform command can read[^fzf-man]. `keys = vim` in `~/.config/resume/config` builds two modes from those (`internal/cmd/fzf.go`):
+
+- Normal-mode keys (`j k g G h l w b 0 $ x D J K p q`, plus `y` in the picker) are bound to fzf actions, and the keys that return to insert mode (`i a A I S /`) are bound to "unbind the normal list, change to the insert prompt", after an optional cursor move. Insert mode starts by unbinding the whole list, so those letters type into the query.
+- esc in insert mode rebinds the list and changes to the normal prompt.
+- esc, ctrl-d, ctrl-u, ctrl-f and ctrl-b mean different things in each mode (ctrl-d is delete-char in insert, half-page-down in normal). Each is bound to a `transform` that compares `$FZF_PROMPT` with the normal prompt and prints the action for the current mode.
+
+The mode is never stored anywhere except the prompt string, so `prompt` and `normal_prompt` must differ, and an `--prompt` in `fzf_opts` breaks vim mode. The picker sets `--with-shell` to `sh -c` so the transforms and the preview run in a POSIX shell rather than the user's login shell. fzf-tab mode cannot do that, because fzf-tab's own preview needs zsh, and it leaves `/` alone because fzf-tab uses it for continuous completion. Print-the-command is `print(print)+accept`: fzf prints a `print` line before the selection, and the binary checks for it. `--expect` would have been simpler, but an `--expect` key cannot also type into the query, and in vim mode `y` has to type in insert mode.
+
+## Gotchas and lessons learned
+
+| Gotcha | What happened | Rule now |
+|---|---|---|
+| Exec skips shell functions | The `claude` zsh function that injects API keys never ran | Launch through the shell function and `RESUME_EMIT_FILE` |
+| Claude Code's `cwd` moves | Later lines carry the directory the user changed into; the file stays under the launch directory | Take the first `cwd` seen |
+| Partial last line | A harness writing while `resume` reads leaves half a JSON object at EOF | Parse complete lines only, store the offset past the last newline |
+| UUIDv7 prefixes | Sessions started within a minute share their first 8 hex digits | Shortest unique prefix, minimum 8 |
+| esc then a key | Sent faster than the terminal's escape timeout, the pair reads as alt+key | Same as vim; tests send keys about 0.3 s apart in tmux |
+| Testing completion | Pressing Enter on a `resume <id>` line launches the harness on a real session | Completion tests drive `zsh -f -i` under `zpty` and capture `$BUFFER` from a widget; never send Enter |
+| A mistyped command | `resume lsit` is a query that matches nothing | Exit 2, the same code as a usage error |
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="Is the session file\non this machine?"];
+  q2 [label="Newest session\nin this directory?"];
+  q3 [label="Know which harness,\nalready inside it?"];
+  ml [label="memledger search\n(read the text, start fresh)"];
+  c  [label="pi -c / claude -c"];
+  p  [label="pi /resume + Tab\nClaude Code picker + Ctrl+A"];
+  r  [label="resume\n(picker, query, TAB)"];
+
+  q1 -> ml [label="no"];
+  q1 -> q2 [label="yes"];
+  q2 -> c  [label="yes"];
+  q2 -> q3 [label="no"];
+  q3 -> p  [label="yes"];
+  q3 -> r  [label="no"];
+}
+```
+
+1. Session file not on this machine: search memledger, read what it holds, start a new session.
+2. The newest session in the current directory: `pi -c` or `claude -c`.
+3. Already inside the right harness: its own picker, widened to every directory.
+4. Anything else, including "which harness was that in": `resume`, `resume <words>` or `resume <TAB>`.
+
+## Evidence
+
+| Claim | How it was checked |
+|---|---|
+| Session counts, directories, hidden breakdown | `resume ls --all -n 0 --json` and `resume ls -n 0 --json` piped to `jq`, 2026-10-21 |
+| Index timings | `make smoke` three times, then six wall-clock runs each of `resume ls -n 5` and `resume __complete -- dotf` against the live cache. The page cache was not dropped between runs, so "from scratch" means no index file, not cold disks |
+| pi picker Tab toggle | String table of the pi 1.3.0 binary ("Resume Session (Current Folder)" / "(All)"); not in pi's docs |
+| Claude Code picker scope and `--resume` search order | Claude Code docs[^cc-picker][^cc-cli]; not exercised here |
+| pi `--session` searches the current project first | pi docs[^pi-cli]; not exercised here |
+| Claude Code subagent transcripts not resumable | Recorded in the repo's AGENTS.md when the parser was written; not re-tested for this page |
+| Completion order, menu insert, fzf-tab flags | zsh under `zpty` and bash in tmux, 2026-10-21, recorded in the repo's AGENTS.md |
+| Vim keymap | The picker in a tmux pane with keys sent about 0.3 s apart, fzf 0.74.5; unit tests assert the generated fzf arguments per mode and keymap |
+| Parser and index behaviour (append, partial line, truncation, deleted file, corrupt cache) | `make test` against synthetic pi and Claude Code trees in `testdata/home/` |
+
+## Related docs
+
+- [A cross-client memory store for coding agents](/reference/agent-memory-store/) - searches every client's sessions on every host; the byte-offset ingest this index borrows
+- [Subagents, worktrees, and parallel agent work](/reference/agent-subagents-and-worktrees/) - the pi workers that land in `subagents/` and are hidden by default
+- [One rule set, two agent harnesses](/reference/one-rule-set-two-agent-harnesses/) - the two-harness setup that made a cross-harness list worth building
+- [The pi harness journey](/reference/pi-harness-journey/) - the series hub, including `session-auto-title`, which the probe heuristic relies on
+
+[^pi-sessions]: Earendil, "Sessions and Context," pi docs. https://github.com/earendil-works/pi/blob/HEAD/packages/coding-agent/docs/sessions.md
+[^pi-cli]: Earendil, "CLI," pi docs. https://github.com/earendil-works/pi/blob/HEAD/packages/coding-agent/docs/cli.md
+[^cc-cli]: Anthropic, "CLI reference," Claude Code Docs. https://code.claude.com/docs/en/cli-reference
+[^cc-picker]: Anthropic, "Where the session picker looks," Claude Code Docs. https://code.claude.com/docs/en/sessions#where-the-session-picker-looks
+[^uuidv7]: K. Davis, B. Peabody, P. Leach, "Universally Unique IDentifiers (UUIDs)," RFC 9562, IETF. https://www.rfc-editor.org/rfc/rfc9562
+[^fzf-tab]: Aloxaf, "fzf-tab," GitHub. https://github.com/Aloxaf/fzf-tab
+[^fzf-man]: J. Choi, "fzf(1) man page," fzf. https://github.com/junegunn/fzf/blob/master/man/man1/fzf.1
