@@ -1798,6 +1798,7 @@ const practicePages: Array<[doc: string, heading: RegExp]> = [
   ["reference/supabase-aws-privatelink", PRACTICES_HEADING],
   ["reference/supabase-branching-two-projects-one-repo", PRACTICES_HEADING],
   ["reference/supabase-compute-disk", /^## Ops playbook$/m],
+  ["reference/supabase-data-api-capacity", PRACTICES_HEADING],
   ["reference/supabase-data-residency", PRACTICES_HEADING],
   ["reference/supabase-data-surface-lockdown", PRACTICES_HEADING],
   ["reference/supabase-dr-tiers", PRACTICES_HEADING],
