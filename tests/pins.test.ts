@@ -279,6 +279,9 @@ const pins: Pin[] = [
       // (~/supabase-lab experiments/platform-downtime). Each of these shipped
       // and each is contradicted by the harness source or RUNLOG.
       //
+      // Void since lab #211 (orchestrator asleep inside Medium C's resize up).
+      "54 to 299",
+      "113 and 299",
       // The 2026-10-23 data-path re-measure contradicts both.
       "Put the read path on PostgREST",
       "fail reads over to REST for the window",
@@ -800,6 +803,18 @@ const pins: Pin[] = [
       "`400` `You cannot rollback a production branch.`",
       "`backup.retention_days` read 14 on",
     ],
+    mustNotContain: [
+      // Withdrawn 2026-10-23: compute-disk D09's 2026-08-19 settle and outage
+      // figures came from an accounting defect (open outages dropped at a
+      // phase end) and from PATCHes the addon rate limit refused; the re-run
+      // measured 144.528 to 254.886 s of data-path outage per resize.
+      "61-105 s",
+      "17.0 s of contiguous REST outage",
+      // Void since lab #211: the orchestrator slept 263 s inside Medium C's
+      // resize up, so its 299 s figures are not a measurement.
+      "54 to 299",
+      "113 and 299",
+    ],
     sections: [
       /^## The tiers on one axis$/m,
       /^## A bad release$/m,
@@ -928,6 +943,9 @@ const pins: Pin[] = [
     mustNotContain: [
       // The error string the platform did not return.
       "exceeds the maximum deployment size",
+      // EF14 (2026-10-23) probed the 30-per-trace budget: 30 calls per
+      // calling invocation, then a thrown RateLimitError.
+      "that budget was not probed",
     ],
     sections: [
       /^## What to do about each ceiling$/m,
