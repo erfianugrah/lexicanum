@@ -324,8 +324,8 @@ Verification, What to do about it, Gotchas, File reference, Modules.
 Fixed: 0 edits.
 
 Unfixed (author judgment):
-- line 154 and 176/178: [D] `l10-tpa-iap-issuer.ts` is pinned at `a07de3d` in the practices
-  table (line 154) and at `f703393` in the Modules table (lines 176 and 178), and
+- line 154 and 176/178: [D] `l10-tpa-iap-issuer.ts` is pinned at `e8a852b` in the practices
+  table (line 154) and at `6d42c55` in the Modules table (lines 176 and 178), and
   `l10e-labissuer-admit.ts` likewise -> pin each test to one commit, the one that row was
   measured at.
 
@@ -367,8 +367,8 @@ Fixed: 1 edit - the diagram had no text fallback.
 
 Unfixed (author judgment):
 - line 197 and 198: [D] two adjacent practice rows pin the same test file to two commits -
-  `92f3469/experiments/security-lockdown/tests/s20-xff-trust-boundary.ts` at line 197 and
-  the `f703393` copy at line 198 (the File reference at line 221 and the Modules table at
+  `59442b9/experiments/security-lockdown/tests/s20-xff-trust-boundary.ts` at line 197 and
+  the `6d42c55` copy at line 198 (the File reference at line 221 and the Modules table at
   line 237 add both again) -> one commit per row.
 - [A] no Related docs section.
 

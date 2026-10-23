@@ -30,7 +30,7 @@ were not re-read because that page's earlier round read them for a different bat
 |---|---|
 | `supabase-edge-function-limits` does not link `guides/supabase-edge-function-bff-fanout` (meta.md one-way pair) | Fixed. Bullet added under `## Related docs` naming the relationship: the guide is the implementation of the ceilings, and "the guide links back here for the numbers". |
 | `image-transformations-billing` line 89 "Three measured disagreements" vs what follows | Fixed. The opening sentence now names the three: the 1-2500 bound (wrong at both ends), the Pro-plan-only sentence, and what the runtime accepts as a transform request. The third paragraph now names the documented claim it contradicts (the bound's lower end), keeping `width=abc`, the 400 body, `width=0`, "no params" and `&bust=xyz`. |
-| `image-transformations-billing` missing `## Modules` table (cites I02-I09) | Fixed. `## Modules` added between the Evidence table and the footnote definitions, one row per id, with the test file per id and `none published` for the artifact (the experiment has no `out/` directory). The doc contains no lab links at all, so the links were built from the lab repo and pinned to `ac103d4` (the commit that created I01-I10, matching the page's 2026-08-18 measurement date); the file list was verified against that ref through the GitHub API. |
+| `image-transformations-billing` missing `## Modules` table (cites I02-I09) | Fixed. `## Modules` added between the Evidence table and the footnote definitions, one row per id, with the test file per id and `none published` for the artifact (the experiment has no `out/` directory). The doc contains no lab links at all, so the links were built from the lab repo and pinned to `b9bb064` (the commit that created I01-I10, matching the page's 2026-08-18 measurement date); the file list was verified against that ref through the GitHub API. |
 | `supabase-dr-tiers` has no decision diagram | Fixed. A `dot` decision guide (house boilerplate, no per-node colours) after the `## Which do I pick` table, built only from that table's own rows, with the required text fallback directly under it. |
 | First-person singular in `supabase-multi-tenant-placement` | Fixed, 2 places: "I confirmed the Micro figure straight from the live billing API" -> "The Micro figure comes straight from the live billing API"; "I tested it three ways" -> "It was tested three ways". The "If you are asking / Go to" routing table keeps the reader's first person ("I just want one bill") - that is the table's voice, not the author's, and was left alone. |
 | TL;DR label form | Fixed in both outliers of this batch: `**TL;DR** -` -> `**TL;DR:**` (`dr-tiers` line 35, `incident-resilience` line 40). Corpus form is 48 `**TL;DR:**` against 2 of this dash form. |
@@ -51,7 +51,7 @@ cell now `LV01e, run1 and run2`).
 name `edge_logs`, so the same event reads two ways on one page.** `LV01j` shows
 `0.97 (1.12)` and `1014 (1144)`, and its prose immediately says 100 cache HIT-reads
 "produced 99 (`run1`) and 90 (`run2`) `edge_logs` rows". Settled from the published
-artifacts (`out/2026-10-15`, ref `e1fa570`): `run2` LV01j `edge_logs_rows_raw` 90,
+artifacts (`out/2026-10-15`, ref `f7e86f3`): `run2` LV01j `edge_logs_rows_raw` 90,
 `edge_logs_rows_per_action` 0.90, `all_sources_rows_per_action` 0.97,
 `all_sources_bytes_per_action` 1014; `run1` 99 / 0.99 / 1.12 / 1144. Same pattern for
 `LV01b`: run2 `edge_logs` 0.92 / 1662 bytes against `all_sources` 0.91 / 1659, and run1
@@ -93,7 +93,7 @@ but not to that limit:
 The two runs are internally consistent, so no single cell is a typo, and both totals sit
 10.8-16.6 MB above the stated 536.9 MB. The published facts file for the run
 (`experiments/pipelines/out/2026-10-10/run-2026-10-10T07-27-52-201Z.facts.md`, ref
-`b237121`) carries the same pair in the same cells - `max_slot_wal_keep_size_mb` 536.9
+`ddd41b2`) carries the same pair in the same cells - `max_slot_wal_keep_size_mb` 536.9
 beside `safe_wal_size_mb` 552.5 with `retained_mb` 1 - so the doc is faithful to its
 artifact and the mismatch is upstream (API semantics or the probe's unit conversion).
 No number changed; either the limit the platform applied was not 536.9 MB, or
