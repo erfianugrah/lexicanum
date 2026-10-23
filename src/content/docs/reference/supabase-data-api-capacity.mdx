@@ -1,0 +1,455 @@
+---
+title: "Supabase Data API connection pool and capacity, measured"
+description: How the Supabase Data API (PostgREST) connection pool behaves when probed - the pool with db_pool unset per compute size (30 on Small, 50 on Large, 70 on 4XL), the 504 PGRST003 a lone request behind a full pool gets after about six times the acquisition timeout, the restart every PostgREST config PATCH causes, the statement timeout each role runs under, request rate against pool size on Small and 4XL, what the pgrst_db_pool_* metric series count, and whether lock-induced statement timeouts leave aborted pooled connections. Measured 2026-10-22/23 on throwaway Pro-plan projects in ap-southeast-1 and ap-northeast-2.
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+How many database connections the Data API holds on a Supabase project, what a client gets back when every one of them is busy, what changing the pool costs, and which numbers the platform exposes about it. It is for whoever sizes a project for Data API traffic, sets `db_pool` or the statement timeouts, or alerts on the pool metrics, and wants the measured behaviour next to the documented one.
+
+All measured rows come from the lab's [data-api-capacity experiment](https://github.com/erfianugrah/supabase-lab/tree/c186f34/experiments/data-api-capacity/), run 2026-10-22/23 against throwaway projects on a Pro-plan organization, each created through `POST /v1/projects` and deleted at the end of its run. Modules DC01-DC03 ran four times in `ap-southeast-1` on a project created Small and resized to Large; run 4 is the reference and its figures are quoted unless another run is named (runs 1 and 2 are published for their repeats, run 3 died in DC02 and wrote no artifact). DC04 ran once in `ap-northeast-2` on a Small project resized to 4XL, and DC05-DC07 once in `ap-northeast-2` on Small. The project region came from an environment variable and is recorded in the RUNLOG; the artifacts' region field is the harness default and was not read from the project. Every request came from one Mac in Singapore over the public internet, so every client time includes the round trip (p50 141 to 150 ms to Seoul at low load). PostgREST 14.18 and Postgres 17.11 were read in DC04a's artifact; for DC01-DC03 they come from console output, and DC05-DC07's artifact records neither. Most cells are n = 1 or n = 2; a row says when it is more. The figures are quoted from the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c186f34/experiments/data-api-capacity/RUNLOG.md) and the redacted run artifacts listed in [Modules](#modules). Rows marked documented come from the pages cited at the claim and were not run; rows marked source-read come from the PostgREST v14.18 source, and that the hosted build matches the tag was not checked.
+
+**TL;DR:**
+
+- With `db_pool` unset the Data API pool was 30 connections on Small, 50 on Large and 70 on 4XL (4XL from `pgrst_db_pool_max` only), against `max_connections` 90, 160 and 480. `GET /postgrest` reads `db_pool` null; I found no published table of these figures.
+- A request behind a full pool answered 504 PGRST003 after 61364 and 61972 ms at the default 10 s acquisition timeout, and each left 6 PostgREST access-log lines. The reading is that a layer in front resent it five times; the public `supabase/postgres` Envoy config retries gateway errors 5 times, and whether hosted projects run it was not checked.
+- Every accepted `PATCH /v1/projects/{ref}/postgrest` restarted PostgREST (9 start lines for 9 PATCHes), a no-change PATCH included, and so did one that answered 500. With 60 s requests in flight the restart line came 55.3 s after, about when they finished (a reading, twice), and new requests got no answer for about 50 s.
+- Statement timeouts through the Data API: anon 3 s, authenticated 8 s, service_role 8 s inherited from `authenticator`. A function's own `set statement_timeout` wins for every key, and `alter role` reaches the Data API only after `notify pgrst, 'reload config'`. All as documented.
+- One indexed point read with the anon key: Small stopped at 853 to 1,020 req/s from 256 concurrent clients on; 4XL reached 3,158 req/s at 512; above that the client (os error 51) and 403s from an unidentified layer stopped the measurement. `db_pool` 15, 30 and 60 on Small gave 853, 902 and 909 req/s at 256, a difference not separated from the spread between repeats.
+- `pgrst_db_pool_waiting` counts a request from its pool request until its session ends, so it includes requests holding a connection and PostgREST's own pool sessions (schema cache, config reads), and `pgrst_db_pool_available` is open connections minus those in use (source-read; the snapshots agree). The series are a snapshot: no refresh landed in a 36 s window, and the pool max showed a PATCHed value after 1.4 s once and 28.9 s once.
+- 60 statement-timeout cancellations caused by a 12.6 s table lock left no aborted pooled connection: 9920 requests answered 200 afterwards, 0 answered 25P02 (one run per arm, anon reads, 20 workers on a pool of 30, so nothing was queued for the pool).
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  client  [label="client\n(one request)"];
+  front   [label="platform layer in front\n(unidentified)"];
+  pgrst   [label="PostgREST\npool: db_pool\nwait: db_pool_acquisition_timeout"];
+  pg      [label="Postgres\nauthenticator backends\n(max_connections)"];
+  metrics [label="/customer/v1/privileged/metrics\npgrst_db_pool_*"];
+
+  client -> front;
+  front -> pgrst [label="6 attempts per lone\nrequest (reading)"];
+  pgrst -> pg [label="pooled connections"];
+  pgrst -> metrics [label="snapshot"];
+}
+```
+
+Text version: a client request passes a platform layer before PostgREST; PostgREST takes a connection from its pool (`db_pool` connections, each an `authenticator` backend in Postgres) or waits up to `db_pool_acquisition_timeout` for one; after a PGRST003 the same request reached PostgREST six times in total, which reads as resends by the layer in front; the pool series reach the project's metrics endpoint as a snapshot.
+
+## Which symptom is which
+
+| What the client sees | What it was in these runs | Lever |
+|---|---|---|
+| 504 PGRST003 after about 6 x the acquisition timeout | every pooled connection busy | `db_pool`, `db_pool_acquisition_timeout`, shorter requests, compute size |
+| 503 PGRST002 that persists after the restart line following a `db_pool` raise | `db_pool` 1000 against `max_connections` 160 | a `db_pool` that fits in `max_connections` |
+| 500 57014 at about 3 s or 8 s | the role's statement timeout | a function-level `set statement_timeout`, or `alter role` plus a config reload |
+| no answer for about 50 s just after a config PATCH | PostgREST restarting behind long in-flight requests | schedule PATCHes, or PATCH when no long requests run |
+| flat req/s while latency doubles per concurrency step | the Small project's throughput ceiling; pool sizes 15 to 60 not separated from noise (DC07) | a larger compute size (4XL scaled) |
+
+---
+
+## The pool with db_pool unset
+
+The Management API documents `db_pool` as "If `null`, the value is automatically configured based on compute size" and `db_pool_acquisition_timeout` as "If `null`, the value is automatically configured to 10".[^sb-api-v1] Upstream PostgREST defaults `db-pool` to 10 and `db-pool-acquisition-timeout` to 10 seconds.[^pgrst-db-pool] The Supabase compute page lists Postgres max connections and pooler clients per size, not the Data API pool;[^sb-compute] I found no published table of the pool per size in that page, the connection management guide[^sb-conn-mgmt] or the Management API spec, read 2026-10-23.
+
+The lab counted the pool as the number of `authenticator` backends (the Data API's login role[^sb-conn-mgmt]) sleeping in `PgSleep` in the middle of a burst of long RPCs larger than the pool.
+
+| Size | `max_connections` | Pool, `db_pool` unset | How counted | Runs |
+|---|---|---|---|---|
+| Small | 90 | 30 | two bursts of 100: 30 / 30 sleeping, 31 `authenticator` backends in total; `pgrst_db_pool_max` 30 (DC04a) | runs 1, 2 and 4 (DC01a), DC04a |
+| Large | 160 | 50 | two bursts of 140: 50 / 50 sleeping, 51 in total | runs 1 and 4 (DC01d) |
+| 4XL | 480 | 70 | `pgrst_db_pool_max` after the resize; no burst count | one run (DC04c) |
+
+`GET /postgrest` read `db_pool` null and `db_pool_acquisition_timeout` 10 (a number, not null) on Small and on Large, and `db_pool` null on 4XL. The `max_connections` figures match the compute page.[^sb-compute] The one `authenticator` backend outside the pool count is unidentified (see [the metric section](#reading-the-pgrst_db_pool-series)).
+
+A burst that drains within about six acquisition timeouts came back as 200s: 100 concurrent 12 s requests on Small's 30 (four waves, the last waiting about 36 s against a 10 s acquisition timeout) all answered 200, as did 140 on Large's 50. That fits the resends below; PostgREST log lines were not counted for bursts. 220 concurrent 15 s requests on a pool of 50 did not: 150 answered 200 and 70 answered 504 PGRST003 (DC02c).
+
+---
+
+## What a client sees when the pool is full
+
+PostgREST documents that a request waits for a pooled connection for at most `db-pool-acquisition-timeout` seconds and that the timeout answers 504 PGRST003, "The request timed out waiting for a pool connection to be available."[^pgrst-db-pool][^pgrst-errors]
+
+DC01b and DC02b held every pooled connection with long sleeps, then sent single `POST /rest/v1/rpc` requests with the service_role key, each with its own User-Agent, and counted the PostgREST access-log lines carrying that User-Agent. The client was a plain `fetch` with no retry logic and a fresh connection per request.
+
+| Acquisition timeout | Pool held | Client's time to the answer | Answer | PostgREST log lines per request |
+|---|---|---|---|---|
+| 10 s (default), run 4 | 30 of 30 sleeping | 61364 ms, 61972 ms | 504 PGRST003, both | 6 (504:6), both |
+| 10 s, run 1 | 30 | 61343 ms, 61493 ms | 504 PGRST003 | 6 each |
+| 10 s, run 2 | 30 | 61972 ms, 61795 ms | 504 PGRST003 | 6 each |
+| 2 s | 90 of 90 sleeping | 13767 ms, 13752 ms | 504 PGRST003, both | 6 (504:6), both |
+| 4 s | 90 of 90 sleeping | 25007 ms | 504 PGRST003 | 6 (504:6) |
+| 4 s, second request | 90 of 90 sleeping | no answer by the client's 105001 ms timeout | status 0 | 0, not explained |
+
+With no separate probe, one client request produced six PostgREST access-log lines, all 504, and the client's wait was six acquisition timeouts plus the round trip (60 s against 61364 ms, 12 s against 13767 ms, 24 s against 25007 ms). The reading is that something between the client and PostgREST sent the request again after each PGRST003, six attempts in total. The competing reading, that PostgREST logs one request several times, was not separated, since no request id was traced through PostgREST. The 4 s figure rests on one request.
+
+A public candidate for that layer is the Envoy configuration in the `supabase/postgres` image repository. Its virtual host carries a retry policy of `num_retries: 5` with `retry_on: gateway-error` and sets `include_attempt_count_in_response: true`, and the `/rest/v1/` routes carry no retry policy of their own;[^sb-envoy-lds] Envoy's `gateway-error` policy retries on 502, 503 and 504, and `include_attempt_count_in_response` returns the attempt count to the client in `x-envoy-attempt-count`.[^envoy-router] Five retries on a 504 is six attempts, and a 500 is outside the policy, which fits DC03d below. That hosted projects run this configuration was not checked, and the attempt-count header was not read in these runs.
+
+Under load the wait was shorter. In DC02c's 220-request control at a pool of 50, the 70 PGRST003 answers came after 10923 to 20903 ms (median 20855), one or two acquisition timeouts. Attempts were not counted inside the burst, so how the resends behave under load is not separated. One candidate in the same repository is the `retry_budget` on Envoy's `postgrest` cluster (`budget_percent` 100, `min_retry_concurrency` 100),[^sb-envoy-cds] which caps concurrent retries at the sum of active and pending requests and never below 100;[^envoy-cb] whether it, or something else, shortened the waits is not established.
+
+A 500 was not sent again. DC03d made an RPC with a side effect (a `nextval`) run past the 8 s authenticated timeout: 500 57014 after 8058 and 8296 ms, one execution per request by the sequence, and one PostgREST log line each (500:1). The resend covered the PGRST003 probes and not this 500. A client that retries a 504 itself adds its attempts on top of the six (inference from the counts above; client retries were not run).
+
+### The bounds the API accepts
+
+The Management API spec gives `db_pool` a range of 0 to 1000 and `db_pool_acquisition_timeout` 0 to 60 on the update body.[^sb-api-v1] Values sent outside them (DC02c):
+
+| Sent | Answer |
+|---|---|
+| `db_pool` 1001 | 400 `db_pool: Too big: expected number to be <=1000` |
+| `db_pool` -1 | 400 `db_pool: Too small: expected number to be >=0` |
+| `db_pool_acquisition_timeout` 61 | 400 `db_pool_acquisition_timeout: Too big: expected number to be <=60` |
+
+A 0 for either was not sent. For 70 and 90 on Large, the PATCHed value is what Postgres saw: both read back and a burst then held 70 and 90 `authenticator` backends in `PgSleep` (DC02a).
+
+### A db_pool above what Postgres can give
+
+DC02c PATCHed `db_pool` 1000 on Large (`max_connections` 160); the PATCH answered 200 and read back 1000. The same burst of 220 concurrent 15 s requests as the control then gave:
+
+| `db_pool` | Answers | Error body |
+|---|---|---|
+| 50 (control, PATCHed back just before) | 150 x 200, 70 x 504 PGRST003 | PGRST003 |
+| 1000 | 154 x 200, 66 x 503 PGRST002 | `"Could not query the database for the schema cache. Retrying."` |
+
+PostgREST documents PGRST002 as "Could not connect with the database when building the Schema Cache due to the PostgreSQL service not running."[^pgrst-errors] The reading: PostgREST tried to open more connections than Postgres accepted and the refused connection surfaced as PGRST002 instead of a wait. It is one burst per arm, and no connection count near 160 was observed: the mid-burst read through the Management API query endpoint returned no row (its status and error were not recorded). After the burst, 5 consecutive good pings took 6 s against the check's floor of about 4 s, so no outage after the burst was measured.
+
+---
+
+## Every config PATCH restarts PostgREST
+
+DC02e counted 9 "Starting PostgREST" lines in the project's PostgREST logs (`postgrest_logs`) for 9 accepted PATCHes to `/v1/projects/{ref}/postgrest`, one of them a PATCH that changed nothing. The sibling `data-api-reenable` experiment recorded the same for a no-change PATCH ([DA02 in its RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c186f34/experiments/data-api-reenable/RUNLOG.md#what-switching-on-does-da02)), and turning the Data API back on is another PATCH that restarts it ([Locking down Supabase](/reference/supabase-data-surface-lockdown/)). PostgREST marks `db-pool` and `db-pool-acquisition-timeout` "Reloadable N", so a new value needs a process start to apply.[^pgrst-db-pool] DC04d adds a case: the PATCH of `db_pool` 250 on 4XL answered 500, and a restart line still followed 1.1 s later.
+
+| PATCH | Restart line after the PATCH | Data API requests during the restart |
+|---|---|---|
+| `db_pool` 70, then 90 (DC02a) | 0.7 s, 0.7 s | 0 of 357 and 0 of 358 pings failed, one every 250 ms for 90 s |
+| acquisition timeout 2, then 4 (DC02b) | 0.9 s, 0.7 s | not sampled |
+| `db_pool` 50, 1000, 50 (DC02c) | 0.8 s, 0.7 s, 0.5 s | `db_pool` 1000: 0 failed |
+| `db_pool` 20, 30 (DC05c) | 1.2 s, 1 s | not sampled |
+| `db_pool` 15, 30, 60 (DC07) | 1.1 s, 1.5 s, 1.3 s | not sampled |
+| no-change `db_pool` with 20 requests sleeping 60 s in flight, twice (DC02d) | 55.3 s, 55.3 s | 20 of 20 in flight answered 200, both times; 5 of 267 and 5 of 265 pings failed (status 0 at the client's 10 s timeout), first at 1.3 s and 0.8 s, back to back for about 50 s |
+
+With nothing long in flight the restart came within about 1.5 s and no sampled request failed. With 60 s requests in flight (sent 5 s before the PATCH) the restart line came 55.3 s after the PATCH, about when they finished; all of them completed, and new requests got no answer for about 50 s, ending before the logged restart. That fits a restart that drains in-flight requests before stopping and holds new requests behind it; no separate probe was run.
+
+Run 1 sent its PATCHes without waiting for the restart line, and three of its rows look like restart overlaps (a burst where 218 of 220 requests ended on a closed socket at the client, among them). From run 2 on, DC02 waits for the restart line after every PATCH before measuring.
+
+---
+
+## Statement timeouts the Data API honours
+
+Documented: anon 3 s, authenticated 8 s, service_role "none (defaults to the `authenticator` role's 8s timeout if unset)", and a role change needs `NOTIFY pgrst, 'reload config'` to reach the Data API.[^sb-timeouts] DC03 checked each of those through the Data API with RPCs that sleep.
+
+| Role, how the request was made | `rolconfig` | Sleep | Answer |
+|---|---|---|---|
+| anon (anon key) | `{statement_timeout=3s}` | 5 s | 500 57014 after 3062 and 3057 ms |
+| authenticated (anon key plus a user token) | `{statement_timeout=8s}` | 10 s | 500 57014 after 8065 and 8048 ms |
+| service_role (service_role key) | null | 10 s | 500 57014 after 8056 and 8048 ms |
+| `authenticator` (PostgREST's login role) | `{"session_preload_libraries=supautils, safeupdate",statement_timeout=8s,lock_timeout=8s}` | - | - |
+
+The error body was `{"code":"57014","details":null,"hint":null,"message":"canceling statement due to statement timeout"}`.
+
+| Change | Answer |
+|---|---|
+| A function declared `set statement_timeout = '30s'`, 12 s sleep, each of the three keys twice | 200 in every case, 12067 to 12105 ms |
+| `alter role authenticated set statement_timeout = '15s'`, user token, 10 s sleep, right after the ALTER | 500 57014 after 8078 and 8064 ms |
+| the same after `notify pgrst, 'reload config'` | 200 after 10076 and 10103 ms |
+| the same after `notify pgrst, 'reload schema'` as well | 200 after 10098 and 10080 ms |
+| back to 8 s plus a config reload | 500 57014 after 8074 ms |
+
+service_role carries no timeout of its own, so a Data API request under it runs with the 8 s that `authenticator` logs in with. A function's own setting applied to the call for every key, anon's 3 s included. An `alter role` reached the Data API only at the next config reload. Every row agrees with the timeouts guide.
+
+---
+
+## Request rate against the pool
+
+DC01-DC03 used requests that hold a connection for seconds. DC04 and DC07 used request rate instead: `oha` (1.16.0, from console output) in a closed loop, 40 s per step, one `GET /rest/v1/dc_items?id=eq.4242&select=id,payload` (an indexed point read on a 100,000-row table) with the legacy anon key, the pool series scraped every 3 s, node CPU from `node_cpu_seconds_total` and the `authenticator` states read once mid-step. Success is 200s over all attempts, client-side errors included. The compute page lists Small as shared CPU and 4XL as 16 dedicated vCPUs.[^sb-compute]
+
+### Small (DC04b)
+
+| Concurrency | req/s | p50 / p99 ms | Success | Pool waiting max (available then, of max) | Node CPU % | `authenticator` mid-step | Client errors |
+|---|---|---|---|---|---|---|---|
+| 16 | 108 | 143 / 374 | 1 | 0 (1 of 30) | not computed | idle:7 | none |
+| 32 | 214 | 144 / 345 | 1 | 1 (5 of 30) | 9.5 | idle:7 | none |
+| 64 | 428 | 145 / 334 | 1 | 1 (5 of 30) | 21.7 | active:1 idle:18 | none |
+| 128 | 825 | 149 / 370 | 1 | 7 (11 of 30) | 49.1 | idle:16 idle in transaction:3 | none |
+| 256 | 925 | 269 / 526 | 1 | 139 (11 of 30) | 73.9 | idle:16 idle in transaction:3 | 2 |
+| 512 | 918 | 547 / 1039 | 0.993 | 139 (11 of 30) | not computed | idle:27 idle in transaction:4 | 277 |
+| 1024 | 1020 | 1110 / 1748 | 0.872 | 0 (30 of 30) | not computed | idle:22 idle in transaction:9 | 5,323 |
+
+From 256 on, throughput stayed at about 920 to 1,020 req/s while latency doubled per step, which is what a closed loop does against a fixed ceiling. In the 256 step one snapshot read 139 waiting with 11 of 30 connections available (the step's median was 7 waiting). Since `waiting` includes requests holding a connection ([below](#reading-the-pgrst_db_pool-series)), and at most 30 minus 11 connections were in use, at least 120 of those 139 had no connection while 11 open ones sat idle, if the payload was internally consistent. The 512 step showed the same 139 and 11 on every scrape, so it is one snapshot across two steps; node CPU comes from the same endpoint and is a snapshot too, which is the condition on the 73.9 % figure. Node CPU covers both Postgres and PostgREST if they share the node, as the project image suggests (it installs PostgREST as a service beside Postgres;[^sb-setup-postgrest] hosted placement not checked), so it does not say which process used the CPU; no per-process figure was read. The 1024 row reads nothing waiting while 12.8 % of requests failed on the client.
+
+### 4XL (DC04c)
+
+| Concurrency | req/s | p50 / p99 ms | Success | Pool waiting max (available then, of max) | Node CPU % | Statuses | Client errors |
+|---|---|---|---|---|---|---|---|
+| 64 | 436 | 141 / 365 | 1 | 0 (1 of 70) | not computed | 200:17521 | none |
+| 128 | 860 | 143 / 339 | 1 | 0 (1 of 70) | 2.2 | 200:34810 | none |
+| 256 | 1699 | 144 / 355 | 1 | 1 (10 of 70) | 5 | 200:68773 | 1 |
+| 512 | 3158 | 150 / 457 | 0.996 | 1 (10 of 70) | 11.5 | 200:127297 | 456 |
+| 1024 | 2243 | 164 / 2162 | 0.837 | 0 (66 of 70) | 11.5 | 200:75566 403:6804 | 16,018 |
+| 1536 | 539 | 801 / 4460 | 0.375 | 0 (66 of 70) | 0.1 | 403:8856 | 14,729 |
+
+On 4XL the same request scaled linearly to 3,158 req/s at 512, with the snapshots reading at most 1 waiting and 10 of 70 available. Node CPU read 11.5 % at both 512 and 1024, which fits a stale window. Above 512 the run stopped measuring PostgREST: the client logged "Network is unreachable (os error 51)" on thousands of requests, and from 1024 the answers included HTTP 403 (every answer at 1536) while node CPU fell to 0.1 %. The 403 body was not recorded, so which layer sent it is not established. Those two rows describe one Mac and the edge in front of the project. DC04d's `db_pool` arms on 4XL (20, 150 and 250) ran behind the same limit and compare nothing about pool size; each arm's pool max read the previous arm's value, and the PATCH to 250 answered 500 and was not investigated.
+
+### Pool size on Small (DC07)
+
+DC07 set `db_pool` to 15, 30 and 60 on a Small project, waited for the restart line and 30 s more, then ran DC04's step at 128, 256 and 512. Every PATCH answered 200 and read back the value set. Every HTTP answer in every step was a 200; the failures in the success column are the client's (mostly os error 51 at 512).
+
+| `db_pool` | Concurrency | req/s | p50 / p99 ms | Success | `authenticator` mid-step | Client errors |
+|---|---|---|---|---|---|---|
+| 15 | 128 | 814 | 147 / 422 | 1 | idle:12 idle in transaction:4 | none |
+| 15 | 256 | 853 | 288 / 667 | 1 | idle:15 idle in transaction:1 | 1 |
+| 15 | 512 | 863 | 615 / 1073 | 0.992 | idle:16 | 280 |
+| 30 | 128 | 834 | 147 / 376 | 1 | idle:28 idle in transaction:1 | none |
+| 30 | 256 | 902 | 281 / 470 | 0.998 | idle:28 idle in transaction:1 | 60 timeouts |
+| 30 | 512 | 878 | 618 / 863 | 0.985 | idle:27 idle in transaction:2 | 516 |
+| 60 | 128 | 836 | 147 / 348 | 1 | idle:35 | none |
+| 60 | 256 | 909 | 277 / 579 | 1 | idle:31 idle in transaction:4 | 17 timeouts |
+| 60 | 512 | 868 | 615 / 940 | 0.993 | idle:34 idle in transaction:1 | 238 |
+
+At 256 concurrent the three pools gave 853, 902 and 909 req/s, a spread of 56 req/s from pool 15 to pool 60. The same configuration on two runs (pool 30 on Small, DC04b's 925 and 918 against DC07's 902 and 878 at 256 and 512) differed by 23 and 40 req/s, so the pool effect is not separated from the spread between repeats. The pool-15 arm also ran with a busier client: the Mac's 1-minute load average read 8.8, 12.9 and 11.7 in its steps against 3.6 to 4.9 in the others. The same Mac reached 3,158 req/s against 4XL the same day (DC04c). Mid-step, most `authenticator` backends were idle at every pool size, and the 60 pool never showed more than 35 of them. Node CPU was not computed in any DC07 step, because the CPU counters did not change within a 40 s step; with steps about 60 s apart and a slow payload refresh, that says little. Each cell is one step with no repeat. Pool 15 was the lowest of the three at every step, and its arm is the only one whose snapshot showed queueing; with one step per cell and a busier client, a small penalty and noise were not separated.
+
+Upstream, PostgREST issue #5336 (open as of 2026-10-23) reports throughput collapsing when requests wait for a pool connection: in `hasql-pool`, every returned connection wakes every waiting request, so PostgREST's CPU per request grows with the number waiting.[^pgrst-5336] Its benchmark ran PostgREST `main` on an AWS Graviton3 host with Postgres pinned to 2 cores, `db-pool` 20 and 100 closed-loop clients, and the collapse grew with PostgREST's core count: 5,714 req/s at 293 microseconds of CPU per request on 2 PostgREST cores, 9,649 req/s at 324 microseconds on 4, 3,366 req/s on 8 and 1,684 req/s on 16. The issue gives a pool large enough that nobody waits as the workaround and points to a fix proposed in `hasql-pool` PR #58. Those are the issue's own measurements under its conditions; the lab did not reproduce them. The issue's 2- and 4-core rows with Postgres on 2 cores show CPU per request near its no-wait figure (293 and 324 microseconds against 333); its 4-core pool contrast with Postgres on 1 core shows pool 20 at 2,768 req/s against 6,875 at 200. Which regime a Small project is in was not established: how many cores PostgREST gets there is not documented, and whether DC07's 30 and 60 arms queued at all was not observed. The issue measured the `hasql-pool` copy vendored on PostgREST `main`; v14.18 takes `hasql-pool` from Hackage at `>= 1.0.1 && < 1.1`,[^pgrst-cabal] and whether that version has the same acquisition code was not checked.
+
+---
+
+## Reading the pgrst_db_pool series
+
+The project metrics endpoint, `/customer/v1/privileged/metrics` (scrape set-up in [Monitor Supabase with Grafana](/guides/supabase-grafana-monitoring/)), served 9 `pgrst_*` series in DC04a: `pgrst_db_pool_available`, `pgrst_db_pool_max`, `pgrst_db_pool_timeouts_total`, `pgrst_db_pool_waiting`, three JWT cache series and two schema cache series. PostgREST's help text calls `pgrst_db_pool_available` "Available connections in the pool" and `pgrst_db_pool_waiting` "Requests waiting to acquire a pool connection".[^pgrst-metrics]
+
+The v14.18 source counts differently from that help text. `usePool` raises the waiting gauge before it asks the pool for a connection and lowers it after the session using that connection returns,[^pgrst-src-usepool] so `waiting` counts requests from their pool request until their session ends: requests queued for a connection plus requests holding one. PostgREST's own pool sessions go through the same function (the connection check when the listener is off, the schema cache load, the in-database config and role-settings reads), so they count too.[^pgrst-src-callers] `available` is computed as open pool connections minus connections in use.[^pgrst-src-metrics] This is source-read; the Supabase build is assumed to match the tag, which was not checked. DC05 read the series against `pg_stat_activity` for `usename = 'authenticator'`, read through the Management API query endpoint, and the snapshots agree with the source.
+
+### How often they change (DC05a)
+
+1 s scrapes for 100 s while held requests stepped 0, 5, 15, 25 and 0 every 20 s; `pg_stat_activity` about every 2.5 s.
+
+| Measured | Value |
+|---|---|
+| scrapes | 100, 0 failed |
+| distinct waiting/available/max readings | 2: `0/1/30` from 0 s to 60 s, `25/0/30` from 62 s to 99 s |
+| changes | 1 |
+| response headers, first scrape | `cf-cache-status=DYNAMIC`, `date` current |
+| `authenticator` total / in `PgSleep` / idle | 2/0/2 to 20 s; 6/5/1 from 22 s; 16/15/1 from 41 s; 16/0/16 at 58 s; 26/25/1 from 61 s; 26/0/26 from 81 s |
+
+The series moved once in 100 s while the backends moved five times. No refresh landed between 22 s and 58 s, a 36 s window in which the 5- and 15-held states existed and never appeared, and none between 81 s and 99 s, after the holds ended. A periodic refresh would therefore be at least about 40 s apart (the change at 62 s, the previous refresh no later than 22 s); no upper bound was measured. The endpoint answered `DYNAMIC` with a current `date`, so the staleness sits behind the edge.
+
+### What they count (DC05b)
+
+10 then 40 requests held for 30 s on a pool of 30; five scrapes 1.5 s apart from 12 s into the hold, `pg_stat_activity` at the third.
+
+| Held | Scrapes (waiting/available/max) | `authenticator` total / in `PgSleep` / idle | `available` if it meant open idle / max minus checked out | Holds |
+|---|---|---|---|---|
+| 10 | `25/0/30` x4, then `10/15/30` | 26 / 10 / 16 | 16 / 20 | 200:10 |
+| 40 | `10/15/30` x5 | 31 / 30 / 1 | 1 / 0 | 200:40 |
+
+Three snapshots line up with a known state:
+
+- `available` read 15 with 10 held against 16 idle `authenticator` backends, 1 at rest (DC05a, 0 s) against 2 idle, and 0 with 25 held (DC05a, 62 s) against 1 idle. That matches open connections minus those in use. In those three, one idle backend was not counted, which fits one connection outside the pool (PostgREST's listener; not identified). "Max minus checked out" would have read 20, 30 and 5.
+- `waiting` read 25 with 25 held and 10 with 10 held, on a pool of 30 where nothing queued: the requests holding a connection, as the source predicts. DC07 shows the queued part too: with `db_pool` 15 at 128 concurrent, one snapshot read 31 waiting against a pool max of 15.
+- The 40-held row is the 10-held snapshot still being served. The queued state, 30 in `PgSleep` and 10 waiting for a connection, was never scraped.
+
+### Pool max after a PATCH (DC05c)
+
+| PATCH | Status | Restart line after | `pgrst_db_pool_max` read the new value after |
+|---|---|---|---|
+| `db_pool` 20 (from unset, 30) | 200 | 1.2 s | 1.4 s, first scrape |
+| `db_pool` 30 | 200 | 1 s | 28.9 s, 22 scrapes |
+
+PostgREST restarted within about 1 s both times; the metric followed after 1.4 s once and 28.9 s the other time. The 28.9 s case fits the slow refresh above. The 1.4 s case puts the refresh within a fraction of a second of the logged restart (client and log clocks, skew not measured), so the competing reading, that a restart resets or refreshes the payload, is open; the two were not separated. Either way it fits DC04d, where each arm read the previous arm's pool.
+
+For an alert or a capacity decision, count the pool where it lives before acting on these series. The lab's own reading was a `pg_stat_activity` query of this shape, run through the SQL editor or the Management API query endpoint:
+
+```sql
+select count(*) filter (where usename = 'authenticator') as total,
+       count(*) filter (where usename = 'authenticator' and state = 'idle') as idle,
+       count(*) filter (where usename = 'authenticator' and state = 'active') as active
+from pg_stat_activity;
+```
+
+---
+
+## Statement timeouts from a lock, then the pool
+
+DC06 asked whether requests cancelled by a statement timeout leave pooled connections in a broken state. 20 workers looped anon GETs on `dc_items` while a Management API query ran `begin; lock table public.dc_items in access exclusive mode; select pg_sleep(N); commit;`, with 75 s observed after the lock and `authenticator` states read about every 5.7 s. Anon's 3 s timeout is the DC03a figure, from a different run and project. The 2 s control ran first; each arm ran once.
+
+| Lock asked / held | Before | During (to 4 s after the lock) | After (4 s to 75 s) | 25P02 after | Most `idle in transaction (aborted)` seen | Requests |
+|---|---|---|---|---|---|---|
+| 2 s / 2.7 s | 200:2034 | 200:664 | 200:9857 | 0 | 0 | 12555 |
+| 12 s / 12.6 s | 200:2050 | 200:643, 500 57014:60 | 200:9920 | 0 | 0 | 12673 |
+
+During the 12 s lock the states read `active:20 idle:1` twice, then `idle:21` from 1.4 s after it, with at most 2 `idle in transaction` (not aborted) in any later sample. 60 requests were cancelled by anon's statement timeout while waiting on the lock, and none of the pooled connections they used was left aborted: every request after the lock answered 200 and no sample showed an aborted backend. With 20 workers on a pool of 30 no request waited for a pool connection, so a cancellation while queued was not exercised. A stall where Postgres stops as a whole, with cancellations landing at a different protocol step, was not made: the lab has no way to stop Postgres as a whole on a managed project.
+
+---
+
+## Docs against runtime
+
+| Claim | Documented | Measured or source-read | Filed upstream |
+|---|---|---|---|
+| Time to PGRST003 | the request waits up to `db-pool-acquisition-timeout`, then 504[^pgrst-db-pool] | a lone request answered after about 6 x that timeout, with 6 PostgREST log lines | not filed; the lab RUNLOG records no report |
+| Pool with `db_pool` null | "automatically configured based on compute size"[^sb-api-v1] | Small 30, Large 50, 4XL 70; no published figure found | not filed |
+| `pgrst_db_pool_waiting` | "Requests waiting to acquire a pool connection"[^pgrst-metrics] | source: queued plus holding a connection; snapshots read 25 and 10 with nothing queued | not filed |
+| `pgrst_db_pool_available` | "Available connections in the pool"[^pgrst-metrics] | source: open connections minus in use; snapshots one fewer than the idle `authenticator` backends | no disagreement |
+| Role statement timeouts and reload | anon 3 s, authenticated 8 s, service_role from `authenticator` 8 s, reload config needed[^sb-timeouts] | the same | no disagreement |
+
+---
+
+## Reading the numbers
+
+| Claim | Measured or documented | How it was checked |
+|---|---|---|
+| Pool 30 / 50 with `db_pool` unset on Small / Large | measured, runs 1, 2 and 4 (Small), 1 and 4 (Large) | `authenticator` backends in `PgSleep` mid-burst, two bursts per size |
+| Pool 70 on 4XL | measured, one run, metric only | `pgrst_db_pool_max` after the resize; no burst count |
+| PGRST003 after about 6 x the acquisition timeout | measured, n = 2 per timeout (n = 1 at 4 s), repeated at 10 s in runs 1 and 2 and at 2 s in run 1 | client time per request; PostgREST access-log lines counted by User-Agent |
+| A component in front resends after PGRST003 | inference; the public Envoy config fits, hosted config not checked | log-line count and timing; the component and the competing reading were not separated |
+| Bounds 0-1000 and 0-60 | documented, edges measured | 1001, -1 and 61 sent; 0 not sent |
+| `db_pool` above `max_connections` gives PGRST002 | measured, one burst per arm | 220 concurrent 15 s RPCs at 50 and at 1000 on Large |
+| Every PATCH restarts PostgREST | measured, 9 of 9 in run 4, plus a PATCH that answered 500 (DC04d) | "Starting PostgREST" log lines against accepted PATCHes |
+| Restart drains in-flight requests | inference from DC02d, twice | in-flight outcomes, ping failures, restart line timing |
+| Role timeouts and reload | measured, n = 2 per row | sleeping RPCs per key and role |
+| Small ceiling 853 to 1,020 req/s, 4XL 3,158 | measured, one step per cell, one indexed point read, one client | `oha` closed loop, 40 s per step |
+| Pool 15 to 60 on Small: 853 to 909 req/s at 256 | measured, one step per cell; not separated from a 23 to 40 req/s repeat spread | DC07 against DC04b at pool 30 |
+| `waiting` = queued plus holding, `available` = open minus in use | source-read (v14.18), three snapshots agree | `usePool` and `Metrics.hs`; DC05a and DC05b against `pg_stat_activity` |
+| Pool series are snapshots, refresh at least about 40 s apart if periodic | measured, one 100 s window plus two PATCHes | 1 s scrapes against `pg_stat_activity` |
+| Lock-induced timeouts leave no aborted connection | measured, one 12.6 s lock and a 2 s control, anon reads | statuses, 25P02 count, state samples about 5.7 s apart |
+| #5336 throughput collapse | upstream report, not reproduced | the issue's own benchmark |
+
+Every figure is one vantage, two regions and a Pro organization on throwaway projects with no other traffic. The throughput rows describe one request shape and one client machine; the pool sizes describe the sizes measured and say nothing about Nano, Micro, Medium, XL, 2XL, 8XL, 12XL or 16XL.
+
+---
+
+## What to do about it
+
+This is the page's operational checklist; each row rests on a measured result unless the cell says otherwise.
+
+| Practice | Evidence | Module |
+|---|---|---|
+| With `db_pool` unset, count the pool mid-burst; `GET /postgrest` reads null. | `db_pool` reads null while the pool was 30 on Small, 50 on Large, 70 on 4XL. | DC01a, DC01d, DC04a, DC04c |
+| Budget about 6 x `db_pool_acquisition_timeout` before a client sees PGRST003. | Lone requests: 61364 / 61972 ms at 10 s, 13767 / 13752 ms at 2 s, 25007 ms at 4 s (n = 1); 6 log lines per request. Under a 220-request burst: 10923 to 20903 ms (DC02c). | DC01b, DC02b, DC02c |
+| Lower `db_pool_acquisition_timeout` to make a full pool fail faster. | 2 s gave 504 after 13767 and 13752 ms, against 61364 and 61972 ms at the default 10 s. | DC02b |
+| Count the resends a layer in front appears to make before retrying PGRST003. | 6 PostgREST log lines per client request; client retries were not run, so this row is design, not result. | DC01b |
+| Keep `db_pool` within what `max_connections` can give. | 1000 on 160 turned 70 x 504 PGRST003 into 66 x 503 PGRST002 in one burst per arm. | DC02c |
+| Treat every `PATCH /postgrest` as a PostgREST restart, a no-change PATCH included. | 9 start lines for 9 accepted PATCHes; a PATCH that answered 500 restarted it too; restart 0.5 to 1.5 s after with nothing long in flight. | DC02a-DC02e, DC04d, DC05c, DC07 |
+| PATCH the PostgREST config when no long requests are in flight. | With 60 s requests in flight: restart after 55.3 s, new requests unanswered for about 50 s, twice. | DC02d |
+| Wait for the restart line before measuring after a PATCH. | Run 1 did not, and three of its rows look like restart overlaps. | DC02 run 1 |
+| Run `notify pgrst, 'reload config'` after `alter role ... set statement_timeout`. | 8 s cancellations continued until the reload; then 10 s sleeps answered 200. | DC03c |
+| Put a long RPC's `set statement_timeout` on the function. | `set statement_timeout = '30s'` ran a 12 s sleep to 200 for anon, a user token and service_role. | DC03b |
+| Expect 8 s on the service_role key unless something raises it. | `rolconfig` null; 500 57014 after 8056 and 8048 ms. | DC03a |
+| Test a larger compute before a larger `db_pool` for point-read throughput on Small. | 4XL with the default pool reached 3,158 req/s; pools 15 to 60 on Small gave 853 to 909 at 256, not separated from repeat spread. | DC04c, DC07 |
+| Load-test from more than one client before reading a ceiling above 3,000 req/s. | One Mac hit os error 51 and 403s (sending layer not identified) from 1024 concurrent on 4XL; a multi-client run was not done, so this row is design. | DC04c |
+| Read `pgrst_db_pool_waiting` minus (max - available) as a lower bound on the queue. | `waiting` counts queued plus holding (source-read v14.18); 31 waiting, 1 of 15 available: at least 17 queued (DC07). Snapshots read 25 and 10 with nothing queued (DC05b). | DC05b, DC07 |
+| Cross-check `pgrst_db_pool_*` against `pg_stat_activity` before acting on them. | One change in 100 s of 1 s scrapes; no refresh in a 36 s window. | DC05a |
+| Confirm a new pool via the restart line or `GET /postgrest`, not `pgrst_db_pool_max`. | The metric showed the new value after 1.4 s once and 28.9 s once; restart line after 1.2 s and 1 s. | DC02a, DC05c |
+| Skip a pool restart after lock-induced 57014s on reads; recheck for writes. | 60 x 57014 during a 12.6 s lock, then 9920 x 200 and 0 x 25P02; one run per arm, anon reads, nothing queued for the pool, whole-instance stall not made. | DC06 |
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  s [label="Data API requests\nfail or slow down"];
+  p3 [label="504 PGRST003\n-> pool full; check pg_stat_activity,\nshorten requests, lower the wait"];
+  p2 [label="503 PGRST002 persisting after the restart\nfollowing a db_pool raise\n-> db_pool past max_connections"];
+  t [label="500 57014 at 3 s / 8 s\n-> role timeout; function setting\nor alter role + reload config"];
+  r [label="no answer just after a config PATCH\n-> PostgREST restart"];
+  c [label="flat req/s, rising latency\n-> compute size before db_pool"];
+
+  s -> p3; s -> p2; s -> t; s -> r; s -> c;
+}
+```
+
+Text version:
+
+1. 504 PGRST003: every pooled connection is busy. Count `authenticator` backends in `pg_stat_activity`, shorten the requests holding them, or lower `db_pool_acquisition_timeout` to fail sooner.
+2. 503 PGRST002 that persists after the restart line following a `db_pool` raise: the pool is past what `max_connections` gives; bring it back down.
+3. 500 57014 at about 3 s or 8 s: the role's statement timeout. Set it on the function, or `alter role` and reload the config.
+4. No answer just after a PostgREST config PATCH: the restart; with long requests in flight it came when they finished (DC02d, twice).
+5. Flat req/s while latency rises with concurrency on Small: try a larger compute size before a larger `db_pool`.
+
+---
+
+## Not measured
+
+- Compute sizes other than Small, Large and 4XL; regions other than `ap-southeast-1` and `ap-northeast-2`; Team or Enterprise organizations.
+- `db_pool` 0 and `db_pool_acquisition_timeout` 0.
+- Which component resends after PGRST003, its policy under load, attempt counts inside a burst, and the `x-envoy-attempt-count` header on a PGRST003 answer.
+- The 60 s ceiling the timeouts guide gives for client queries.[^sb-timeouts]
+- The pool metric refresh interval measured directly (only a lower bound if periodic), whether a restart refreshes the payload, and a `waiting` snapshot taken while requests were known to queue.
+- Whether the hosted PostgREST matches the v14.18 source read here.
+- A per-process CPU split between PostgREST and Postgres, and node CPU in DC07.
+- DC07 repeated per cell, on a size with more vCPU, or with requests that hold a connection longer than a point read, where waiting for a connection is certain.
+- Load above about 3,000 req/s from more than one client or from inside the region.
+- Any request shape other than one indexed point read under load: RPCs, inserts, wide responses, `Prefer: count=exact`, a high `max_rows`.
+- A whole-instance stall for DC06, a cancellation while queued for a pool connection, the authenticated role's 8 s timeout under a lock, RPC or write requests under cancellation.
+- Requests through Supavisor or a direct Postgres connection; this page covers the Data API path only.
+- Client-side error text for the status-0 rows in run 4.
+- Repeats of any DC04-DC07 row beyond DC07's pool-30 arm, which re-ran DC04b's step on another project.
+
+---
+
+## Reproducing
+
+The experiment provisions and deletes its own project; it needs a Pro-plan organization slug in `PVLAB_ORG_PRO` and a personal access token in `SUPABASE_ACCESS_TOKEN`.
+
+```bash
+make run                         # DC01-DC03 then DC99, about 45 minutes
+make run ONLY=DC04,DC99          # opt-in, needs oha; PVLAB_DC_REGION / PVLAB_DC_SIZE pick the project
+make run ONLY=DC05,DC06,DC07,DC99
+make clean                       # list leftover pvlab-dc-* projects; DELETE=1 deletes
+make publish-evidence RUN=evidence/<ts>/run-<stamp>.json
+```
+
+Project time was about 40 minutes for run 4, 18 minutes for DC04 and 21 minutes for DC05-DC07, each on a Small project except DC01d-DC03 on Large and the DC04c-DC04d tail on 4XL.
+
+---
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| DC01 | data-api-capacity | [`dc01-default-pool.ts`](https://github.com/erfianugrah/supabase-lab/blob/661afdf/experiments/data-api-capacity/tests/dc01-default-pool.ts) | run 4 [`run-2026-10-23T00-37-06-485Z`](https://github.com/erfianugrah/supabase-lab/blob/661afdf/experiments/data-api-capacity/out/2026-10-23/run-2026-10-23T00-37-06-485Z.facts.md); runs 1 and 2 [`run-2026-10-22T23-02-55-371Z`](https://github.com/erfianugrah/supabase-lab/blob/661afdf/experiments/data-api-capacity/out/2026-10-22/run-2026-10-22T23-02-55-371Z.facts.md), [`run-2026-10-22T23-43-28-093Z`](https://github.com/erfianugrah/supabase-lab/blob/661afdf/experiments/data-api-capacity/out/2026-10-22/run-2026-10-22T23-43-28-093Z.facts.md) |
+| DC02 | data-api-capacity | [`dc02-pool-config.ts`](https://github.com/erfianugrah/supabase-lab/blob/661afdf/experiments/data-api-capacity/tests/dc02-pool-config.ts) | run 4 [`run-2026-10-23T00-37-06-485Z`](https://github.com/erfianugrah/supabase-lab/blob/661afdf/experiments/data-api-capacity/out/2026-10-23/run-2026-10-23T00-37-06-485Z.facts.md) |
+| DC03 | data-api-capacity | [`dc03-statement-timeouts.ts`](https://github.com/erfianugrah/supabase-lab/blob/661afdf/experiments/data-api-capacity/tests/dc03-statement-timeouts.ts) | run 4 [`run-2026-10-23T00-37-06-485Z`](https://github.com/erfianugrah/supabase-lab/blob/661afdf/experiments/data-api-capacity/out/2026-10-23/run-2026-10-23T00-37-06-485Z.facts.md) |
+| DC04 | data-api-capacity | [`dc04-throughput-stall.ts`](https://github.com/erfianugrah/supabase-lab/blob/661afdf/experiments/data-api-capacity/tests/dc04-throughput-stall.ts) | [`run-2026-10-23T07-13-34-754Z`](https://github.com/erfianugrah/supabase-lab/blob/661afdf/experiments/data-api-capacity/out/2026-10-23/run-2026-10-23T07-13-34-754Z.facts.md) |
+| DC05 | data-api-capacity | [`dc05-pool-metrics.ts`](https://github.com/erfianugrah/supabase-lab/blob/c186f34/experiments/data-api-capacity/tests/dc05-pool-metrics.ts) | [`run-2026-10-23T07-49-11-858Z`](https://github.com/erfianugrah/supabase-lab/blob/c186f34/experiments/data-api-capacity/out/2026-10-23/run-2026-10-23T07-49-11-858Z.facts.md) |
+| DC06 | data-api-capacity | [`dc06-aborted-after-stall.ts`](https://github.com/erfianugrah/supabase-lab/blob/c186f34/experiments/data-api-capacity/tests/dc06-aborted-after-stall.ts) | [`run-2026-10-23T07-49-11-858Z`](https://github.com/erfianugrah/supabase-lab/blob/c186f34/experiments/data-api-capacity/out/2026-10-23/run-2026-10-23T07-49-11-858Z.facts.md) |
+| DC07 | data-api-capacity | [`dc07-pool-size-under-waiters.ts`](https://github.com/erfianugrah/supabase-lab/blob/c186f34/experiments/data-api-capacity/tests/dc07-pool-size-under-waiters.ts) | [`run-2026-10-23T07-49-11-858Z`](https://github.com/erfianugrah/supabase-lab/blob/c186f34/experiments/data-api-capacity/out/2026-10-23/run-2026-10-23T07-49-11-858Z.facts.md) |
+
+## Related docs
+
+- [What a Supabase platform operation costs a client](/reference/supabase-platform-operation-cost/): what a restart and a resize cost the Data API path, beside the config-PATCH restart measured here.
+- [Locking down Supabase](/reference/supabase-data-surface-lockdown/): turning the Data API off and on, the other PostgREST config PATCH that restarts it.
+- [Monitor Supabase with Grafana](/guides/supabase-grafana-monitoring/): scraping the metrics endpoint whose `pgrst_db_pool_*` series are read here.
+- [Supabase observability surface](/reference/supabase-observability-surface/): the log sources and advisors that see the same Data API errors.
+- [Run your own PostgREST against a Supabase project](/guides/supabase-own-postgrest/): when the hosted pool's settings are not enough and the config has to be yours.
+
+[^sb-api-v1]: Supabase, "Management API OpenAPI document (v1)," Supabase. https://api.supabase.com/api/v1-json
+[^pgrst-db-pool]: PostgREST, "Configuration: db-pool, db-pool-acquisition-timeout," PostgREST 14 documentation. https://docs.postgrest.org/en/v14/references/configuration.html#db-pool-acquisition-timeout
+[^sb-compute]: Supabase, "Compute and Disk," Supabase Docs. https://supabase.com/docs/guides/platform/compute-and-disk
+[^sb-conn-mgmt]: Supabase, "Connection management," Supabase Docs. https://supabase.com/docs/guides/database/connection-management
+[^pgrst-errors]: PostgREST, "Errors: Group 0 - Connection," PostgREST 14 documentation. https://docs.postgrest.org/en/v14/references/errors.html#group-0-connection
+[^sb-timeouts]: Supabase, "Timeouts," Supabase Docs. https://supabase.com/docs/guides/database/postgres/timeouts
+[^pgrst-5336]: PostgREST GitHub Issue #5336, "Throughput collapses when requests wait for a pool connection: CPU per request grows 25x, and more cores make it worse," opened 2026-10-16. https://github.com/PostgREST/postgrest/issues/5336
+[^pgrst-metrics]: PostgREST, "Observability: Connection Pool Metrics," PostgREST 14 documentation. https://docs.postgrest.org/en/v14/references/observability.html#connection-pool-metrics
+[^pgrst-src-usepool]: PostgREST, `src/PostgREST/AppState.hs`, `usePool`, lines 161-167, tag v14.18. https://github.com/PostgREST/postgrest/blob/v14.18/src/PostgREST/AppState.hs#L161-L167
+[^pgrst-src-metrics]: PostgREST, `src/PostgREST/Metrics.hs`, `calcAvailable`, lines 59-61, tag v14.18. https://github.com/PostgREST/postgrest/blob/v14.18/src/PostgREST/Metrics.hs#L59-L61
+[^pgrst-src-callers]: PostgREST, `src/PostgREST/AppState.hs`, `usePool` callers at lines 275, 319, 348, 392 and 402, tag v14.18. https://github.com/PostgREST/postgrest/blob/v14.18/src/PostgREST/AppState.hs#L275
+[^pgrst-cabal]: PostgREST, `postgrest.cabal`, `hasql-pool` dependency, tag v14.18. https://github.com/PostgREST/postgrest/blob/v14.18/postgrest.cabal#L118
+[^sb-envoy-lds]: Supabase, `ansible/files/envoy_config/lds.yaml` (and `lds.supabase.yaml`), supabase/postgres at 920bb63. https://github.com/supabase/postgres/blob/920bb634698fef8dee6e78d738330d2dd8e489c5/ansible/files/envoy_config/lds.yaml#L421-L427
+[^sb-envoy-cds]: Supabase, `ansible/files/envoy_config/cds.yaml`, `postgrest` cluster, supabase/postgres at 920bb63. https://github.com/supabase/postgres/blob/920bb634698fef8dee6e78d738330d2dd8e489c5/ansible/files/envoy_config/cds.yaml#L45-L64
+[^sb-setup-postgrest]: Supabase, `ansible/tasks/setup-postgrest.yml`, supabase/postgres at 920bb63. https://github.com/supabase/postgres/blob/920bb634698fef8dee6e78d738330d2dd8e489c5/ansible/tasks/setup-postgrest.yml
+[^envoy-router]: Envoy, "Router: x-envoy-retry-on, x-envoy-attempt-count," Envoy documentation. https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/router_filter
+[^envoy-cb]: Envoy, "Circuit breakers (proto): RetryBudget," Envoy documentation. https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/cluster/v3/circuit_breaker.proto
