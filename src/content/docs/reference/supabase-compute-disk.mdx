@@ -173,15 +173,40 @@ start.[^sb-compute]
 
 ### Resize: duration + downtime (measured)
 
-The order Micro -> Small -> Large -> Small -> Micro was run with REST
-(anon table read) and Auth health sampled every 250 ms:
+The order Micro -> Small -> Large -> Small -> Micro was run on 2026-10-23 on
+one throwaway Pro project in `ap-southeast-1` (compute-disk D09, n=1 per op),
+with three data-path probes: a row read through REST with the anon key
+(`rest_read`) and `GET /auth/v1/health` with the anon key, sampled every
+250 ms, and a Postgres Changes join (`realtime_join`) every 1 s. Every PATCH answered `200` on the
+first attempt, and the next one was sent only after every path had been up for
+15 s. Seconds after the accepted PATCH[^lab-compute-d09]:
 
-| op | settle | REST max contiguous outage | Auth max outage |
-|---|---|---|---|
-| upgrade Micro->Small | 105 s | 1.0 s | 0 s |
-| upgrade Small->Large | 61 s | 17.0 s | 0 s |
-| downgrade Large->Small | 61 s | 0 s | 0 s |
-| downgrade Small->Micro | 73 s | 0 s | 0 s |
+| op | `ACTIVE_HEALTHY` after | REST read max outage | Auth max outage | Realtime join max outage | REST read recovered |
+|---|---|---|---|---|---|
+| upgrade Micro->Small | 218 s | 231.465 s | 231.433 s | 228.188 s | 249.832 s |
+| upgrade Small->Large | 216 s | 223.28 s | 223.516 s | 223.421 s | 233.974 s |
+| downgrade Large->Small | 136 s | 152.466 s | 152.375 s | 144.528 s | 171.37 s |
+| downgrade Small->Micro | 245 s | 254.886 s | 254.869 s | 244.941 s | 273.785 s |
+
+- Every resize, in either direction, took the three data paths down together
+  for 144.528 to 254.886 s. The downgrades were not cheaper: Small -> Micro
+  was the longest of the four.
+- The status read `ACTIVE_HEALTHY` before the data paths were back: REST reads
+  recovered about 18 to 35 s after the 3 s status poll first read healthy.
+- REST and Auth each had a second, shorter outage of 1.3 to 2.0 s per op; the
+  table carries the long one. Failure modes were `HTTP 521` and timeouts on
+  REST and Auth, and `pg_changes: {:error, "Too many database timeouts"}` on
+  Realtime.
+
+The 2026-08-19 figures that stood here (settle 105, 61, 61 and 73 s; REST
+outage 1.0, 17.0, 0 and 0 s; Auth 0 s) are withdrawn. The old module dropped
+an outage still open when a phase ended, stopped sampling at `ACTIVE_HEALTHY`,
+and timed PATCHes the addon rate limit had refused as resizes: each 61 s row
+was its 60 s wait for a status change after a `429`, so no Small -> Large
+resize ran in that run or in the 2026-10-13 re-run. Its `/auth/v1/health`
+probe sent no apikey, and the endpoint answered `401` without one on 2026-10-23 (not
+re-checked for the earlier dates); if it did then, no Auth sample counted as up
+and its 0 s meant an outage never closed.
 
 Adjacent resize PATCHes are rate-limited independent of rebuild: the
 second within a window answered 429 `We are still processing addon
@@ -194,16 +219,14 @@ its REST probe at zero failed samples; that probe was an anon
 the database is reached, so it never tested a read. Re-run on 2026-10-23
 with a row read, the same experiment saw REST reads fail for 171 and 218 s
 on Micro -> Small and 54 s on Small -> Micro, close to Auth's 171, 218 and
-54 s in the same passes.[^lab-downtime] D09's REST read saw 1.0 s on
-Micro -> Small and 0 s on Small -> Micro against 171/218 s and 54 s there,
-and its `/auth/v1/health` probe 0 s on every resize against Auth's 171/218 s
-and 54 s.
-D09's counter drops failures still open at a phase end, and in its 2026-10-13
-re-run only the first PATCH applied, the other three refused by the addon
-rate limit; the 2026-08-19 figures show the same pattern (compute-disk
-RUNLOG, 2026-10-13)[^lab-compute-d09], so its 1.0 s may be low and its
-17.0 s on Small -> Large may be the tail of the first resize.
-Docs cite "typically less than 2 minutes".[^sb-compute]
+54 s in the same passes.[^lab-downtime] D09's 231.465 s on Micro -> Small is
+the same order as those 171 and 218 s; the two are different metrics (D09's
+longest outage, platform-downtime's first failure to sustained recovery) on
+different projects, n=1 each, so not a like-for-like comparison.
+The docs say compute changes are "usually applied with less than 2 minutes of
+downtime, but can take longer depending on the underlying Cloud
+Provider";[^sb-compute] all four D09 resizes ran past 2 minutes on every data
+path.
 The measured restart and resize dwell times per connection path are in
 [the platform operation-cost reference](/reference/supabase-platform-operation-cost/).
 
@@ -433,23 +456,24 @@ A line marked "docs" or "design choice" is not a measurement.
   fires, its message carries `Last modified at <UTC>`, so parse the timestamp and schedule
   from it rather than re-trying blind (D03).
 - **Space resize PATCHes**: wait >= 2 minutes between adjacent resize
-  PATCHes, or the second returns 429 with `still processing` (D09).
-- **Poll for `ACTIVE_HEALTHY` after a resize** with
-  `GET /v1/projects/{ref}` instead of sleeping a fixed time: settle ran
-  61-105 s across four operations (D09) and 107 s on D01.
-- **Size client retries for the resize gap**: a row read (platform-downtime,
-  2026-10-23) failed for 171 and 218 s on Micro -> Small and 54 s on Small
-  -> Micro, so budget in minutes. D09's 1.0 s on Micro -> Small, 17.0 s on
-  Small -> Large and 0 s on both downgrades come from a counter that drops
-  failures still open at a phase end, with later PATCHes refused by the rate
-  limit (compute-disk RUNLOG, 2026-10-13), so they understate the gap. The default
-  supabase-js client took 4 attempts and ~7.0s to ride out three 503s
-  (edge-resilience W02); whether it survives a 17.0 s gap was not
-  measured (D09; W02).
-- **Rehearse the resize mechanics on a downgrade if you need a cheap dry
-  run** - PATCH, settle, 429 spacing - not the outage: both measured
-  downgrades produced 0 s of REST outage (Large -> Small, Small -> Micro)
-  while both upgrades did not (D09).
+  PATCHes, or the second returns 429 with `still processing` (D09). On
+  2026-10-23 no follow-on PATCH was refused when each was sent after every
+  data path had been up for 15 s; whether that wait avoided the 429 was not
+  separated (D09).
+- **Poll for `ACTIVE_HEALTHY` after a resize, then probe a read** with
+  `GET /v1/projects/{ref}` instead of sleeping a fixed time: the status
+  flipped 136-245 s after the PATCH across four operations (D09, 2026-10-23)
+  and 107 s on D01, and REST reads came back about 18 to 35 s after it (D09).
+- **Size client retries for the resize gap in minutes**: a row read
+  (platform-downtime, 2026-10-23) failed for 171 and 218 s on Micro -> Small
+  and 54 s on Small -> Micro, and D09 the same day saw 144.528 to 254.886 s
+  on every data path per resize. The default supabase-js client took 4
+  attempts and ~7.0s to ride out three 503s (edge-resilience W02); a gap of
+  minutes is beyond a retry loop of that shape (reasoned from W02's timings,
+  not measured).
+- **Do not treat a downgrade as a cheap dry run**: on 2026-10-23 Large ->
+  Small took the data paths down for 144.528 to 152.466 s and Small -> Micro
+  for 244.941 to 254.886 s (D09, n=1 per op).
 - **Read the addon GET for `null` when returning to Micro**, not for
   `ci_micro`: Micro is the absence of a compute addon
   (platform-downtime D04).
@@ -507,25 +531,27 @@ per-vantage; the disk quota's determinism (D03 varied run to run).
 | gp3 max IOPS 16,000 | API message: 500 per GB or 80,000 | docs and API disagree |
 | Large-only for IOPS/throughput | accepted + applied on Micro | UI-only gate |
 | autoscale config via API | verbs 404; GET empty or all-null; `POST /config/disk` takes the keys, returns 201, applies nothing | surface gap, and it fails silently |
+| compute change "usually applied with less than 2 minutes of downtime" | REST read, Auth and Realtime join down 144.528 to 254.886 s on each of four resizes (D09, 2026-10-23, n=1 per op) | docs understate |
 
 Each measured row above comes from the
 [supabase-lab](https://github.com/erfianugrah/supabase-lab) pvlab harness,
-module ids D01-D09 (2026-08-19) and D10-D11 (2026-10-01) under
-[experiments/compute-disk](https://github.com/erfianugrah/supabase-lab/tree/e8a852b/experiments/compute-disk),
-2026-08-19, and re-runs are driven from the experiment's probe scripts -
+module ids D01-D08 (2026-08-19), D09 (re-run 2026-10-23) and D10-D11 (2026-10-01) under
+[experiments/compute-disk](https://github.com/erfianugrah/supabase-lab/tree/fb257e4/experiments/compute-disk);
 the full run log is
-[RUNLOG.md](https://github.com/erfianugrah/supabase-lab/blob/e8a852b/experiments/compute-disk/RUNLOG.md);
+[RUNLOG.md](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/compute-disk/RUNLOG.md);
 the consolidated reference is
 [COMPUTE-DISK.md](https://github.com/erfianugrah/supabase-lab/blob/e8a852b/COMPUTE-DISK.md)
 at the repo root.
 
 ## Reading the numbers
 
-- Settle seconds are measured from PATCH -> ACTIVE_HEALTHY status flip.
-  Treat them as a floor; longer providers and disks stretch it.
-- contiguous-outage values in the resize table are the MAX visible gap
-  across sampled clients - percent-ok inside a window can dip below that
-  without creating an officially long gap.
+- `ACTIVE_HEALTHY` seconds are measured from the accepted PATCH to the
+  first status poll (every 3 s) that read healthy. They are not the outage:
+  in D09 the data paths stayed down 18 to 35 s past them.
+- Outage values in the resize table are the longest outage per path, first
+  failing sample to the first success after it, on one sample timeline per
+  path; a shorter second outage of 1.3 to 2.0 s per op is not in the table.
+  n=1 per op, one project, one vantage.
 - Disk quota behaviour varied run to run (bursts accepted, then reject);
   treat the limit as volatile rather than a fixed number to schedule against.
 
@@ -546,7 +572,8 @@ the documented and not-run rows rest on the cited pages only.
 | Free read-only at ~726 MB database size (docs: 500 MB); reads kept answering; TRUNCATE rejected, DELETE required for recovery | measured | [D06](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/compute-disk/tests/d05-free-org-autoscale-readonly.ts) - write rejection, endpoint SELECT, and recovery in the same fill run |
 | Autoscale gap identical on a Team org | measured | [D07](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/compute-disk/tests/d04-autoscale-surface.ts) - the same verb probes as [D04](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/compute-disk/tests/d04-autoscale-surface.ts) |
 | IOPS/throughput raise accepted and applied on Micro; the Large gate is UI-only | measured | [D08](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/compute-disk/tests/d08-storage-type-gate.ts) - config/disk POST, verified by follow-up GET |
-| Resize settle 105/61/61/73 s; max contiguous outages 1.0/17.0/0/0 s; Auth 0 s | measured | [D09](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/compute-disk/tests/d09-compute-resize-timing.ts) - REST and Auth sampled every 250 ms across the sequence |
+| Resize Micro -> Small -> Large -> Small -> Micro: `ACTIVE_HEALTHY` after 218/216/136/245 s; REST read max outage 231.465/223.28/152.466/254.886 s, Auth and Realtime join within 10 s of it in each op; REST back 18-35 s after `ACTIVE_HEALTHY` | measured, 2026-10-23, n=1 per op | [D09](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/compute-disk/tests/d09-compute-resize-timing.ts) - `rest_read` and `auth_health` (anon key) every 250 ms, `realtime_join` every 1 s, on one timeline per path; [artifact](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/compute-disk/out/2026-10-23/run-2026-10-23T07-56-13-302Z.facts.md) |
+| Resize settle 105/61/61/73 s; max contiguous outages 1.0/17.0/0/0 s; Auth 0 s | withdrawn 2026-10-23 | [D09](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/compute-disk/tests/d09-compute-resize-timing.ts) as of 2026-08-19: open outages dropped at a phase end, refused PATCHes timed as resizes, Auth probe sent no apikey ([RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/compute-disk/RUNLOG.md), 2026-10-23) |
 | Nano rejected on a paid org; Free-org wake ~162-204 s | measured | instance-sizing [I01](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/instance-sizing/tests/i01-nano-availability.ts) (create + PATCH + catalogue); [I04](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/instance-sizing/tests/i04-free-org.ts) (figure in the lab's AGENTS.md, no RUNLOG entry) |
 | Legacy free-era paused project on a Pro org: wake ~30 min, then `400 Project is not free-tier` on pause | measured | instance-sizing [I03](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/instance-sizing/tests/i03-legacy-pause-lifecycle.ts), 2026-08-18 |
 | `platform`-plan org creates Nano by default (224 MB `shared_buffers`), and it can pause | measured elsewhere | sfp-platforms [S01](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/sfp-platforms/tests/s01-entitlement-sweep.ts) via the instance-sizing addendum, 2026-08-24/25 |
@@ -575,7 +602,7 @@ the documented and not-run rows rest on the cited pages only.
 | D06 | compute-disk | [`d05-free-org-autoscale-readonly.ts`](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/compute-disk/tests/d05-free-org-autoscale-readonly.ts) | none published |
 | D07 | compute-disk | [`d04-autoscale-surface.ts`](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/compute-disk/tests/d04-autoscale-surface.ts) | none published |
 | D08 | compute-disk | [`d08-storage-type-gate.ts`](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/compute-disk/tests/d08-storage-type-gate.ts) | none published |
-| D09 | compute-disk | [`d09-compute-resize-timing.ts`](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/compute-disk/tests/d09-compute-resize-timing.ts) | none published |
+| D09 | compute-disk | [`d09-compute-resize-timing.ts`](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/compute-disk/tests/d09-compute-resize-timing.ts) (2026-08-19); [2026-10-23 version](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/compute-disk/tests/d09-compute-resize-timing.ts) | [`run-2026-10-23T07-56-13-302Z`](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/compute-disk/out/2026-10-23/run-2026-10-23T07-56-13-302Z.facts.md) |
 | D10 | compute-disk | [`d10-paid-fill-readonly.ts`](https://github.com/erfianugrah/supabase-lab/blob/36e7440/experiments/compute-disk/tests/d10-paid-fill-readonly.ts) | none published |
 | D11 | compute-disk | curl replay ([RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/36e7440/experiments/compute-disk/RUNLOG.md), 2026-10-01) | none published |
 | D12 | compute-disk | [`d12-spend-cap-manual-grow.ts`](https://github.com/erfianugrah/supabase-lab/blob/c9c9b1b/experiments/compute-disk/tests/d12-spend-cap-manual-grow.ts) | none published |
@@ -601,6 +628,6 @@ the documented and not-run rows rest on the cited pages only.
 [^sb-cost]: Supabase, "Cost Control - Spend Cap," Supabase Docs. https://supabase.com/docs/guides/platform/cost-control
 [^sb-billing-faq]: Supabase, "Billing FAQ," Supabase Docs. https://supabase.com/docs/guides/platform/billing-faq
 [^lab-downtime]: supabase-lab, "Platform-downtime experiment," supabase-lab runlog, including the 2026-10-23 data-path re-measure. https://github.com/erfianugrah/supabase-lab/blob/4141477/experiments/platform-downtime/RUNLOG.md
-[^lab-compute-d09]: supabase-lab, "Compute-disk experiment," supabase-lab runlog, section "2026-10-13 - D09 re-run after the explicit Data API grant". https://github.com/erfianugrah/supabase-lab/blob/4141477/experiments/compute-disk/RUNLOG.md
+[^lab-compute-d09]: supabase-lab, "Compute-disk experiment," supabase-lab runlog, section "2026-10-23 - D09 outage accounting fixed; a resize is minutes down, not seconds" (2026-10-23; supersedes the section "2026-10-13 - D09 re-run after the explicit Data API grant" at https://github.com/erfianugrah/supabase-lab/blob/4141477/experiments/compute-disk/RUNLOG.md). https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/compute-disk/RUNLOG.md
 [^lab-restore]: supabase-lab, "Restore-paths experiment," supabase-lab runlog, runs R4 and R5 (2026-10-10). https://github.com/erfianugrah/supabase-lab/blob/b292b6b/experiments/restore-paths/RUNLOG.md
 [^lab-oriole]: supabase-lab, "OrioleDB experiment," supabase-lab runlog, OR02 heap-control disk, runs A, B, E and F (2026-10-10). https://github.com/erfianugrah/supabase-lab/blob/b292b6b/experiments/orioledb/RUNLOG.md
