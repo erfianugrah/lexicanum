@@ -235,8 +235,11 @@ const pins: Pin[] = [
       // and n=1 is the honest caveat that stops it being read as a SLA.
       "500 ms",
       "n=1",
-      // Measured, and the most counter-intuitive result here.
-      "REST and Realtime never failed",
+      // Withdrawn 2026-10-23: "REST and Realtime never failed" came from an
+      // anon GET /rest/v1/ (the gateway answers 401 without reaching the
+      // database) and a WebSocket handshake. A row read and a Postgres Changes
+      // join failed with Auth and Storage (supabase-lab, 2026-10-23).
+      "REST and Realtime do go down",
       // The dwell is a test parameter, not a platform property. Losing this
       // sentence turns a chosen constant into a published measurement.
       "artifact of the test",
@@ -261,6 +264,9 @@ const pins: Pin[] = [
       // (~/supabase-lab experiments/platform-downtime). Each of these shipped
       // and each is contradicted by the harness source or RUNLOG.
       //
+      // The 2026-10-23 data-path re-measure contradicts both.
+      "Put the read path on PostgREST",
+      "fail reads over to REST for the window",
       // The hypothesis table listed six; the lede and description said five.
       "and four related ones",
       "Five hypotheses",
