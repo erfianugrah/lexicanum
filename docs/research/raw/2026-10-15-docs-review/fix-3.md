@@ -20,7 +20,7 @@ measures, and one rounding replaced by the measurement it rounded.
   sample at that probe's 500 ms resolution (platform-downtime D03/D04, 2026-08-04; the same
   Micro -> Small resize sampled at 250 ms on another rig shows 1.0 s of contiguous REST
   failure - compute-disk D09, 2026-08-19)". Evidence: `platform-downtime` RUNLOG at the pinned
-  commit 22fac44 ("REST and Realtime never failed under any of the four", 500 ms resolution)
+  commit b100447 ("REST and Realtime never failed under any of the four", 500 ms resolution)
   against `compute-disk` RUNLOG ("upgrade micro->small 105s, max contiguous REST outage 1.0s",
   250 ms sampling). Both figures stay; each now names its sampling resolution.
 - `guides/supabase-preview-branch-compute.mdx:645` (practice row) - "1.0 s of contiguous failure
@@ -32,7 +32,7 @@ measures, and one rounding replaced by the measurement it rounded.
   hangs in pg_subscription_rel state `d` ... Instance size is not the variable" -> same two
   states, now scoped and attributed: "on those platform-managed schemas the sync never
   completes: ... (edge-resilience W14, 2026-08-15, a manual drill)". Evidence: the
-  `edge-resilience` RUNLOG at f703393, W05 ("Initial sync ~3.1-6.5s", public tables) against
+  `edge-resilience` RUNLOG at 6d42c55, W05 ("Initial sync ~3.1-6.5s", public tables) against
   W14 ("auth.* with copy_data=true: initial sync stalls in 'd' at any size"; the wall is
   specific to platform-managed schemas). This is what reconciles the hang with the
   successful 3.1-6.5s / 22.7s / 12.5s initial-sync figures earlier in the same doc.
@@ -43,7 +43,7 @@ measures, and one rounding replaced by the measurement it rounded.
 - `guides/supabase-platform-management-api.mdx:316-322` - "parked 2026-09-09 and read back 13
   days later" -> "parked 2026-09-09 and read back on 2026-09-23 (the lab's 13-day check-back)".
   The 13-day figure is kept because the source carries it: the `s2z-wake` RUNLOG at the pinned
-  commit 9d27845 ("## 2026-09-23 - the check-back, 13 days in"; "Both fleets were parked
+  commit 7dd32bd ("## 2026-09-23 - the check-back, 13 days in"; "Both fleets were parked
   2026-09-09 and read back 13 days later"). The two dates are 14 calendar days apart, which is
   exactly why the end date and the label are now in the sentence. The evidence row at line 396
   and the practice row at line 446 are unchanged and still read consistently against it.
@@ -91,7 +91,7 @@ workflow files, `supabase/config.toml`, `supabase/seed.sql`, `supabase/.env.prev
 ### guides/supabase-region-migration-e2e.mdx
 D: the W05 date reconciled with a preamble sentence on the `## Modules` table (line 602):
 artifact cells date the battery re-run, the prose date is the module's first run. Evidence:
-the `edge-resilience` RUNLOG at f703393 dates W05 2026-08-15 ("## W05 - standby replication +
+the `edge-resilience` RUNLOG at 6d42c55 dates W05 2026-08-15 ("## W05 - standby replication +
 token portability (2026-08-15, green)") and both the 2026-08-16 and 2026-08-17 batteries
 re-ran W01-W13 / W01-W26, so both Artifact links are correct for the module; `out/2026-08-15`
 does not exist in the experiment's `out/` (the 08-15 battery artifact is

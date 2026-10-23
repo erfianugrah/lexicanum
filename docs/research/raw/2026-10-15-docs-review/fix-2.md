@@ -9,16 +9,16 @@ Files edited: 19 of the 23 in `batches/batch-2.txt`. No git operations run.
 (path:line before -> after - evidence)
 
 - `guides/supabase-own-postgrest.mdx` (8 pins: practice rows 197-198, File
-  reference 221, Modules rows 236-237): commit `92f3469` -> `f703393`.
+  reference 221, Modules rows 236-237): commit `59442b9` -> `6d42c55`.
   Evidence: GitHub API, one blob sha per path at both refs -
   `experiments/security-lockdown/tests/s04-self-hosted-postgrest.ts`,
   `s20-xff-trust-boundary.ts`, `s05-rate-limit.ts`, `s06-postgrest-role.ts`,
-  `ratelimit.nginx.conf`, `edge.nginx.conf` are byte-identical at `92f3469`,
-  `f703393` (and `a07de3d`), so the cited content is unchanged at the newer
-  commit; `f703393` is later (2026-09-14 vs 2026-09-03) and the page already
+  `ratelimit.nginx.conf`, `edge.nginx.conf` are byte-identical at `59442b9`,
+  `6d42c55` (and `e8a852b`), so the cited content is unchanged at the newer
+  commit; `6d42c55` is later (2026-09-14 vs 2026-09-03) and the page already
   pinned its S16/S20 rows there.
 - `guides/supabase-iap-data-api.mdx` (3 pins: practice row 154, Module rows,
-  the experiment tree link at 167): `a07de3d` -> `f703393`. Same evidence:
+  the experiment tree link at 167): `e8a852b` -> `6d42c55`. Same evidence:
   `tests/l10-tpa-iap-issuer.ts` and `tests/l10e-labissuer-admit.ts` are
   byte-identical at both refs; the page already pinned L07/L08 there.
 - `guides/self-host-matrix.mdx` Resource summary total row: CPU limit
@@ -194,7 +194,7 @@ Files edited: 19 of the 23 in `batches/batch-2.txt`. No git operations run.
 - `prose-lint --config .prose-lint.json --before HEAD --no-max <23 files>`:
   no fact drift except the intended commit-pin replacements - `fact-retention`
   FAILs on `supabase-iap-data-api` (3 of 101 facts) and `supabase-own-postgrest`
-  (9 of 169), and every dropped item is one of the old `a07de3d` / `92f3469`
+  (9 of 169), and every dropped item is one of the old `e8a852b` / `59442b9`
   URLs replaced by the new pin (blob identity verified above). Plus the three
   pre-existing gates below.
 - `prose-lint --config .prose-lint.json --no-max --no-counters --baseline .prose-terms-baseline.json <23 files>`: no terms rotation; the
