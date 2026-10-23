@@ -70,6 +70,21 @@ const CHOOSING_SECRETS_BACKEND = "reference/choosing-a-secrets-backend";
 const SOPS_COMPOSE = "guides/sops-age-compose-stacks";
 
 const pins: Pin[] = [
+  // The Hyperdrive connection budget (supabase-lab hyperdrive-direct H02/H03).
+  // Review 2026-10-23 found the first draft advising "terminate the Hyperdrive
+  // roles' backends" to free slots, which no run measured (the next burst
+  // reopened 60), and the 21-minute budget stated as a result rather than a
+  // design choice from one run. The TL;DR and setup step link the anchor.
+  {
+    doc: "reference/cloudflare-supabase-architecture",
+    mustContain: [
+      "Do not terminate `authenticator` backends to free slots",
+      "is a design choice built on that one run",
+    ],
+    mustNotContain: ["terminate the Hyperdrive roles' backends"],
+    sections: [/^### Connection budget with the Data API$/m],
+    anchors: ["connection-budget-with-the-data-api"],
+  },
   // The two PrivateLink docs went unpinned through the corrections that made
   // them worth reading, and the gap showed: the evidence table said "5
   // API-triggered restarts" while its own prose described three by psql plus
