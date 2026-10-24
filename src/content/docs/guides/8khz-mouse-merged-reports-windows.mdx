@@ -1,0 +1,236 @@
+---
+title: Fixing merged reports from an 8 kHz mouse on Windows
+description: Diagnosing and fixing the count spikes an 8 kHz mouse shows in MousePlotter on Windows 10 - reports that carry 2-4 polls of motion because the host serviced the USB controller late. Count the merged reports from the export, rule out USB filter drivers such as USBPcap, capture a DPC/ISR trace with WPR (and get past its 0x80010106 stop failure), read it with xperf, and pin the mouse's xHCI controller interrupts to a CPU the GPU driver does not use.
+author: "Erfi Anugrah"
+category: workstations
+---
+
+An 8 kHz mouse sends a report every 125 us. When Windows services the USB controller late, the mouse cannot send on time, so the next report carries the motion of two to four polls. In MousePlotter that shows as isolated dots far outside the counts band, and the counts axis stretches until the normal trace is a solid block. This guide takes one such machine from 66.5 merged reports a minute to zero: it measures the problem from the export, removes a USB filter driver that made it worse, traces where the delay comes from, and moves the mouse's controller interrupts off the CPU the GPU driver uses.
+
+Prerequisites: admin PowerShell on the Windows box, MousePlotter run elevated (it needs ETW for kernel timestamps), and the Windows Performance Toolkit for the trace step. The numbers are from one machine, measured on 2026-10-16 and 2026-10-24; the closing sections say what was and was not shown.
+
+## Constants (read this first)
+
+### The rig (measured example)
+
+| Piece | Detail |
+|---|---|
+| Board | ASUS ROG Strix X670E-I (AM5) |
+| CPU | AMD Ryzen 7 7800X3D, 8 cores / 16 threads |
+| GPU | NVIDIA GeForce RTX 5090, driver 32.0.16.1742 |
+| OS | Windows 10 22H2 (build 19045) |
+| Mouse | Endgame Gear OP1 8k v2, wired, 8000 Hz, 800 CPI |
+| Second mouse | Pulsar X2 CL with the Pulsar 8K dongle |
+| Mouse controller | AMD USB 3.10 xHCI, `PCI\VEN_1022&DEV_15B7`, CPU-attached, mouse alone on it |
+| Recorder | MousePlotter 1.1, kernel event time (ETW) |
+
+### What the export can tell you
+
+Every MousePlotter HTML export embeds the raw CSV: per report, `x`, `y`, `eventTime (ms)` (kernel, from ETW) and `userTime (ms)` (user space). Three numbers separate the failure modes:
+
+| Number | Definition | Healthy 8 kHz |
+|---|---|---|
+| Merged reports | Moving reports (4+ counts) carrying more than 2.5x the median motion of the 21 reports around them | 0 |
+| Bunched deliveries | Intervals under 40 % of the median interval (several reports delivered together) | about 1 a minute |
+| Off-band intervals | Intervals outside the median +-20 % | about 30 a minute |
+
+A merged report points the same way as the motion around it and carries 2.5-3.5x the local median; a sensor glitch would not. On the bad runs here, 97 % of the outliers matched that shape and sat right after a run of late (0.25-0.5 ms) or bunched deliveries. That pattern means the host was late, not the mouse.
+
+### Why a late DPC means a merged report
+
+| Constant | Value | Why it matters |
+|---|---|---|
+| Poll interval at 8 kHz | 125 us | Any delay longer than this misses a poll |
+| DPC ordering | DPCs queued on one CPU run one after another | A long DPC from another driver delays the USB completion queued behind it |
+| Where a DPC runs | Normally on the CPU that took the interrupt | Moving a device's interrupt moves its DPCs with it |
+| Windows 10 raw input | Background raw-input listeners get every report | Windows 11 throttles background listeners to about 125 Hz (KB5028185); Windows 10 22H2 does not[^boosterx-raw] |
+
+### The numbers to expect
+
+OP1, 60 s of fast circles, quiet host (browser, Discord and WSL closed):
+
+| Config | Off-band /min | Bunched /min | Merged /min | Max counts in one report |
+|---|---|---|---|---|
+| Baseline 2026-10-16 | 31 | 1 | 0 | 15 |
+| USBPcap filter installed | 769 | 135 | 66.5 | 75 |
+| USBPcap removed from the mouse's hub | 251 | 46 | 16.8 | 50 |
+| + reboot (filter gone from every hub), Windows Sandbox off | 126 | 19 | 10.1 | 38 |
+| + controller pinned to CPU 4 | 112 | 32 | 0.0 | 31 |
+| Controller pinned to CPU 6 (final) | 123 | 13 | 0.0 | 17 |
+
+The pin removes the merged reports. It does not bring the timing back to the 2026-10-16 baseline; see [What is left](#what-is-left).
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  mouse [label="8 kHz mouse"];
+  xhci [label="xHCI controller\n15B7"];
+  gpu [label="GPU\n(cursor redraw per report)"];
+  cpu0 [label="CPU 0\nNVIDIA DPCs + GPU ISRs"];
+  cpu6 [label="CPU 6\nUSB ISR + DPCs (after pin)"];
+  app [label="MousePlotter / game"];
+  mouse -> xhci [label="report every 125 us"];
+  xhci -> cpu0 [label="before: shared", style=dashed];
+  xhci -> cpu6 [label="after: pinned"];
+  gpu -> cpu0;
+  cpu6 -> app;
+}
+```
+
+Text version: the mouse's controller raised its interrupts on CPU 0, where the NVIDIA driver's DPCs and the GPU's interrupts also ran, so a long NVIDIA DPC held the USB completion. After the pin, the controller's interrupts and DPCs run on CPU 6 and the GPU work stays on CPU 0.
+
+## Part 1: measure the merged reports
+
+1. Close what you can: browsers, Discord, Steam, tray apps. On Windows 10 each of them receives every raw mouse report. Shut WSL down if you use it (`wsl --shutdown`); its memory reclaim caused 5 s stalls on this machine earlier.
+2. Run MousePlotter elevated, set its DPI field to the mouse's real CPI, record 60 s of continuous fast circles and sweeps, and Export.
+3. Pull the CSV out of the export into `run.csv` (it is embedded in the HTML), then count:
+
+```sql
+-- duckdb: merged reports, bunched and off-band intervals per minute
+create table d as select row_number() over () i, x, y,
+  "eventTime (ms)" t,
+  "eventTime (ms)" - lag("eventTime (ms)") over () dt,
+  sqrt(x*x + y*y) cnt
+  from read_csv('run.csv');
+create table f as select *, median(cnt) over (order by i rows between 10 preceding and 10 following) loc
+  from d where t > 1000 and t < (select max(t) - 1000 from d);
+select
+  round(count(*) filter (where dt < 0.8*m or dt > 1.2*m) * 60000.0 / any_value(span)) off_band_per_min,
+  round(count(*) filter (where dt < 0.4*m) * 60000.0 / any_value(span)) bunched_per_min,
+  round(count(*) filter (where cnt >= 4 and cnt > 2.5 * greatest(loc, 4)) * 60000.0 / any_value(span), 1) merged_per_min,
+  round(max(cnt)) max_counts
+from f, (select median(dt) m, max(t) - min(t) span from f) q;
+```
+
+Merged reports above zero, with gaps over 0.4 ms staying rare, is the signature this guide fixes. Large gaps (1-6 ms) arriving on a fixed period are a different problem: a timer stalling the whole system.
+
+## Part 2: remove USB filter drivers
+
+A class filter on the USB host-controller class sits in the stack of every root hub and every USB device. On this machine USBPcap (installed for protocol captures) was the only non-Microsoft one, and removing it cut merged reports from 66.5 to 16.8 a minute.
+
+Check what is registered:
+
+```powershell
+(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{36FC9E60-C465-11CF-8056-444553540000}').UpperFilters
+```
+
+To take USBPcap out without uninstalling it, remove it from that value, then restart each root hub that carries it (devices behind the hub drop for about a second):
+
+```powershell
+$k = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{36FC9E60-C465-11CF-8056-444553540000}'
+$rest = @((Get-ItemProperty $k).UpperFilters | Where-Object { $_ -ne 'USBPcap' })
+if ($rest) { Set-ItemProperty $k UpperFilters $rest } else { Remove-ItemProperty $k UpperFilters }
+Get-PnpDevice -PresentOnly | Where-Object InstanceId -like 'USB\ROOT_HUB*' | ForEach-Object { pnputil /restart-device $_.InstanceId }
+```
+
+Windows can refuse a restart while a device behind the hub is in use (an audio interface was, here); that hub keeps the filter until a reboot. Check a hub's stack with `Get-PnpDeviceProperty -InstanceId <hub> DEVPKEY_Device_Stack`.
+
+:::caution
+Do not disable the USBPcap service while it is still listed in UpperFilters. Windows then cannot load the filter and the USB stack fails to start, which can leave you without keyboard and mouse. Change the registry value, not the service.
+:::
+
+## Part 3: trace the DPCs and interrupts
+
+The Windows Performance Toolkit installs alone from the ADK, without the rest of it:
+
+```powershell
+winget install --id Microsoft.WindowsADK --override "/features OptionId.WindowsPerformanceToolkit /quiet"
+```
+
+Record a trace across a MousePlotter run. Use `GeneralProfile`: the built-in `CPU` profile has no DPC or interrupt events (check with `wpr -profiledetails`).
+
+```powershell
+wpr -start GeneralProfile
+# record in MousePlotter for 60 s
+wpr -stop "$env:USERPROFILE\Downloads\mouse-dpc.etl" -skipPdbGen
+```
+
+A plain `wpr -stop` failed every time on this machine with `Cannot change thread mode after it is set` (0x80010106), and the session kept recording afterwards. Adding `-skipPdbGen` (skip the PDB/NGEN merge, which a DPC/ISR summary does not need) made the stop succeed. An unelevated `wpr -status` does not see the elevated session; check from the admin window, and `wpr -cancel` a leftover session before the next measurement, or that measurement runs under the trace.
+
+Tracing costs MousePlotter its kernel timestamps: thousands of rows fall back to user-space time, so the timing columns of a traced run are not comparable. Measure in an untraced run first, trace in a second one. The merged count uses report counts, not timestamps, so it stays valid under a trace.
+
+Summarise per driver and per CPU:
+
+```powershell
+& "C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe" -i mouse-dpc.etl -o dpcisr.txt -a dpcisr -summary
+```
+
+On this machine (628 s trace):
+
+| Module | DPCs | DPC time CPU 0 / CPU 1 | Long DPCs |
+|---|---|---|---|
+| USBXHCI.SYS (USB controllers) | 432,164 | 4.48 s / 0.76 s | 32 of 128-256 us, 1 of 256-512 us |
+| nvlddmkm.sys (NVIDIA driver) | 227,323 | 4.18 s / 0.19 s | 3,827 of 128-256 us, 13 of 256-512 us, 1 of 0.5-1 ms, 1 of 1-2 ms, 16 of 2-4 ms |
+| storport.sys (NVMe) | 187,087 | 0.14 s / 0.21 s (spread over all cores) | 12 of 128-256 us, 7 of 256-512 us |
+
+The GPU's interrupts (dxgkrnl.sys ISR, 3.67 s) ran on CPU 0 as well. USB and NVIDIA sharing a CPU, with thousands of NVIDIA DPCs longer than one poll interval, is what to look for. The GPU is busy during a recording because Windows redraws the cursor for every report.
+
+## Part 4: pin the controller interrupts
+
+Microsoft documents a per-device affinity policy under the device's registry key[^ms-irq-affinity]: `DevicePolicy` 4 (`IrqPolicySpecifiedProcessors`) plus `AssignmentSetOverride`, a KAFFINITY mask with bit i for logical processor i. Microsoft recommends the default policy where it applies, so keep the revert at hand.
+
+Find the controller the mouse is on (here `PCI\VEN_1022&DEV_15B7`), then:
+
+```powershell
+$id  = (Get-PnpDevice -PresentOnly | Where-Object InstanceId -like 'PCI\VEN_1022&DEV_15B7*').InstanceId
+$key = "HKLM:\SYSTEM\CurrentControlSet\Enum\$id\Device Parameters\Interrupt Management\Affinity Policy"
+$cpu = 6
+New-Item -Path $key -Force | Out-Null
+New-ItemProperty -Path $key -Name DevicePolicy -PropertyType DWord -Value 4 -Force | Out-Null
+New-ItemProperty -Path $key -Name AssignmentSetOverride -PropertyType Binary -Value ([BitConverter]::GetBytes([uint64]1 -shl $cpu)) -Force | Out-Null
+pnputil /restart-device $id
+```
+
+The controller restart was enough here; no reboot. Pick a logical CPU the GPU driver does not use (in the trace above that was everything except CPU 0 and CPU 1). Revert with `Remove-ItemProperty -Path $key -Name DevicePolicy, AssignmentSetOverride` and the same restart.
+
+Confirm with a second trace: on this machine USBXHCI.SYS DPCs moved to 4.37 of 4.39 s on the pinned CPU, its ISR with them, while nvlddmkm.sys and dxgkrnl.sys stayed on CPU 0.
+
+## Verification
+
+| Check | How | Expected |
+|---|---|---|
+| Filter gone | `UpperFilters` value from Part 2; `DEVPKEY_Device_Stack` of each root hub | no USBPcap |
+| Pin set | `Get-ItemProperty $key` | `DevicePolicy 4`, mask with one bit |
+| Pin active | xperf dpcisr on a new trace | USBXHCI.SYS DPC time on the pinned CPU |
+| Merged reports | Part 1 query on an untraced 60 s run | 0.0 /min |
+
+On this machine merged reports were 0.0 a minute in four runs in a row after the pin (CPU 4 twice, CPU 6, and one traced run with the second mouse).
+
+## What is left
+
+After the pin the export still shows scattered single reports 0.25-0.5 ms late: 3.4-6.3 a minute over 0.4 ms, worst 0.58 ms, none over 1 ms, with off-band intervals at 112-123 a minute against 31 on 2026-10-16. Two things were ruled out:
+
+- Which core handles USB: CPU 4 and CPU 6 differ in both directions (gaps over 0.4 ms 6.3 vs 3.4 a minute, over 0.2 ms 65 vs 100).
+- Other DPCs on the pinned CPU: in the trace, CPU 4 ran 4.37 s of USB DPCs and 0.036 s of anything else.
+
+Finding the rest needs a trace lined up event by event with a recording, which the timestamp fallback above makes awkward. It is open.
+
+## Gotchas and lessons learned
+
+- **Disabling processor idle made it much worse.** `powercfg /setacvalueindex scheme_current sub_processor IDLEDISABLE 1` (no C-states on any CPU) took gaps over 0.4 ms from 3.4 to 47.9 a minute, worst 4.25 ms, and WSL would not start until it was reverted. The cause was not investigated; one candidate is the idle loop spinning on every thread, so the pinned CPU's SMT sibling competes for the core. Do not use it as a latency tweak without measuring.
+- **Change one thing per run, and record the conditions.** The reboot run changed two things at once (filter gone from the last hub, Windows Sandbox disabled) and cannot say which helped.
+- **A traced run is a diagnosis run, not a measurement.** Its timing is distorted; only the merged count survives.
+- **The Steam friends-list stutter is a different problem.** It is real in games that poll the friends list with hundreds of friends; it does not explain count spikes in MousePlotter.
+- **Keep the mouse alone on its controller.** A keyboard on the same controller shares its interrupt path; check with the PnP parent chain of each USB device.
+
+## File reference
+
+| Path or object | What it is |
+| --- | --- |
+| `HKLM\SYSTEM\CurrentControlSet\Control\Class\{36FC9E60-C465-11CF-8056-444553540000}\UpperFilters` | USB host-controller class filters; USBPcap registers here |
+| `HKLM\SYSTEM\CurrentControlSet\Enum\<controller>\Device Parameters\Interrupt Management\Affinity Policy` | `DevicePolicy` and `AssignmentSetOverride` for the pin |
+| `wpr -start GeneralProfile` / `wpr -stop <file> -skipPdbGen` | Trace capture with DPC and interrupt events |
+| `xperf -i <file> -a dpcisr -summary` | Per-module, per-CPU DPC and ISR totals with duration histograms |
+| MousePlotter export (HTML) | Embedded per-report CSV with kernel and user-space timestamps |
+
+## Related docs
+
+The same machine's 10GbE adapter tuning, including the powercfg and Device Manager power settings it shares with this setup, is in [Tuning a 10GbE link end to end](/guides/10gbe-link-tuning/). Another WSL2-on-Windows host issue on this box: [Reclaiming WSL2 disk space](/guides/wsl2-disk-reclaim/).
+
+[^boosterx-raw]: BoosterX, "Background Raw Input listeners in Windows 10 and Windows 11," BoosterX Wiki. https://wiki.boosterx.org/en/windows-research/input/background-raw-input-throttling/
+[^ms-irq-affinity]: Microsoft, "Interrupt Affinity," Microsoft Learn. https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/interrupt-affinity-and-priority
