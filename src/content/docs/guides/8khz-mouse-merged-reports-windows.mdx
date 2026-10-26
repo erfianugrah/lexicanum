@@ -7,7 +7,7 @@ category: workstations
 
 An 8 kHz mouse sends a report every 125 us. When Windows services the USB controller late, the mouse cannot send on time, so the next report carries the motion of two to four polls. In MousePlotter that shows as isolated dots far outside the counts band, and the counts axis stretches until the normal trace is a solid block. This guide takes one such machine from 66.5 merged reports a minute to zero: it measures the problem from the export, removes a USB filter driver that made it worse, traces where the delay comes from, moves the mouse's controller interrupts off the CPU the GPU driver uses, and then reserves that CPU so nothing else is scheduled there, which removed the remaining timing jitter.
 
-Prerequisites: admin PowerShell on the Windows box, MousePlotter run elevated (it needs ETW for kernel timestamps), and the Windows Performance Toolkit for the trace step. The numbers are from one machine, measured on 2026-10-16, 2026-10-24 and 2026-10-26; the closing sections say what was and was not shown.
+Prerequisites: admin PowerShell on the Windows box (Windows PowerShell 5.1 is enough; every snippet below was run on this machine), MousePlotter run elevated (it needs ETW for kernel timestamps), DuckDB to count the results (`winget install DuckDB.cli`), and the Windows Performance Toolkit for the trace step. The numbers are from one machine, measured on 2026-10-16, 2026-10-24 and 2026-10-26; the closing sections say what was and was not shown.
 
 ## Constants (read this first)
 
@@ -91,24 +91,38 @@ Text version: the mouse's controller raised its interrupts on CPU 0, where the N
 
 1. Close what you can: browsers, Discord, Steam, tray apps. On Windows 10 each of them receives every raw mouse report. Shut WSL down if you use it (`wsl --shutdown`); its memory reclaim caused 5 s stalls on this machine earlier.
 2. Run MousePlotter elevated, set its DPI field to the mouse's real CPI, record 60 s of continuous fast circles and sweeps, and Export.
-3. Pull the CSV out of the export into `run.csv` (it is embedded in the HTML), then count:
+3. Pull the CSV out of the export. MousePlotter embeds it in a `<script type="application/csv" id="embeddedCsv">` block; its first two lines are the device name and the DPI field, then a normal header (`xCount,yCount,eventTime (ms),userTime (ms),timestampSource`). In PowerShell, from an empty working folder:
+
+```powershell
+$export = "$env:USERPROFILE\Downloads\<your export>.html"
+$html = Get-Content -Raw -Encoding UTF8 $export
+$m = [regex]::Match($html, '(?s)<script type="application/csv" id="embeddedCsv">(.*?)</script>')
+$lines = $m.Groups[1].Value.Trim() -split "`r?`n"
+"device: $($lines[0]), DPI field: $($lines[1])"
+$lines | Select-Object -Skip 2 | Set-Content -Encoding ascii run.csv
+```
+
+4. Count, with `duckdb` started in the same folder (the first and last second are left out: lift-off and stop artifacts):
 
 ```sql
--- duckdb: merged reports, bunched and off-band intervals per minute
-create table d as select row_number() over () i, x, y,
+-- gaps over 0.4 ms, off-band and bunched intervals, merged reports, per minute
+create table d as select row_number() over () i, xCount x, yCount y,
   "eventTime (ms)" t,
   "eventTime (ms)" - lag("eventTime (ms)") over () dt,
-  sqrt(x*x + y*y) cnt
+  sqrt(xCount*xCount + yCount*yCount) cnt
   from read_csv('run.csv');
 create table f as select *, median(cnt) over (order by i rows between 10 preceding and 10 following) loc
   from d where t > 1000 and t < (select max(t) - 1000 from d);
 select
+  round(count(*) filter (where dt > 0.4) * 60000.0 / any_value(span), 1) gaps_over_04ms_per_min,
   round(count(*) filter (where dt < 0.8*m or dt > 1.2*m) * 60000.0 / any_value(span)) off_band_per_min,
   round(count(*) filter (where dt < 0.4*m) * 60000.0 / any_value(span)) bunched_per_min,
   round(count(*) filter (where cnt >= 4 and cnt > 2.5 * greatest(loc, 4)) * 60000.0 / any_value(span), 1) merged_per_min,
   round(max(cnt)) max_counts
 from f, (select median(dt) m, max(t) - min(t) span from f) q;
 ```
+
+On a clean run here (2026-10-26 10:01) that prints 0.0, 16, 0, 0.0 and 14.
 
 Merged reports above zero, with gaps over 0.4 ms staying rare, come from a host that services the controller late. Large gaps (1-6 ms) arriving on a fixed period are a different problem: a timer stalling the whole system.
 
@@ -177,7 +191,17 @@ The GPU's interrupts (dxgkrnl.sys ISR, 3.67 s) ran on CPU 0 as well. USB and NVI
 
 valleyofdoom's PC-Tuning guide recommends this for xHCI controllers (move them to an underused CPU, check the result with an xperf DPC/ISR report, keep each ISR and its DPC on the same CPU)[^pctuning-kms]. Microsoft documents the per-device affinity policy under the device's registry key[^ms-irq-affinity]: `DevicePolicy` 4 (`IrqPolicySpecifiedProcessors`) plus `AssignmentSetOverride`, a KAFFINITY mask with bit i for logical processor i. Microsoft recommends the default policy where it applies, so keep the revert at hand.
 
-Find the controller the mouse is on (here `PCI\VEN_1022&DEV_15B7`), then:
+Find the controller each USB device hangs off by walking its PnP parents up to the PCI device (about 20 s, `Get-PnpDeviceProperty` is slow). Match the mouse by its `VID_xxxx&PID_xxxx` (the OP1 is `VID_3367&PID_1978`):
+
+```powershell
+Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -match '^USB\\VID_[0-9A-F]{4}&PID_[0-9A-F]{4}\\' } | ForEach-Object {
+  $id = $_.InstanceId
+  while ($id -and $id -notlike 'PCI\*') { $id = (Get-PnpDeviceProperty -InstanceId $id -KeyName DEVPKEY_Device_Parent).Data }
+  [pscustomobject]@{ Controller = ($id -split '\\')[1] -replace '&SUBSYS.*'; Device = $_.FriendlyName; Id = $_.InstanceId }
+} | Sort-Object Controller, Device | Format-Table -AutoSize
+```
+
+The mouse should be the only device on its controller; move other devices to other ports until it is. Here the OP1 was alone on `VEN_1022&DEV_15B7` (a CPU-attached controller); the keyboard and hubs sat on `DEV_15B8`, the audio interfaces, webcam and Bluetooth on the chipset's `DEV_43F7`. Then pin it:
 
 ```powershell
 $id  = (Get-PnpDevice -PresentOnly | Where-Object InstanceId -like 'PCI\VEN_1022&DEV_15B7*').InstanceId
@@ -206,9 +230,45 @@ New-ItemProperty -Path $k -Name ReservedCpuSets -PropertyType Binary -Value ([Bi
 Restart-Computer
 ```
 
-Reserve the CPU the controller is pinned to and its SMT sibling (here CPU 6 and CPU 7, two threads of one core). Never reserve CPU 0. A restart applies it.
+Reserve the CPU the controller is pinned to and its SMT sibling (here CPU 6 and CPU 7, two threads of one core). Never reserve CPU 0. A restart applies it. To see which logical CPUs share a core, ask Windows (`GetLogicalProcessorInformation`[^ms-glpi]):
 
-Check that it took: put a busy thread on every CPU for about 10 s (CpuStres from Sysinternals, or any load tool) and watch per-CPU usage in Task Manager. Here CPUs 6 and 7 stayed at 0 % while the other 14 ran at 100 %. The ReservedCpuSets README says older Windows 10 builds need another route (NtSetSystemInformation); 22H2 (build 19045) honoured the registry value. Revert with `Remove-ItemProperty -Path $k -Name ReservedCpuSets` and a restart.
+```powershell
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class Topo {
+  [DllImport("kernel32.dll")] static extern bool GetLogicalProcessorInformation(IntPtr buf, ref uint len);
+  public static string[] Cores() {   // SYSTEM_LOGICAL_PROCESSOR_INFORMATION is 32 bytes on x64
+    uint len = 0; GetLogicalProcessorInformation(IntPtr.Zero, ref len);
+    IntPtr p = Marshal.AllocHGlobal((int)len); var r = new System.Collections.Generic.List<string>();
+    GetLogicalProcessorInformation(p, ref len);
+    for (int off = 0; off + 32 <= len; off += 32) {
+      long mask = Marshal.ReadInt64(p, off);
+      if (Marshal.ReadInt32(p, off + 8) != 0) continue;   // 0 = RelationProcessorCore
+      var cpus = new System.Collections.Generic.List<string>();
+      for (int i = 0; i < 64; i++) if ((mask >> i & 1) == 1) cpus.Add(i.ToString());
+      r.Add("core: CPUs " + string.Join(", ", cpus));
+    }
+    Marshal.FreeHGlobal(p); return r.ToArray();
+  }
+}
+'@
+[Topo]::Cores()
+```
+
+On the 7800X3D that prints eight lines, `core: CPUs 0, 1` to `core: CPUs 14, 15`.
+
+Check that it took: start one busy loop per logical CPU and read per-CPU usage while they run (about 30 s):
+
+```powershell
+$jobs = 1..[Environment]::ProcessorCount | ForEach-Object { Start-Job { $end = (Get-Date).AddSeconds(20); while ((Get-Date) -lt $end) { } } }
+Start-Sleep -Seconds 8
+(Get-Counter '\Processor(*)\% Processor Time' -SampleInterval 1 -MaxSamples 5).CounterSamples |
+  Group-Object InstanceName | Where-Object Name -ne '_total' | Sort-Object { [int]$_.Name } |
+  ForEach-Object { 'CPU {0,-3} {1,5:N0} %' -f $_.Name, ($_.Group | Measure-Object CookedValue -Average).Average }
+$jobs | Wait-Job | Remove-Job
+```
+
+Here CPUs 6 and 7 stayed at 1 % while the others ran at 8-85 % (the loops do not fill every CPU evenly; what matters is that the reserved pair stays idle). Without the reservation they are loaded like the rest. The ReservedCpuSets README says older Windows 10 builds need another route (NtSetSystemInformation); 22H2 (build 19045) honoured the registry value. Revert with `Remove-ItemProperty -Path $k -Name ReservedCpuSets` and a restart.
 
 The restart that activated the reservation also carried two smaller changes (Phone Link removed, HVCI and NetBIOS explicitly off), which were not tested on their own. BIOS Global C-state Control was tested both ways afterwards and made no difference (table above).
 
@@ -239,7 +299,7 @@ Mechanism (reasoned from the data): the mouse builds reports on its own clock in
 - **Change one thing per run, and record the conditions.** The reboot run changed two things at once (filter gone from the last hub, Windows Sandbox disabled) and cannot say which helped.
 - **A traced run is a diagnosis run, not a measurement.** Its timing is distorted; only the merged count survives.
 - **The Steam friends-list stutter is a different problem.** It is real in games that poll the friends list with hundreds of friends; it does not explain count spikes in MousePlotter.
-- **Keep the mouse alone on its controller.** A keyboard on the same controller shares its interrupt path; check with the PnP parent chain of each USB device.
+- **Keep the mouse alone on its controller.** A keyboard on the same controller shares its interrupt path; the controller list in Part 4 shows what shares it.
 
 ## File reference
 
@@ -259,4 +319,5 @@ The same machine's 10GbE adapter tuning, including the powercfg and Device Manag
 [^pctuning-kms]: valleyofdoom, "11.43. Kernel-Mode Scheduling (Interrupts, DPCs and more)," PC-Tuning, GitHub. https://github.com/valleyofdoom/PC-Tuning#kernel-mode-scheduling-interrupts-dpcs-and-more
 [^ms-idlestatemax]: Microsoft, "Mitigation for AMD Family 17h Models 30h-3Fh (Rome) erratum 1474," Microsoft Learn (previous versions). https://learn.microsoft.com/en-us/previous-versions/troubleshoot/windows-server/mitigation-for-amd-family-17h-models-30h-3fh-rome-erratum-1474
 [^reservedcpusets]: valleyofdoom, "ReservedCpuSets," GitHub. https://github.com/valleyofdoom/ReservedCpuSets
+[^ms-glpi]: Microsoft, "GetLogicalProcessorInformation function (sysinfoapi.h)," Microsoft Learn. https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getlogicalprocessorinformation
 [^ms-irq-affinity]: Microsoft, "Interrupt Affinity," Microsoft Learn. https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/interrupt-affinity-and-priority
