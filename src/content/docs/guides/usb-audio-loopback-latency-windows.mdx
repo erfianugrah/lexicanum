@@ -1,11 +1,11 @@
 ---
 title: Measuring USB audio output latency on Windows with a loopback cable
-description: How long a sound takes from a Windows app to the output of a USB DAC, measured the way games play audio (WASAPI shared mode) with a cable from the DAC into an audio interface and a PowerShell script that times each click with QPC. Reads Windows' engine periods per output, measures a Topping D70 Pro Sabre at 47.3 ms and an SSL 2 at 51.5 ms through the same input, and says what the numbers can and can't separate, including the onboard-vs-USB audio claim.
+description: How long a sound takes from a Windows app to the output of a USB DAC, measured the way games play audio (WASAPI shared mode) with a cable from the DAC into an audio interface and a PowerShell script that times each click with QPC and splits it with the render stream's IAudioClock. A Topping D70 Pro Sabre comes out at 43.0-47.9 ms app to analog, 12 ms of it Windows' queue, with the recorder's own share bounded at 4.8 ms. Also reads Windows' engine periods per output and covers the onboard-vs-USB audio claim.
 author: "Erfi Anugrah"
 category: workstations
 ---
 
-How long does a sound take from a game to my ears through a USB DAC? I wanted a number rather than a forum claim, so this times it with a cable loop: the DAC's output goes into an audio interface, a script plays clicks through the DAC the way most games play audio, and it timestamps when each click comes back in. My D70 path comes out at 47.3 ms, 12 ms of which is Windows' own queue. The catch is that the recording side is part of every number, so this gives an upper bound and a clean comparison between outputs, not one output's absolute latency.
+How long does a sound take from a game to my ears through a USB DAC? I wanted a number rather than a forum claim, so this times it with a cable loop: the DAC's output goes into an audio interface, a script plays clicks through the DAC the way most games play audio, and it timestamps when each click comes back in. My D70 comes out at 43.0-47.9 ms from the app to the DAC's output, 12 ms of which is Windows' own queue. The recording side is part of every loop, so on its own a loop only gives an upper bound, but reading the output driver's clock as well lets you bound the recorder's share, which is how the range comes out.
 
 You'll need Windows PowerShell 5.1 (no admin), an audio interface with a line or mic input, a cable from the output under test into that input, and the script below. Everything was measured on one machine on 2026-10-26.
 
@@ -69,7 +69,7 @@ Text version: the script writes a click into a shared-mode buffer and notes the 
 
 ## Part 2: the script
 
-Save as `audio-loopback.ps1`. It opens the output in shared mode, event-driven, at the default engine period, plays 25 bursts of 2 kHz for 2 ms each, a quarter second apart, and prints each click's latency and the median.
+Save as `audio-loopback.ps1`. It opens the output in shared mode, event-driven, at the default engine period, plays bursts of 2 kHz for 2 ms each, a quarter second apart, and prints each click's latency and the median. It also reads the render stream's `IAudioClock`, whose device position is "the sample that is currently playing through the speakers" with the QPC time it was read[^ms-clock], and interpolates when each click was reported playing. That splits every click into the part up to where the output driver says it's playing and the part after.
 
 ```powershell
 # audio-loopback.ps1 - output latency as a game sees it, measured through a cable loop.
@@ -119,6 +119,8 @@ interface IAudioClient {
   int SetEventHandle(IntPtr h); int GetService(ref Guid iid, [MarshalAs(UnmanagedType.IUnknown)] out object o); }
 [ComImport, Guid("F294ACFC-3146-4483-A7BF-ADDCA7C260E2"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 interface IAudioRenderClient { int GetBuffer(uint frames, out IntPtr data); int ReleaseBuffer(uint frames, uint flags); }
+[ComImport, Guid("CD63314F-3FBA-4A1B-812C-EF96358728E7"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IAudioClock { int GetFrequency(out ulong f); int GetPosition(out ulong pos, out ulong qpc); int GetCharacteristics(out uint c); }
 [ComImport, Guid("C8ADBD64-E71E-48A0-A4DE-185C395CD317"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 interface IAudioCaptureClient {
   int GetBuffer(out IntPtr data, out uint frames, out uint flags, out ulong devPos, out ulong qpcPos);
@@ -184,6 +186,11 @@ public static class Loop {
     log.Add(string.Format("render buffer {0} frames ({1:F2} ms) at {2} Hz, {3} ch; GetStreamLatency {4:F2} ms; device period {5:F2} ms",
       bufFrames, bufFrames * 1000.0 / rrate, rrate, rch, lat / 1e4, dp / 1e4));
     Guid rcid = typeof(IAudioRenderClient).GUID; object ro; Ck(ren.GetService(ref rcid, out ro), "render GetService"); var rc = (IAudioRenderClient)ro;
+    // IAudioClock: device position = "the sample that is currently playing through the speakers", with its QPC time
+    // (https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclock-getposition)
+    Guid ckid = typeof(IAudioClock).GUID; object cko; Ck(ren.GetService(ref ckid, out cko), "render clock"); var clk = (IAudioClock)cko;
+    ulong cfreq; clk.GetFrequency(out cfreq);
+    var clkFrames = new List<double>(); var clkQpc = new List<long>(); var clickFrames = new List<long>(); long written = bufFrames;
     int burst = rrate / 500; // 2 ms
     var writes = new List<long>(); var pads = new List<uint>();
     IntPtr p0; Ck(rc.GetBuffer(bufFrames, out p0), "prefill"); rc.ReleaseBuffer(bufFrames, 2); // 2 = AUDCLNT_BUFFERFLAGS_SILENT
@@ -192,6 +199,7 @@ public static class Loop {
     long t0 = Now(), every = 2500000, warm = 10000000; int sent = 0; long nextAt = t0 + warm;
     while (sent < clicks) {
       ev.WaitOne(200);
+      { ulong cp, cq; if (clk.GetPosition(out cp, out cq) == 0) { clkFrames.Add(cp * (double)rrate / cfreq); clkQpc.Add((long)cq); } }
       uint pad; ren.GetCurrentPadding(out pad); uint avail = bufFrames - pad; if (avail == 0) continue;
       IntPtr data; Ck(rc.GetBuffer(avail, out data), "render GetBuffer");
       var buf = new float[avail * rch];
@@ -199,9 +207,12 @@ public static class Loop {
       if (click) for (int f = 0; f < Math.Min(burst, (int)avail); f++) {
         float v = (float)(amp * Math.Sin(2 * Math.PI * 2000 * f / rrate)); for (int k = 0; k < (leftOnly ? 1 : rch); k++) buf[f * rch + k] = v; }
       Marshal.Copy(buf, 0, data, buf.Length); rc.ReleaseBuffer(avail, 0);
-      if (click) { writes.Add(Now()); pads.Add(pad); sent++; nextAt += every; }
+      if (click) { writes.Add(Now()); pads.Add(pad); clickFrames.Add(written); sent++; nextAt += every; }
+      written += avail;
     }
-    Thread.Sleep(500); ren.Stop(); cap.Stop(); stop = true; th.Join();
+    var tail = Stopwatch.StartNew();
+    while (tail.ElapsedMilliseconds < 500) { ulong cp, cq; if (clk.GetPosition(out cp, out cq) == 0) { clkFrames.Add(cp * (double)rrate / cfreq); clkQpc.Add((long)cq); } Thread.Sleep(2); }
+    ren.Stop(); cap.Stop(); stop = true; th.Join();
     if (capErr != null) throw capErr;
     // onsets: first frame above 25 % of the run's peak, 150 ms refractory
     float peak = 0; foreach (var s in samples) peak = Math.Max(peak, s);
@@ -209,18 +220,30 @@ public static class Loop {
     if (peak < 0.002) { log.Add("no signal on the capture input: check the cable, the input gain and the output volume"); return log.ToArray(); }
     var onsets = new List<long>(); float thr = peak * 0.25f; long last = 0; bool any = false;
     for (int i = 0; i < samples.Count; i++) if (samples[i] >= thr && (!any || times[i] - last > 1500000)) { onsets.Add(times[i]); last = times[i]; any = true; }
-    var lats = new List<double>();
+    var lats = new List<double>(); var winPart = new List<double>(); var hwPart = new List<double>();
     for (int i = 0; i < writes.Count; i++) {
       long w = writes[i]; long hit = -1; foreach (var o in onsets) if (o > w - 50000 && o < w + 2000000) { hit = o; break; } // -5 ms .. +200 ms
       if (hit < 0) { log.Add(string.Format("click {0,2}: not found", i + 1)); continue; }
       double ms = (hit - w) / 1e4; lats.Add(ms);
-      log.Add(string.Format("click {0,2}: {1,7:F2} ms  (queued behind {2} frames = {3:F2} ms)", i + 1, ms, pads[i], pads[i] * 1000.0 / rrate));
+      // when did the render clock reach the click's first frame? interpolate between clock readings
+      double dev = double.NaN; long cf = clickFrames[i];
+      for (int k = 1; k < clkFrames.Count; k++) if (clkFrames[k - 1] < cf && clkFrames[k] >= cf && clkFrames[k] > clkFrames[k - 1]) {
+        dev = clkQpc[k - 1] + (clkQpc[k] - clkQpc[k - 1]) * (cf - clkFrames[k - 1]) / (clkFrames[k] - clkFrames[k - 1]); break; }
+      string split = "";
+      if (!double.IsNaN(dev)) { double a = (dev - w) / 1e4, b = (hit - dev) / 1e4; winPart.Add(a); hwPart.Add(b); split = string.Format("  = {0,6:F2} until the driver reports it playing + {1,6:F2} after", a, b); }
+      log.Add(string.Format("click {0,2}: {1,7:F2} ms  (queued behind {2} frames = {3:F2} ms){4}", i + 1, ms, pads[i], pads[i] * 1000.0 / rrate, split));
     }
     if (lats.Count > 0) {
       lats.Sort(); double sum = 0; foreach (var x in lats) sum += x;
       log.Add(string.Format("RESULT {0}/{1} clicks: median {2:F2} ms, min {3:F2}, max {4:F2}, mean {5:F2}",
         lats.Count, writes.Count, lats[lats.Count / 2], lats[0], lats[lats.Count - 1], sum / lats.Count));
+      log.Add(string.Format("        p25 {0:F2} ms, p75 {1:F2} ms", lats[lats.Count / 4], lats[lats.Count * 3 / 4]));
     }
+    if (winPart.Count > 0) {
+      winPart.Sort(); hwPart.Sort();
+      log.Add(string.Format("SPLIT   app -> render driver reports it playing: median {0:F2} ms; that -> captured: median {1:F2} ms ({2} clicks, render clock {3} Hz)",
+        winPart[winPart.Count / 2], hwPart[hwPart.Count / 2], winPart.Count, cfreq));
+    } else log.Add("SPLIT   render clock gave no usable readings");
     log.Add(string.Format("onsets detected: {0}", onsets.Count));
     return log.ToArray();
   }
@@ -243,35 +266,40 @@ Run it from a normal PowerShell window:
 
 ```powershell
 .\audio-loopback.ps1 -List                                    # endpoint names
-.\audio-loopback.ps1 -Render 'D70' -Capture 'Input 1 (SSL 2'   # 25 clicks
-.\audio-loopback.ps1 -Render 'SSL 2' -Capture 'Input 1 (SSL 2' -LeftOnly
+.\audio-loopback.ps1 -Render 'D70' -Capture 'Input 2 (SSL 2' -Clicks 50
+.\audio-loopback.ps1 -Render 'SSL 2' -Capture 'Input 1 (SSL 2' -LeftOnly -Clicks 50
+.\audio-loopback.ps1 -Render 'SSL 2' -Capture 'Loopback 1' -Clicks 50   # the driver's own loopback, no analog
 ```
 
 `-Render` and `-Capture` match on the endpoint name and have to match exactly one endpoint each. If it says there's no signal, check the cable, the gain and the Windows volume, the script prints the capture peak so you can see how far off it is (below 0.002 counts as no signal; the noise floor here was about 0.0001).
 
 ## Part 3: measure the outputs
 
-My results, 25 clicks each, 48 kHz, default shared-mode period:
+Run the outputs back to back so the comparison holds. My runs, 50 clicks each, 48 kHz, default shared-mode period, one session (2026-10-26, about 17:00):
 
-| Loop | Clicks found | Median | Range |
+| Loop | Total (median, p25-p75) | App -> driver says playing | -> captured |
 |---|---|---|---|
-| D70 XLR out -> SSL 2 Input 1 | 25/25 | 47.33 ms | 47.16-47.54, one at 38.56 |
-| SSL 2 headphone out -> SSL 2 Input 1 (`-LeftOnly`) | 25/25 | 51.51 ms | 50.09-51.61, one at 42.22 |
+| D70 XLR -> SSL 2 Input 2 | 47.88 ms (47.57-48.10) | 42.97 ms | 4.83 ms |
+| SSL 2 headphone -> SSL 2 Input 1 (`-LeftOnly`) | 51.32 ms (51.30-51.33) | 31.97 ms | 19.35 ms |
+| SSL 2 driver loopback (no analog) | 50.26 ms (50.23-50.27) | 31.97 ms | 18.29 ms |
 
-In every run Windows gave the stream a 1056-frame buffer (22 ms) and each click sat behind 576 frames (12 ms) already queued. `GetStreamLatency` came back 0, so neither driver tells Windows about its own delay. The single low reading in each loop is most likely the script stamping `ReleaseBuffer` late rather than the audio path. The D70 readings crept up about 0.4 ms over the run, which is the DAC's and the interface's clocks drifting against each other.
+In every run Windows gave the stream a 1056-frame buffer (22 ms) and each click sat behind 576 frames (12 ms) already queued. `GetStreamLatency` came back 0, so neither driver tells Windows about its own delay. A D70 run earlier that day gave 47.33 ms. The D70's wider p25-p75 is the DAC's and the interface's clocks drifting against each other; the SSL 2 loops share one clock.
 
 ## Reading the numbers
 
-| Part of the 47.3 ms | Amount | How it's known |
+The last column is "output delay the driver doesn't report" plus "the recorder's capture delay". Both real loops went through the same SSL 2, so the capture delay is the same in both. For the D70 the sum is 4.83 ms. A DAC can only add delay after its driver says a sample is playing, never take it away, so the SSL 2's capture side is at most 4.83 ms. That bounds both outputs:
+
+| Output | App to analog out | Of which Windows' queue |
 |---|---|---|
-| Windows' queue ahead of the click | 12 ms | measured in every run |
-| Engine, D70 driver and DAC, plus the SSL 2 recording side | about 35 ms | the remainder |
-| D70 output against the SSL 2's own output | the D70 is about 4.2 ms faster | same recorder, 47.33 vs 51.51 |
-| SSL 2 recording side alone | unknown | it's in both loops |
+| D70 Pro Sabre (`usbaudio2`) | 43.0-47.9 ms | 12 ms |
+| SSL 2 (Thesycon) | 46.5-51.3 ms | 12 ms |
 
-So the D70 path is the faster of my two USB outputs, and its own output latency is somewhere under 47.3 ms. How far under needs one end of the loop that isn't USB.
+Two more things fall out:
 
-There's a claim going round that onboard (PCH) HD Audio is about 35 ms faster than any USB DAC. These numbers don't confirm or rule that out. The smaller minimum buffer of the HD Audio driver (2.67 ms against 7-10 ms here) explains a few ms for apps that ask for small buffers; 35 ms would need the USB driver and DAC to add around 30 ms on their own, which this loop can't separate from the recorder.
+- The SSL 2's analog loop is only 1.06 ms longer than its driver-internal loopback, so its converters and the cable are about 1 ms. Its driver reports samples playing at least 14.5 ms before they leave the jack (19.35 minus at most 4.83).
+- The "driver says playing" column means different things per driver (43 ms for usbaudio2, 32 ms for the Thesycon driver), so don't compare that column across drivers, only the totals and the bounds.
+
+There's a claim going round that onboard (PCH) HD Audio is about 35 ms faster than any USB DAC. These numbers don't confirm or rule that out. The HD Audio driver's smaller minimum buffer (2.67 ms against 7-10 ms here) explains a few ms for apps that ask for small buffers. Of the D70's 43-48 ms, 12 ms is the shared-mode queue every output pays, which leaves 31-36 ms for the engine, usbaudio2 and the DAC, and only a non-USB output measured the same way can say how much of that onboard audio would save. A browser round-trip test (speaker out to mic in through the browser's own audio stack) isn't comparable: it includes the input device and the browser's buffering, which change when you swap the DAC.
 
 ## Verification
 
@@ -288,7 +316,8 @@ There's a claim going round that onboard (PCH) HD Audio is about 35 ms faster th
 - A driver's software loopback endpoint isn't a hardware loop. The SSL 2's `Loopback 1 L/R` measured about 50 ms, but that signal never leaves the driver, so it says nothing about the analog path.
 - Stereo into balanced cancels. Identical left and right into a TRS balanced input record as near silence; play one channel.
 - Check Windows mute and the interface's input mode before anything else. I lost most of an afternoon to a muted output and a pressed LINE button.
-- Run the outputs you compare back to back. Mine were hours apart (morning and afternoon), which is fine for a 4 ms gap with 0.5 ms spread, but don't push it.
+- Run the outputs you compare back to back. My first D70 and SSL 2 runs were hours apart; the table above is from one session.
+- Don't clip the input. My D70 run hit full scale (peak 1.0) at 100 % Windows volume into the mic preamp. The onset is the first sample over 25 % of the peak, so it moves by at most part of a 2 kHz cycle, but turn it down.
 - Exclusive mode and the D70's 7 ms period aren't measured here. Few games use either, but they'd show how much of the 47 ms is Windows rather than the USB driver and DAC.
 
 ## File reference
@@ -298,6 +327,7 @@ There's a claim going round that onboard (PCH) HD Audio is about 35 ms faster th
 | `audio-loopback.ps1` | the script above: WASAPI shared render + capture, QPC-timed clicks |
 | `IAudioClient3::GetSharedModeEnginePeriod` | default and minimum shared-mode engine period per endpoint |
 | `IAudioCaptureClient::GetBuffer` (`pu64QPCPosition`) | per-packet capture timestamp in 100 ns units |
+| `IAudioClock::GetPosition` | render device position (the sample playing now) with its QPC time |
 | `Get-PnpDevice -Class MEDIA` + `DEVPKEY_Device_Service` | which driver each audio device runs on |
 
 ## Related docs
@@ -306,4 +336,5 @@ The same machine's 8 kHz mouse work, including keeping the mouse alone on a CPU-
 
 [^ms-lowlatency]: Microsoft, "Low latency audio," Microsoft Learn. https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/low-latency-audio
 [^ms-engineperiod]: Microsoft, "IAudioClient3::GetSharedModeEnginePeriod method (audioclient.h)," Microsoft Learn. https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient3-getsharedmodeengineperiod
+[^ms-clock]: Microsoft, "IAudioClock::GetPosition method (audioclient.h)," Microsoft Learn. https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclock-getposition
 [^ms-getbuffer]: Microsoft, "IAudioCaptureClient::GetBuffer method (audioclient.h)," Microsoft Learn. https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudiocaptureclient-getbuffer
