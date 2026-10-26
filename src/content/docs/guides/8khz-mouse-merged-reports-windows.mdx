@@ -60,6 +60,7 @@ OP1, 60 s of fast circles, with the browser, Discord and WSL closed:
 | + CPUs 6 and 7 reserved, restart (two runs) | 16-23 | 0 | 0.0 | 13-26 |
 | Same, BIOS Global C-state Control on Auto instead of Disabled | 35 | 2 | 0.0 | 28 |
 | Same, usual apps open (Discord, browser, chat apps; WSL off), two runs | 16-24 | 0-1 | 0.0 | 14-33 |
+| + GPU interrupts on CPU 2, audio controller on CPU 4, restart; quiet and apps open | 17 | 0 | 0.0 | 24-27 |
 
 The pin gets rid of the merged reports, reserving the pinned CPU then brings the timing back to the baseline or a bit better. Of the 16-35 off-band intervals left, 15-22 a minute are the mouse skipping a poll on its own (see [What is left](#what-is-left)).
 
@@ -197,14 +198,24 @@ To find which controller each USB device is on, walk its PnP parents up to the P
 Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -match '^USB\\VID_[0-9A-F]{4}&PID_[0-9A-F]{4}\\' } | ForEach-Object {
   $id = $_.InstanceId
   while ($id -and $id -notlike 'PCI\*') { $id = (Get-PnpDeviceProperty -InstanceId $id -KeyName DEVPKEY_Device_Parent).Data }
-  [pscustomobject]@{ Controller = ($id -split '\\')[1] -replace '&SUBSYS.*'; Device = $_.FriendlyName; Id = $_.InstanceId }
-} | Sort-Object Controller, Device | Format-Table -AutoSize
+  [pscustomobject]@{
+    Controller = ($id -split '\\')[1] -replace '&SUBSYS.*'
+    Location   = (Get-PnpDeviceProperty -InstanceId $id -KeyName DEVPKEY_Device_LocationInfo).Data
+    Device     = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_BusReportedDeviceDesc).Data
+    Id         = ($_.InstanceId -split '\\')[1]
+  }
+} | Sort-Object Controller, Location, Device | Format-Table -AutoSize
 ```
 
-The mouse should be the only thing on its controller, move other devices to other ports until it is. Mine was alone on `VEN_1022&DEV_15B7` (a CPU-attached controller), with the keyboard and hubs on `DEV_15B8` and the audio interfaces, webcam and Bluetooth on the chipset's `DEV_43F7`. Then pin it:
+`Device` is the name the device reports about itself, so you see "Endgame Gear OP1 8k v2 Gaming Mouse" rather than "USB Composite Device". `Location` matters because two controllers can share a VEN&DEV: my X670E board has two chipset controllers that are both `VEN_1022&DEV_43F7`, on PCI bus 102 and 104.
+
+The mouse should be the only thing on its controller, move other devices to other ports until it is. Mine was alone on `VEN_1022&DEV_15B7` (a CPU-attached controller), with the keyboard and hubs on `DEV_15B8` and the audio interfaces, webcam and Bluetooth on one of the chipset's `DEV_43F7` controllers. Then pin the controller the mouse is on. Finding it from the mouse rather than by its VEN&DEV means a duplicate controller ID can't send the pin to the wrong one:
 
 ```powershell
-$id  = (Get-PnpDevice -PresentOnly | Where-Object InstanceId -like 'PCI\VEN_1022&DEV_15B7*').InstanceId
+$device = 'VID_3367&PID_1978'   # your mouse's VID&PID from the table above
+$id = (Get-PnpDevice -PresentOnly | Where-Object InstanceId -like "USB\$device\*" | Select-Object -First 1).InstanceId
+while ($id -and $id -notlike 'PCI\*') { $id = (Get-PnpDeviceProperty -InstanceId $id -KeyName DEVPKEY_Device_Parent).Data }
+$id                             # check it's the controller you expect before writing anything
 $key = "HKLM:\SYSTEM\CurrentControlSet\Enum\$id\Device Parameters\Interrupt Management\Affinity Policy"
 $cpu = 6
 New-Item -Path $key -Force | Out-Null
@@ -215,7 +226,7 @@ pnputil /restart-device $id
 
 This assumes the controller uses message-signalled interrupts. Mine did and so did the GPU, `MSISupported` is 1 under `Device Parameters\Interrupt Management\MessageSignaledInterruptProperties` for both, and the only shared line interrupt was IRQ 0 (system timer and HPET).
 
-Restarting the controller was enough, no reboot needed. Pick a logical CPU the GPU driver doesn't use (in my trace that was everything except CPU 0 and CPU 1). To revert, `Remove-ItemProperty -Path $key -Name DevicePolicy, AssignmentSetOverride` and the same restart.
+Restarting the controller was enough, no reboot needed. If `pnputil` returns 3010, something behind the controller is in use (an audio device playing, for one) and the pin only takes effect after a Windows restart; the registry already shows the new value, so don't take that as proof it's active. Pick a logical CPU the GPU driver doesn't use (in my trace that was everything except CPU 0 and CPU 1). To revert, `Remove-ItemProperty -Path $key -Name DevicePolicy, AssignmentSetOverride` and the same restart.
 
 Check it with a second trace. For me USBXHCI.SYS DPCs moved to the pinned CPU (4.37 of 4.39 s) and its ISR went with them, nvlddmkm.sys and dxgkrnl.sys stayed on CPU 0.
 
@@ -296,7 +307,7 @@ My guess from the data is that the mouse builds its reports on its own clock rat
 - Disabling processor idle made it a lot worse. `powercfg /setacvalueindex scheme_current sub_processor IDLEDISABLE 1` (no C-states on any CPU) took gaps over 0.4 ms from 3.4 to 47.9 a minute, worst 4.25 ms, and WSL wouldn't start until I reverted it. I didn't dig into why, my guess is the idle loop spinning on every thread so the pinned CPU's SMT sibling fights it for the core. Don't use it as a latency tweak without measuring. If you want to test C-states, `powercfg -setacvalueindex scheme_current sub_processor IDLESTATEMAX 1` is the narrower setting, Microsoft documents value 1 as idle depths down to C1 only[^ms-idlestatemax] so idle threads still halt instead of spinning. I didn't need it.
 - BIOS Global C-state Control made no difference for me. Disabled and Auto gave the same result once the CPU was reserved (off-band 16-23 against 35 a minute, which is about the spread between two runs of the same setup). What Auto means is up to the board, so check it, Windows' `\Processor(*)\% C2 Time` counter showed every CPU idling 94-100 % in ACPI C2 on Auto (C2 is the deep core state, CC6, on AMD[^ms-idlestatemax]), so deep core sleep was on during the clean runs, the USB CPU too. Data-fabric C-states aren't visible from Windows. I'd leave it on Auto unless your own runs say otherwise, it uses less power at idle.
 - With the CPU reserved, closing apps stopped mattering for report timing, runs with my usual apps open matched the quiet ones. Give it a minute or two after the apps start though, the first run after relaunching them had a burst of late reports in its first 20 s. WSL is the exception here, its memory reclaim stalled the whole machine for milliseconds.
-- Pinning the GPU's interrupts off CPU 0 isn't needed for the mouse once its controller has its own reserved CPU. I tested it for frame times anyway (`DevicePolicy` 4 on the GPU, CPU 2, 3DMark Time Spy with PresentMon, 3 pinned runs between 4 and 3 unpinned ones): graphics test 2 went from 226.6-228.5 to 229.6-230.3 fps, about 1 %, the 99.9th percentile frame time and the CPU test didn't move. My card only allows one MSI message (`MessageNumberLimit` 1), so its interrupts sit on one CPU whatever the policy says. Small enough that I'd only bother if you're CPU-bound at high fps, which Time Spy doesn't test.
+- Pinning the GPU's interrupts off CPU 0 isn't needed for the mouse once its controller has its own reserved CPU. I tested it for frame times anyway (`DevicePolicy` 4 on the GPU, CPU 2, 3DMark Time Spy with PresentMon, 3 pinned runs between 4 and 3 unpinned ones): graphics test 2 went from 226.6-228.5 to 229.6-230.3 fps, about 1 %, the 99.9th percentile frame time and the CPU test didn't move. My card only allows one MSI message (`MessageNumberLimit` 1), so its interrupts sit on one CPU whatever the policy says. Small, and I kept it anyway: with the GPU on CPU 2 and the audio controller on CPU 4 the mouse runs stayed clean (last row of the results table). The Part 4 snippet works for the GPU too, set `$id` to its PCI instance ID (`VEN_10DE&DEV_2B85` here) instead of walking up from a USB device.
 - Change one thing per run and write down the conditions. My reboot run changed two things at once (filter gone from the last hub, Windows Sandbox disabled) so I can't say which one helped.
 - Use a traced run to diagnose, not to measure, its timing is off and only the merged count holds.
 - The Steam friends-list stutter is a separate thing. It's real in games that poll the friends list when you have hundreds of friends, but it doesn't explain count spikes in MousePlotter.
