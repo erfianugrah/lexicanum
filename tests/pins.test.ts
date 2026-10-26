@@ -81,7 +81,13 @@ const pins: Pin[] = [
       "Do not terminate `authenticator` backends to free slots",
       "is a design choice built on that one run",
     ],
-    mustNotContain: ["terminate the Hyperdrive roles' backends"],
+    mustNotContain: [
+      "terminate the Hyperdrive roles' backends",
+      // pgnet-under-load NL04 (2026-10-26): raw pg_net lost every refused
+      // message and resent nothing; only a retry job or pgmq made delivery
+      // at-least-once.
+      "`pg_net` is at-least-once",
+    ],
     sections: [/^### Connection budget with the Data API$/m],
     anchors: ["connection-budget-with-the-data-api"],
   },
@@ -1133,10 +1139,14 @@ const pins: Pin[] = [
       "refused `429 over_email_send_rate_limit",
       "102/105/110ms sequential to 411/368/366ms at concurrency 8",
       "`db_max_pool_size=10`",
-      // The unresolved unit rather than a tidy number: AR01c read 150 and the
-      // page then quoted 1800/hour, and the run did not settle which unit the
-      // field carries.
+      // The unit: AR01c read 150 and the page then quoted 1800/hour, and the
+      // 2026-09-08 run did not settle which unit the field carries. AR06a
+      // (2026-10-26) settled it as per five minutes; keep both the open
+      // question and its answer so neither half drifts.
       "agree only if the field is per five minutes rather than per hour",
+      "so the field is per five minutes and the figures agree",
+      // AR06c: the burst stays 30 whatever the limit.
+      "Raising the limit raises the refill, not the 30",
       // identity-transfer ITL1b (2026-09-11): the lookup reads the
       // `provider_id` column and not the JSON copy, which is what makes the
       // one-column remap safe to publish.
@@ -1726,6 +1736,46 @@ const pins: Pin[] = [
     sections: [/^## Checklist$/m, /^## What was checked here$/m],
     linksTo: ["reference/openaq-pm25-home-assistant"],
   },
+  // 2026-10-26 lab runs (supabase-lab aca5612). Each pin is a correction of a
+  // claim the page carried before: the resending layer was "unidentified",
+  // a function's statement_timeout "wins for every key", the same-region
+  // split was "not measured", and the Realtime pool was compared against the
+  // settings page's 2 rather than the concepts table's 4.
+  {
+    doc: "reference/supabase-data-api-capacity",
+    mustContain: [
+      "x-envoy-attempt-count: 6",
+      "a nested function's setting neither extended nor shortened the call",
+      "120 set on Large stayed 120 on Small",
+    ],
+    mustNotContain: [
+      "A function's own `set statement_timeout` wins for every key",
+      "platform layer in front\\n(unidentified)",
+    ],
+    anchors: ["a-set-db_pool-across-a-resize-dc15"],
+  },
+  {
+    doc: "reference/supabase-read-replicas",
+    mustContain: ["roughly half each", "`25006` does not tell a client which node it reached"],
+    mustNotContain: ["same-region split not measured", "the supabase-js option itself was not called"],
+    anchors: ["the-split-inside-one-region-rr03h"],
+  },
+  {
+    doc: "reference/supabase-realtime-surface",
+    mustContain: [
+      "the RUNLOG corrected it on 2026-10-26 to cite the concepts table",
+      "The Authorization pool did not follow the size",
+    ],
+    anchors: ["subscription-bursts-and-realtimes-connection-pools-rt05"],
+  },
+  {
+    doc: "reference/supabase-pg-net-under-load",
+    mustContain: [
+      "`timeout_milliseconds` defaults to 5000",
+      "the timeout clock starts at send, not at enqueue",
+      "A `timed_out` row is \"maybe delivered\"",
+    ],
+  },
 ];
 
 describe.each(pins.map((p) => [p.doc, p] as const))("%s", (_name, pin) => {
@@ -1840,6 +1890,7 @@ const practicePages: Array<[doc: string, heading: RegExp]> = [
   ["reference/supabase-incident-resilience", PRACTICES_HEADING],
   ["reference/supabase-logs-volume", PRACTICES_HEADING],
   ["reference/supabase-multi-tenant-placement", PRACTICES_HEADING],
+  ["reference/supabase-pg-net-under-load", PRACTICES_HEADING],
   ["reference/supabase-platform-operation-cost", PRACTICES_HEADING],
   ["reference/supabase-read-replicas", PRACTICES_HEADING],
   ["reference/supabase-rls-policy-cost", PRACTICES_HEADING],
