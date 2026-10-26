@@ -1,0 +1,323 @@
+---
+title: "pg_net on Supabase under load: timeouts, batches and delivery, measured"
+description: What hosted pg_net 0.20.4 did with a slow receiver, a busy database and an unreliable endpoint - the timeout default (5000 ms, not the guide's 2000) and the missing max_timeout_ms ceiling, batches of 200 that block on their slowest call, a timeout clock that starts at send, the cold first burst that times out calls the receiver already got, what CPU saturation did and did not cause, an error_msg phase split that does not locate a timeout, and how many of 1,000 messages arrived through raw pg_net, a pg_cron retry job and pgmq. Measured 2026-10-26 on throwaway Pro-plan Micro and Large projects in ap-southeast-1.
+author: Erfi Anugrah
+category: supabase
+group: architecture
+---
+
+How `pg_net`, the extension behind Database Webhooks, behaves on a hosted Supabase project when the receiver is slow, the database is busy or the endpoint fails some of the time. It is for anyone sending HTTP from a trigger or a scheduled job who needs to know what a `timed_out` row means, how long a queued call can wait, and how many messages arrive. The architecture around it, a trigger posting to a Worker, is in [Cloudflare Workers + Supabase](/reference/cloudflare-supabase-architecture/#the-reverse-path-supabase-to-a-worker); the egress risk of `pg_net` is in [Locking down Supabase](/reference/supabase-data-surface-lockdown/).
+
+All measured rows come from the lab's [pgnet-under-load experiment](https://github.com/erfianugrah/supabase-lab/tree/bcf925e/experiments/pgnet-under-load/), run 2026-10-26 on throwaway projects on a Pro-plan organization in `ap-southeast-1`, each created through `POST /v1/projects` and deleted by the module that created it: NL01 and NL02 on one Micro, NL03 on one Large, NL04 twice on two more Large projects, NL05 on a fourth Large. Postgres 17.11 and `pg_net` 0.20.4 were recorded on the Micro project and on the NL03 and first NL04 Large projects; the last two Large projects ran the same code and did not record versions. The Large projects' metrics endpoint listed 2 CPUs. The receiver was a Cloudflare Worker on `workers.dev` that writes every arrival to a Durable Object ledger before it answers, so a call the sender gave up on still leaves a record. Receiver times are the Worker's clock at request entry minus the enqueue time the database wrote into the body, so they include the offset between the two hosts' clocks (not separated). Each module ran once except NL04, which ran twice. The figures are quoted from the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/aca5612/experiments/pgnet-under-load/RUNLOG.md) and the artifacts listed in [Modules](#modules). Rows marked documented come from the pages cited at the claim and were not run.
+
+**TL;DR:**
+
+- `timeout_milliseconds` defaults to 5000 in the hosted `net.http_post` signature, and calls with the argument omitted timed out at 5000 ms. The Supabase `pg_net` guide shows `default 2000`. `pg_net.max_timeout_ms`, which the upstream README documents, does not exist at 0.20.4 (`42704: unrecognized configuration parameter`); 600001 and 0 were accepted at enqueue, and 0 meant no timeout (a 90 s call answered 200).
+- The worker takes up to 200 queued requests and starts the next batch only when the whole batch is done. One 4.5 s call delayed the 200 calls behind it to 6010 to 6065 ms after enqueue; one call timing out at 30 s delayed them to 31031 to 31083 ms. None of the delayed calls timed out at 5000 ms: the timeout clock starts at send, not at enqueue.
+- A burst of 200 calls sent after the worker had been quiet (the project's first outbound calls, or 120 s idle) lost 89 and 139 of 200 to the 5000 ms timeout although every one had reached the receiver, within 825 ms of enqueue. Bursts sent straight after lost none. A `timed_out` row is "maybe delivered".
+- Saturating both CPUs of a Large project with 4 spinning backends caused no timeout: 0 of 3009 calls across a Worker, a trivial Edge Function and an Edge Function querying the same database. The one timeout in that run came, with the database idle, from the function that queries the same database. Cold starts were not the cause.
+- The `error_msg` of a timeout splits the time into DNS, TCP/TLS and request phases, and the split does not say where the time went: eight timeouts of calls that had reached the receiver put all 5001 ms under "DNS time".
+- Of 1,000 messages to a receiver that refused 20 % with 503 and held 10 % for 8 s, raw `pg_net` lost 194 to 274 per arm: every message the receiver refused, plus 35 calls of one cold first burst that never arrived. A `pg_cron` retry job and a `pgmq` queue with a `pg_cron` consumer lost 0 in all eight arms and processed 11 to 14 % of messages twice or more. CPU saturation changed no delivery count.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  caller [label="trigger, function\nor pg_cron job"];
+  queue  [label="net.http_request_queue"];
+  worker [label="pg_net worker\nup to 200 per batch\n(pg_net.batch_size)"];
+  recv   [label="receiver\n(Worker, Edge Function)"];
+  resp   [label="net._http_response\ncreated = batch pickup\ntimed_out, error_msg"];
+
+  caller -> queue [label="net.http_post\nafter commit"];
+  queue -> worker [label="next batch when the\nwhole batch is done"];
+  worker -> recv [label="timeout clock\nstarts here"];
+  worker -> resp;
+}
+```
+
+Text version: a trigger, function or scheduled job calls `net.http_post`, which writes a row to `net.http_request_queue`; the `pg_net` background worker takes up to `pg_net.batch_size` (200) rows, sends them, and takes the next batch only when every call in the current one has finished or timed out; each call's timeout counts from when the worker sends it; the outcome lands in `net._http_response`, whose `created` column is the moment the worker took the batch.
+
+## Which do I pick
+
+| What the receiver must get | Mechanism | What it cost here (NL04, 1,000 messages, two runs) |
+|---|---|---|
+| Notifications where a lost one is acceptable | raw `net.http_post` | lost 194 to 274 per arm, every message the receiver refused, none resent |
+| Every message, receiver idempotent | `pg_net` plus a `pg_cron` job that re-enqueues on 5xx or timeout | 0 lost; 11.8 to 14.4 % processed twice or more (derived from 118 to 144 of 1,000); all confirmed in 73 to 103 s |
+| Every message, retries spaced by a visibility timeout | `pgmq` queue plus a `pg_cron` consumer, ack on 2xx | 0 lost; 11.1 to 14 % processed twice or more (derived from 111 to 140 of 1,000); about 186 to 187 s to confirm all, or 1 to 2 left at a 180 s deadline |
+
+Both at-least-once paths duplicate for the same reason: a call that times out at the sender may already have been processed, so the resend is a second delivery. A receiver of either has to be idempotent.
+
+---
+
+## Settings and the timeout (NL01)
+
+NL01 read the hosted settings on a Micro project and then sent 28 calls to a receiver that answers after 4, 8, 30 or 90 s, crossed with `timeout_milliseconds` 5000, 30000, 120000, 600000, 600001, 0 and omitted.
+
+| Read | Value |
+|---|---|
+| `pg_net%` settings | `pg_net.batch_size=200`, `pg_net.ttl=6 hours`, `pg_net.database_name=postgres`, `pg_net.username=postgres`, nothing else |
+| `show pg_net.max_timeout_ms` | `42704: unrecognized configuration parameter "pg_net.max_timeout_ms"` |
+| `net.http_post` signature, `timeout_milliseconds` default | 5000 |
+
+| Calls | Outcome |
+|---|---|
+| timeout above the receiver's sleep | 200, including 30 s and 90 s calls at 120000 and above |
+| timeout at or below the sleep | `timed_out` |
+| timeout omitted | as 5000 |
+| timeout 0 | no timeout: 200 after a 90 s sleep |
+| timeout 600001 | accepted at enqueue, completed a 90 s call |
+
+None of the 28 was refused at enqueue and all 28 arrived at the receiver. The Supabase guide shows `timeout_milliseconds int default 2000` for `http_get`, `http_post` and `http_delete`,[^sb-pg-net] which the hosted signature and the omitted-timeout calls contradict. The upstream README documents `pg_net.max_timeout_ms` with a default of 600000 and says a request outside `1..pg_net.max_timeout_ms` is not sent;[^pgnet-readme] at 0.20.4 the setting does not exist, and 0 and 600001 were sent. Nothing in the run lasted 600 s, so whether any cap applies above 600000 was not measured.
+
+The guide also says the extension "is configured to reliably execute up to 200 requests per second";[^sb-pg-net] no module measured a rate.
+
+### What `net._http_response.created` holds
+
+`created` is when the worker took the request's batch, not when the response arrived. In NL02c call 1 timed out after 30 s and its row's `created` was 48 ms after enqueue. In NL01 the 28 calls were enqueued one statement at a time over 2893 ms; the first call's row was created 7 ms after its enqueue and the other 27 within a few ms of one instant about 4.5 s after the first enqueue, after that first call (a 4 s sleep) finished. The worker took call 1 alone, then the other 27 as one batch. Response latency cannot be computed from `created`.
+
+### The error_msg phase split
+
+A timeout's `error_msg` has this shape:
+
+```text
+Timeout of 5000 ms reached. Total time: 5001.621000 ms (DNS time: 5001.621000 ms, TCP/SSL handshake time: 0.000000 ms, HTTP Request/Response time: 0.000000 ms)
+```
+
+| Where | Calls | Split |
+|---|---|---|
+| NL01 | 8 timeouts | all of about 5001 ms under "DNS time", although every one of those requests had reached the receiver, so name resolution, TCP and TLS had completed |
+| NL02c | the 30 s timeout | `DNS time: 0.294000 ms, TCP/SSL handshake time: -0.294000 ms, HTTP Request/Response time: 30000.796000 ms` |
+| NL03 | 1 timeout | all 5000.566 ms under "DNS time"; whether that call reached the receiver is not recorded |
+| NL05 | cold-burst timeouts | `DNS time: 35.321000 ms, TCP/SSL handshake time: 112.676000 ms, HTTP Request/Response time: 4888.822000 ms` (burst 1) and `15.926000 / 235.276000 / 4769.802000 ms` (burst 4), for requests that had equally arrived |
+
+The split is inconsistent across runs and includes a negative handshake time, so it does not locate a timeout. Locate one from the receiver's arrival log or from timing. Why the figures come out this way was not investigated.
+
+---
+
+## Batches and head-of-line blocking (NL02)
+
+NL02 enqueued 400 calls in one transaction on the Micro project. Call 1 went to a fast receiver (control), a 4.5 s receiver, or a 60 s receiver with `timeout_milliseconds` 30000; calls 2 to 400 went to a fast receiver with the default 5000 ms timeout. Arrival delay is the receiver's arrival minus the enqueue time.
+
+| Part | Call 1 | Calls 2-200 arrival p50 / max | Calls 201-400 arrival min / p50 / max | Gap after the last of 2-200 | `timed_out` 2-200 / 201-400 |
+|---|---|---|---|---|---|
+| NL02a control | fast, 200 | 134 / 374 ms | 2132 / 2151 / 2187 ms | 1775 ms | 0 / 0 |
+| NL02b slow | 4.5 s receiver, 200 | 67 / 126 ms | 6010 / 6031 / 6065 ms | 5904 ms | 0 / 0 |
+| NL02c hang | 60 s receiver, timeout 30000, `timed_out` | 65 / 96 ms | 31031 / 31048 / 31083 ms | 30957 ms | 0 / 0 |
+
+- Calls 201 to 400 waited for the whole first batch, so one slow call delayed the next 200 by its own duration: 6 s behind a 4.5 s receiver, 31 s behind a 30 s timeout.
+- None of them timed out at 5000 ms after waiting about 6 s and about 31 s in the queue (0 of 200 in both parts): the timeout clock starts when the call is sent, not when it is enqueued.
+- Even with no slow call (NL02a) the second batch started 1775 ms after the last arrival of the first, 2132 ms after enqueue at the earliest. A wait between batches in the worker loop would produce it; the run does not separate that.
+
+NL04 showed the same pacing at the receiver: with 10 % of each 200-call batch held past the 5 s timeout, each batch of the raw arm arrived 6 s after the previous one (0, 6, 12, 18 and 24 s).
+
+---
+
+## Under CPU saturation: who times out (NL03)
+
+NL03 ran on a Large project (2 CPUs). Per arm, a `pg_cron` job every 10 s enqueued 17 calls to each of three targets with `timeout_milliseconds` 5000, for 600 s: the Worker, a trivial Edge Function (`ef_echo`), and an Edge Function that runs one query (`nl_work()`, a count over 2M rows, 181.361 ms alone by `EXPLAIN ANALYZE`) through the Data API (`ef_query`). The saturated arm added 4 session-pooler backends spinning a PL/pgSQL loop, all 4 seen `active`. CPU busy from the metrics endpoint: 0.162 over the idle arm (the function's query load), 0.954 over the saturated arm, 1 in nine of its ten 60 s samples.
+
+| Arm | Target | Calls | 2xx | `timed_out` | Enqueue to arrival p50 / p95 / max | Query inside the function p50 / p95 / max |
+|---|---|---|---|---|---|---|
+| idle | Worker | 1020 | 1020 | 0 | 8 / 20 / 363 ms | - |
+| idle | `ef_echo` | 1020 | 1020 | 0 | 104 / 146 / 2579 ms | - |
+| idle | `ef_query` | 1020 | 1019 | 1 | 104 / 151 / 1387 ms | 1326 / 1397 / 3870 ms |
+| saturated | Worker | 1003 | 1003 | 0 | 19 / 31 / 146 ms | - |
+| saturated | `ef_echo` | 1003 | 1003 | 0 | 109 / 136 / 2551 ms | - |
+| saturated | `ef_query` | 1003 | 1003 | 0 | 110 / 139 / 2623 ms | 1692 / 1790 / 4482 ms |
+
+- The worker was not starved: 0 of 3009 calls timed out in the saturated arm. Pickup (`created` minus enqueue) went from p50 4 ms, max 14 ms (Worker target, idle) to p50 14 ms, max 42 ms, and the Worker's arrival p50 from 8 to 19 ms. The `pg_cron` job ran 60 times idle (average 14 ms, max 16 ms) and 59 times saturated (average 41 ms, max 53 ms).
+- The one timeout, with the database idle, came from the target that queries the same database. 17 calls arrived together every 10 s, each running a 181 ms query on 2 CPUs, so the query inside the function took 1326 ms at p50 and 3870 ms at most; saturation moved that to 1692 ms and 4482 ms, still under 5 s. The function answered the other 1019 calls of that arm.
+- Cold starts were not the cause. `function_logs` counted a Boot for most invocations (865 and 858 of 1020 idle, 833 and 839 of 1003 saturated), and arrival stayed at p95 136 to 151 ms and at most 2623 ms, well under 5 s. Boots were counted per function over each arm's window plus 30 s; whether some belong to a neighbouring window was not checked.
+- The worker's own `pg_stat_activity` row, sampled every 1 s, read idle on `Extension/Extension` in 402 samples (idle arm) and 397 (saturated), and active in 214 and 223 (derived: active on `Extension/Extension` 119 and 104, active with no wait event 95 and 118, and one `LWLock/ProcArray` when saturated). The largest queue seen was 51 in both arms.
+
+This rules out worker-side starvation at 4 spinning backends on 2 CPUs and nothing heavier: more backends, I/O or memory pressure, lock waits, other sizes, Micro's shared CPU and a target slower than 5 s on a cold boot were not run.
+
+---
+
+## A cold burst times out delivered calls (NL05)
+
+NL04's first run left an excess of sender-side timeouts in the idle raw arm (240 against 81 held requests, and 35 calls that never arrived), and its second run repeated the excess with every call arriving (277 timeouts against 97 held). Both were the project's first outbound burst. NL05 tested that on a fresh Large: four bursts of 200 calls to the receiver's `/echo` with the default 5000 ms timeout, each in one transaction after the queue drained, each to a fresh ledger.
+
+| Burst | 200 | `timed_out` (of them arrived at the receiver) | Never arrived | Arrival p50 / p95 / max |
+|---|---|---|---|---|
+| 1, the project's first outbound calls | 111 | 89 (89) | 0 | 484 / 781 / 816 ms |
+| 2, at once after 1 | 200 | 0 | 0 | 55 / 85 / 92 ms |
+| 3, at once after 2 | 200 | 0 | 0 | 44 / 69 / 187 ms |
+| 4, after 120 s idle | 61 | 139 (139) | 0 | 493 / 785 / 825 ms |
+
+- A burst of 200 after the worker had sent nothing for a while lost 89 and 139 calls to the 5 s timeout; bursts straight after a previous one lost none. It is about being quiet, not about the project being new.
+- Every timed-out call had reached the receiver within 825 ms of enqueue, and `/echo` answers at once after its ledger write. The slower cold arrivals (p50 484 and 493 ms against 55 and 44 ms warm) fit 200 new TLS connections with none reused (reasoned, not measured).
+- From the lab Mac in Singapore the same receiver answered 200 concurrent `POST`s to `/echo` on a fresh ledger in under 1 s, after about 150 s idle (`time_total` p50 / p95 / max 0.079 / 0.557 / 0.898 s, then 0.522 / 0.890 / 0.986 s). The receiver does not reproduce the stall from that vantage, which points at the database host's side or the path between it and Cloudflare; those two were not separated, and neither was whether a smaller first batch or a longer first timeout avoids it. n = 1 run, two cold bursts.
+
+---
+
+## Delivery of 1,000 messages (NL04)
+
+The receiver's `/flaky` route answered 20 % of requests 503, held 10 % for 8 s then answered 200, and answered the rest 200 at once; every call used `timeout_milliseconds` 5000. Three mechanisms, each with the database idle and then saturated (CPU busy 0.999, 4 backends): raw `net.http_post` per message (deadline 90 s), `pg_net` plus a `pg_cron` job that re-enqueues on 5xx or timeout, and a `pgmq` 1.5.1 queue with a `pg_cron` consumer, visibility timeout 30 s, ack on 2xx (deadlines 180 s). Delivered means the receiver recorded a 200 or a held request for the message at least once; a held request whose sender timed out still counts as processed.
+
+Run 1:
+
+| Arm | Mechanism | Delivered | Lost | Processed twice or more (extra deliveries) | Receiver arrivals (503 / held) | Sender: calls, confirmed, `timed_out` | All confirmed |
+|---|---|---|---|---|---|---|---|
+| idle | raw | 726 | 274 | 0 (0) | 965 (239 / 81) | 1000, 555, 240 | no (90 s) |
+| idle | retry | 1000 | 0 | 144 (168) | 1468 (300 / 168) | 1468, 1000, 168 | after 103 s |
+| idle | `pgmq` | 1000 | 0 | 111 (125) | 1414 (289 / 126) | 1414, 999 (1 left in queue), 126 | no (180 s) |
+| saturated | raw | 806 | 194 | 0 (0) | 1000 (194 / 104) | 1000, 702, 104 | no (90 s) |
+| saturated | retry | 1000 | 0 | 133 (152) | 1444 (292 / 152) | 1444, 1000, 152 | after 73 s |
+| saturated | `pgmq` | 1000 | 0 | 122 (142) | 1450 (308 / 144) | 1450, 998 (2 left in queue), 144 | no (180 s) |
+
+Run 2, a third fresh Large:
+
+| Arm | Mechanism | Delivered | Lost | Processed twice or more (extra deliveries) | Receiver arrivals (503 / held) | Sender: calls, confirmed, `timed_out` | All confirmed |
+|---|---|---|---|---|---|---|---|
+| idle | raw | 797 | 203 | 0 (0) | 1000 (203 / 97) | 1000, 566, 277 | no (90 s) |
+| idle | retry | 1000 | 0 | 118 (137) | 1425 (288 / 137) | 1425, 1000, 137 | after 93 s |
+| idle | `pgmq` | 1000 | 0 | 125 (139) | 1384 (245 / 139) | 1384, 1000 (0 left in queue), 139 | after 187 s |
+| saturated | raw | 792 | 208 | 0 (0) | 1000 (208 / 113) | 1000, 679, 113 | no (90 s) |
+| saturated | retry | 1000 | 0 | 127 (144) | 1405 (261 / 144) | 1405, 1000, 144 | after 73 s |
+| saturated | `pgmq` | 1000 | 0 | 140 (158) | 1452 (294 / 158) | 1452, 1000 (0 left in queue), 158 | after 186 s |
+
+- Raw `pg_net` lost every message the receiver refused: lost equals the receiver's 503 count in the run 2 arms, and in run 1's saturated arm. Run 1's idle raw arm also had 35 calls that never arrived, all in the first batch of 200, the cold-burst effect above. Measured from the sender, raw also counted the held-then-answered requests as failures: it confirmed 555, 702, 566 and 679 where the receiver processed 726, 806, 797 and 792.
+- The retry job and `pgmq` delivered all 1,000 in every arm, at a duplicate cost: each held request that timed out at 5 s had been processed and was sent again. Extra deliveries equalled held requests in every retry row, and in run 2's `pgmq` rows; run 1's `pgmq` rows had 125 of 126 and 142 of 144, the rest still in flight at the deadline. Run 1's 1 and 2 messages left in the queue had been delivered already and were waiting out their 30 s visibility timeout.
+- CPU saturation changed no delivery count beyond the receiver's own random mix. The retry arm confirmed sooner saturated (73 s, both runs) than idle (103 s and 93 s); the random fault draw is as likely a cause as anything, not separated at n = 2.
+- The idle raw arm was each project's first burst, so its sender-side timeouts include the cold-burst effect (240 for 81 held, 277 for 97); its receiver-side delivered and lost counts do not depend on it. The saturated raw arms, which followed other traffic, matched exactly (104 and 113 timeouts against 104 and 113 held).
+
+---
+
+## Docs against runtime
+
+| Claim | Documented | Measured | Filed upstream |
+|---|---|---|---|
+| `timeout_milliseconds` default | `int default 2000` in the Supabase guide[^sb-pg-net] | 5000 in the hosted signature; omitted-timeout calls timed out at 5000 ms (NL01) | not filed; the lab RUNLOG records no report |
+| A timeout ceiling | `pg_net.max_timeout_ms`, default 600000, requests outside `1..max` not sent (upstream README at HEAD)[^pgnet-readme] | the setting does not exist at 0.20.4; 0 and 600001 were sent, 0 as no timeout (NL01) | not filed; the README describes a later version than the hosted 0.20.4, so this is version drift |
+| Throughput | "configured to reliably execute up to 200 requests per second"[^sb-pg-net] | not measured | - |
+
+---
+
+## Reading the numbers
+
+| Claim | Measured or documented | How it was checked |
+|---|---|---|
+| Default 5000 ms, no `max_timeout_ms`, 0 = no timeout | measured, one run (NL01), Micro | `show`, the function signature, 28 calls against 4 to 90 s sleeps |
+| Batches of 200 block on their slowest call; timeout counts from send | measured, one run per part (NL02), Micro | receiver arrival minus enqueue for 400 calls per part |
+| `created` is batch pickup | measured (NL01, NL02c) | `created` against enqueue and the known outcome |
+| `error_msg` phase split does not locate a timeout | measured across NL01, NL02c, NL03, NL05 | the split against receiver arrivals |
+| CPU saturation caused no timeout | measured, one run (NL03), Large, 4 spinning backends | 600 s per arm, three targets, metrics endpoint CPU, worker `pg_stat_activity` |
+| Cold burst times out delivered calls | measured, one run, two cold and two warm bursts (NL05), Large | ledger arrivals against `timed_out`; receiver control from the lab Mac |
+| Delivery counts per mechanism | measured, two runs (NL04), Large | receiver ledger per message id against the sender's rows |
+| 200 requests per second | documented, not run | the Supabase guide |
+
+Every figure comes from one region, a Pro organization, Micro (NL01, NL02) or Large (NL03 to NL05), one receiver on Cloudflare, and a database clock against Cloudflare's for every arrival delay. n = 1 per module except NL04.
+
+---
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Pass `timeout_milliseconds` explicitly on every call. | Omitted means 5000 ms on 0.20.4; the Supabase guide shows 2000. | NL01 |
+| Do not rely on a server-side timeout ceiling; set a finite timeout yourself. | `pg_net.max_timeout_ms` is absent at 0.20.4; 0 was accepted and meant no timeout. | NL01 |
+| Keep slow endpoints off the queue that carries fast ones. | One 4.5 s call delayed the next 200 calls to 6010 to 6065 ms; one 30 s timeout to 31031 to 31083 ms. | NL02 |
+| Size timeouts for the call, not for its time in the queue. | Calls queued 6 s and 31 s behind a slow batch did not time out at 5000 ms: the clock starts at send. | NL02 |
+| Treat `timed_out` as "maybe delivered" and make receivers idempotent. | Cold bursts: 89 and 139 of 200 timed out, every one already at the receiver within 825 ms. | NL05 |
+| Expect timeouts on the first burst after a quiet period. | 200 calls after 120 s idle lost 139 to the timeout; the bursts straight after lost 0. Smaller batches or longer first timeouts were not tested. | NL05 |
+| Locate a timeout from the receiver's log, not from `error_msg`. | All of 5001 ms reported as "DNS time" for calls that had arrived; a negative handshake time in NL02c. | NL01, NL02c, NL05 |
+| Do not compute response latency from `net._http_response.created`. | A call that timed out after 30 s had `created` 48 ms after enqueue. | NL01, NL02c |
+| Add a retry job or `pgmq` when every message must arrive. | Raw lost 194 to 274 of 1,000 per arm; retry and `pgmq` lost 0 in all 8 arms. | NL04 |
+| Budget about 11 to 14 % duplicates for an at-least-once path. | Extra deliveries equalled held-then-timed-out requests: 137 to 168 per retry arm. | NL04 |
+| Look past CPU for `pg_net` timeouts: a receiver waiting on the same database first. | 0 of 3009 timeouts with both CPUs saturated; the one timeout was the function querying the same database. | NL03 |
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="Must every message\narrive?"];
+  raw [label="raw net.http_post,\nexplicit timeout"];
+  q2 [label="Retries spaced by a\nvisibility timeout?"];
+  retry [label="pg_cron retry job;\nidempotent receiver"];
+  mq [label="pgmq + pg_cron consumer;\nidempotent receiver"];
+  q3 [label="Seeing timed_out rows?"];
+  cold [label="First burst after a quiet\nperiod: check receiver log"];
+  slow [label="Slow call in the batch:\nsplit slow endpoints off"];
+  db [label="Receiver querying the same\ndatabase: its own concurrency"];
+
+  q1 -> raw [label="no"];
+  q1 -> q2 [label="yes"];
+  q2 -> mq [label="yes"];
+  q2 -> retry [label="no"];
+  q3 -> cold; q3 -> slow; q3 -> db;
+}
+```
+
+Text version:
+
+1. If a lost message is acceptable, use raw `net.http_post` with an explicit `timeout_milliseconds`.
+2. If every message must arrive, add a `pg_cron` job that re-enqueues on 5xx or timeout, or use `pgmq` with a `pg_cron` consumer when retries should wait out a visibility timeout. Either way, make the receiver idempotent: 11 to 14 % of messages arrived twice or more.
+3. If `timed_out` rows appear, check three causes in the receiver's own log before blaming load: a first burst after a quiet period (calls arrived, then timed out), a slow call holding its whole batch, or a receiver whose work queries the same database.
+
+---
+
+## Not measured
+
+- Load from `pg_net` itself: throughput, the documented 200 requests per second, and a `pg_net.batch_size` other than 200.
+- Heavier database pressure than 4 spinning backends on 2 CPUs: I/O, memory, lock waits; Micro's shared CPU under saturation; other compute sizes for NL03 to NL05.
+- A `timeout_milliseconds` cap above 600000 (nothing ran 600 s), and `pg_net` versions other than 0.20.4.
+- The cause of the cold-burst stall (database host side or the path to Cloudflare), and whether a smaller first batch or a longer first timeout avoids it.
+- The source of the about 1.8 s gap between batches with no slow call.
+- Database Webhooks as configured from the dashboard (the run called `net.http_post` directly), `http_get` and `http_delete`, and receivers other than one Worker and two Edge Functions.
+- Repeats of NL01 to NL03 and NL05.
+
+---
+
+## Reproducing
+
+The experiment provisions its own projects and deploys its own receiver; it needs a Pro-plan organization slug in `PVLAB_ORG_PRO`, a personal access token in `SUPABASE_ACCESS_TOKEN`, and a Cloudflare token for the Worker.
+
+```bash
+make receiver-up                       # deploys the workers.dev receiver, prints its URL
+make micro RECEIVER=<url>              # NL01, NL02, NL99 on a Micro; about 10 minutes
+make large RECEIVER=<url>              # NL03, NL04, NL99 on a Large; about 50 minutes
+make large LARGE=NL05,NL99 RECEIVER=<url>
+make clean                             # list leftover pvlab-nl-* projects; DELETE=1 deletes
+make receiver-down
+make publish-evidence RUN=evidence/<ts>/run-<stamp>.json
+```
+
+`PVLAB_NL_ARM_S` (default 600) and `PVLAB_NL_MECH_S` (default 180) set the NL03 arm and NL04 per-mechanism lengths.
+
+---
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| NL01 | pgnet-under-load | [`nl01-timeout-ceiling.ts`](https://github.com/erfianugrah/supabase-lab/blob/bcf925e/experiments/pgnet-under-load/tests/nl01-timeout-ceiling.ts) | [`run-2026-10-26T00-24-41-120Z`](https://github.com/erfianugrah/supabase-lab/blob/bcf925e/experiments/pgnet-under-load/out/2026-10-26/run-2026-10-26T00-24-41-120Z.facts.md) |
+| NL02 | pgnet-under-load | [`nl02-head-of-line.ts`](https://github.com/erfianugrah/supabase-lab/blob/bcf925e/experiments/pgnet-under-load/tests/nl02-head-of-line.ts) | [`run-2026-10-26T00-24-41-120Z`](https://github.com/erfianugrah/supabase-lab/blob/bcf925e/experiments/pgnet-under-load/out/2026-10-26/run-2026-10-26T00-24-41-120Z.facts.md) |
+| NL03 | pgnet-under-load | [`nl03-attribution.ts`](https://github.com/erfianugrah/supabase-lab/blob/bcf925e/experiments/pgnet-under-load/tests/nl03-attribution.ts) | [`run-2026-10-26T00-30-17-690Z`](https://github.com/erfianugrah/supabase-lab/blob/bcf925e/experiments/pgnet-under-load/out/2026-10-26/run-2026-10-26T00-30-17-690Z.facts.md) |
+| NL04 | pgnet-under-load | [`nl04-delivery.ts`](https://github.com/erfianugrah/supabase-lab/blob/bcf925e/experiments/pgnet-under-load/tests/nl04-delivery.ts) | run 1 [`run-2026-10-26T00-28-01-744Z`](https://github.com/erfianugrah/supabase-lab/blob/bcf925e/experiments/pgnet-under-load/out/2026-10-26/run-2026-10-26T00-28-01-744Z.facts.md), run 2 [`run-2026-10-26T00-42-43-410Z`](https://github.com/erfianugrah/supabase-lab/blob/bcf925e/experiments/pgnet-under-load/out/2026-10-26/run-2026-10-26T00-42-43-410Z.facts.md) |
+| NL05 | pgnet-under-load | [`nl05-first-burst.ts`](https://github.com/erfianugrah/supabase-lab/blob/bcf925e/experiments/pgnet-under-load/tests/nl05-first-burst.ts) | [`run-2026-10-26T00-57-29-512Z`](https://github.com/erfianugrah/supabase-lab/blob/bcf925e/experiments/pgnet-under-load/out/2026-10-26/run-2026-10-26T00-57-29-512Z.facts.md) |
+
+## Related docs
+
+- [Cloudflare Workers + Supabase](/reference/cloudflare-supabase-architecture/#the-reverse-path-supabase-to-a-worker): the trigger-to-Worker path these calls ran on, and the authentication and idempotency rules for its receiver.
+- [Locking down Supabase](/reference/supabase-data-surface-lockdown/): `pg_net` as an egress path from SQL, and why the project owner cannot revoke it.
+- [Edge Function limits](/reference/supabase-edge-function-limits/): the cold start and idle timeout of the Edge Functions used as targets in NL03.
+- [Postgres entity graphs](/reference/postgres-entity-graphs/): a queue in Postgres with `pgmq` beside `pg_cron` and `pg_net`, the pattern NL04's queue arm used.
+
+[^sb-pg-net]: Supabase, "pg_net: Async Networking," Supabase Docs. https://supabase.com/docs/guides/database/extensions/pg_net
+[^pgnet-readme]: Supabase, `README.md`, supabase/pg_net at ddd4485. https://github.com/supabase/pg_net/blob/ddd44859303c/README.md
