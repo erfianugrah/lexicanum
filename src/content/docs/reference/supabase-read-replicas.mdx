@@ -32,7 +32,7 @@ Pricing, prerequisites and the product boundaries here are documented rather tha
 | --- | --- | --- |
 | Primary CPU high, workload under roughly 80% reads | Larger compute | "Read Replicas only serve reads and won't help writes."[^sb-rr] |
 | Read-heavy, users far from the primary's region | Replica near the users, clients on the load balancer endpoint | geo-routing sends each `GET` to the closest database[^sb-rr] |
-| Read-heavy, users near the primary | Replica in the primary's region, clients on the load balancer endpoint | RR03h: the load balancer split `GET`s roughly half and half between a same-region primary and replica; read-your-writes is not guaranteed, since the next `GET` can land on either node |
+| Read-heavy, users near the primary | Replica in the primary's region, clients on the load balancer endpoint | RR03h: the load balancer split `GET`s roughly half and half between a same-region primary and replica; read-your-writes was not measured; inferred not guaranteed, since the next `GET` can land on either node |
 | Analytical queries competing with the app | Replica, the analytics job on the replica's connection string | the replica has its own pooler and database endpoint[^sb-rr] |
 | Region outage cover | Warm standby, not a replica | no promotion path is documented; see [the DR tiers](/reference/supabase-dr-tiers/) |
 | Data must stay in one jurisdiction | Replica only in an acceptable region | a replica is a full copy in its own region; see [data residency](/reference/supabase-data-residency/) |
@@ -51,13 +51,13 @@ digraph {
   q2 [label="Clients on the load balancer\nor replica endpoint?"];
   q3 [label="Reads sent as POST rpc?"];
   q4 [label="Behind a custom domain?"];
-  q5 [label="Replica in the primary's region,\nor users closer to the primary?"];
+  q5 [label="Replica in another region and users\ncloser to the primary than to it?"];
   ok [label="It is serving reads:\nkeep it, watch lag"];
   a2 [label="Point Data API reads at\nthe load balancer endpoint"];
   a3 [label="Call read-only functions\nwith get: true"];
   a4 [label="Send reads to the\nreplica's own endpoint"];
   a5 [label="Move the replica toward\nthe users, or delete it"];
-  a6 [label="Check chosen_supabase_region in\nthe logs; a same-region replica takes\nabout half the GETs (RR03h)"];
+  a6 [label="Same-region replica: expect about\nhalf the GETs (RR03h); check\nchosen_supabase_region in the logs"];
 
   q1 -> ok [label="yes"];
   q1 -> q2 [label="no"];
@@ -78,8 +78,8 @@ The same check as a list:
 2. If not, are the clients on the load balancer endpoint or the replica's endpoint? If not, point Data API reads at the load balancer endpoint.
 3. Are the reads function calls sent as `POST`? If yes, call read-only functions with `get: true`.
 4. Is the Data API behind a custom domain? If yes, send reads to the replica's own endpoint.
-5. Is the replica in the primary's region, or are the users closer to the primary? If yes, move the replica toward the users or delete it.
-6. If not, check `chosen_supabase_region` in the `edge_logs` rows (RR01o). With the primary and the replica in the same region, expect roughly half the `GET`s on the replica (RR03h, two runs); a share far from that is worth a look at the client path.
+5. Are the users closer to the primary than to the replica, with the replica in another region? If yes, move the replica toward the users or delete it.
+6. If the replica is in the primary's region, expect roughly half the `GET`s on it (RR03h, two runs) and check `chosen_supabase_region` in the `edge_logs` rows (RR01o); a share far from that is worth a look at the client path.
 
 ## Where each request lands
 
@@ -177,7 +177,7 @@ Each user read a `security_invoker` view over `rr3_docs` and a stable function t
 
 RLS and `auth.uid()` behaved the same on the replica as on the primary for an ES256 user token, in both runs; through the load balancer the node changed from read to read and the rows did not.
 
-- `auth.setSession()` on the replica's host failed in both runs with `Failed to parse JSON`, because the replica host answers `GET /auth/v1/user` with `400` and a body that is not JSON. The read after it went out with the anon key as Bearer and returned 0 rows with no error. In run 2 the same call succeeded on the load balancer host and the primary host. Run 1's `setSession` failed on every host with `400 Auth session missing!` because the module had signed out (`signOut({ scope: "local" })` ends the session on the server); that was a module bug, not a platform finding.
+- `auth.setSession()` on the replica's host failed in both runs with `Failed to parse JSON`, because the replica host's answer to `GET /auth/v1/user` was not JSON (RR02f recorded `400` for its other Auth paths; RR03 did not record the status). The read after it went out with the anon key as Bearer and returned 0 rows with no error. In run 2 the same call succeeded on the load balancer host and the primary host. Run 1's `setSession` failed on the load balancer and primary hosts with `Auth session missing!` (status 400 on the supabase-js error object; `edge_logs` recorded HTTP 403 for the two load balancer attempts) and on the replica host with `Failed to parse JSON` as in run 2, because the module had signed out (`signOut({ scope: "local" })` ends the session on the server); that was a module bug, not a platform finding.
 - `signInWithPassword` on a client created on the load balancer host worked in both runs; the token's `iss` was the primary's host, and that token read as user B on the replica's host. On the replica's host it failed with `Failed to parse JSON`.
 
 ### Key types (RR03e)
@@ -208,10 +208,10 @@ supabase-js on the load balancer host, user A by `accessToken`, 5 calls per func
 | `list_docs_volatile` (volatile, reads only) | 1 / 4 | 2 / 3 | 0 / 5 |
 | `touch` (volatile, inserts a row) | `405` `25006`, 3 / 2 | `405` `25006`, 3 / 2 | 0 / 5, HTTP 200 |
 
-- Routing followed the method and nothing else: the volatile read-only function was served by `GET` on the replica as well as the primary, and every `POST` went to the primary, where `touch` wrote (`rr3_touch` went from 0 to 6 rows each run, 5 through the load balancer and 1 on the primary's host).
+- Routing followed the method; volatility and security definer did not change it: the volatile read-only function was served by `GET` on the replica as well as the primary, and every `POST` went to the primary, where `touch` wrote (`rr3_touch` went from 0 to 6 rows each run, 5 through the load balancer and 1 on the primary's host).
 - `touch` by `GET` answered HTTP `405`, SQLSTATE `25006`, `cannot execute INSERT in a read-only transaction`, on the replica (`in_recovery=t` in the error detail) and on the primary (`in_recovery=f`). PostgREST runs a `GET` read-only on either node, so `25006` does not tell a client which node it reached.
 - `list_docs_definer` ran as `postgres` on both nodes and saw `n` 3 (filtered by `auth.uid()` inside the function) and `all_rows` 10 (the table owner is not subject to RLS), the same on the replica as on the primary.
-- On the replica's own host every `GET` answered as above and every `POST` answered `400 Read replica does not handle POST requests for the path /res...` (the module kept 70 characters).
+- On the replica's own host every `GET` answered as above and every `POST` answered `400 Read replica does not handle POST requests for the path /res...` (the module's 60-character cut of a non-JSON body).
 
 ### HEAD and count=exact (RR03g)
 
@@ -237,15 +237,15 @@ supabase-js sends `HEAD` for `select('*', { count: 'exact', head: true })`. `edg
 | Edge Function `x-region us-east-1`, n = 50 (IAD) | 20 / 30 | 27 / 23 | 25 / 49 | 7 |
 | Edge Function `x-region eu-west-1`, n = 50 (DUB) | 26 / 24 | 24 / 26 | 21 / 49 | 6 |
 
-0 errors in every row. `edge_logs` on the load balancer host read available regions `["SIN"]` on every `GET` and `HEAD` row, chosen region `SIN` for the SIN, IAD and DUB colos, and over all of a run's load balancer rows 845 `GET`s to the primary and 813 to the replica in run 1, 841 and 860 in run 2.
+0 errors in every row. `edge_logs` on the load balancer host read available regions `["SIN"]` or empty (the artifact keeps the set of values, not the row), chosen region `SIN` for the SIN, IAD and DUB colos, and over all of a run's load balancer rows 845 `GET`s to the primary and 813 to the replica in run 1, 841 and 860 in run 2.
 
 - With both databases in one region the load balancer spread `GET`s over the primary and the replica, roughly half each, from every vantage. In the cross-region shape (RR01f, RR02) the same workstation got 100 % replica. That fits geo-routing picking the region and a second step choosing a database inside it.
-- The order is not a strict alternation, which would switch at all 199 (or 49) transitions; run 2 switched at roughly half, about what independent 50/50 draws give. Inference: a choice per request, not tied to the client's connection (the `Connection: close` row spread the same way). The run cannot tell a random choice from another rule, and whether the weights move with load or health was not tested.
+- The order is not a strict alternation, which would switch at all 199 (or 49) transitions; run 2 switched at roughly half, about what independent 50/50 draws give. Inference: a choice per request, not tied to the client's connection (the keep-alive row switched at 92 of 199 and the `Connection: close` row spread the same way; connection reuse was not recorded). The run cannot tell a random choice from another rule, and whether the weights move with load or health was not tested.
 - Latency from the workstation, keep-alive, run 2 medians: 20.9 ms when the primary served, 19.2 ms when the replica served.
 
 ### Lag under steady writes (RR03i)
 
-A session-pooler connection on the primary inserted one heartbeat row every 20 ms for 300 s: 15,096 rows, 50 a second, 0 errors, both runs. Meanwhile `GET rpc/rr_node` (anon) every 250 ms on each host returned `stale_ms`, the serving node's clock minus the newest row's `written_at`. A node that keeps up therefore reads up to the 20 ms insert period plus delay, and the two hosts' clock skew sits inside every replica figure. `pg_stat_replication.replay_lag` was read on the primary every 5 s.
+A session-pooler connection on the primary inserted one heartbeat row every 20 ms for 300 s: 15,096 rows, 50 a second, 0 errors, both runs. Meanwhile `GET rpc/rr_node` (anon), with a 250 ms pause after each response on each host, returned `stale_ms`, the serving node's clock minus the newest row's `written_at`. A node that keeps up therefore reads up to the 20 ms insert period plus delay, and the two hosts' clock skew sits inside every replica figure. `pg_stat_replication.replay_lag` was read on the primary every 5 s.
 
 | Source | Run | n | `stale_ms` p50 | p95 | max |
 | --- | --- | --- | --- | --- | --- |
@@ -258,9 +258,9 @@ A session-pooler connection on the primary inserted one heartbeat row every 20 m
 
 `replay_lag` read p50 2.2 ms, p95 2.4 ms and max 2.5 ms (n 61, run 1), and 2.1, 2.5 and 3.4 ms (n 59, run 2). 0 read errors on any host. At this write rate the replica's median was 5 ms (run 1) and 9 ms (run 2) above the primary's, with clock skew inside that difference.
 
-Run 1's `edge_logs` hold two load balancer `GET`s answered `503` by the replica that none of the module's results show, and run 2 has none. postgrest-js 2.118.0 retries a `GET` or `HEAD` answered `503` or `520` by default (`fetchWithRetry`, with an `X-Retry-Count` header), so those two were most likely retried by supabase-js and answered on the retry. The 503 bodies were not recorded.
+Run 1's `edge_logs` hold two load balancer `GET`s routed to the replica (redirect identifier) that answered `503`, which none of the module's results show, and run 2 has none. postgrest-js 2.118.0 retries a `GET` or `HEAD` answered `503` or `520` by default (`fetchWithRetry`, with an `X-Retry-Count` header),[^pgjs-retry] so those two were most likely retried by supabase-js and answered on the retry. The 503 bodies were not recorded.
 
-Not settled by RR03: a cross-region arm (RR01 and RR02 cover that shape); the load balancer's rule inside a region, under load, with two replicas, or with one same-region node stale or down; read-your-writes through the load balancer in this shape, which the lag figures bound at this write rate only; Auth-issued HS256 user tokens, third-party-auth tokens, and Realtime or Storage with a user token through the load balancer; why the replica's host refuses `HEAD` while the load balancer delivers one to the replica. Cost was not metered: each run kept a Small primary, a Small replica and `pitr_7` for about 10 and 11 minutes.
+Not settled by RR03: a cross-region arm (RR01 and RR02 cover that shape); the load balancer's rule inside a region, under load, with two replicas, or with one same-region node stale or down; read-your-writes through the load balancer in this shape, whose size at this write rate only the lag figures indicate; Auth-issued HS256 user tokens, third-party-auth tokens, and Realtime or Storage with a user token through the load balancer; why the replica's host refuses `HEAD` while the load balancer delivers one to the replica. Cost was not metered: each run kept a Small primary, a Small replica and `pitr_7` for about 10 and 11 minutes.
 
 ## What the load balancer did in RR01
 
@@ -480,11 +480,11 @@ Rows marked documented rest on the docs, read 2026-10-08; rows with an RR01 id w
 | Keep `get: true` to functions whose arguments are scalars or arrays. | The client converts each argument to a string for the query string; an object argument becomes `[object Object]`. | source read at `84e2c5d`; not run |
 | Send reads to a replica endpoint when the project uses a custom domain. | Custom-domain requests are not routed through the load balancer. | documented; not measured |
 | Place a replica closer to the users than the primary is. | Chosen region followed the Cloudflare colo in 9 groups of rows (SIN, SYD, BOM, GRU to the replica's region; NRT, DUB, IAD, SJC to the primary's); a distance rule and a fixed colo table both fit. A replica in the primary's region took 94 to 115 of 200 `GET`s, about half. | RR01h, RR01o (2026-10-10); RR03h (2026-10-26, two runs); MS06 shows a same-region replica serves SQL |
-| Pass user tokens by `accessToken` or a header on a replica host, not `setSession()`. | On the replica's host `setSession()` failed with `Failed to parse JSON` (its `/auth/v1/user` answers `400`), and the next read went out as anon: 0 rows, no error. The other patterns read 3 and 5 rows per user with RLS, as on the primary. | RR03d (2026-10-26, two runs) |
+| Pass user tokens by `accessToken` or a header on a replica host, not `setSession()`. | On the replica's host `setSession()` failed with `Failed to parse JSON` (its `/auth/v1/user` answer was not JSON; RR02f: the replica host answers other Auth paths with `400`), and the next read went out as anon: 0 rows, no error. The other patterns read 3 and 5 rows per user with RLS, as on the primary. | RR03d (2026-10-26, two runs) |
 | Do not read `25006` as proof that the replica answered. | A writing function under `GET` answered `405` `25006` on the replica (`in_recovery=t`) and on the primary (`in_recovery=f`). | RR03f (2026-10-26) |
 | Send `HEAD` and `POST` through the load balancer, never the replica's own host. | The replica's host answered `400` to `HEAD` and `400 Read replica does not handle POST requests...` to `POST`; through the load balancer `HEAD` reached both nodes, all 200. | RR03f, RR03g (2026-10-26) |
 | With a same-region replica, read a just-written row from the primary. | `GET`s through the load balancer landed on either node per request; replica `stale_ms` p50 17 and 21 ms against 12 on the primary at 50 inserts/s. Read-your-writes through the load balancer was not measured as such. | RR03h, RR03i (2026-10-26) |
-| Check `edge_logs` for replica `503`s that supabase-js retried. | Run 1's logs held two `GET`s answered `503` by the replica that no client result showed; postgrest-js 2.118.0 retries `GET` and `HEAD` on `503` and `520`. | RR03 run 1 (2026-10-26) |
+| Check `edge_logs` for replica `503`s that supabase-js retried. | Run 1's logs held two `GET`s routed to the replica that answered `503` and that no client result showed; postgrest-js 2.118.0 retries `GET` and `HEAD` on `503` and `520`. | RR03 run 1 (2026-10-26) |
 | Price each replica as a second database at the primary's compute size. | Compute, 1.25x disk from the first byte, IOPS, throughput and IPv4 are mirrored; credits and the spend cap do not apply. | documented |
 | Budget the replicas into every primary upsize. | Replicas are resized with the primary, after it, concurrently. | documented; not measured |
 | Wait for, or force, a completed physical backup after the resize to Small. | Setup answered `406 "Failed to check for latest completed physical backup"` on Small; `204` after `pitr_7`. MS06 served 219 s after setup; the cross-region replica on Small served at 271 s. | S07/S07e (2026-08-25), MS06 (2026-09-30), RR01d (2026-10-10) |
@@ -516,8 +516,8 @@ Not measured anywhere in the lab, and stated as such above: the rule behind the 
 | Every key type tried (legacy anon and service_role JWTs, `sb_publishable_`, `sb_secret_`, a user's ES256 and HS256 tokens) gave the same role on all three hosts | measured | RR03e, same runs |
 | `get: true` reached the replica for stable, definer and volatile read-only functions; every `POST` went to the primary; a writing function under `GET` answered `405` `25006` on both nodes | measured | RR03f, same runs, 5 calls per function and method |
 | `HEAD` through the load balancer reached both nodes; the replica's host refused `HEAD` with `400` | measured | RR03g, same runs, 10 calls per row; `edge_logs` agrees |
-| Same-region split: 111 / 89 and 94 / 106 replica / primary of 200 from Singapore, about half from Edge Functions in three regions, switching per request | measured | RR03h, same runs; `edge_logs` 845 / 813 and 841 / 860 primary / replica `GET`s |
-| Same-region lag at 50 inserts/s: replica `stale_ms` p50 17 and 21 ms against 12 on the primary; `replay_lag` p50 2.2 and 2.1 ms | measured, clock skew inside | RR03i, same runs, 300 s each |
+| Same-region split: 111 / 89 and 94 / 106 replica / primary of 200 from Singapore; from Edge Functions 100 / 100 and 115 / 85 of 200 in ap-southeast-1, and 20 to 27 of 50 to the replica from us-east-1 and eu-west-1; switching per request | measured | RR03h, same runs; `edge_logs` 845 / 813 and 841 / 860 primary / replica `GET`s |
+| Same-region staleness and lag at 50 inserts/s: replica `stale_ms` (includes the 20 ms insert period and clock skew) p50 17 and 21 ms against 12 on the primary; `replay_lag` p50 2.2 and 2.1 ms | measured, clock skew inside | RR03i, same runs, 300 s each |
 | Stopped replay: the load balancer sent every read to the replica (586 of 586 over 174.6 s, run 1; 98 of 98 over 28.8 s, run 2), up to 176,772 ms stale, 0 to the primary, 0 errors | measured | replica-routing [RR02h](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/replica-routing/tests/rr02-replica-rerouting.ts), 2026-10-23, two Pro projects in RR01's shape; [facts](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/replica-routing/out/2026-10-23/run-2026-10-23T07-57-32-539Z.facts.md) (run 1), [facts](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/replica-routing/out/2026-10-23/run-2026-10-23T08-22-50-864Z.facts.md) (run 2) |
 | Project restart: while the replica was down and the primary up, every load balancer read failed (21 and 29 failed reads across its failing span), and none of its 334 / 415 reads across the restart phase went to the primary | measured | RR02i, same runs |
 | Replica removed: load balancer `400 Load balancer does not seem to be configured properly.` to the end of the watch (360 s, 1,200 s), 0 of 1,034 / 0 of 4,103 reads from the primary, name resolving | measured | RR02j, same runs |
@@ -579,3 +579,4 @@ One docs-vs-runtime disagreement, not filed upstream (filed: no): the docs descr
 [^postgrest-tx]: PostgREST, "Transactions," PostgREST Docs. https://docs.postgrest.org/en/stable/references/transactions.html
 [^postgrest-fn]: PostgREST, "Functions," PostgREST Docs. https://docs.postgrest.org/en/stable/references/api/functions.html
 [^postgrest-js-rpc]: Supabase, "postgrest-js PostgrestClient.ts, rpc()," GitHub, commit 84e2c5d. https://github.com/supabase/supabase-js/blob/84e2c5d/packages/core/postgrest-js/src/PostgrestClient.ts
+[^pgjs-retry]: Supabase, "postgrest-js fetchWithRetry.ts," GitHub, supabase-js v2.118.0 (commit 6ede0cb). https://github.com/supabase/supabase-js/blob/6ede0cbfc880/packages/core/postgrest-js/src/fetchWithRetry.ts

@@ -1756,8 +1756,20 @@ const pins: Pin[] = [
   },
   {
     doc: "reference/supabase-read-replicas",
-    mustContain: ["roughly half each", "`25006` does not tell a client which node it reached"],
-    mustNotContain: ["same-region split not measured", "the supabase-js option itself was not called"],
+    mustContain: [
+      "roughly half each",
+      "`25006` does not tell a client which node it reached",
+      // Review 2026-10-26: decision-guide step 5 sent a same-region replica
+      // (the shape RR03h measured at about half the GETs) to "move or
+      // delete", contradicting step 6 and the which-to-pick row.
+      "Are the users closer to the primary than to the replica, with the replica in another region?",
+    ],
+    mustNotContain: [
+      "same-region split not measured",
+      "the supabase-js option itself was not called",
+      "Is the replica in the primary's region, or are the users closer to the primary?",
+      "Replica in the primary's region,\\nor users closer to the primary?",
+    ],
     anchors: ["the-split-inside-one-region-rr03h"],
   },
   {
@@ -1775,6 +1787,9 @@ const pins: Pin[] = [
       "the timeout clock starts at send, not at enqueue",
       "A `timed_out` row is \"maybe delivered\"",
     ],
+    // Review 2026-10-26: two of NL01's eight timeouts were 30000 ms ones
+    // (about 30002 ms each), so "all 5001 ms" was a figure not in the artifact.
+    mustNotContain: ["put all 5001 ms under"],
   },
 ];
 
