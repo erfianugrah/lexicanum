@@ -1,13 +1,13 @@
 ---
 title: Fixing merged reports from an 8 kHz mouse on Windows
-description: Diagnosing and fixing the count spikes an 8 kHz mouse shows in MousePlotter on Windows 10 - reports that carry 2-4 polls of motion because the host serviced the USB controller late. Count the merged reports from the export, rule out USB filter drivers such as USBPcap, capture a DPC/ISR trace with WPR (and get past its 0x80010106 stop failure), read it with xperf, and pin the mouse's xHCI controller interrupts to a CPU the GPU driver does not use.
+description: Diagnosing and fixing the count spikes an 8 kHz mouse shows in MousePlotter on Windows 10 - reports that carry 2-4 polls of motion because the host serviced the USB controller late. Count the merged reports from the export, rule out USB filter drivers such as USBPcap, capture a DPC/ISR trace with WPR (and get past its 0x80010106 stop failure), read it with xperf, pin the mouse's xHCI controller interrupts to a CPU the GPU driver does not use, and reserve that CPU with ReservedCpuSets to remove the leftover jitter.
 author: "Erfi Anugrah"
 category: workstations
 ---
 
-An 8 kHz mouse sends a report every 125 us. When Windows services the USB controller late, the mouse cannot send on time, so the next report carries the motion of two to four polls. In MousePlotter that shows as isolated dots far outside the counts band, and the counts axis stretches until the normal trace is a solid block. This guide takes one such machine from 66.5 merged reports a minute to zero: it measures the problem from the export, removes a USB filter driver that made it worse, traces where the delay comes from, and moves the mouse's controller interrupts off the CPU the GPU driver uses.
+An 8 kHz mouse sends a report every 125 us. When Windows services the USB controller late, the mouse cannot send on time, so the next report carries the motion of two to four polls. In MousePlotter that shows as isolated dots far outside the counts band, and the counts axis stretches until the normal trace is a solid block. This guide takes one such machine from 66.5 merged reports a minute to zero: it measures the problem from the export, removes a USB filter driver that made it worse, traces where the delay comes from, moves the mouse's controller interrupts off the CPU the GPU driver uses, and then reserves that CPU so nothing else is scheduled there, which removed the remaining timing jitter.
 
-Prerequisites: admin PowerShell on the Windows box, MousePlotter run elevated (it needs ETW for kernel timestamps), and the Windows Performance Toolkit for the trace step. The numbers are from one machine, measured on 2026-10-16 and 2026-10-24; the closing sections say what was and was not shown.
+Prerequisites: admin PowerShell on the Windows box, MousePlotter run elevated (it needs ETW for kernel timestamps), and the Windows Performance Toolkit for the trace step. The numbers are from one machine, measured on 2026-10-16, 2026-10-24 and 2026-10-26; the closing sections say what was and was not shown.
 
 ## Constants (read this first)
 
@@ -56,9 +56,12 @@ OP1, 60 s of fast circles, quiet host (browser, Discord and WSL closed):
 | USBPcap removed from the mouse's hub | 251 | 46 | 16.8 | 50 |
 | + reboot (filter gone from every hub), Windows Sandbox off | 126 | 19 | 10.1 | 38 |
 | + controller pinned to CPU 4 | 112 | 32 | 0.0 | 31 |
-| Controller pinned to CPU 6 (final) | 123 | 13 | 0.0 | 17 |
+| Controller pinned to CPU 6 | 123 | 13 | 0.0 | 17 |
+| + CPUs 6 and 7 reserved, restart (two runs) | 16-23 | 0 | 0.0 | 13-26 |
+| Same, BIOS Global C-state Control on Auto instead of Disabled | 35 | 2 | 0.0 | 28 |
+| Same, usual apps open (Discord, browser, chat apps; WSL off), two runs | 16-24 | 0-1 | 0.0 | 14-33 |
 
-The pin removes the merged reports. It does not bring the timing back to the 2026-10-16 baseline; see [What is left](#what-is-left).
+The pin removes the merged reports; reserving the pinned CPU brings the timing back to the baseline or better. Of the 16-35 off-band intervals left, 15-22 a minute are the mouse's own skipped poll (see [What is left](#what-is-left)).
 
 ## Architecture
 
@@ -192,6 +195,23 @@ The controller restart was enough here; no reboot. Pick a logical CPU the GPU dr
 
 Confirm with a second trace: on this machine USBXHCI.SYS DPCs moved to 4.37 of 4.39 s on the pinned CPU and its ISR moved with them, while nvlddmkm.sys and dxgkrnl.sys stayed on CPU 0.
 
+## Part 5: reserve the pinned CPU
+
+After the pin, scattered reports still arrived 0.25-0.5 ms late (3-6 a minute over 0.4 ms, off-band 112-123 a minute). Reserving the pinned CPU and its SMT sibling removes them: ReservedCpuSets keeps the scheduler from placing other threads there[^pctuning-kms]. The value is a CPU bitmask, least significant byte first[^reservedcpusets]; CPUs 6 and 7 are bits 6 and 7, `0xC0`:
+
+```powershell
+$k = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel'
+$mask = [uint64](1 -shl 6) -bor [uint64](1 -shl 7)
+New-ItemProperty -Path $k -Name ReservedCpuSets -PropertyType Binary -Value ([BitConverter]::GetBytes($mask)) -Force | Out-Null
+Restart-Computer
+```
+
+Reserve the CPU the controller is pinned to and its SMT sibling (here CPU 6 and CPU 7, two threads of one core). Never reserve CPU 0. A restart applies it.
+
+Check that it took: put a busy thread on every CPU for about 10 s (CpuStres from Sysinternals, or any load tool) and watch per-CPU usage in Task Manager. Here CPUs 6 and 7 stayed at 0 % while the other 14 ran at 100 %. The ReservedCpuSets README says older Windows 10 builds need another route (NtSetSystemInformation); 22H2 (build 19045) honoured the registry value. Revert with `Remove-ItemProperty -Path $k -Name ReservedCpuSets` and a restart.
+
+The restart that activated the reservation also carried two smaller changes (Phone Link removed, HVCI and NetBIOS explicitly off), which were not tested on their own. BIOS Global C-state Control was tested both ways afterwards and made no difference (table above).
+
 ## Verification
 
 | Check | How | Expected |
@@ -200,25 +220,22 @@ Confirm with a second trace: on this machine USBXHCI.SYS DPCs moved to 4.37 of 4
 | Pin set | `Get-ItemProperty $key` | `DevicePolicy 4`, mask with one bit |
 | Pin active | xperf dpcisr on a new trace | USBXHCI.SYS DPC time on the pinned CPU |
 | Merged reports | Part 1 query on an untraced 60 s run | 0.0 /min |
+| CPUs reserved | per-CPU usage under a full load (Part 5) | the reserved pair near 0 % |
+| Late reports | Part 1 query | off-band near 30 /min or less, bunched 0-2 /min |
 
-On this machine merged reports were 0.0 a minute in every recording after the pin: three untraced OP1 runs (CPU 4 twice, CPU 6), two traced runs with the second mouse, and the processor-idle experiment in the gotchas below.
+On this machine merged reports were 0.0 a minute in every recording after the pin, 13 of them by 2026-10-26: OP1 and second-mouse runs, traced and untraced, quiet and with apps open, and the processor-idle experiment in the gotchas below.
 
 ## What is left
 
-After the pin the export still shows scattered single reports 0.25-0.5 ms late: 3.4-6.3 a minute over 0.4 ms, worst 0.58 ms, none over 1 ms, with off-band intervals at 112-123 a minute against 31 on 2026-10-16. Two things were ruled out:
+One report about 0.25 ms late (one empty poll) on a near-fixed period: 15-22 a minute, every 3.55-3.73 s across runs, in every OP1 recording, the 2026-10-16 baseline included, and through every change in this guide. The second mouse (Pulsar 8K dongle), recorded on the same machine in the same conditions, has no periodic skip and 5 off-band intervals a minute, so the skip is in the OP1, not the PC.
 
-- Which core handles USB: CPU 4 and CPU 6 differ in both directions (gaps over 0.4 ms 6.3 vs 3.4 a minute, over 0.2 ms 65 vs 100).
-- Other DPCs on the pinned CPU: in the trace, CPU 4 ran 4.37 s of USB DPCs and 0.036 s of anything else.
-
-Finding the rest needs a trace lined up event by event with a recording, which the timestamp fallback above makes awkward, and it is still open. Untried candidates, one change per run:
-
-- Reserving the pinned CPU and its SMT sibling with ReservedCpuSets, so the scheduler routes nothing else there[^pctuning-kms]. A Windows restart applies it; under a full load the reserved CPUs should stay much quieter than the rest.
-- Keeping cores out of deep C-states while leaving C1: `powercfg -setacvalueindex scheme_current sub_processor IDLESTATEMAX 1` (and `-setdcvalueindex`), then `powercfg -setactive scheme_current`. Microsoft documents value 1 as allowing idle depths down to C1 only[^ms-idlestatemax]; the page was written for Zen 2 server parts. This is the OS-side version of the common "disable C-states in the BIOS" advice, and unlike `IDLEDISABLE` (see the gotchas) it keeps the halt instruction, so idle threads do not spin. If it helps, the BIOS data-fabric C-state switch is the next step: the CPU's USB controllers sit on the I/O die, and no Windows setting covers fabric C-states. That mechanism is reasoned, not measured.
-- Moving the GPU's interrupts off CPU 0 with the same affinity policy, or benchmarking the choice with AutoGpuAffinity[^pctuning-kms].
+Mechanism (reasoned from the data): the mouse builds reports on its own clock instead of the host's USB microframe clock. Its 8 kHz runs about 35 ppm slow, so every ~3.5 s one poll finds no report ready and the next report carries two polls of motion. That is 2x, under the 2.5x merged threshold, and no motion is lost. Owners in the XBAB Tech Discord report the same and say Endgame Gear plans a firmware fix (not confirmed by Endgame Gear here); one says it stops at 4 kHz, which was not measured here. No host setting can change the mouse's clock.
 
 ## Gotchas and lessons learned
 
-- **Disabling processor idle made it much worse.** `powercfg /setacvalueindex scheme_current sub_processor IDLEDISABLE 1` (no C-states on any CPU) took gaps over 0.4 ms from 3.4 to 47.9 a minute, worst 4.25 ms, and WSL would not start until it was reverted. The cause was not investigated; one candidate is the idle loop spinning on every thread, so the pinned CPU's SMT sibling competes for the core. Do not use it as a latency tweak without measuring. `IDLESTATEMAX 1` (above) is the narrower setting to test instead.
+- **Disabling processor idle made it much worse.** `powercfg /setacvalueindex scheme_current sub_processor IDLEDISABLE 1` (no C-states on any CPU) took gaps over 0.4 ms from 3.4 to 47.9 a minute, worst 4.25 ms, and WSL would not start until it was reverted. The cause was not investigated; one candidate is the idle loop spinning on every thread, so the pinned CPU's SMT sibling competes for the core. Do not use it as a latency tweak without measuring. If you want to test C-states, `powercfg -setacvalueindex scheme_current sub_processor IDLESTATEMAX 1` is the narrower setting: Microsoft documents value 1 as allowing idle depths down to C1 only[^ms-idlestatemax], so idle threads still halt instead of spinning. It was not needed here.
+- **BIOS Global C-state Control made no difference here.** Disabled and Auto gave the same result once the CPU was reserved (off-band 16-23 against 35 a minute, within the spread between two runs of one setup). Leave it on Auto unless your own runs show otherwise; it lowers idle power.
+- **With the CPU reserved, closing apps no longer mattered for report timing.** Runs with the usual apps open matched the quiet runs. Measure a minute or two after apps start, though: the first run after relaunching them had a burst of late reports in its first 20 s. WSL is the exception on this machine: its memory reclaim stalled the host for milliseconds.
 - **Change one thing per run, and record the conditions.** The reboot run changed two things at once (filter gone from the last hub, Windows Sandbox disabled) and cannot say which helped.
 - **A traced run is a diagnosis run, not a measurement.** Its timing is distorted; only the merged count survives.
 - **The Steam friends-list stutter is a different problem.** It is real in games that poll the friends list with hundreds of friends; it does not explain count spikes in MousePlotter.
@@ -241,4 +258,5 @@ The same machine's 10GbE adapter tuning, including the powercfg and Device Manag
 [^boosterx-raw]: BoosterX, "Background Raw Input listeners in Windows 10 and Windows 11," BoosterX Wiki. https://wiki.boosterx.org/en/windows-research/input/background-raw-input-throttling/
 [^pctuning-kms]: valleyofdoom, "11.43. Kernel-Mode Scheduling (Interrupts, DPCs and more)," PC-Tuning, GitHub. https://github.com/valleyofdoom/PC-Tuning#kernel-mode-scheduling-interrupts-dpcs-and-more
 [^ms-idlestatemax]: Microsoft, "Mitigation for AMD Family 17h Models 30h-3Fh (Rome) erratum 1474," Microsoft Learn (previous versions). https://learn.microsoft.com/en-us/previous-versions/troubleshoot/windows-server/mitigation-for-amd-family-17h-models-30h-3fh-rome-erratum-1474
+[^reservedcpusets]: valleyofdoom, "ReservedCpuSets," GitHub. https://github.com/valleyofdoom/ReservedCpuSets
 [^ms-irq-affinity]: Microsoft, "Interrupt Affinity," Microsoft Learn. https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/interrupt-affinity-and-priority
