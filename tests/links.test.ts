@@ -47,30 +47,64 @@ describe.skipIf(!ENABLED)("external links", () => {
   test(
     "every cited URL is reachable",
     async () => {
+      // Hosts run in parallel, each host's URLs through a small pool: the corpus
+      // cites ~1,000 URLs (900+ on github.com), and the old fully-serial loop
+      // could not finish inside any sane timeout (lexicanum#31). The per-host
+      // cap keeps the politeness that serial bought - no burst against one
+      // host - which is what gets a runner rate-limited into false negatives.
+      const byHost = new Map<string, [string, string[]][]>();
+      for (const entry of all) {
+        const host = new URL(entry[0]).host;
+        byHost.set(host, [...(byHost.get(host) ?? []), entry]);
+      }
       const dead: string[] = [];
-      // Serial with a short timeout: politeness to the hosts, and a parallel
-      // burst is what gets a runner rate-limited into a false negative.
-      for (const [url, docs] of all) {
+      const limited: string[] = [];
+      let checked = 0;
+      const check = async (url: string, docs: string[]) => {
         let status = 0;
         for (const method of ["HEAD", "GET"] as const) {
-          try {
-            const res = await fetch(url, {
-              method,
-              redirect: "follow",
-              signal: AbortSignal.timeout(15000),
-              headers: { "user-agent": "lexicanum-link-check" },
-            });
-            status = res.status;
-            if (status < 400) break;
-          } catch {
-            status = 0;
+          for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+              const res = await fetch(url, {
+                method,
+                redirect: "follow",
+                signal: AbortSignal.timeout(15000),
+                headers: { "user-agent": "lexicanum-link-check" },
+              });
+              status = res.status;
+              if (status !== 429 || attempt === 1) break;
+              // Rate limited: honour Retry-After once (capped), then retry.
+              const wait = Math.min(Number(res.headers.get("retry-after")) || 10, 30);
+              await new Promise((r) => setTimeout(r, wait * 1000));
+            } catch {
+              status = 0;
+              break;
+            }
           }
+          if (status < 400 && status !== 0) break;
         }
-        // 405 and 403 to a HEAD-hostile or bot-hostile host are not dead links.
-        if (status === 0 || status >= 400) dead.push(`${status || "no response"} ${url} (${docs[0]})`);
-      }
+        checked++;
+        // A host still throttling after a retry is not evidence the page is gone.
+        if (status === 429) limited.push(`${url} (${docs[0]})`);
+        else if (status === 0 || status >= 400) dead.push(`${status || "no response"} ${url} (${docs[0]})`);
+      };
+      const PER_HOST = 4;
+      await Promise.all(
+        [...byHost.values()].map(async (entries) => {
+          let next = 0;
+          const worker = async () => {
+            while (next < entries.length) {
+              const [url, docs] = entries[next++]!;
+              await check(url, docs);
+            }
+          };
+          await Promise.all(Array.from({ length: Math.min(PER_HOST, entries.length) }, worker));
+        }),
+      );
+      console.log(`checked ${checked} URLs on ${byHost.size} hosts; rate-limited (not counted dead): ${limited.length}`);
+      for (const l of limited) console.log(`  429 ${l}`);
       expect(dead).toEqual([]);
     },
-    { timeout: 300000 },
+    { timeout: 900000 },
   );
 });
