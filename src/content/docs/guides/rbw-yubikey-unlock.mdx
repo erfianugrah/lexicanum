@@ -1,0 +1,549 @@
+---
+title: Unlocking rbw with a YubiKey touch on Linux and WSL2
+description: "Replace the typed rbw master password with a touch on a YubiKey. The master password is age-encrypted to a P-256 key in the YubiKey's PIV applet (age-plugin-yubikey, PIN policy never, touch policy always), and a small pinentry wrapper answers rbw's first-try master-password prompt by decrypting it, while retries, other prompts and every failure go to the normal dialog. On native Linux the plugin talks to the key through pcscd; on WSL2 the key stays attached to Windows and the Windows build of the plugin does the work through interop, so Windows keeps the key and nothing has to be re-attached after a reboot. Covers the polkit rule a session-less pcscd needs, routing gpg through pcscd, the firmware 5.7 management-key incompatibility, and touch notifications on both."
+author: "Erfi Anugrah"
+category: secrets
+aliases:
+  - "/guides/rbw-yubikey-unlock-wsl2"
+---
+
+`rbw unlock` asks for the Vaultwarden master password every time the agent locks. This guide moves that password onto a YubiKey: it is stored age-encrypted to a key that never leaves the YubiKey's PIV applet, and rbw's pinentry is replaced by a wrapper that decrypts it when rbw asks. Unlocking becomes a touch on the key, prompted by a desktop notification. Typing the password still works, and is what you get whenever the key is missing or not touched in time.
+
+Why rbw is the command-line client in the first place is in [choosing a secrets backend](/reference/choosing-a-secrets-backend/); what reads through the unlocked agent afterwards (`sx`, the digest guard) is in [keeping credentials out of coding-agent transcripts](/reference/agent-secret-guard/). The WSL2 parts were built on the same box as [keeping /run/user alive across Docker Desktop stops](/guides/wsl2-run-user-docker-desktop/), whose repair step ends in `rbw unlock`.
+
+Prerequisites: rbw already logged in and working with a GUI pinentry (`pinentry-gtk`; under WSL2 that runs on WSLg), a YubiKey 5 with an unused PIV applet, and a terminal that is not wrapped by another program (Part 3 says why). WSL2 additionally needs admin rights on Windows once. Everything here was done and measured on 2026-10-28 on the rig below; native Linux was not run on separate hardware, but the native route is the same code path the WSL2 box used with the key attached to Linux.
+
+## Constants (read this first)
+
+### The rig
+
+| Piece | Detail |
+|---|---|
+| Windows host | Windows 10 22H2, build 19045 |
+| WSL kernel | `6.18.54.1-microsoft-standard-WSL2`, built with `CONFIG_USBIP_VHCI_HCD=m` |
+| Distro | Arch Linux, systemd as PID 1 |
+| YubiKey | YubiKey 5 NFC, firmware 5.7.1, USB id `1050:0407` (OTP+FIDO+CCID) |
+| rbw | 1.15.0 (a patched build; the pinentry protocol below is upstream's) |
+
+### What the setup depends on
+
+| Fact | Consequence |
+|---|---|
+| rbw-agent daemonises with no controlling terminal | Nothing can prompt on a terminal from inside its pinentry, so the key must decrypt without a PIN: PIN policy `never`, touch policy `always`. The touch is the consent. |
+| rbw writes `SETTITLE`, `SETPROMPT`, `SETDESC`, an optional `SETERROR`, then `GETPIN`, closes stdin, and reads one `OK` per command plus a `D` line[^rbw-pinentry] | A pinentry replacement can be a short script that never speaks the full Assuan protocol. |
+| A wrong password makes rbw re-prompt with `SETERROR ... (attempt N/3)`, three attempts in all[^rbw-actions] | The wrapper answers only when `SETERROR` is absent, so a stale encrypted file costs one attempt and the dialog handles the rest. |
+| With no touch, the YubiKey gives up after about 15 s (measured: `Failed to decrypt YubiKey stanza` at 14.6 s, three times) | A missed touch comes back as an error before the wrapper's own 30 s timeout. A touch before the key starts blinking does not count. |
+| pcsc-lite's polkit policy allows `access_pcsc` and `access_card` to active local sessions only (`allow_active` yes, `allow_any` and `allow_inactive` no) | A desktop login works as is. A WSL2 shell or an ssh session is never an active local session, so pcscd rejects it until a polkit rule says otherwise (Part 1). |
+| gpg's scdaemon has its own CCID driver | It cannot reach a key that pcscd serves: `gpg --card-status` says `No such device` while `ykman list` works. `disable-ccid` sends it through pcscd (Part 1). |
+| WSL2 has no USB passthrough of its own, and a device attached to WSL over usbipd-win disappears from Windows | Daily use keeps the key on Windows and runs the Windows build of the plugin through interop[^ayk-readme]. usbipd is only needed for the PIV setup steps, which use Linux `ykman`. |
+| age finds plugins by name on `PATH` (`age-plugin-yubikey`), and WSL interop runs a Windows `.exe` with pipes intact | A two-line shim named `age-plugin-yubikey` that execs the `.exe` lets the Linux `age` use the Windows plugin. |
+| `usbipd detach` returns before WSL's kernel has dropped the device | Anything that decides "is the key in WSL?" right after a detach can see a stale answer; the wrapper retries through Windows when the native plugin cannot open the key. |
+| Firmware 5.7 ships an AES192 default PIV management key; age-plugin-yubikey 0.5.1 handles only TDES or a PIN-protected key | Key generation fails until the management key is replaced (Part 3). |
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.6;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  agent [label="rbw-agent"]; wrap [label="pinentry-rbw"]; gtk [label="pinentry-gtk"];
+  age [label="age -d\n+ master.age"];
+  native [label="age-plugin-yubikey\n(Linux)"]; pcscd [label="pcscd"];
+  shim [label="shim\nage-plugin-yubikey"]; winexe [label="age-plugin-yubikey.exe\n(Windows, interop)"];
+  yk [label="YubiKey PIV slot 82\nP-256, touch always"];
+  agent -> wrap [label="GETPIN"]; wrap -> gtk [label="retry, other prompt,\nany failure"];
+  wrap -> age; age -> native [label="native Linux,\nor key attached to WSL"]; native -> pcscd -> yk;
+  age -> shim [label="WSL2, key on Windows"]; shim -> winexe -> yk;
+}
+```
+
+1. rbw-agent starts the configured pinentry, `pinentry-rbw`, and sends its commands.
+2. On a first-try `Master Password` prompt the wrapper shows a touch notification and runs `age -d` on `master.age` with the identity stub.
+3. age hands the stub to an `age-plugin-yubikey` found on `PATH`. On native Linux, or on WSL2 with the key attached to Linux, that is the Linux plugin talking through pcscd. On WSL2 with the key on Windows (no Yubico device in `/sys/bus/usb/devices`), the wrapper puts the shim directory first on `PATH`, and the shim runs the Windows build.
+4. The key waits for a touch; the decrypted password goes back to rbw-agent on stdout. Anything else - a retry, a 2FA prompt, a missing file, no touch - goes to `pinentry-gtk`, with the reason and the elapsed time added to the dialog text.
+
+| Where | Plugin | Touch prompt |
+|---|---|---|
+| Native Linux desktop | Linux `age-plugin-yubikey` through pcscd | `notify-send` |
+| WSL2, key with Windows (daily use) | Windows build through the shim | Windows toast |
+| WSL2, key attached over usbipd | Linux plugin (Windows cannot see the key) | Windows toast |
+
+### Component versions
+
+| Component | Version | Source |
+|---|---|---|
+| age | 1.3.2 | Arch `extra` |
+| age-plugin-yubikey (Linux) | 0.5.1 | Arch `extra` |
+| age-plugin-yubikey (Windows) | 0.5.1, `x86_64-windows.zip`, sha256 `ba00ebd999b928994dc1f1ee0a83562f97b538f8ece75945aa6caf3695bfe3aa` | GitHub release[^ayk-release] |
+| pcsclite / ccid | 2.5.3 / 1.8.4 | Arch `extra` |
+| yubikey-manager (ykman) | 5.9.2 | Arch `extra` |
+| usbipd-win (WSL2 only) | 5.3.0 | winget `dorssel.usbipd-win` |
+
+## Part 1: pcscd and gpg on Linux
+
+```bash
+sudo pacman -S --needed age age-plugin-yubikey yubikey-manager pcsclite ccid
+sudo systemctl enable --now pcscd.socket
+```
+
+On NixOS pcscd is a system service, `services.pcscd.enable = true;` in the host configuration; a home-manager profile cannot provide it.
+
+From a desktop session `ykman list` now shows the key. From a WSL2 shell (once the key is attached, Part 2) or over ssh it does not:
+
+```bash
+ykman list
+# WARNING: PC/SC not available. Smart card (CCID) protocols will not function.
+# ERROR: Unable to list devices for connection
+journalctl -u pcscd --since -5min
+# pcscd[...]: auth.c:166:IsClientAuthorized() Process 332763 (user: 1000) is NOT authorized for action: access_pcsc
+# pcscd[...]: winscard_svc.c:361:ContextThread() Rejected unauthorized PC/SC client
+```
+
+For those, allow the one user both pcsc-lite actions, and nothing else:
+
+```js
+// /etc/polkit-1/rules.d/49-pcscd-wsl.rules
+// WSL2 (and ssh) sessions are never active local sessions, so pcsc-lite's
+// default polkit policy rejects every client. Allow the desktop user only.
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.debian.pcsc-lite.access_pcsc" ||
+         action.id == "org.debian.pcsc-lite.access_card") &&
+        subject.user == "<user>") {
+        return polkit.Result.YES;
+    }
+});
+```
+
+```bash
+sudo chmod 644 /etc/polkit-1/rules.d/49-pcscd-wsl.rules
+sudo systemctl restart polkit pcscd
+```
+
+Then route gpg's scdaemon through pcscd, on any Linux. Without it, `gpg --card-status` says `No such device` while `ykman list` sees the key:
+
+```bash
+echo disable-ccid >> ~/.gnupg/scdaemon.conf
+gpgconf --kill scdaemon
+gpg --card-status | grep -E 'Reader|Serial'
+# Reader ...........: Yubico YubiKey OTP FIDO CCID 00 00
+```
+
+scdaemon and age-plugin-yubikey share the card on this box: `age-plugin-yubikey --list` answered with scdaemon running and after `gpgconf --kill scdaemon`. Nothing in this setup needs gpg to touch the card - gpg's passphrase is seeded from rbw once rbw is unlocked - but a gpg that cannot see an attached card is a trap the next time something does.
+
+## Part 2: WSL2 only - the Windows plugin, and usbipd for setup
+
+Install the Windows build of the plugin into the Windows profile and check it against the release digest:
+
+```bash
+v=v0.5.1; zip=age-plugin-yubikey-$v-x86_64-windows.zip
+dst="$(wslpath "$(cd /mnt/c && cmd.exe /c 'echo %LOCALAPPDATA%' | tr -d '\r')")/Programs/age-plugin-yubikey"
+curl -fsSLO "https://github.com/str4d/age-plugin-yubikey/releases/download/$v/$zip"
+echo "ba00ebd999b928994dc1f1ee0a83562f97b538f8ece75945aa6caf3695bfe3aa  $zip" | sha256sum -c
+mkdir -p "$dst" && unzip -j -o "$zip" '*/age-plugin-yubikey.exe' -d "$dst"
+"$dst/age-plugin-yubikey.exe" --list    # runs through interop; lists nothing until Part 4
+```
+
+The shim that lets the Linux `age` find it, saved as `~/.local/share/pinentry-rbw/winplugin/age-plugin-yubikey` (executable). It is only ever first on `PATH` inside the wrapper, so other uses of age keep the Linux plugin:
+
+```sh
+#!/bin/sh
+# age looks plugins up by name on PATH; hand the plugin protocol to the
+# Windows build through interop, so the YubiKey stays attached to Windows.
+for exe in /mnt/c/Users/*/AppData/Local/Programs/age-plugin-yubikey/age-plugin-yubikey.exe; do
+  [ -x "$exe" ] && exec "$exe" "$@"
+done
+echo "age-plugin-yubikey.exe not found" >&2
+exit 127
+```
+
+The PIV setup in Parts 3 and 4 runs Linux `ykman`, so the key has to be in WSL for those steps. usbipd-win provides that; binding needs an elevated shell once, attaching does not:
+
+```powershell
+winget install --exact --id dorssel.usbipd-win
+usbipd list                            # BUSID ... 1050:0407  USB Input Device, Microsoft Usbccid Smartcard Reader (WUDF)
+usbipd bind --busid <busid>            # elevated, once; persists
+usbipd attach --wsl --busid <busid>    # for setup; lost on reboot or replug
+```
+
+From inside WSL the same commands run as `"/mnt/c/Program Files/usbipd-win/usbipd.exe"`. After the attach `cat /sys/bus/usb/devices/*/idVendor` includes `1050`. While attached, Windows cannot use the key, passkeys included; Part 7 detaches it again.
+
+## Part 3: prepare the PIV applet
+
+Run Parts 3 to 5 in an ordinary terminal. age-plugin-yubikey's PIN dialog misbehaved inside a coding agent's pseudo-terminal wrapper here: one run exited 130 at the "Repeat the PIN/PUK" prompt, the next printed nothing at all.
+
+```bash
+ykman piv info
+# PIN tries remaining:      3/3
+# Management key algorithm: AES192
+# WARNING: Using default PIN!
+# WARNING: Using default PUK!
+# WARNING: Using default Management key!
+```
+
+Change the PIN and PUK first, with ykman, so the plugin never runs its own PIN-change dialog. The PIV PIN is 6 to 8 bytes; the plugin's dialog fails a longer one as `Error while communicating with YubiKey: size error`, without using an attempt. The factory PIN is `123456`, the PUK `12345678`; setting the PUK equal to the PIN is the plugin's own choice:
+
+```bash
+ykman piv access change-pin      # current 123456, then the new 6-8 byte PIN
+ykman piv access change-puk      # current 12345678, then the same value
+```
+
+On the key used here the change went through the plugin's own dialog during generation (with the 8-byte limit learned the hard way); the two ykman commands are the equivalent that keeps the plugin's dialog out of it.
+
+Then the management key. With the firmware 5.7 AES192 default, plugin 0.5.1 stops with:
+
+```
+Error: Custom unprotected non-TDES management keys are not supported.
+You can use the YubiKey Manager CLI to change to a protected management key:
+  ykman piv access change-management-key -a TDES --protect
+```
+
+`--protect` generates a random TDES key and stores it on the YubiKey behind the PIN. Press Enter for the current (default) key and give the PIN:
+
+```bash
+ykman piv access change-management-key -a tdes --protect
+# Enter the current management key [blank to use default key]:
+# Enter PIN:
+# New management key set.
+```
+
+## Part 4: create the age key
+
+Generate the key in PIV slot 1 (retired slot 82) and save the identity stub, which only tells age which YubiKey and slot to ask and is not secret. The plugin asks for the PIN once, to unlock the protected management key:
+
+```bash
+umask 077
+age-plugin-yubikey --generate --serial <serial> --slot 1 --name rbw-unlock \
+  --pin-policy never --touch-policy always > ~/.config/rbw/yubikey-identity.txt
+grep -o 'age1yubikey1[0-9a-z]*' ~/.config/rbw/yubikey-identity.txt   # the recipient
+ykman piv info | sed -n '/Slot 82/,/Subject DN/p'
+# Slot 82 (RETIRED1):
+#   Private key type: ECCP256
+#   Subject DN:       CN=rbw-unlock,OU=0.5.1,O=age-plugin-yubikey
+```
+
+If the slot already holds the key (a second machine, a lost identity file), regenerate the stub instead of the key: `age-plugin-yubikey --identity --serial <serial> --slot 1 > ~/.config/rbw/yubikey-identity.txt`.
+
+## Part 5: encrypt the master password
+
+Read the password without echo, encrypt it without a trailing newline, and check the round trip without printing anything about the value (one touch):
+
+```bash
+umask 077
+d=~/.config/rbw
+recip=$(grep -o 'age1yubikey1[0-9a-z]*' "$d/yubikey-identity.txt" | head -1)
+read -rsp 'rbw master password: ' pw; echo
+printf '%s' "$pw" | age -r "$recip" -o "$d/master.age"
+[ "$(age -d -i "$d/yubikey-identity.txt" "$d/master.age")" = "$pw" ] && echo "roundtrip ok"
+unset pw
+```
+
+The password exists only in the shell variable and the pipe. A changed master password later needs only this part again.
+
+## Part 6: the pinentry wrapper
+
+The wrapper reads rbw's commands, decides, and either answers or hands the same commands to the real pinentry. It answers only a first-try `Master Password` prompt; 2FA codes, the API key prompts and retries keep the normal dialog. Every failure adds its reason and the elapsed time to the dialog's description: about 15 s means the key waited for a touch that did not come, an immediate failure means something else.
+
+Save it as `~/.local/bin/pinentry-rbw` and make it executable:
+
+```python
+#!/usr/bin/env python3
+# pinentry-rbw: answer rbw's first-try master-password prompt from a
+# YubiKey-bound age file; relay everything else to the real pinentry.
+import glob, os, shlex, shutil, signal, subprocess, sys, time
+
+REAL = os.environ.get("PINENTRY_RBW_REAL") or shutil.which("pinentry-gtk") or "pinentry"
+DIR = os.environ.get("PINENTRY_RBW_DIR") or os.path.expanduser("~/.config/rbw")
+TIMEOUT = float(os.environ.get("PINENTRY_RBW_TIMEOUT", "30"))
+SHARE = os.path.expanduser("~/.local/share/pinentry-rbw")
+WINPLUGIN_DIR = os.path.join(SHARE, "winplugin")  # holds the age-plugin-yubikey shim
+WINEXE_GLOB = "/mnt/c/Users/*/AppData/Local/Programs/age-plugin-yubikey/age-plugin-yubikey.exe"
+PS = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+
+
+def is_wsl():
+    if os.environ.get("PINENTRY_RBW_WSL") in ("0", "1"):
+        return os.environ["PINENTRY_RBW_WSL"] == "1"
+    return "microsoft" in open("/proc/sys/kernel/osrelease").read().lower()
+
+
+def yubikey_on_usb():  # a Yubico device (vendor 1050) visible to this kernel
+    root = os.environ.get("PINENTRY_RBW_SYSFS", "/sys/bus/usb/devices")
+    for vid in glob.glob(os.path.join(root, "*", "idVendor")):
+        if open(vid).read().strip() == "1050":
+            return True
+    return False
+
+
+def windows_plugin_exe():
+    found = glob.glob(os.environ.get("PINENTRY_RBW_WINEXE_GLOB", WINEXE_GLOB))
+    return next((e for e in sorted(found) if os.access(e, os.X_OK)), None)
+
+
+def plugin_route():  # -> (route, PATH for age, reason if neither works)
+    path = os.environ.get("PATH", "")
+    if is_wsl() and not yubikey_on_usb():
+        if windows_plugin_exe():
+            return "windows", WINPLUGIN_DIR + os.pathsep + path, None
+        return None, None, "key not attached to WSL and age-plugin-yubikey.exe not installed"
+    if not shutil.which("age-plugin-yubikey", path=path):
+        return None, None, "age-plugin-yubikey not installed"
+    return "native", path, None
+
+
+def windows_retry_route(err):  # WSL: the key left WSL after the sysfs check
+    if is_wsl() and windows_plugin_exe() and "could not open" in err.lower():
+        return "windows", WINPLUGIN_DIR + os.pathsep + os.environ.get("PATH", "")
+    return None
+
+
+def explain(err, route):
+    last = ([l for l in err.strip().splitlines() if not l.startswith("age: report ")] or ["no output"])[-1][:160]
+    if "Failed to decrypt YubiKey stanza" in err:
+        return "no touch, or the key refused (%s plugin): %s" % (route, last)
+    if "could not open" in err.lower() or "not found" in err.lower():
+        return "YubiKey not found by the %s plugin: %s" % (route, last)
+    return "YubiKey decrypt failed (%s plugin): %s" % (route, last)
+
+
+def toast(*args):  # WSL2 only; fire and forget, never blocks the unlock
+    ps1 = os.path.join(SHARE, "toast.ps1")
+    if not (is_wsl() and os.path.isfile(ps1) and os.access(PS, os.X_OK)):
+        return False
+    win = subprocess.run(["wslpath", "-w", ps1], capture_output=True, text=True).stdout.strip()
+    subprocess.Popen([PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", win, *args],
+                     cwd="/mnt/c", start_new_session=True, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True
+
+
+def notify():
+    if toast():
+        return True
+    if not is_wsl() and shutil.which("notify-send"):  # native Linux desktop
+        subprocess.Popen(["notify-send", "-t", "15000", "rbw", "Touch the YubiKey to unlock rbw"],
+                         start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return False
+
+
+def run_age(cmd, shell, env, route):  # -> (returncode or None on timeout, stdout, stderr)
+    p = subprocess.Popen(cmd, shell=shell, env=env, cwd="/mnt/c" if route == "windows" else None,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.communicate()
+        return None, b"", ""
+    return p.returncode, out, err.decode(errors="replace")
+
+
+def enc(s):  # Assuan percent-encoding for D and SETDESC lines
+    return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def decrypt():
+    agefile, ident = os.path.join(DIR, "master.age"), os.path.join(DIR, "yubikey-identity.txt")
+    for f in (agefile, ident):
+        if not os.path.isfile(f):
+            return None, "no " + f
+    env, hook = dict(os.environ), os.environ.get("PINENTRY_RBW_DECRYPT")  # hook: tests
+    if hook:
+        cmd, route = hook, "test"
+    else:
+        route, env["PATH"], why = plugin_route()
+        if route is None:
+            return None, why
+        cmd = ["age", "-d", "-i", ident, agefile]
+    shown, started = notify(), time.monotonic()
+    try:
+        rc, out, err = run_age(cmd, bool(hook), env, route)
+        retry = rc and route == "native" and windows_retry_route(err)
+        if retry:
+            route, env["PATH"] = retry
+            rc, out, err = run_age(cmd, False, env, route)
+    finally:
+        if shown:
+            toast("-Clear")
+    if rc is None:
+        return None, "timed out after %ds waiting for the touch" % TIMEOUT
+    if rc != 0:  # the elapsed time tells a missed touch (~15 s) from an error
+        return None, "%s [after %.1fs]" % (explain(err or "exit %d" % rc, route), time.monotonic() - started)
+    value = out.decode().rstrip("\r\n")
+    return (value, None) if value else (None, "YubiKey decrypt returned an empty value")
+
+
+def relay(lines, reason):
+    if reason:
+        print("pinentry-rbw: " + reason, file=sys.stderr)
+        lines = [l + "%0A%0A(pinentry-rbw: " + enc(reason) + ")" if l.startswith("SETDESC ") else l
+                 for l in lines]
+    p = subprocess.Popen(shlex.split(REAL) + sys.argv[1:], stdin=subprocess.PIPE)
+    p.communicate("".join(l + "\n" for l in lines).encode())
+    return p.returncode
+
+
+def main():
+    lines = []
+    for raw in sys.stdin:  # rbw writes everything, then closes stdin
+        lines.append(raw.rstrip("\n"))
+        if lines[-1].startswith("GETPIN"):
+            break
+    first_try_master = ("SETPROMPT Master Password" in lines
+                        and not any(l.startswith("SETERROR") for l in lines))
+    if not first_try_master:
+        return relay(lines, None)
+    value, reason = decrypt()
+    if value is None:
+        return relay(lines, reason)
+    out = ["OK Pleased to meet you"]
+    for l in lines:
+        if l.startswith("GETPIN"):
+            out.append("D " + enc(value))
+        out.append("OK")
+    sys.stdout.write("".join(l + "\n" for l in out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+On WSL2 the touch prompt is a Windows toast. WSL has no notification daemon (`notify-send` fails with `org.freedesktop.DBus.Error.ServiceUnknown`), so the wrapper calls Windows PowerShell 5.1 through interop and shows a WinRT toast, then removes it once the decrypt returns. Save this as `~/.local/share/pinentry-rbw/toast.ps1`; without the file the key's blinking light is the only prompt. Native Linux uses `notify-send` and needs no file:
+
+```powershell
+# toast.ps1 - Windows toast for pinentry-rbw on WSL2 (WSL has no notification
+# daemon, so notify-send has nowhere to go). Windows PowerShell 5.1 (WinRT).
+#   toast.ps1 -Title rbw -Body '...' [-Icon <png path, UNC ok>]   show
+#   toast.ps1 -Clear                                             remove it
+# The icon is copied to %LOCALAPPDATA%\pinentry-rbw\ because toast images must
+# be local files. Tag/group keep one toast at a time and let -Clear find it.
+param(
+    [string]$Title = 'rbw',
+    [string]$Body = 'Touch the YubiKey to unlock rbw',
+    [string]$Icon = '',
+    [int]$Seconds = 35,
+    [switch]$Clear
+)
+$ErrorActionPreference = 'Stop'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+$tag = 'touch'
+$group = 'pinentry-rbw'
+
+if ($Clear) {
+    [Windows.UI.Notifications.ToastNotificationManager]::History.Remove($tag, $group, $app)
+    exit 0
+}
+
+$logo = ''
+if ($Icon -and (Test-Path -LiteralPath $Icon)) {
+    $dir = Join-Path $env:LOCALAPPDATA 'pinentry-rbw'
+    $dst = Join-Path $dir 'icon.png'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    if (-not (Test-Path -LiteralPath $dst) -or
+        (Get-Item -LiteralPath $dst).Length -ne (Get-Item -LiteralPath $Icon).Length) {
+        Copy-Item -LiteralPath $Icon -Destination $dst -Force
+    }
+    $uri = ([System.Uri]$dst).AbsoluteUri
+    $logo = "<image placement='appLogoOverride' src='$uri'/>"
+}
+
+$esc = [System.Security.SecurityElement]
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml("<toast scenario='reminder'><visual><binding template='ToastGeneric'>$logo<text>$($esc::Escape($Title))</text><text>$($esc::Escape($Body))</text></binding></visual><actions><action content='Dismiss' arguments='dismiss' activationType='system'/></actions></toast>")
+$t = New-Object Windows.UI.Notifications.ToastNotification $xml
+$t.ExpirationTime = [DateTimeOffset]::Now.AddSeconds($Seconds)
+$t.Tag = $tag
+$t.Group = $group
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show($t)
+```
+
+An optional `-Icon` PNG (a UNC `\\wsl.localhost\...` path is fine) is copied to `%LOCALAPPDATA%\pinentry-rbw\` and shown from there as the toast's logo. The AppUserModelID is Windows PowerShell's own, so the toast needs no app registration.
+
+## Part 7: point rbw at the wrapper and test it
+
+On WSL2, hand the key back to Windows first and wait until WSL's kernel has let go of it:
+
+```bash
+"/mnt/c/Program Files/usbipd-win/usbipd.exe" detach --busid <busid>
+while grep -qx 1050 /sys/bus/usb/devices/*/idVendor 2>/dev/null; do sleep 0.5; done
+```
+
+Then, on either platform:
+
+```bash
+rbw config set pinentry "$HOME/.local/bin/pinentry-rbw"
+rbw lock && rbw unlock && rbw unlocked && echo unlocked
+```
+
+`rbw unlock` blocks until you touch the key. `rbw config set` stops the agent, so the next command starts one that reads the new setting[^rbw-config]. A full path keeps the wrapper independent of the agent's `PATH`.
+
+Measured on the WSL2 box, from start to answer, touch included: through the Windows plugin 4.3 s and 4 s (`rbw unlock`) and 1.9 s (the wrapper above, run directly); through the Linux plugin with the key attached, 3 s and 10 s (`rbw unlock`) and 9.5 s and 3.0 s (run directly). One Linux-plugin attempt failed in under 9 s with `Failed to decrypt YubiKey stanza` and did not reproduce in two retries of the same sequence; the elapsed time in the dialog text exists to classify the next one.
+
+## Verification
+
+| Check | How | Expected |
+|---|---|---|
+| pcscd lets you in (Linux plugin) | `ykman list` with the key on Linux | `YubiKey 5 ... Serial: <serial>`, no `PC/SC not available` |
+| gpg reaches the card | `gpg --card-status` with the key on Linux | `Reader ...: Yubico YubiKey ...`, no `No such device` |
+| Windows plugin sees the key (WSL2) | `age-plugin-yubikey.exe --list` with the key on Windows | `Name: rbw-unlock`, `PIN policy: Never` |
+| Round trip | `age -d -i ~/.config/rbw/yubikey-identity.txt ~/.config/rbw/master.age >/dev/null && echo ok` (touch); on WSL2 with the key on Windows prefix `PATH=~/.local/share/pinentry-rbw/winplugin:$PATH` | `ok`, and nothing about the value printed |
+| Unlock by touch | `rbw lock && rbw unlock` | notification, touch, exit 0; `rbw unlocked` exits 0 |
+| Fallback | `rbw lock && rbw unlock`, then do not touch | after about 15 s the `pinentry-gtk` dialog, its text ending in `(pinentry-rbw: no touch, or the key refused (windows plugin): ... [after 14.6s])`; typing the password unlocks |
+| Retries go to the dialog | in the fallback dialog, submit a wrong password | the next two prompts are `pinentry-gtk` dialogs too, never an automatic answer |
+
+All seven were run on the WSL2 box on 2026-10-28 (the round trip as written, with the WSL2 `PATH` prefix: `ok` in 2.3 s); the fallback and retry rows were checked in rbw-agent's log (`~/.local/share/rbw/agent.err`), which records the wrapper's stderr line and three `pinentry-gtk` launches. Offline, the wrapper above passes a 20-case suite that feeds it rbw's exact command sequence with a fake real pinentry and a fake decrypt: the first-try answer, the `SETERROR` retry, a different prompt, a failing, empty or timed-out decrypt, a missing `master.age`, the plugin choice for native Linux and both WSL2 cases, the Windows retry after `Could not open YubiKey`, and no retry after a missed touch.
+
+## What protects what
+
+| Asset | Protected by |
+|---|---|
+| The P-256 private key | Generated on the YubiKey, not exportable |
+| `master.age` on disk | Useless without that key; decrypting needs the key present and a touch |
+| Use of the key | Physical touch per decrypt (touch policy `always`); no PIN, by choice (see Constants) |
+| Managing the PIV applet (new keys, changing policy) | The PIN, which now also guards the management key |
+| Unlocking rbw without the key | The master password, typed, exactly as before |
+
+A process on the box can start the decrypt of a locked rbw but cannot finish it without a touch. Someone at the desk with the key plugged in can unlock with one touch. Once rbw is unlocked none of this applies: the agent answers any process of the same user, as it did before. With rbw's `lock_timeout` at 86400 s on this box, one touch covers a day of reads.
+
+## Gotchas and lessons learned
+
+- Run the PIV steps in a plain terminal. age-plugin-yubikey's interactive dialogs need a real TTY; inside an agent harness's pseudo-terminal they were interrupted (exit 130) or printed nothing.
+- Change the PIN with ykman before generating, and keep it to 8 bytes. A longer PIN typed into the plugin's dialog fails as `size error`, which reads like a hardware fault and costs no attempt.
+- Firmware 5.7's AES192 default management key looks like a custom key to age-plugin-yubikey 0.5.1. Replace it with `change-management-key -a tdes --protect` before generating.
+- On WSL2, attaching the key to Linux takes it away from Windows. Keep it on Windows for daily use and attach only for the setup steps; the Windows plugin made the reboot and replug re-attach unnecessary.
+- After `usbipd detach`, WSL still lists the device for a moment. Wait for `/sys/bus/usb/devices/*/idVendor` to lose `1050` before testing, or the Linux plugin is chosen and fails with `Could not open YubiKey with serial ...`; the wrapper retries that case through Windows.
+- Touch when the key blinks, not when the notification appears. Plugin start-up through interop takes a moment, and a touch before the key asks for it is ignored.
+- The wrapper must never answer a retry. If `master.age` is stale (the master password changed), answering every prompt would spend all three attempts in under a second; answering only the first spends one and hands the rest to the dialog.
+
+## File reference
+
+| Path | What |
+|---|---|
+| `~/.local/bin/pinentry-rbw` | The wrapper (Part 6), set as rbw's `pinentry` |
+| `~/.local/share/pinentry-rbw/toast.ps1` | Windows toast (WSL2, Part 6) |
+| `~/.local/share/pinentry-rbw/winplugin/age-plugin-yubikey` | Shim to the Windows plugin (WSL2, Part 2) |
+| `%LOCALAPPDATA%\Programs\age-plugin-yubikey\age-plugin-yubikey.exe` | Windows build of the plugin (WSL2, Part 2) |
+| `~/.config/rbw/master.age` | Master password, age-encrypted to the YubiKey recipient, mode 0600 |
+| `~/.config/rbw/yubikey-identity.txt` | age-plugin-yubikey identity stub (serial, slot, recipient); not secret |
+| `/etc/polkit-1/rules.d/49-pcscd-wsl.rules` | Lets the one user use pcscd without an active session (WSL2, ssh; Part 1) |
+| `~/.gnupg/scdaemon.conf` | `disable-ccid` (Part 1) |
+| YubiKey PIV slot 82 (RETIRED1) | P-256 key `rbw-unlock`, PIN policy never, touch policy always |
+
+## Related docs
+
+- [Choosing a secrets backend](/reference/choosing-a-secrets-backend/) - why Vaultwarden with rbw is the human and command-line surface; this guide changes how that surface is unlocked, not what it holds.
+- [Keeping credentials out of coding-agent transcripts](/reference/agent-secret-guard/) - `sx` and the digest guard, which read through the agent this guide unlocks.
+- [Keeping /run/user alive across Docker Desktop stops on WSL2](/guides/wsl2-run-user-docker-desktop/) - the same box; its repair restarts the user manager, after which `rbw unlock` is now a touch.
+- [Encrypting Docker Compose .env files with SOPS and age](/guides/sops-age-compose-stacks/) - age with a file-based key for committed secrets, where this guide uses age with a hardware-bound key for one local one.
+
+[^rbw-pinentry]: J. Luehrs, "rbw/src/pinentry.rs," GitHub. https://github.com/doy/rbw/blob/main/src/pinentry.rs
+[^rbw-actions]: J. Luehrs, "rbw/src/bin/rbw-agent/actions.rs," GitHub. https://github.com/doy/rbw/blob/main/src/bin/rbw-agent/actions.rs
+[^rbw-config]: J. Luehrs, "rbw/src/bin/rbw/commands.rs (config_set)," GitHub. https://github.com/doy/rbw/blob/main/src/bin/rbw/commands.rs
+[^ayk-readme]: J. Grigg (str4d), "age-plugin-yubikey README: Windows Subsystem for Linux (WSL)," GitHub. https://github.com/str4d/age-plugin-yubikey#windows-subsystem-for-linux-wsl
+[^ayk-release]: J. Grigg (str4d), "age-plugin-yubikey v0.5.1," GitHub Releases. https://github.com/str4d/age-plugin-yubikey/releases/tag/v0.5.1
