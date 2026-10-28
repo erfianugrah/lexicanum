@@ -1,6 +1,6 @@
 ---
 title: "Supabase disaster recovery tiers: daily backups, PITR, warm standby - RPO, RTO, and cost"
-description: The three durability tiers a Supabase project has - included daily backups, the PITR add-on, and a hand-rolled warm standby - priced and keyed on worst-case RPO, expected RTO, and monthly cost, with the restore caveats (replication slots, Storage objects, role passwords), recovering from a bad release, the compute, Postgres and plan upgrades the tiers depend on, and the Fair Use billing restriction that causes org-wide 402s.
+description: The three durability tiers a Supabase project has - included daily backups, the PITR add-on, and a hand-rolled warm standby - priced and keyed on worst-case RPO, expected RTO, and monthly cost, with the restore caveats (replication slots, Storage objects, role passwords), recovering from a bad release, what a restore to a new project copies and what it leaves to set up again, the compute, Postgres and plan upgrades the tiers depend on, scheduled jobs across a restart or resize, and the Fair Use billing restriction that causes org-wide 402s.
 author: Erfi Anugrah
 category: supabase
 group: operations
@@ -34,7 +34,10 @@ on default-compute projects in the same region. The release-gating figures
 are github-branching GB03 (2026-09-23); the transactional-apply,
 read-replica floor and restore-point figures are sfp-platforms S04, S07 and
 S03 (2026-08-24 to 2026-09-03); the clone timings are from
-[the major-upgrade guide](/guides/supabase-postgres-major-upgrade-e2e/). The remaining figures are quoted from the cited
+[the major-upgrade guide](/guides/supabase-postgres-major-upgrade-e2e/). The restore-to-new-project API
+surface was re-read in observability-surface OB06, and `pg_cron` across a
+restart and a resize is cron-behaviour CB04 and CB05 (both 2026-10-28, Micro
+projects on a Pro org in ap-southeast-1). The remaining figures are quoted from the cited
 Supabase docs and the SLA page, and the evidence table at the end of the
 doc splits measured from documented.
 
@@ -138,7 +141,9 @@ Restoring from a daily backup has these limits:
   dashboard and the clone-project flow both offer it.[^sb-backups] The
   Management API documents no clone path: the published OpenAPI document (115
   paths) has none, the create-project body has no source field, and the
-  Dashboard's clone route answers a PAT `401` `Unsupported access token`.
+  Dashboard's clone route answers a PAT `401` `Unsupported access token`
+  (re-checked 2026-10-28 with the v2 document as well, see
+  [restoring to a new project](#restoring-to-a-new-project)).
   The entitlements `project_cloning` and `backup.restore_to_new_project`
   read true on the Pro org (RP01, 2026-10-10) and on the Team org (RP04,
   2026-10-20). The restore-paths modules did not clone; the dashboard
@@ -396,6 +401,80 @@ The grant behaviour before the date is measured in
 [locking down Supabase](/reference/supabase-data-surface-lockdown/); the
 behaviour after it has not been run yet.
 
+## Restoring to a new project
+
+Restore to a new project builds a separate project, in the source's region,
+from one of the source's backups or, with PITR, from an instant you pick. It
+needs a paid plan with physical backups enabled, and a project created this
+way cannot itself be the source of another one.[^sb-clone] The docs page
+marks the feature "Beta Version" (read 2026-10-28), so it is outside the
+uptime SLA's GA-only scope ([below](#what-the-sla-does-and-does-not-cover)).
+The source stays up
+throughout,[^sb-backups] which makes it the restore to reach for mid-incident
+and after [a bad release](#a-bad-release). The docs call the result a
+database-only copy. The table sets their list (read 2026-10-28) beside what the
+dashboard clones for
+[the major-upgrade guide](/guides/supabase-postgres-major-upgrade-e2e/#what-carries-over-and-what-does-not)
+found on 2026-07-29 and 2026-08-04; the supabase-lab modules have not run a
+clone.
+
+| Part of the project | The clone docs say | Dashboard clones, 2026-07-29 and 2026-08-04 |
+| --- | --- | --- |
+| Schema, data, indexes, database roles and permissions | copied | copied, as of the backup or PITR instant picked, not the click |
+| Auth users (the `auth` schema: accounts, hashed passwords) | copied | `auth.users` copied intact |
+| Encryption root key | copied, so Vault secrets and encrypted columns stay readable | Vault secrets decrypted |
+| Compute size, disk attributes, SSL enforcement, network restrictions | copied, same region | compute, disk and region matched the source; SSL enforcement and network restrictions not checked |
+| Storage objects and bucket settings | not copied | the bucket and object rows came across (they live in the database), the file bytes did not |
+| Edge Functions | not copied | not copied, their secrets neither |
+| Auth settings and API keys | not copied | new API keys and JWT signing secret, so existing sessions are invalid; SMTP, templates and redirect URLs reset to defaults |
+| Realtime settings | not copied | not copied |
+| Data API exposed schemas | not listed | reset to `public,graphql_public` |
+| Database extensions and settings | listed under manual reconfiguration, though the same page says the binary restore copies enabled extensions | a deprecated extension (`pgjwt`) came across |
+| `pg_cron`, `pg_net` and wrapper jobs | come across and start running as soon as the restore completes, with no way to exclude or pause them | two `pg_cron` jobs arrived `active = true` and both ran at their first matching tick, six minutes after the clone came up |
+| Read replicas | not copied | not copied |
+| PITR | not listed | not inherited: the clone came up with daily backups |
+| Database password | not listed | not read |
+
+**The copy runs its jobs before you can reach them.** The docs call this a
+binary restore: it copies the whole database, including enabled extensions
+that act outside it, and the jobs those extensions hold start as soon as the
+restore completes.[^sb-clone] A job that only touches its own database is
+harmless on a copy. A cron job that calls a webhook, a `pg_net` trigger, or a
+wrapper that writes to a remote system acts from the copy against the targets
+the source uses, so both projects fire. The docs' route for inspecting or
+removing those first is a logical restore with the Supabase CLI.[^sb-logical-restore]
+It is manual and does not carry the encryption root key, so Vault secrets and
+encrypted columns in it are unreadable unless you move the key
+separately.[^sb-clone] Whether a clone's `pg_cron` runs the instants missed
+between the backup and the clone coming up was not recorded; CB04 and CB05
+([below](#scheduled-jobs-across-a-restart-or-resize)) found no catch-up after a
+restart or a resize, and reading that across to a restore is inference.
+
+**No API creates the copy.** observability-surface OB06g re-read the
+Management API on 2026-10-28 (2 runs, Pro org): the v1 OpenAPI document has
+115 paths and the v2 document 36, none mentions clone, and the create-project
+body has no source, backup or restore field. The restore routes it lists act
+in place (`/v1/projects/{ref}/restore`, `database/backups/restore`,
+`restore-pitr`, `restore-point`, `undo`), plus
+`POST /v2/projects/{ref}/backups/download`, whose body takes a backup id and
+the type `project_backup_file_url`. `GET /v1/projects/{ref}/clone` answered `404`,
+and the Dashboard's clone route answered a personal access token with `401`
+`Unsupported access token` (the `401` as restore-paths RP01d found on 2026-10-10). Branch
+creation takes `with_data`; whether that or the backup download gives a usable
+copy was not run. A scripted drill therefore stops at one Dashboard step.
+
+**The RTO has three parts, and only the first has figures.** Because the
+source keeps serving, cutting over to the copy costs the time until the new
+project serves, plus switching clients to its URL and new API keys, plus
+re-applying everything the table lists as not copied (reasoned from the docs,
+not measured end to end). The only figures for the first part are the three
+dashboard clones in the major-upgrade guide: 100 to 180 s to `ACTIVE_HEALTHY` (150 s for the PITR
+one), timed to the status, not to a working Data API read. Restore to a new
+project has not been timed in the restore-paths or observability-surface
+modules (not run), and the other two parts belong to your runbook. When the
+copy is only a source of rows to copy back after a bad release, no client
+switches and production's RTO does not move.
+
 ## The upgrades a tier depends on
 
 An upgrade to a production project is one of three changes, and each costs
@@ -417,6 +496,42 @@ second compute change (D09) and to a PITR change right after a compute
 change (sfp-platforms S07, 2026-08-25).
 Turning PITR on stops the daily backups ([Tier 2](#tier-2-pitr-the-add-on));
 whether any gap opens between the two was not measured.
+
+### Scheduled jobs across a restart or resize
+
+A restart or a resize restarts Postgres, and `pg_cron` does not catch up the
+runs it missed. cron-behaviour ran a project restart (CB04) and a resize from
+Micro to Small (CB05) on 2026-10-28, one of each in each of two runs (n=2
+each), with pg_cron 1.6.4 running jobs over libpq connections to localhost
+(`cron.use_background_workers=off`):
+
+| Event | New postmaster answering the probe, after the request | Every-minute job: last run before / first after | Instants missed | `'10 seconds'` job gap |
+| --- | --- | --- | --- | --- |
+| restart, run a | 49.5 s | 08:34:00.024 / 08:36:00.131 | 1 (08:35) | 62.4 s |
+| restart, run b | 67.7 s | 08:35:00.116 / 08:37:00.086 | 1 (08:36) | 83.7 s |
+| resize, run a | 67.7 s | 08:40:00.076 / 08:42:00.021 | 1 (08:41) | 81.7 s |
+| resize, run b | 49.7 s | 08:41:00.063 / 08:43:00.017 | 1 (08:42) | 61.8 s |
+
+- The every-minute instant inside the outage was skipped, not run late, in 4
+  of 4 events, and `cron.job_run_details` held no row for it. After recovery
+  every every-minute run started 0 to 0.2 s past its boundary, with no late
+  run and no same-minute duplicate. The `'10 seconds'` job's first run came
+  10.2 to 10.3 s after the new postmaster started, then every 10 to 10.1 s,
+  with no burst.
+- A run in flight at the event (a `pg_sleep(120)` job) was recorded `failed`
+  in 4 of 4 events and never re-run. The message was `SSL connection has been
+  closed unexpectedly` in run a and `server restarted`, with no end time, in
+  run b; which one appears depends on whether the old scheduler recorded the
+  lost connection before it stopped (the lab's inference; the order was not
+  observed).
+- A Management API `select` every 2 s failed for 49.3 s and 67.6 s across
+  the restarts and 67.5 s and 47.4 s across the resizes.
+
+So a job that must run once per period cannot rely on the schedule across a
+restart or a resize (or, by inference, a restore); it has to find the work it
+has not done itself. More than one missed minute, a job longer than its
+interval, background workers on, and a restart on Small or larger compute were
+not run.
 
 ## Class zero: your own billing state
 
@@ -527,7 +642,9 @@ resolve in the
 [edge-resilience RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/b100447/experiments/edge-resilience/RUNLOG.md)
 the [compute-disk RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/b100447/experiments/compute-disk/RUNLOG.md)
 and the [restore-paths RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/b292b6b/experiments/restore-paths/RUNLOG.md)
-(RP04 and RP05 in the [2026-10-20 RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/dfd5573/experiments/restore-paths/RUNLOG.md)).
+(RP04 and RP05 in the [2026-10-20 RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/dfd5573/experiments/restore-paths/RUNLOG.md)),
+with OB06 in the [observability-surface RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/b3d9a40/experiments/observability-surface/RUNLOG.md)
+and CB04 and CB05 in the [cron-behaviour RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/RUNLOG.md).
 
 | Practice | Evidence | Module |
 | --- | --- | --- |
@@ -550,6 +667,13 @@ and the [restore-paths RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/
 | Resize to Small before enabling PITR, as two separate changes. | PITR and replicas refuse Micro; a second compute change, or a PITR change right after a compute change, answered `429`. | compute-disk [D09](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/compute-disk/tests/d09-compute-resize-timing.ts); sfp-platforms [S07](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/sfp-platforms/tests/s07-read-replicas.ts) (2026-08-25); docs[^sb-backups] |
 | Verify the 2-minute PITR recovery point before quoting it into a contract. | Use a canary insert against the WAL archive lag. Under a light writer the quoted latest instant lagged at most 107 s after the first sample, and idle it climbed to 752 s (RP06, n=1 per phase); a restore to that instant kept every acknowledged statement older than 0.4 s before it in 10 of 10 restores, 6 of them with 7 to 33 WAL segments unarchived at the call (RP08 `live` arm, Small only). | the docs;[^sb-backups] restore-paths RP06, [RP08](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/restore-paths/tests/rp08-pitr-archiver-lag.ts) ([RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/restore-paths/RUNLOG.md), 2026-10-22/23) |
 | Alert on the spend-cap notification and the usage page rather than on a request error. | 105 renders against a quota of 100 all returned 200, so the notification is the first detectable signal. | [W21](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/edge-resilience/tests/w21-spend-cap.ts), 2026-08-17 |
+| Before restoring to a new project, list the jobs that act outside the database. | `cron.job`, `pg_net` triggers and wrapper servers come across in the binary restore and start when it completes, with no way to pause them (docs); on a 2026-08-04 dashboard clone two `pg_cron` jobs arrived active and ran at their first tick, six minutes after it came up. | docs;[^sb-clone] dashboard clone in [the major-upgrade guide](/guides/supabase-postgres-major-upgrade-e2e/#clone-cron-jobs-fire-before-you-get-to-them), no module |
+| Make those jobs safe to fire from a copy, or use a logical restore and move the root key. | The logical restore with the CLI lets you inspect and remove jobs first but does not carry the encryption root key, so Vault secrets and encrypted columns are unreadable without it. Documented, not run. | docs[^sb-clone][^sb-logical-restore] |
+| Write the drill with one manual Dashboard step to create the copy. | No clone path in the v1 (115 paths) or v2 (36 paths) OpenAPI document, no source field on create-project, `GET /v1/projects/{ref}/clone` `404`, Dashboard clone route `401` `Unsupported access token` to a PAT (OB06g, 2026-10-28, 2 runs; RP01d, 2026-10-10). | observability-surface [OB06](https://github.com/erfianugrah/supabase-lab/blob/b3d9a40/experiments/observability-surface/tests/ob06-planning-locks-clone.ts); [RP01](https://github.com/erfianugrah/supabase-lab/blob/b292b6b/experiments/restore-paths/tests/rp01-pro-surface.ts) |
+| Keep a reconfigure list for the copy: keys, Auth, schemas, Functions, Storage bytes. | The clones came up with new API keys and JWT signing secret, Auth settings and exposed schemas reset, no Edge Functions, and object rows without file bytes (dashboard clones, 2026-07-29 and 2026-08-04); the docs list Realtime settings, extensions and settings, and read replicas too. | docs;[^sb-clone] dashboard clones in [the major-upgrade guide](/guides/supabase-postgres-major-upgrade-e2e/#what-carries-over-and-what-does-not), no module |
+| Budget a cutover to the copy as new project serving + client switch + settings. | The source stays up. Only the first part has figures: 100 to 180 s to `ACTIVE_HEALTHY` across three dashboard clones, timed to the status only; the lab modules have not timed a restore to a new project (not run). The three-part split is a design choice. | design choice; docs[^sb-backups] |
+| Make once-per-period jobs find their own missed work after a restart or resize. | The every-minute instant inside the outage was skipped, not run late, in 4 of 4 events (1 instant each), and after recovery runs started 0 to 0.2 s past their boundary with no burst (n=2 restarts, n=2 Micro to Small resizes). | cron-behaviour [CB04](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/tests/cb04-restart.ts), [CB05](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/tests/cb05-resize.ts) |
+| Re-run by hand the job that was in flight when Postgres restarted. | A `pg_sleep(120)` run in flight was recorded `failed` (`SSL connection has been closed unexpectedly` or `server restarted`) and never re-run, in 4 of 4 events. | cron-behaviour [CB04](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/tests/cb04-restart.ts), [CB05](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/tests/cb05-resize.ts) |
 | On the free tier, schedule the `db dump` and ship it off the project. | Size the job off 12.4s dump / 6.4s restore per 10k rows through the pooler session host. | [W06](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/edge-resilience/tests/w06-cold-dr-timing.ts), 2026-08-15 |
 
 Not measured, so stated as such above: daily-backup restore downtime at any
@@ -566,7 +690,13 @@ restriction path (W21 proved only the absence of a request-path breaker);
 the cutover RTO end to end (per-step timings exist: W05, W16, W17); the
 monthly rehearsal cadence; a stored migration rollback that fails on a
 branch, and the order several rollbacks run in; the Data API grant
-behaviour after 2026-10-30.
+behaviour after 2026-10-30; restore to a new project timed in the lab modules
+(not run; the only times are the dashboard clones), whether the copy keeps the source's database password,
+SSL enforcement and network restrictions on the copy, whether its `pg_cron`
+runs instants missed between the backup and the copy coming up, and whether
+branch `with_data` or the v2 backup download gives a usable copy; `pg_cron`
+across more than one missed minute, with background workers on, or after a
+restart on Small or larger compute.
 
 ## Evidence
 
@@ -586,11 +716,14 @@ behaviour after 2026-10-30.
 | Migration rollback route: `400` on production; on a branch the one stored rollback ran and a migration with none kept its table; a failing apply left no table and no history row (n=2) | measured elsewhere | restore-paths lab [RP05](https://github.com/erfianugrah/supabase-lab/blob/dfd5573/experiments/restore-paths/tests/rp05-migration-rollback.ts), 2026-10-20: one Pro project per run (n=2), one git-less preview branch (n=1) |
 | `MIGRATIONS_FAILED` on a preview branch at 81 s | measured elsewhere | github-branching lab [GB03](https://github.com/erfianugrah/supabase-lab/blob/3a6ca0a/experiments/github-branching/RUNLOG.md), 2026-09-23, one sample |
 | Clone: 100-180 s to `ACTIVE_HEALTHY`, new keys, Auth settings reset, object bytes not copied, as old as the backup picked | measured elsewhere | dashboard clones, 2026-07-29 and 2026-08-04, in [the major-upgrade guide](/guides/supabase-postgres-major-upgrade-e2e/#what-carries-over-and-what-does-not) |
+| Restore to a new project: no clone path in the v1 (115) or v2 (36) OpenAPI document; clone route `404`; Dashboard clone route `401` to a PAT | measured elsewhere | observability-surface lab [OB06g](https://github.com/erfianugrah/supabase-lab/blob/b3d9a40/experiments/observability-surface/RUNLOG.md), 2026-10-28: two Micro projects on a Pro org, document reads and one call per route per run; no clone created |
+| Restore to a new project: what it copies, the binary restore starting `pg_cron`/`pg_net`/wrapper jobs, the logical restore dropping the encryption root key | documented | the clone docs,[^sb-clone] read 2026-10-28; the dashboard clones in [the major-upgrade guide](/guides/supabase-postgres-major-upgrade-e2e/#what-carries-over-and-what-does-not) measured the copied and reset items on 2026-07-29 and 2026-08-04 |
+| `pg_cron` skipped the missed every-minute instant (4 of 4), no burst after; in-flight run `failed`, not re-run (4 of 4) | measured elsewhere | cron-behaviour lab [CB04](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/tests/cb04-restart.ts) and [CB05](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/tests/cb05-resize.ts), 2026-10-28: one restart and one Micro to Small resize per run, two runs, pg_cron 1.6.4, `job_run_details` and `clock_timestamp()` in the database |
 | Daily-backup restore inaccessibility, custom-role passwords not stored, clone behaviour | documented | the backups docs[^sb-backups]; not reproduced because `backups/restore` answered unavailable and clone has no Management API path |
 | Current credentials reapplied after every physical restore | documented | the 2026-07-30 changelog entry[^sb-restore-creds]; the RP02 fingerprints are consistent with it |
 | Retention 7/14/30 days, PITR ~2 minutes, add-on pricing, Fair Use 402 behaviour, 99.9% uptime and support SLAs | documented | Supabase docs and the SLA page, cited per claim with the footnotes below |
 
-Two docs-versus-runtime differences on this page: the daily-backup "project is inaccessible" claim against the narrower PITR outage measured on a small database, and a documented restore route that answered "unavailable" on one fresh Pro project. Filed upstream: no.
+Three docs-versus-runtime differences on this page: the daily-backup "project is inaccessible" claim against the narrower PITR outage measured on a small database, a documented restore route that answered "unavailable" on one fresh Pro project, and the clone docs' "Storage objects & settings" not copied against bucket and object rows that came across without their file bytes. Filed upstream: no.
 
 ## Modules
 
@@ -617,6 +750,9 @@ Two docs-versus-runtime differences on this page: the daily-backup "project is i
 | GB03 | github-branching | [`gb03-per-project-signal.ts`](https://github.com/erfianugrah/supabase-lab/blob/3a6ca0a/experiments/github-branching/tests/gb03-per-project-signal.ts) | [`out/2026-09-23`](https://github.com/erfianugrah/supabase-lab/tree/3a6ca0a/experiments/github-branching/out/2026-09-23) |
 | S04 | sfp-platforms | [`s04-migrations-endpoint.ts`](https://github.com/erfianugrah/supabase-lab/blob/3a6ca0a/experiments/sfp-platforms/tests/s04-migrations-endpoint.ts) | none published |
 | RP03 | restore-paths | [`rp03-free-pause-unpause.ts`](https://github.com/erfianugrah/supabase-lab/blob/b292b6b/experiments/restore-paths/tests/rp03-free-pause-unpause.ts) | [`run-2026-10-10T01-30-06-076Z-rp03`](https://github.com/erfianugrah/supabase-lab/blob/ddd41b2/experiments/restore-paths/out/2026-10-10/run-2026-10-10T01-30-06-076Z-rp03.facts.md), [`run-2026-10-10T01-43-58-645Z`](https://github.com/erfianugrah/supabase-lab/blob/ddd41b2/experiments/restore-paths/out/2026-10-10/run-2026-10-10T01-43-58-645Z.facts.md), [`run-2026-10-10T02-19-59-081Z`](https://github.com/erfianugrah/supabase-lab/blob/ddd41b2/experiments/restore-paths/out/2026-10-10/run-2026-10-10T02-19-59-081Z.facts.md) |
+| OB06 | observability-surface | [`ob06-planning-locks-clone.ts`](https://github.com/erfianugrah/supabase-lab/blob/b3d9a40/experiments/observability-surface/tests/ob06-planning-locks-clone.ts) | [`out/2026-10-28`](https://github.com/erfianugrah/supabase-lab/tree/b3d9a40/experiments/observability-surface/out/2026-10-28) |
+| CB04 | cron-behaviour | [`cb04-restart.ts`](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/tests/cb04-restart.ts) | [`out/2026-10-28`](https://github.com/erfianugrah/supabase-lab/tree/2f7df19/experiments/cron-behaviour/out/2026-10-28) |
+| CB05 | cron-behaviour | [`cb05-resize.ts`](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/tests/cb05-resize.ts) | [`out/2026-10-28`](https://github.com/erfianugrah/supabase-lab/tree/2f7df19/experiments/cron-behaviour/out/2026-10-28) |
 
 [^sb-backups]: Supabase, "Backups," Supabase Docs. https://supabase.com/docs/guides/platform/backups
 [^lab-rp-1023]: supabase-lab, "Restore-paths experiment," supabase-lab runlog, sections "2026-10-22/23 - RP06 (PITR recovery point) and RP07 (restore time against size)", "2026-10-23 - RP08" and "2026-10-23 - RP09". https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/restore-paths/RUNLOG.md
@@ -629,5 +765,6 @@ Two docs-versus-runtime differences on this page: the daily-backup "project is i
 [^sb-sla]: Supabase, "Service Level Agreement." https://supabase.com/sla
 [^sb-restore-creds]: Supabase, "Fixed stale database credentials left behind after a restore," Supabase Changelog, 2026-07-30. https://supabase.com/changelog/restore-credential-resync
 [^sb-clone]: Supabase, "Restore to a new project," Supabase Docs. https://supabase.com/docs/guides/platform/clone-project
+[^sb-logical-restore]: Supabase, "Backup and Restore using the CLI," Supabase Docs. https://supabase.com/docs/guides/platform/migrating-within-supabase/backup-restore
 [^sb-declarative]: Supabase, "Declarative database schemas - Rolling back a schema change," Supabase Docs. https://supabase.com/docs/guides/local-development/declarative-database-schemas
 [^sb-grants-change]: Supabase, "Breaking Change: Tables not exposed to Data and GraphQL API automatically," supabase GitHub Discussions #45329, 2026-04-28. https://github.com/orgs/supabase/discussions/45329
