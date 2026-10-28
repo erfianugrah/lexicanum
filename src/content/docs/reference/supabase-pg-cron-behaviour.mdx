@@ -1,0 +1,305 @@
+---
+title: "pg_cron on Supabase: restarts, resizes, COMMIT in a job and run history, measured"
+description: What hosted pg_cron 1.6.4 did across a project restart and a Micro to Small resize - the run scheduled inside the window skipped and never caught up (1 every-minute instant per event, 0 late, 0 duplicates, n = 2 each), a run in flight recorded failed with "server restarted" or "SSL connection has been closed unexpectedly" and never re-run - plus a COMMITting procedure that works only as a lone CALL, cron.use_background_workers off, cron.job_run_details deletable as postgres while cron.log_run cannot be turned off, and what a pgmq consumer run costs by batch size. Measured 2026-10-28 on throwaway Pro-plan Micro projects in ap-southeast-1.
+author: Erfi Anugrah
+category: supabase
+group: architecture
+---
+
+What hosted `pg_cron` does in the cases an app with scheduled jobs runs into: a run whose time falls inside a restart or a compute resize, a run in flight when the database goes down, a procedure that commits inside its loop scheduled as the job command, keeping `cron.job_run_details` small, and a Supabase Queues (`pgmq`) consumer driven by a job. It is for anyone whose correctness depends on a job having run. The HTTP side of a scheduled job, `pg_net` and a `pg_cron` retry job, is in [pg_net on Supabase under load](/reference/supabase-pg-net-under-load/).
+
+All measured rows come from the lab's [cron-behaviour experiment](https://github.com/erfianugrah/supabase-lab/tree/2f7df19/experiments/cron-behaviour/), run 2026-10-28 on throwaway projects on a Pro-plan organisation in `ap-southeast-1`, each created through `POST /v1/projects` and deleted by CB99. Two processes ran CB01 to CB05 in parallel, each on its own Micro (run a and run b); CB02 ran again on a third Micro (run c) after a fix to how CB02a counted deleted rows. Postgres 17.11, `pg_cron` 1.6.4 and `pgmq` 1.5.1 on all of them. CB01 to CB04 ran on Micro; CB05 resized Micro to Small (the size after the resize was not read back; the change of postmaster was observed). Database times are `clock_timestamp()` and `pg_postmaster_start_time()` in UTC; probe times are the orchestrator's clock. n = 2 per module, one per run, except CB02, which ran three times. The figures are quoted from the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/RUNLOG.md) and the artifacts listed in [Modules](#modules). Two earlier experiments that observed `pg_cron` across downtime, edge-resilience W23 and upgrade-integrity UI06, are cited where they agree. Rows marked documented come from the pages cited at the claim and were not run.
+
+**TL;DR:**
+
+- A run whose scheduled instant fell inside a restart or a resize was skipped, never run late: 1 every-minute instant missed per event, 0 late runs, 0 duplicates, as many runs after recovery as minute boundaries (2 restarts, 2 resizes). A `'10 seconds'` job resumed 10.2 to 10.3 s after the new postmaster started and kept 10 s spacing, with no burst. An in-place major upgrade (UI06, 4 runs) also showed no catch-up: about 9 to 11 runs of a 5 s job never started per gap, none recorded, and the every-minute job missed one run in 2 of 4.
+- A run in flight at the event was recorded `failed` in 4 of 4 events and never re-run, with either `SSL connection has been closed unexpectedly` or `server restarted` as its `return_message`.
+- A procedure that `COMMIT`s inside its loop works as the job command only when `CALL proc()` is the whole command: 5 rows in 5 transactions. An error at iteration 3 failed the run and kept the 2 earlier commits. Any other statement in the same command string, before or after, failed the run with `invalid transaction termination` and kept 0 rows.
+- `cron.use_background_workers` is `off`: jobs run over libpq connections to `localhost`. Of the 10 `cron.*` settings read, 8 are `postmaster` context.
+- `postgres` can `delete from cron.job_run_details`, directly and from a scheduled job. `cron.log_run` is `on` and cannot be changed as `postgres` (`55P02` for `SET` and `ALTER ROLE`, `42501` for `ALTER SYSTEM`), so a cleanup job is the only control over run history.
+- A `pgmq` consumer run (`pgmq.read` then archive or delete) took 5 to 6 ms at p50 for 10 messages, 7 to 8 ms for 100 and 19 to 25 ms for 1,000. Archiving 10,000 messages of 145 B grew the archive table 2555904 B (2.4 MiB); the queue table doubled after the drain either way, with no VACUUM run.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  job    [label="cron.job\nschedule, command"];
+  sched  [label="pg_cron scheduler\nin the running postmaster"];
+  conn   [label="libpq connection\nto localhost\n(use_background_workers=off)"];
+  cmd    [label="command string\nas one query"];
+  runs   [label="cron.job_run_details\n(log_run=on)"];
+
+  job -> sched;
+  sched -> conn [label="at each due instant\nwhile the postmaster is up"];
+  conn -> cmd;
+  sched -> runs [label="status, return_message"];
+}
+```
+
+Text version: jobs live in `cron.job`; the `pg_cron` scheduler runs inside the postmaster and, at each due instant, opens a libpq connection to `localhost` and sends the job's command string; it records every run in `cron.job_run_details`. A due instant that passes while no postmaster is running has no scheduler to start it, and the new postmaster's scheduler starts from the next instant.
+
+## Which do I pick
+
+| What the job does | Shape to use | Rests on |
+|---|---|---|
+| Processes "the last minute" or "the last interval" of data | Read from a stored high-water mark instead, so the run after a skipped instant covers it | CB04, CB05, UI06 |
+| Runs for long enough to be in flight at a restart | Commit progress in chunks from a procedure called alone, and resume from the last committed chunk | CB01, CB04, CB05 |
+| Must not fail silently | A check on `cron.job_run_details` for `failed` rows, and a re-run path | CB04, CB05 |
+| Drains a `pgmq` queue | Batches of 100 to 1,000 per run, delete unless the archive is read | CB03 |
+
+The shapes are design choices; the modules measured the behaviour each one answers. Schedules themselves survived every event: the jobs ran again after recovery without being re-created.
+
+---
+
+## Settings (CB01a)
+
+| Setting | Value (`pg_settings` context) |
+|---|---|
+| `cron.use_background_workers` | `off` (postmaster) |
+| `cron.host` | `localhost` (postmaster) |
+| `cron.database_name` | `postgres` (postmaster) |
+| `cron.enable_superuser_jobs` | `on` (postmaster) |
+| `cron.log_run` | `on` (postmaster) |
+| `cron.log_statement` | `on` (postmaster) |
+| `cron.max_running_jobs` | `32` (postmaster) |
+| `cron.timezone` | `GMT` (postmaster) |
+| `cron.launch_active_jobs` | `on` (sighup) |
+| `cron.log_min_messages` | `warning` (sighup) |
+
+The same in both runs. With `use_background_workers` off, the upstream README says `pg_cron` opens a new libpq connection to the local database for each run;[^pgcron-readme] connection use per running job was not measured here. Supabase recommends no more than 8 jobs running at once and no job longer than 10 minutes;[^sb-cron] neither limit was tested.
+
+---
+
+## Runs scheduled inside a restart or a resize (CB04, CB05)
+
+Each process ran one restart (`POST /v1/projects/{ref}/restart`) and one resize Micro to Small (`PATCH /v1/projects/{ref}/billing/addons`) with three jobs across the event: every minute (`'* * * * *'`), every 10 s (`'10 seconds'`), and a once-a-day `select pg_sleep(120)` started at the minute before the request and running at the request in all 4 events. Each job wrote `clock_timestamp()` and `pg_postmaster_start_time()` per run, so every row names the postmaster that ran it. After the new postmaster answered, the module watched for 240 s more.
+
+| Event | New postmaster answering the probe, after the request | Every-minute last before / first after | Instants missed | Runs after / minute boundaries since the new postmaster | 10 s job gap | 10 s runs not started (about) |
+|---|---|---|---|---|---|---|
+| restart, run a | 49.5 s | 08:34:00.024 / 08:36:00.131 | 1 (08:35) | 4 / 4 | 62.4 s | 5 |
+| restart, run b | 67.7 s | 08:35:00.116 / 08:37:00.086 | 1 (08:36) | 4 / 4 | 83.7 s | 7 |
+| resize, run a | 67.7 s | 08:40:00.076 / 08:42:00.021 | 1 (08:41) | 4 / 4 | 81.7 s | 7 |
+| resize, run b | 49.7 s | 08:41:00.063 / 08:43:00.017 | 1 (08:42) | 4 / 4 | 61.8 s | 5 |
+
+- No catch-up in 4 of 4 events. The instant inside the window was skipped: in run a's restart the new postmaster started at 08:35:01.369, 1.4 s after the missed 08:35 instant, and the next run was at 08:36:00.131. After recovery every every-minute run started 0 to 0.2 s past its boundary.
+- The `'10 seconds'` job's first run came 10.2 to 10.3 s after the new postmaster started, then every 10 to 10.1 s. No run came early to make up the gap.
+- `cron.job_run_details` held only `succeeded` rows for both jobs and no row at all for the skipped instants. The history does not show that a run was missed; only the gap between two `start_time` values does.
+- A Management API `select` every 2 s saw outages of 49.3 s and 67.6 s (restarts) and 67.5 s and 47.4 s (resizes).
+
+Two earlier experiments agree. edge-resilience W23 (2026-08-16) ran a 1/min heartbeat job across a restart and counted 2 rows before and 5 after ([RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/edge-resilience/RUNLOG.md)), a count taken once, four minutes after the REST API answered again ([`w23-cron-restart.ts`](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/edge-resilience/tests/w23-cron-restart.ts)); it shows the job resumed with no burst of doubled runs, and a single count cannot show which instants were skipped. upgrade-integrity UI06 ran a 5 s job and an every-minute job across an in-place upgrade from Postgres 15 to 17 on Micro, four runs on 2026-10-23 and 2026-10-26: the 5 s job resumed on 17 after gaps of 52.4, 59.2, 53.7 and 49.4 s (about 9, 11, 10 and 9 runs never started, none recorded as failed), the every-minute job missed one run in runs 1 and 2 and none in runs 3 and 4, and `job_run_details` held only `succeeded` ([RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/upgrade-integrity/RUNLOG.md)). Neither placed a long-running job across the event.
+
+## A run in flight at the event (CB04b, CB05b)
+
+| Event | Status | `return_message` | `end_time` | Runs after the new postmaster |
+|---|---|---|---|---|
+| restart, run a | `failed` | `SSL connection has been closed unexpectedly` | 08:34:17.757, request 08:34:15.755 | 0 |
+| restart, run b | `failed` | `server restarted` | none | 0 |
+| resize, run a | `failed` | `SSL connection has been closed unexpectedly` | 08:40:20.038, request 08:40:16.391 | 0 |
+| resize, run b | `failed` | `server restarted` | none | 0 |
+
+- The `pg_sleep(120)` run was recorded `failed` in 4 of 4 events and was never re-run; its next scheduled run was a day away, and no run of it started in the 240 s watched after recovery (the job was then unscheduled).
+- The message split by run, not by event type. `SSL connection has been closed unexpectedly` came with an `end_time` 2.0 and 3.6 s after the request (derived); `server restarted` came with no `end_time`; the upstream README's example shows the same status and message, with an end time.[^pgcron-readme] That `pg_cron` writes it at startup for runs left pending is inference. Which one appears depends on whether the old scheduler recorded the lost connection before it stopped (inference; the order was not observed).
+- A job longer than its own interval across a restart, and more than one missed minute, were not run.
+
+---
+
+## A procedure that commits, as the job command (CB01b)
+
+A procedure `cb_loop` that inserts one row and `COMMIT`s, 5 iterations, scheduled `'30 seconds'` and unscheduled after one run, per command shape. Both runs gave identical results.
+
+| Command | Status | `return_message` | Rows kept (distinct transactions) |
+|---|---|---|---|
+| `CALL public.cb_loop('solo', 5)` | `succeeded` | `CALL` | 5 (5) |
+| `CALL public.cb_loop('err', 5, 3)`, error raised at iteration 3 | `failed` | `ERROR:  cb_loop err failing at iteration 3` | 2 (2) |
+| `select 1; CALL public.cb_loop('pre', 5)` | `failed` | `ERROR:  invalid transaction termination` at the procedure's `COMMIT` | 0 |
+| `CALL public.cb_loop('post', 5); select 1` | `failed` | `ERROR:  invalid transaction termination` | 0 |
+| `CALL public.cb_loop('two', 5); CALL public.cb_loop('two', 5)` | `failed` | `ERROR:  invalid transaction termination` | 0 |
+| control: the lone CALL through the Management API query endpoint | ok | - | 5 |
+
+- Alone, the CALL ran each iteration in its own transaction, and an error kept what was committed before it. The 2 rows that survived the failed run mean a re-run of that procedure repeats iterations 1 and 2 unless it starts from what is already there.
+- Any second statement, even a `select 1` after the CALL, failed the first `COMMIT` and rolled back the insert before it. That matches Postgres running a multi-statement query string as one implicit transaction block,[^pg-multi-statement] and a procedure called inside a transaction block being refused transaction control;[^pg-call] the `pg_cron` source was not read.
+- The Supabase quickstart schedules a procedure as `'CALL my_procedure()'` on its own,[^sb-cron-quickstart] the shape that worked.
+
+---
+
+## Keeping cron.job_run_details small (CB02)
+
+| Read | Result |
+|---|---|
+| Owner of `cron.job_run_details` | `supabase_admin` |
+| `postgres` DELETE privilege | yes |
+| Direct `delete ... where end_time < now() - interval '20 seconds'` through the Management API, run c | 3 rows removed (7 before, 5 after; a filler job added rows in between) |
+| Same direct delete, runs a and b | the delete ran (12 rows before, 4 after in both); the removed count those runs report is wrong and is superseded by run c |
+| A `pg_cron` job every 15 s deleting rows older than 10 s, sparing its own | 4 runs of 4 `succeeded` in every run, `return_message` `DELETE 5` once and `DELETE 3` three times (runs a and b), `DELETE 6` once and `DELETE 3` three times (run c) |
+| `cron.log_run` | `on`, context `postmaster` |
+| `SET cron.log_run` and `ALTER ROLE postgres SET cron.log_run` | `55P02: parameter "cron.log_run" cannot be changed without restarting the server` |
+| `ALTER SYSTEM SET cron.log_run` | `42501: permission denied to set parameter "cron.log_run"` |
+
+The Supabase quickstart says `cron.job_run_details` is never cleaned up automatically, also not when a job is unscheduled, and gives a daily job that deletes rows older than 7 days.[^sb-cron-quickstart] The run tested the same kind of statement as `postgres`, directly and as a job, with 20 s and 10 s cut-offs; the 7-day value and the daily schedule are the docs' choice and were not run. The upstream README's other option, `cron.log_run = off` in `postgresql.conf`,[^pgcron-readme] is not available to `postgres` on the hosted project (3 runs).
+
+---
+
+## A pgmq consumer on pg_cron (CB03)
+
+Messages were 145 B of `jsonb`. Storage, 10,000 messages, identical in both runs, no VACUUM run:
+
+| Table | Empty | 10k queued | After reading all 10k and archiving | After reading all 10k and deleting |
+|---|---|---|---|---|
+| queue table | 24576 B | 2523136 B | 5128192 B | 5128192 B |
+| archive table | 24576 B | - | 2580480 B (10000 rows) | 24576 B |
+
+- Archiving grew the archive table 2555904 B (2.4 MiB) for 10,000 messages, about 256 B per 145 B message (derived). Delete mode left it at its empty size.
+- The queue table, empty of rows after the drain, was twice its size with 10k queued. `pgmq.read` rewrites each row to set its visibility timeout, which is the likely reason (inference); whether autovacuum or VACUUM gives the space back was not run.
+- Draining 10k in 10 batches of 1,000 from one Management API call took 305 and 636 ms archiving and 264 and 310 ms deleting (runs a and b).
+
+Consumer run duration: a `pg_cron` job every 10 s calling a function that runs `pgmq.read(q, 30, n)` and then `pgmq.archive` or `pgmq.delete` of the ids read, 4 runs per cell, `job_run_details` end minus start, p50:
+
+| n | archive run a | archive run b | delete run a | delete run b |
+|---|---|---|---|---|
+| 10 | 5 ms | 5 ms | 5 ms | 6 ms |
+| 100 | 8 ms | 8 ms | 7 ms | 7 ms |
+| 1000 | 25 ms | 25 ms | 19 ms | 19 ms |
+
+- The function's own time at n = 1000, p50: archive 19.9 ms (run a) and 20.7 ms (run b), delete 15.2 ms and 15.4 ms. In run b the slowest archive run at n = 1000 took 59 ms and the slowest function time was 52.6 ms (maxima read separately).
+- Every run got its full batch. A hundred times the messages per run cost about three to five times the run time (5 ms to 25 ms archiving, 5 or 6 ms to 19 ms deleting; derived), so larger batches spend less per message, on an idle Micro with a 145 B payload.
+- The consumer ran every 10 s; the schedule decides how often a run happens and has no part in the per-run figures. An every-minute consumer was not run. How many messages arrived at the receiver through such a consumer is measured in [pg_net on Supabase under load](/reference/supabase-pg-net-under-load/#delivery-of-1000-messages-nl04) (NL04).
+
+---
+
+## Docs against runtime
+
+| Claim | Documented | Measured | Filed upstream |
+|---|---|---|---|
+| Run history cleanup | `cron.job_run_details` is never cleaned automatically; schedule a daily delete of rows older than 7 days[^sb-cron-quickstart] | the delete works as `postgres`, directly and as a job; the 7-day job itself not run (CB02) | no disagreement |
+| Turning run logging off | `cron.log_run = off` in `postgresql.conf`; settings changed with `ALTER SYSTEM SET cron.<parameter>`[^pgcron-readme] | `postmaster` context; `SET` and `ALTER ROLE` `55P02`, `ALTER SYSTEM` `42501` as `postgres` (CB02) | not filed; the upstream README describes a self-managed server |
+| A procedure as the command | `'CALL my_procedure()'` alone[^sb-cron-quickstart] | works alone, including `COMMIT` inside; fails with `invalid transaction termination` beside any other statement (CB01) | no disagreement; the combined case is not documented |
+| Runs due during downtime | neither page says what happens | skipped, not caught up; a run in flight fails and is not re-run (CB04, CB05) | nothing to file |
+| Concurrency and run length | no more than 8 jobs at once, each no more than 10 minutes[^sb-cron] | not measured | - |
+
+---
+
+## Reading the numbers
+
+| Claim | Measured or documented | How it was checked |
+|---|---|---|
+| Settings and contexts | measured, two runs (CB01a), Micro | `pg_settings` for `cron.%` |
+| A lone CALL may COMMIT; a combined command may not | measured, two runs per shape (CB01b), Micro | per command shape: status, `return_message`, rows kept, distinct transaction ids |
+| `postgres` can delete run history; `cron.log_run` fixed | measured, three runs (CB02), Micro | owner and privilege, a direct delete, a scheduled delete, `SET` / `ALTER ROLE` / `ALTER SYSTEM` |
+| Consumer cost and archive growth | measured, two runs (CB03), Micro | `pg_total_relation_size`, `job_run_details` end minus start, the function's own clock |
+| No catch-up across a restart or resize | measured, 2 restarts and 2 resizes (CB04a, CB05a), Micro and Micro to Small; agrees with W23 (row count, 1 restart) and UI06 (4 upgrades) | per-run `clock_timestamp()` and postmaster start, against minute boundaries |
+| A run in flight fails and is not re-run | measured, 4 events (CB04b, CB05b) | the `pg_sleep(120)` job's `job_run_details` row and later runs |
+| 8 jobs at once, 10 minutes per job | documented, not run | the Supabase Cron guide |
+
+Every figure comes from one region, a Pro organisation, Micro (Small only after CB05's resize) and an otherwise idle database. n = 2 per module except CB02 (3).
+
+---
+
+## Not measured
+
+- `cron.use_background_workers = on` (a `postmaster` setting `postgres` cannot change).
+- A job longer than its own interval across a restart, more than one missed minute in a window, and a run in flight that was not a `pg_sleep`.
+- An every-minute `pgmq` consumer, a consumer under load or on a busy database, VACUUM or autovacuum after the drain, and payloads other than 145 B.
+- The 7-day cleanup job from the docs as written, and the cost of `cron.job_run_details` growth.
+- Compute other than Micro for CB01 to CB04, other regions, other `pg_cron` versions, and connection use per running job.
+
+---
+
+## Reproducing
+
+The experiment provisions its own Micro per process; it needs a Pro-plan organisation slug in `PVLAB_ORG_PRO` and a personal access token in `SUPABASE_ACCESS_TOKEN`.
+
+```bash
+make run LABEL=a                          # CB01-CB05 on a fresh Micro, then CB99 deletes it; about 21 minutes on 2026-10-28
+make run LABEL=b                          # a second project in parallel, for n = 2
+make run LABEL=c IDS=CB02,CB99            # CB02 alone
+make clean                                # list leftover cb-* projects; DELETE=1 deletes
+make publish-evidence RUN=evidence/<ts>/run-<stamp>.json
+```
+
+`PVLAB_CB_OBS_S` (default 240) is how long CB04 and CB05 watch after the new postmaster answers.
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="Does a run's work depend\non its scheduled instant?"];
+  mark [label="Read from a stored\nhigh-water mark"];
+  q2 [label="Can a run be in flight\nat a restart?"];
+  chunk [label="Procedure called alone,\ncommit per chunk, resume"];
+  q3 [label="Must a failed run\nbe noticed?"];
+  check [label="Check job_run_details\nfor failed rows"];
+  done [label="Plain job command"];
+
+  q1 -> mark [label="yes"];
+  q1 -> q2 [label="no"];
+  mark -> q2;
+  q2 -> chunk [label="yes"];
+  q2 -> q3 [label="no"];
+  chunk -> q3;
+  q3 -> check [label="yes"];
+  q3 -> done [label="no"];
+}
+```
+
+Text version:
+
+1. If a run processes "its" minute or interval, read from a stored high-water mark instead: an instant that falls inside a restart or resize is skipped and not run later.
+2. If a run can last long enough to be in flight at a restart, make it a procedure that commits per chunk, schedule it as `CALL proc()` with nothing else in the command, and have it resume from the last committed chunk: the run in flight fails and is not re-run.
+3. If a failed run must be noticed, check `cron.job_run_details` for `failed` rows: the history records no row for a skipped instant, only for runs that started.
+
+---
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Write jobs to process everything since their last success. | 1 every-minute instant skipped per restart or resize, never run late, no row in `job_run_details` (4 of 4); UI06 missed one in 2 of 4 upgrades. | CB04, CB05, UI06 |
+| Do not guard against catch-up bursts (one missed instant per event tested). | 0 late runs and 0 duplicates in 4 events; the 10 s job resumed 10.2 to 10.3 s after the new postmaster at 10 to 10.1 s spacing; W23 saw no doubling. | CB04, CB05, W23 |
+| Make long jobs resumable: commit per chunk and restart from the last chunk. | A `pg_sleep(120)` run in flight was `failed` in 4 of 4 events and never re-run. | CB04, CB05 |
+| Alert on `failed` runs whose message is `server restarted` or a closed SSL connection. | The in-flight run's `return_message` was `SSL connection has been closed unexpectedly` (2 events) or `server restarted` (2 events). | CB04, CB05 |
+| Schedule a COMMITting procedure as `CALL proc()` with nothing else in the command. | Alone: 5 rows in 5 transactions. With `select 1` before or after, or a second CALL: `invalid transaction termination`, 0 rows. | CB01 |
+| Make each committed iteration safe to repeat. | An error at iteration 3 failed the run and kept the 2 earlier commits. | CB01 |
+| Schedule a `cron.job_run_details` cleanup job; logging cannot be switched off. | `postgres` deleted rows directly and from a job (`DELETE N`, 4 of 4 `succeeded`, 3 runs); `cron.log_run` is `postmaster` context, `55P02` / `42501`. The docs' 7-day cut-off was not run. | CB02 |
+| Count running jobs against the database connection limit. | `cron.use_background_workers=off`, `cron.host=localhost`, `cron.max_running_jobs=32`; per the upstream README each run is a libpq connection (not measured here). | CB01 |
+| Delete consumed `pgmq` messages unless something reads the archive. | Archive grew 2555904 B per 10,000 145 B messages; delete mode left it at 24576 B; delete runs were faster at n = 1000 (19 against 25 ms p50). | CB03 |
+| Read 100 to 1,000 messages per consumer run. | p50 run 5 to 6 ms at n = 10, 7 to 8 ms at 100, 19 to 25 ms at 1,000, every batch full, idle Micro. | CB03 |
+| Budget a drained queue table at twice its queued size until vacuum runs. | 2523136 B with 10k queued, 5128192 B after the drain in both modes, no VACUUM run. | CB03 |
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| CB01 | cron-behaviour | [`cb01-transaction-control.ts`](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/tests/cb01-transaction-control.ts) | run a [`run-2026-10-28T08-24-27-769Z`](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/out/2026-10-28/run-2026-10-28T08-24-27-769Z.facts.md), run b [`run-2026-10-28T08-25-24-631Z`](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/out/2026-10-28/run-2026-10-28T08-25-24-631Z.facts.md) |
+| CB02 | cron-behaviour | [`cb02-run-details-maintenance.ts`](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/tests/cb02-run-details-maintenance.ts) | runs a and b as CB01, run c [`run-2026-10-28T08-45-41-492Z`](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/out/2026-10-28/run-2026-10-28T08-45-41-492Z.facts.md) |
+| CB03 | cron-behaviour | [`cb03-pgmq-consumer.ts`](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/tests/cb03-pgmq-consumer.ts) | runs a and b as CB01 |
+| CB04 | cron-behaviour | [`cb04-restart.ts`](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/tests/cb04-restart.ts), method in [`lib/downtime.ts`](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/lib/downtime.ts) | runs a and b as CB01 |
+| CB05 | cron-behaviour | [`cb05-resize.ts`](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/cron-behaviour/tests/cb05-resize.ts) | runs a and b as CB01 |
+| W23 | edge-resilience | [`w23-cron-restart.ts`](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/edge-resilience/tests/w23-cron-restart.ts) | [`out/2026-08-16`](https://github.com/erfianugrah/supabase-lab/tree/2f7df19/experiments/edge-resilience/out/2026-08-16/); result in the [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/edge-resilience/RUNLOG.md) |
+| UI06 | upgrade-integrity | [`ui06-cron-queue-window.ts`](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/upgrade-integrity/tests/ui06-cron-queue-window.ts) | [`out/2026-10-23`](https://github.com/erfianugrah/supabase-lab/tree/2f7df19/experiments/upgrade-integrity/out/2026-10-23/), [`out/2026-10-26`](https://github.com/erfianugrah/supabase-lab/tree/2f7df19/experiments/upgrade-integrity/out/2026-10-26/) |
+
+## Related docs
+
+- [pg_net on Supabase under load](/reference/supabase-pg-net-under-load/): HTTP from a scheduled job, and the `pg_cron` retry job and `pgmq` consumer that delivered all 1,000 messages where raw `pg_net` lost up to 274.
+- [Data API capacity](/reference/supabase-data-api-capacity/#which-function-setting-a-request-honours-dc09): a function's own `set statement_timeout` did not lift the timeout set earlier in a `pg_cron` command (DC09).
+- [What a Supabase platform operation costs a client](/reference/supabase-platform-operation-cost/): how long a restart and a resize break Auth, the pooler and the other connection paths, measured separately from the outages above.
+- [Postgres major upgrade, end to end](/guides/supabase-postgres-major-upgrade-e2e/): the in-place upgrade UI06 ran `pg_cron` across.
+
+[^sb-cron]: Supabase, "Cron," Supabase Docs. https://supabase.com/docs/guides/cron
+[^sb-cron-quickstart]: Supabase, "Quickstart," Supabase Cron docs. https://supabase.com/docs/guides/cron/quickstart
+[^pgcron-readme]: Citus Data, `README.md`, citusdata/pg_cron at 5cedfa4. https://github.com/citusdata/pg_cron/blob/5cedfa472ccc/README.md
+[^pg-multi-statement]: PostgreSQL Global Development Group, "Message Flow: Multiple Statements in a Simple Query," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/17/protocol-flow.html#PROTOCOL-FLOW-MULTI-STATEMENT
+[^pg-call]: PostgreSQL Global Development Group, "CALL," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/17/sql-call.html

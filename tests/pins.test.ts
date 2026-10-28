@@ -1770,15 +1770,27 @@ const pins: Pin[] = [
       "Is the replica in the primary's region, or are the users closer to the primary?",
       "Replica in the primary's region,\\nor users closer to the primary?",
     ],
-    anchors: ["the-split-inside-one-region-rr03h"],
+    anchors: [
+      "the-split-inside-one-region-rr03h",
+      // 2026-10-28: RR04, RR06/RR07, RR08 sections.
+      "a-custom-domain-with-a-replica-rr06-rr07",
+      "data-api-reads-against-updates-and-vacuum-rr08",
+      "head-on-the-replica-host-rr04d",
+    ],
   },
   {
     doc: "reference/supabase-realtime-surface",
     mustContain: [
       "the RUNLOG corrected it on 2026-10-26 to cite the concepts table",
       "The Authorization pool did not follow the size",
+      // 2026-10-28: DC16 settled the creation-size reading; RT06 added.
+      "so the Authorization pool comes from the size a project is created at",
     ],
-    anchors: ["subscription-bursts-and-realtimes-connection-pools-rt05"],
+    mustNotContain: ["a project created at XL or 2XL was not run"],
+    anchors: [
+      "subscription-bursts-and-realtimes-connection-pools-rt05",
+      "per-user-feeds-at-5000-subscribers-rt06",
+    ],
   },
   {
     doc: "reference/supabase-pg-net-under-load",
@@ -1905,6 +1917,7 @@ const practicePages: Array<[doc: string, heading: RegExp]> = [
   ["reference/supabase-incident-resilience", PRACTICES_HEADING],
   ["reference/supabase-logs-volume", PRACTICES_HEADING],
   ["reference/supabase-multi-tenant-placement", PRACTICES_HEADING],
+  ["reference/supabase-pg-cron-behaviour", PRACTICES_HEADING],
   ["reference/supabase-pg-net-under-load", PRACTICES_HEADING],
   ["reference/supabase-platform-operation-cost", PRACTICES_HEADING],
   ["reference/supabase-read-replicas", PRACTICES_HEADING],
