@@ -1,21 +1,23 @@
 ---
 title: GPU voltage-frequency curve control without Afterburner
-description: vfctl - a Go CLI that reads and writes NVIDIA VF curves via NVAPI, replacing MSI Afterburner for undervolting, and programs the motherboard fan chip so FanControl can go too. Verified write path, full telemetry, the Blackwell DVFS findings, and what sensor polling costs an 8 kHz mouse.
+description: vfctl - a Go CLI that reads and writes NVIDIA VF curves via NVAPI, with P-states 2.0 memory and power controls, crash forensics, and motherboard fan curves. Verified write path, full telemetry, the Blackwell DVFS findings, and what sensor polling costs an 8 kHz mouse.
 author: "Erfi Anugrah"
 category: workstations
 featured: true
-blurb: "GPU undervolting and fan curves without Afterburner or FanControl."
+blurb: "GPU undervolting, P-states 2.0 memory offsets, and fan curves without Afterburner or FanControl."
 ---
 
 vfctl is a Go CLI that reads and writes NVIDIA GPU voltage-frequency curves directly via NVAPI, replacing MSI Afterburner's curve editor. Built after Afterburner's editor repeatedly produced broken curves - notch artifacts at selection boundaries, temperature-stale baselines, and unexpected whole-curve shifts[^afterburner] - on an RTX 5090 FE.
 
-Curve struct layouts are from the PenguinBurner reverse-engineering effort[^penguinburner], cross-checked against the LACT issue #936 discovery[^lact-936] and verified via ctypes. Telemetry structs are from nvapi-sys[^nvapi-sys] and NVIDIA's official open-source NVAPI reference[^nvapi-docs]. The write path is verified end-to-end on live silicon: a single-point selftest writes +15 MHz, reads it back, and restores. Telemetry (clock, voltage, utilisation, temperature, power) is verified across full gaming sessions. Measured on a single RTX 5090 FE with driver 610.88; the curve interfaces are undocumented and could change between driver releases.
+Curve struct layouts are from the PenguinBurner reverse-engineering effort[^penguinburner], cross-checked against the LACT issue #936 discovery[^lact-936], the public NVIDIA nvapi header[^nvapi-header], and verified via ctypes. Telemetry structs are from nvapi-rs[^nvapi-rs], nvapi-sys[^nvapi-sys], and NVIDIA's official open-source NVAPI reference[^nvapi-docs]. The write path is verified end-to-end on live silicon: a single-point selftest writes +15 MHz, reads it back, and restores. Telemetry (clock, voltage, utilisation, temperature, power) is verified across full gaming sessions. Measured on a single RTX 5090 FE with driver 610.88; the curve interfaces are undocumented and could change between driver releases.
 
 ## TL;DR
 
 - Curve write, telemetry, persistence and automated stability search in one static binary, replacing Afterburner for undervolting.
+- Since v0.6 vfctl also sets the memory offset and the power limit through P-states 2.0 (`pstates`, `mem`, `selftest-mem`, `power`). On the 5090 any P-states 2.0 write zeroes the VF curve, so `mem` saves the curve first and restores and re-verifies it after.
 - Writes are read-modify-write via `ClkVfPointsSetControl`, confirmed by selftest on the card.
 - Telemetry covers clock, voltage, utilisation, temperature and live power draw, logged as CSV with a voltage histogram summary.
+- `live --chart` and `live --svg` plot stock vs applied curve with the current operating point.
 - A logon task runs `vfctl hold`, which applies the curve and re-applies it whenever a driver reset wipes the offsets. It reacts to driver events instead of polling.
 - On Blackwell the curve sets the frequency ceiling per voltage, and the DVFS governor picks where the card sits.
 - Since v0.4.0 vfctl also writes the fan curves into the motherboard's Nuvoton NCT6799D, which then runs them with no software in the loop. That replaced FanControl, whose once-a-second polling cost an 8 kHz mouse dozens of missed polls a minute; most of that cost was the NVAPI GPU temperature read.
@@ -25,8 +27,10 @@ Curve struct layouts are from the PenguinBurner reverse-engineering effort[^peng
 | Job | Command | What it replaces |
 | --- | --- | --- |
 | Undervolting a card, with every write read back before it is trusted | `set` to write the curve, `persist` to install the logon task, `hold` to re-apply it when the driver reloads | Afterburner's curve editor, whose notch artifacts at selection boundaries, temperature-stale baselines and whole-curve shifts[^afterburner] this was built to escape; a logon-only `set` also cannot see a driver reinstall |
+| Memory offset or power limit on P-states 2.0 | `pstates` for the table, `mem` for the P0 memory delta, `selftest-mem` for the write path, `power` for the policy limit | Afterburner's memory slider and power limit controls, with VF curve writes kept separate |
 | Fan curves that run with no software in the loop | `hold` writes the fitted curves into the NCT6799D at logon and re-reads them on its safety check; `vfctl fan restore` undoes it | FanControl, whose once-a-second sensor polling cost an 8 kHz mouse 54 missed polls a minute, most of it the NVAPI GPU temperature read |
-| A session's telemetry, or an automated search for the stability cliff | `watch` for the CSV and the per-voltage histogram, `test` for the TDR step-down loop | a second tool: both ship in the same static binary as the curve write |
+| A live plot of stock vs applied curve | `live --chart` in the terminal, `live --svg PATH` for a saved plot | reading raw offsets and reconstructing the curve by hand |
+| A session's telemetry, or an automated search for the stability cliff | `watch` for the CSV and the per-voltage histogram, `watch --limits` for perf-limit flags, `test` for the TDR step-down loop | a second tool: both ship in the same static binary as the curve write |
 
 ## Architecture
 
@@ -37,12 +41,14 @@ Curve struct layouts are from the PenguinBurner reverse-engineering effort[^peng
 | `internal/testloop` | TDR-loop logic: Classify, StepFreq, ParseTDRCount | 100% coverage |
 | `internal/profile` | Afterburner .cfg INI read/write | legacy import path |
 | `internal/task` | Task Scheduler XML for `persist` | no 72h limit, restart on failure |
-| `internal/nvapi` | nvapi64.dll syscall layer | curve writes + telemetry reads |
+| `internal/nvapi` | nvapi64.dll syscall layer | curve writes, P-states 2.0 (curve saved and restored around each write), telemetry reads |
+| `internal/forensics` | heartbeat file, crash records, event-log parsing for `hold` | no NVAPI calls |
 | `internal/drvevents` | System event log subscription for `hold` | TDR (4101) and driver install (UserPnp 20003) |
 | `internal/sio` | Nuvoton NCT6799D access over a two-method port interface | tested against a simulated chip |
 | `internal/pawnio` | PawnIO driver binding, embedded signed LpcIO module | shared ISA-bus mutex |
 | `internal/fancurve` | FanControl curve import, 4-point chip fit | pure maths |
-| `cmd/vfctl` | CLI dispatch | 20 commands |
+| `internal/vfplot` | live curve plots | stock vs applied curve, profile cap, current operating point |
+| `cmd/vfctl` | CLI dispatch | curve, P-states, hold, fan, telemetry, and crash commands |
 
 Built partly by a self-correcting loop on a local Gemma 4 26B model - the `internal/curve` and `internal/testloop` extractions converged in one iteration each against a `go test` sensor, with human review catching a dropped sentinel guard the tests missed.
 
@@ -101,6 +107,24 @@ Only points with info-struct `type==0 && voltage_based==1` are editable core poi
 
 `ClientPowerPoliciesGetStatus` (0x70916171) is one name away from `ClientPowerTopologyGetStatus` and returns the power-limit *policy* (frozen ~100%), not live draw. The symptom is a power reading pinned at exactly 100.0 W that never moves.
 
+## Memory offset and power limit (P-states 2.0)
+
+`vfctl pstates [--json]` dumps the table. `vfctl mem [--offset MHZ|--reset]`, `vfctl selftest-mem`, and `vfctl power [--limit PCT]` use the same P-states 2.0 path.
+
+Measured on an RTX 5090 FE with driver 617.42 on 2026-10-28:
+
+| Finding | measured: |
+|---------|-----------|
+| `NvAPI_GPU_GetPstates20` accepts struct version 3; only P0 is editable | `pstates` table read |
+| P0 delta ranges: graphics -1000..+1000 MHz, memory -1000..+3000 MHz; video, P1, P3, P5 and P8 read-only | `pstates` table read |
+| Memory clock per P-state: P0 14001, P1 13801, P3 7001, P5 810, P8 405 MHz | `pstates` table read |
+| The memory offset adds 1:1 to the reported clock: idle P1 13801 + 200 = 14001 MHz. An old Afterburner profile with memory +2000 read 15801 MHz, which is 13801 + 2000, not the stock clock | `mem --offset 200` before/after |
+| The card exposes no base-voltage entry, so a voltage offset is not available; undervolting stays on the VF curve | `pstates` table read |
+| Any `NvAPI_GPU_SetPstates20` write zeroes every VF-curve offset, even a memory delta of 0 to 0 (+892 MHz at 900 mV read +0 after) | VF offsets read before and after |
+| A P0 graphics delta replaces every VF point offset with that one flat value (+892 became +15 on all points), so `core` refuses while a curve is applied unless `--force` | VF offsets read before and after |
+| With the save-and-restore in place, `selftest-mem`, `mem --offset 200` and `mem --reset` leave the curve unchanged | VF offsets read after each step |
+| Power limit range 69.6% to 104.3% (default 100%); `power --limit` writes, reads back, and leaves the curve alone | `power` read, write and read-back |
+
 ## The undervolt algorithm
 
 Stock below the ramp start, linear ramp to the target frequency at the target voltage, flat above. Offsets are computed against the live base (`vf_tuple_base`), so the result is temperature-correct at apply time:
@@ -108,6 +132,8 @@ Stock below the ramp start, linear ramp to the target frequency at the target vo
 ```
 offset = target_freq - base_freq_at_voltage
 ```
+
+Curve view is `vfctl live --chart` in the terminal or `vfctl live --svg PATH` for a saved file. It shows stock vs applied curve, the profile cap, and the current operating point.
 
 NVIDIA snaps frequencies to 15 MHz steps. A bounds guard rejects values outside sane envelopes (the catastrophic-typo check: 27970 instead of 2797). Every write is verified by read-back within one step, and `set` self-cleans stale offsets below the ramp region so switching curves never stacks.
 
@@ -117,7 +143,11 @@ The offsets live in driver memory. A reboot clears them, and so does any driver 
 
 `vfctl hold` closes that gap. It applies the curve, then checks it only when the driver may have reset it: it subscribes to the System event log for a TDR (Event 4101) or a driver install (Event 20003 from UserPnp, which the 2026-10-08 reinstall logged for `nvlddmkm`) and checks 10 s after one fires. A safety check every 15 minutes covers anything the log misses and is skipped while a fullscreen game is in front. The first version polled every 15 s, then every 30 s; seven days of its log showed the poll catching drift once, 30 s after startup, so v0.3.0 moved to events. Each check opens a fresh NVAPI session, compares the offsets with what `hold` last wrote, and re-applies on drift. After 20 failed checks in a row it exits non-zero so Task Scheduler restarts it with a freshly loaded `nvapi64.dll`.
 
-`persist --profile` installs the binary and a machine profile under `%ProgramFiles%` (the task runs elevated, so neither may sit in a user-writable folder) and registers the task without the default 72-hour execution limit. The profile is a JSON file kept in the repo with the undervolt and fan settings, so changing a setting means editing the file and running `persist` again. Verified live: a fake Event 4101 written to the System log produced a check that found the curve intact, and resetting the card to stock followed by another fake 4101 got the curve re-applied (63 points verified).
+`persist --profile` installs the binary and a machine profile under `%ProgramFiles%` (the task runs elevated, so neither may sit in a user-writable folder) and registers the task without the default 72-hour execution limit. The profile is a JSON file kept in the repo with the undervolt and fan settings, so changing a setting means editing the file and running `persist` again. Verified live: a fake Event 4101 written to the System log produced a check that found the curve intact, and resetting the card to stock followed by another fake Event 4101 got the curve re-applied (63 points verified).
+
+### Crash forensics
+
+Since v0.6.1 `hold` writes a small heartbeat file after every check and on every 15-minute tick while it is paused for a game: the target V/F, whether the curve checked clean, whether it was paused and for which exe, and the last apply time. The paused ticks make no NVAPI call. When `hold` finds the curve reset it appends one crash record per episode, with the cause read from the System log (TDR Event 4101, driver install UserPnp 20003, otherwise unknown) and any new crash dumps. At startup it looks for a Kernel-Power 41 newer than the last heartbeat and records it with the Application Error 1000 and WER 1001 events around it. `vfctl crashes` lists the records. A one-second telemetry history was left out on purpose: it would mean polling NVAPI during games, which the mouse-poll measurements below show is not free. One gotcha when shelling out from Go: Windows PowerShell 5.1 `Get-WinEvent -ErrorAction SilentlyContinue` exits 1 with no output when nothing matches, so exit 1 with empty output has to be read as "no events".
 
 ## Fan curves on the motherboard chip
 
@@ -176,6 +206,8 @@ On driver 610.88, the stability cliff for a 5090 FE is exactly one 15 MHz step w
 - The curve does not pin the operating voltage; the DVFS governor adds margin under sustained load. Forcing lower needs a declining curve, which is notch territory
 - The undocumented curve interfaces may change between driver releases
 - Windows only (driver 610.88). The Linux driver ships `libnvidia-api.so.1` with the same `nvapi_QueryInterface` entry point and VF function IDs (LACT's VF curve editor uses them[^lact-957]), so a Linux backend is a port of the call layer, not new reverse engineering
+- Not yet measured: memory clock under game load with an offset
+- Not yet measured: `watch --limits` inside a GPU-bound game
 - GPU fan control is out of scope: manual % clamps to 30% minimum and 0 RPM is vBIOS-auto only; the card's own curve stays in charge
 - Motherboard fan control covers the Nuvoton NCT6799D only, verified on one ASUS board; other Super I/O chips need their own register map
 - Tested on a single card: RTX 5090 FE (Blackwell GB202)
@@ -215,6 +247,10 @@ The same three jobs as a list:
 [^lact-957]: I. Zlobintsev, "feat: add Nvidia VF curve editor," LACT pull request #957, merged 2026-04-18. https://github.com/ilya-zlobintsev/LACT/pull/957
 
 [^penguinburner]: jpietek, "hidden_nvapi_vf.py," PenguinBurner. https://github.com/jpietek/PenguinBurner/blob/d8901e64a9c7b479d6ae4ced63b7a2048b61e3ce/hidden_nvapi_vf.py
+
+[^nvapi-header]: NVIDIA, "NVAPI," GitHub repository. https://github.com/NVIDIA/nvapi
+
+[^nvapi-rs]: arcnmx, "nvapi-rs," Rust crate. https://github.com/arcnmx/nvapi-rs
 
 [^nvapi-sys]: arcnmx, "nvapi-sys," Rust crate. https://docs.rs/nvapi-sys - struct layouts for power/thermal reads
 
