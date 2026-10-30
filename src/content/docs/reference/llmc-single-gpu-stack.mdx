@@ -107,7 +107,7 @@ Text fallback: a request for a preset other than the resident one starts a pendi
 
 The VRAM gate is checked twice: on a preset before the scheduler sees the request (422 `model_unavailable`), and on the chain head of a route alias at swap-decision time. The reserve is the reason a preset that fits the card can still be refused the swap.
 
-A third check runs at spawn time against measured memory, not declared budgets. After stopping the outgoing engine, the orchestrator polls `nvidia-smi` until free VRAM covers the incoming preset's `vram_gb` plus 512 MiB, and fails the swap with the shortfall in MiB if it never does. NInfer sizes itself to whatever is free at boot, so a desktop application holding VRAM used to produce an engine that hung on the first long prompt instead of an error. The proxy image is distroless rather than Alpine for this: the `nvidia-smi` the NVIDIA runtime injects is a glibc binary.
+A third check runs at spawn time against measured memory, not declared budgets. After stopping the outgoing engine, the orchestrator polls `nvidia-smi` until free VRAM covers the incoming preset's `vram_gb` plus 512 MiB, and fails the swap with the shortfall in MiB if it never does. NInfer sizes itself to whatever is free at boot, so a desktop application holding VRAM used to produce an engine that hung on the first long prompt instead of an error. The proxy image is distroless rather than Alpine for this: the `nvidia-smi` the NVIDIA runtime injects is a glibc binary. The idea of granting the GPU only once memory is actually free came from a review of Berth, a VRAM lease daemon[^berth]; Berth itself was not adopted, because it tracks memory per process through `nvidia-smi --query-compute-apps`, which returns no rows under WSL2 on this box, so the gate here reads total free memory instead.
 
 Swap latency is dominated by the model read. Cold storage is 30-60 s per swap; a page-cache-warm swap is 5-10 s. An agent session that hits a swap pays that once, plus the re-prefill described below.
 
@@ -117,7 +117,7 @@ A preset is a TOML file in the presets directory, mounted read-only into the pro
 
 - The schema is strict. One unknown key fails the entire reload, not just that file, so a preset added with a newer key silently freezes `/v1/models` at its last good state. A key that exists in the Python preset loader but not in the Go one is the common way to hit this.
 - Reload is live. `/v1/models` rescans the directory, so adding or editing a TOML needs no rebuild and no restart. A schema-shape change to the proxy itself does need one.
-- Presets deduplicate by model id, derived from the artifact filename stem. Two presets naming one file is a load error rather than a duplicate entry, so an A/B arm on the same weights needs a second filename - a hardlink costs no disk.
+- Presets deduplicate by model id, derived from the artifact filename stem. Two presets naming one file is a load error rather than a duplicate entry, and like an unknown key it fails the whole reload, so `/v1/models` keeps its last good state and the new preset never appears. An A/B arm on the same weights needs a second filename - a hardlink costs no disk.
 - Ephemeral presets can be registered at runtime through `POST /v1/presets`. They survive reloads, are never written to disk, and are lost on restart; an on-disk preset wins a model-id collision.
 - `capabilities = ["vision", ...]` lets a request name a capability rather than a model, either as an `X-LLM-Capability` header or as a `cap:<name>` model. If the resident model has it, the request is served in place and the swap is skipped entirely.
 - The listing carries the metadata clients need to size themselves: effective context, whether reasoning is on, the output cap, the VRAM estimate, and which preset is currently loaded.
@@ -146,6 +146,7 @@ Rules that matter in practice:
 - **Requests under a lock are policed.** A request for a different preset while a lock is held is rejected 422 `model_unavailable` rather than swapping, and an unknown model name is rejected rather than passed through to silently run on the locked model.
 - **The queue holds names, not swaps.** A queued owner waits for the preset; the swap itself happens lazily, on the winner's first request. Entries carry a timestamp and are pruned once their owner has been silent for a TTL, so a dropped queue heals itself and a waiter re-enqueues on its next poll. The state file carries the queue as well as the lock, so the lock is restart-safe; a waiter's own polling loop is what makes its place survive.
 - **Bench and audit modules take the lock with their own owner name and fail fast** rather than queueing, so a measurement either runs on an uncontended card or refuses to run.
+- **Image and training requests under a lock.** A `/comfyui/*` or `/train/*` request for the mode that is already active is granted. Leaving llm mode while a preset is locked is refused with 503 `model lock active`, unless the request carries an `X-LLM-Lock-Owner` header naming a lock owner, which evicts the pinned model. Until 2026-10-27 any image or training request under any lock was refused, including the owner's own and including the mode already running, so an image job during a locked session meant starting ComfyUI by hand outside the proxy.
 
 ## What an eviction costs
 
@@ -171,7 +172,7 @@ A swap is not the only way to lose the cache. The engine reuses a saved context 
 | Two loops | same preset, one owner each; different presets queue with `--wait` | different presets on one card swap against each other forever |
 | Interactive work alongside a loop | lock the same preset the loop uses, or accept the queue | a second preset is a second swap |
 | Measuring throughput | lock the preset, and name the locked model in the request | an unlocked probe measures whoever else is using the card |
-| One image or a short training run | just call ComfyUI or `/train/*` | the proxy swaps when it can, and refuses when a lock is held |
+| One image or a short training run | just call ComfyUI or `/train/*` | the proxy swaps when it can, and refuses to leave a locked model unless the lock owner asks |
 | A client that must never trigger a swap | a route alias with an empty chain | resolves to whatever is resident, or fails cleanly |
 
 ```dot
@@ -216,6 +217,20 @@ Every row here is a dated entry in the stack's own incident log, not a hypotheti
 | 2026-09-28 | Every swap failed with a dial error on the container runtime socket | the socket is mounted as its parent directory rather than as a file, so a recreated socket is not pinned to a dead inode |
 
 Two of these are worth separating in kind. The wedge is an engine bug with a client-side trigger: the damage landed on the request *after* the one that was aborted, which is why the defence is a probe on the next request rather than a fix to the aborted one. The swap war is a scheduling failure with two ordinary clients - each client's behaviour was correct in isolation, and reading the proxy log for the pair reproduced it in minutes.
+
+## Quality telemetry
+
+The bench suite samples a handful of short tasks on demand; it cannot tell whether a quantised model is degrading real agent traffic over weeks. Since 2026-09-14 the proxy writes one JSONL record per tool-bearing LLM request, clean ones included, so a failure rate per preset is a single query over the file.
+
+| Field | What it records |
+|---|---|
+| `leak` | tool-call markup in the message content instead of a tool call |
+| `unclosed` | a tool-call block that was opened and never closed |
+| `args_bad` | tool-call arguments missing or not valid JSON |
+| `truncated` | the response stopped on `finish_reason=length` |
+| `effort`, `prompt_tok`, `completion_tok`, `reasoning_tok`, `reasoning_chars` | the requested reasoning effort and token counts, added 2026-09-20 |
+
+`reasoning_chars` is the length of the returned reasoning text, and it exists because the engine's own per-request log reported zero thinking tokens in every record it had written as of 2026-09-20; the proxy measures thinking length itself. Writes go through a buffered channel and are dropped and counted when it is full, so the telemetry never slows a stream.
 
 ## Reading the numbers
 
@@ -284,3 +299,4 @@ No figure on this page was measured for it. The throughput and latency numbers t
 
 [^llama-swap]: mostlygeek, "llama-swap," GitHub. https://github.com/mostlygeek/llama-swap
 [^ninfer-184]: Neroued, "NInfer issue #184," GitHub. https://github.com/Neroued/ninfer/issues/184
+[^berth]: T-Crypt, "berth," GitHub. https://github.com/T-Crypt/berth
