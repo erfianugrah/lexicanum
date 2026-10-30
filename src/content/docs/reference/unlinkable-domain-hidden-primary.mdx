@@ -1,0 +1,134 @@
+---
+title: "Running a domain that does not link back to you"
+description: How to host a domain on your own authoritative DNS and your own servers without anything public tying it to the rest of your infrastructure - the links an observer can follow (WHOIS, nameserver addresses, A records, SOA, certificate logs, mail headers), why a Cloudflare secondary and a second IP on the same Fly.io app both fell short, and the design that held - a hidden primary, a single-purpose secondary with its own address, and an mTLS origin.
+author: Erfi Anugrah
+category: networking
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+This doc is for running a domain whose ownership should not be discoverable from public data, while still keeping its records in your own git-managed DNS and its traffic on your own servers. It covers what links a domain to its owner, the options that were tried, and the design that was built on 2026-10-30.
+
+<Aside type="note" title="Provenance">
+  Everything here was built and checked on 2026-10-30 against the author's own setup: [knotea](/reference/knotea-self-hosted-dns/) as the authoritative server on Fly.io, a NixOS edge router running Caddy, and one domain that had to stay unlinked. The domain, its addresses and the service behind it are deliberately not named; the examples use `quiet.example` and documentation-range addresses (192.0.2.0/24 for the public secondary, 198.51.100.0/24 for the primary, 203.0.113.0/24 for home). Rows marked measured were observed from the internet that day; the Fly and Cloudflare behaviour is cited from their docs.
+</Aside>
+
+**TL;DR:**
+
+- WHOIS privacy is the easy part. The links that give a domain away are addresses: the IP its nameservers resolve to, and the IP its A record points at. Passive-DNS services index every name ever seen on an address.
+- Keep the zone on your own authoritative server as a hidden primary that refuses every public query for it, and publish it through a secondary whose address serves nothing else.
+- Front the service with the same single-purpose host, and let the real origin accept only that host's client certificate.
+- On Fly.io this needs a separate app: one app cannot tell which of its dedicated IPv4 addresses a UDP packet was sent to, so it cannot serve a zone on one address and refuse it on the other.
+
+## What links a domain to its owner
+
+An observer who wants to know who runs `quiet.example` does not need anything private. Each row is a public lookup.
+
+| Link | What the observer does | Closed by |
+|---|---|---|
+| Registrant data | WHOIS / RDAP | registrar privacy service (fields read REDACTED) |
+| Nameserver address | `dig NS quiet.example`, then resolve the NS and look the address up in passive DNS | NS on an address used by no other zone |
+| A / AAAA | `dig A quiet.example`, then passive DNS or a direct request to that IP | the same single-purpose address; the origin hidden behind it |
+| Asking your own server | query your main authoritative server directly for `quiet.example` | the primary answers REFUSED for that zone |
+| SOA | MNAME and RNAME in `dig SOA` | both names inside `quiet.example` |
+| Certificates | certificate transparency search | CT records the name and the CA, not the ACME account; no ACME contact email |
+| Mail headers | read the raw source of a mail sent from the domain | the mail provider's own relay hops only, DKIM and Return-Path on `quiet.example` |
+| Reverse DNS | PTR of the public address | the hosting provider's generic PTR |
+
+Two links stay open by design. The registrar, the hosting provider and the mail provider can each tie the domain to the accounts that pay for it. Nobody outside them can.
+
+## Options that fell short
+
+| Option | Why it failed |
+|---|---|
+| Point the domain at your existing nameservers | Their address is the address of every other zone you serve. One passive-DNS query lists them side by side. |
+| Cloudflare as a proxied secondary | Cloudflare secondary DNS is an Enterprise feature[^cf-secondary], and proxying transferred records needs Secondary DNS override[^cf-override]. On the account that had Enterprise, a new zone inherited the account's vanity nameservers (names under the owner's own domain), which links the zone outright; a second Enterprise account refused to create a secondary zone (both observed on the author's accounts, see Evidence). It also reintroduces a third-party DNS host the setup had just moved away from. |
+| A second dedicated IPv4 on the existing Fly.io DNS app | Fly delivers UDP to the app on a special `fly-global-services` address and expects replies from it[^fly-udp]. A probe app with two dedicated IPv4 addresses logged the destination the kernel reported for each UDP packet (`IP_PKTINFO`): queries sent to the two addresses arrived looking identical. The server cannot answer `quiet.example` on one address and refuse it on the other, and most DNS is UDP. |
+| A public secondary from a free DNS host | Workable, and it hides the nameserver address. It leaves the A record to solve separately and adds a third party; the single-purpose host below solves both with one address. |
+
+## The design that held
+
+```dot
+digraph unlinked {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.35; ranksep=0.8;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box, style=rounded];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  resolver [label="public resolvers"];
+  client [label="clients"];
+  edge_host [label="single-purpose host\n192.0.2.53\nknotd secondary + Caddy"];
+  primary [label="main authoritative server\n198.51.100.10\nhidden primary (REFUSED publicly)"];
+  home [label="home edge\n203.0.113.7\nquiet.example site"];
+  svc [label="service"];
+  resolver -> edge_host [label="NS / A"];
+  client -> edge_host [label="HTTPS"];
+  edge_host -> primary [label="TSIG SOA + AXFR\n(NOTIFY back)"];
+  edge_host -> home [label="mTLS, SNI quiet.example"];
+  home -> svc;
+}
+```
+
+1. **Hidden primary.** The zone file lives with every other zone, in git, on the main authoritative server. That server is configured to answer nothing for `quiet.example` on any query path; in knotea this is the per-zone `hidden: true` option, which takes the zone out of authoritative routing entirely (details in [the knotea doc](/reference/knotea-self-hosted-dns/#hidden-zones)). Transfers still work, because they arrive over TCP with a TSIG signature and are relayed to knotd before the query path.
+2. **Single-purpose secondary.** A small Fly.io app with its own dedicated IPv4 runs knotd as a TSIG secondary for this one zone. Its address is the glue for `ns1.quiet.example` and `ns2.quiet.example` at the registrar, and nothing else is ever served from it. Only IPv4 glue: Fly does not carry UDP over public IPv6[^fly-udp].
+3. **Same host fronts the service.** Caddy on that app terminates HTTPS for `quiet.example` (ACME TLS-ALPN-01 on its own address, no account email) and reverse-proxies to the home edge, presenting a client certificate and the SNI `quiet.example`. The home address lives in an app secret, not in the repo.
+4. **The origin admits one client.** The home edge's `quiet.example` site requires the client certificate from a private CA whose key was destroyed after issuing that one certificate (or a LAN address, for debugging). A direct request to the home address with the right SNI and no certificate gets 401.
+
+### Records
+
+```yaml
+zone: quiet.example
+records:
+  - { name: '@',   type: NS,   content: [ns1.quiet.example., ns2.quiet.example.] }
+  - { name: '@',   type: A,    content: 192.0.2.53 }
+  - { name: ns1,   type: A,    content: 192.0.2.53 }
+  - { name: ns2,   type: A,    content: 192.0.2.53 }
+  - { name: mail,  type: MX,   content: 10 bounces.mail-provider.example. }   # provider's bounce path
+  - { name: mail,  type: TXT,  content: '"v=spf1 include:spf.mail-provider.example -all"' }
+  - { name: _dmarc, type: TXT, content: '"v=DMARC1; p=none;"' }   # no rua: reports would go to a named mailbox
+# SOA: ns1.quiet.example. hostmaster.quiet.example. ...
+```
+
+The DMARC record carries no `rua` address, because aggregate reports have to go to a mailbox, and any mailbox you read names you.
+
+## Gotchas and lessons learned
+
+- **A hidden primary breaks the secondary's refresh, not its first transfer.** The secondary bootstrapped fine (AXFR was relayed), then every refresh failed with REFUSED: the refresh starts with a TSIG-signed SOA query, which is a plain QUERY and took the public path. knotea 1.5.4 relays TSIG-signed SOA queries to knotd too. knotd checks the signature before looking up the zone, so a wrong key gets NOTAUTH for every zone alike and does not reveal which zones exist (measured: hidden zone, non-existent zone and a public zone all answered NOTAUTH to a bogus key).
+- **The secondary can serve a stale copy that names the origin.** Before the design settled, the zone briefly held an A record for the home address, and the secondary kept serving that copy until a forced retransfer. Nothing was delegated to it yet, so no ordinary lookup reached it. Delegate only after checking every record on the secondary itself.
+- **DNS-01 for the origin certificate must check propagation against the secondary.** Caddy writes the challenge TXT to the primary over RFC 2136, then waits until it resolves. The hidden primary refuses that query, so point the propagation resolver at the public secondary's address.
+- **Apex NS and SOA changes are refused over DNS UPDATE.** RFC 2136 only makes the apex SOA and NS sets undeletable[^rfc2136]; knotd went further and answered REFUSED to the replacement (measured). Change them with `knotc zone-begin` / `zone-set` / `zone-commit` on the server, with a SOA serial above the current one. A record-sync tool that reads back through public queries will report REFUSED for the hidden zone even after a correct write; check drift with a dry run instead.
+- **One app per secret address.** The Fly UDP behaviour above is why. TCP arrives on the machine's own interface and UDP on `fly-global-services`, so the DNS server must listen on both addresses (knotd binds UDP and TCP per listed address).
+- **Long-lived streams through the front need keepalives.** Subscriptions over WebSocket or server-sent events that go quiet are closed by any proxy with an idle timeout. The service sends a ping or comment every 30 seconds; a stream left idle for 150 seconds through the front still delivered the next message (measured).
+- **Certificate logs keep history.** A CT search showed a certificate for the name from before the move, issued for whatever was serving it then. It names nothing else, but CT is a log of everything that ever happened to the name, not only what you issued.
+- **Your own docs are the biggest leak.** A public write-up, repo or config file that names the domain undoes all of the above at once. The repos that hold the zone, the app and the edge config are private; this page uses placeholders, and the docs repo blocks the real names in a pre-commit and pre-push check.
+
+## Evidence
+
+| Claim | How it was checked | Status |
+|---|---|---|
+| Registrant fields redacted | `whois` on the real name | measured |
+| Delegation and glue live | the TLD servers and three public resolvers returned the single-purpose NS and address | measured |
+| Main server refuses the hidden zone | `dig @primary SOA` over UDP and TCP returned REFUSED | measured |
+| Single-purpose server refuses other zones and identity queries | `dig @secondary SOA` for the other zones: REFUSED; `version.bind`, `hostname.bind`, `id.server`, NSID: empty | measured |
+| Bad TSIG gives NOTAUTH for every zone | AXFR with a random key for the hidden zone, a non-existent zone and a public zone | measured |
+| Secondary refreshes on NOTIFY | serial moved twice as the origin's DNS-01 TXT was added and removed | measured |
+| Origin refuses requests without the client certificate | from the internet: home address + SNI, no certificate 401, with certificate 200 | measured |
+| Mail headers carry only the provider's hops | raw source of a test message sent to a throwaway inbox; home address and own hostnames searched, 0 matches | measured |
+| One Fly app cannot distinguish its IPv4 addresses for UDP | probe app with two dedicated IPv4s logging `IP_PKTINFO` destinations | measured |
+| No UDP over IPv6 on Fly; UDP via `fly-global-services` | Fly docs[^fly-udp] | cited |
+| Cloudflare secondary is Enterprise-only; proxying needs override | Cloudflare docs[^cf-secondary][^cf-override] | cited |
+| A new secondary zone inherited the account's vanity nameservers; a second Enterprise account refused secondary-zone creation | Cloudflare API responses on the author's accounts | measured |
+
+## Decision guide
+
+If the domain only needs a private owner on paper, WHOIS privacy and a shared DNS host are enough. If it must not be traceable from public data, every address it shows has to be an address that shows nothing else: a hidden primary keeps your records where they already live, and a single-purpose host with its own IP carries both the nameservers and the front door. If you cannot run that host, a third-party secondary hides the nameservers but leaves the A record to solve.
+
+## Related docs
+
+- [knotea](/reference/knotea-self-hosted-dns/) - the authoritative server that holds the hidden primary.
+- [Caddy on the NixOS edge](/reference/edge-caddy-on-nixos/) - the edge that hosts the mTLS origin site.
+- [NixOS router network design](/reference/nixos-router-network-design/) - the home network behind that edge.
+
+[^fly-udp]: Fly.io, "Running fly.io apps on UDP and TCP," Fly Docs. https://fly.io/docs/networking/udp-and-tcp/
+[^cf-secondary]: Cloudflare, "Cloudflare as Secondary," Cloudflare Docs. https://developers.cloudflare.com/dns/zone-setups/zone-transfers/cloudflare-as-secondary/
+[^cf-override]: Cloudflare, "Proxy traffic (Secondary DNS override)," Cloudflare Docs. https://developers.cloudflare.com/dns/zone-setups/zone-transfers/cloudflare-as-secondary/proxy-traffic/
+[^rfc2136]: P. Vixie et al., "Dynamic Updates in the Domain Name System (DNS UPDATE)," RFC 2136, IETF. https://www.rfc-editor.org/rfc/rfc2136
