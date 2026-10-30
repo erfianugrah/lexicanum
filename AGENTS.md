@@ -325,6 +325,11 @@ on the author.
 ## Verify before done
 
 Run `bun run build` and confirm:
+- `tsc --noEmit` passes. It is the first step of `build` since 2026-10-30
+  (`typescript` is a devDependency, so CI runs the same compiler); before that
+  typecheck sat outside the gate and five errors accumulated unnoticed
+  (lexicanum#37). `src/types/hpcc-wasm-graphviz.d.ts` stands in for types the
+  `@hpcc-js/wasm` package references but does not install.
 - exit 0. The page count is no longer a number to keep in your head: `tests/
   docs.test.ts` asserts built pages minus redirect stubs equals the doc count,
   so a doc that stops building fails the build instead of quietly shrinking the
