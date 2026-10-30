@@ -524,6 +524,208 @@ keyboards/boardsource/5x12/keymaps/vial/
 
 ---
 
+## Keeping keymaps outside qmk_firmware (External Userspace)
+
+Everything above keeps keymaps inside a `qmk_firmware` clone, which means maintaining a fork. Mine sat on a May 2024 base until October 2026. QMK's [External Userspace](https://docs.qmk.fm/newbs_external_userspace) keeps only your keymaps in a small repo and builds them against an upstream checkout. Start from the [qmk_userspace template](https://github.com/qmk/qmk_userspace).
+
+The repo mirrors the `qmk_firmware` layout:
+
+```
+qmk_userspace/
+├── qmk.json
+└── keyboards/boardsource/equals/60/keymaps/
+    ├── erfi/         keymap.c  rules.mk  config.h
+    └── erfi_cast/    keymap.c  rules.mk  config.h
+```
+
+`qmk.json` lists what to build:
+
+```json
+{
+    "userspace_version": "1.0",
+    "build_targets": [
+        ["boardsource/equals/60", "erfi"],
+        ["boardsource/equals/60", "erfi_cast"]
+    ]
+}
+```
+
+Keymap names in `qmk.json` must match `^[0-9a-z_]*$` (`data/schemas/definitions.jsonschema`, the `filename` type). A hyphenated name such as `via-colemak-mod-dh-erfi` fails schema validation and the CLI reports "Could not determine QMK userspace location", so rename keymaps when you move them over.
+
+Anything a fork changed at keyboard level moves into the keymap's `config.h`. My fork had added `DYNAMIC_KEYMAP_LAYER_COUNT 5` and the RP2040 double-tap reset to `keyboards/boardsource/equals/60/config.h`; upstream's copy has neither, so both now sit in each keymap's `config.h`:
+
+```c
+#pragma once
+
+#define DYNAMIC_KEYMAP_LAYER_COUNT 5
+
+// Double-tap the PCB reset button to enter the RP2040 bootloader.
+#define RP2040_BOOTLOADER_DOUBLE_TAP_RESET
+#define RP2040_BOOTLOADER_DOUBLE_TAP_RESET_TIMEOUT 200U
+```
+
+### Build locally in the QMK container
+
+The `ghcr.io/qmk/qmk_cli` image carries the toolchains and the `qmk` CLI, so nothing needs installing on the host. Clone upstream once (a shallow clone with submodules was 1.5 GB on 2026-10-30), then point the CLI at both trees:
+
+```bash
+git clone --depth 1 --recurse-submodules --shallow-submodules \
+  https://github.com/qmk/qmk_firmware.git ~/qmk_firmware
+
+cd qmk_userspace
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v ~/qmk_firmware:/qmk_firmware -v "$PWD":/userspace -w /userspace \
+  ghcr.io/qmk/qmk_cli:latest sh -c \
+  'qmk config user.qmk_home=/qmk_firmware user.overlay_dir=/userspace && qmk userspace-compile -p'
+```
+
+`qmk userspace-compile` builds every target in `qmk.json` and leaves the `.uf2` files in the userspace root.
+
+### Build in CI on Forgejo Actions
+
+The template ships a GitHub Actions workflow that calls QMK's reusable workflows in `qmk/.github`. On Forgejo Actions I replaced it with one job that runs inside `ghcr.io/qmk/qmk_cli`. That image has no Node.js, so JavaScript actions (`actions/checkout`, `actions/cache`, `actions/upload-artifact`) cannot run in the job: checkout is a `git fetch` with the job token, and publishing is `curl` against the release API. Each push to `main` rebuilds every target and replaces a rolling `latest` release that holds the `.uf2` files and their SHA-256 sums. The first run took 2m08s and a second 1m02s (2026-10-30). The general porting notes are in [Porting a GitHub Actions workflow to Forgejo Actions](/guides/porting-github-actions-to-forgejo/), and release storage in [Forgejo releases and registry](/reference/forgejo-releases-and-registry/).
+
+```yaml
+# .forgejo/workflows/build.yml
+name: Build firmware
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ghcr.io/qmk/qmk_cli:latest
+    timeout-minutes: 45
+    env:
+      QMK_REPO: https://github.com/qmk/qmk_firmware.git
+      QMK_REF: master
+    steps:
+      - name: checkout userspace
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git init -q userspace
+          cd userspace
+          git -c http.extraHeader="Authorization: token $TOKEN" \
+            fetch -q --depth 1 "${{ forgejo.server_url }}/${{ github.repository }}.git" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: checkout qmk_firmware
+        run: |
+          set -eu
+          git clone -q --depth 1 --branch "$QMK_REF" --recurse-submodules --shallow-submodules "$QMK_REPO" qmk_firmware
+          git -C qmk_firmware rev-parse HEAD | tee qmk_sha
+
+      - name: build
+        run: |
+          set -eu
+          qmk config user.qmk_home="$PWD/qmk_firmware" user.overlay_dir="$PWD/userspace" \
+            userspace_compile.parallel="$(nproc)"
+          qmk userspace-doctor
+          cd userspace
+          qmk userspace-compile -p
+          sha256sum *.uf2 > checksums.txt
+
+      - name: publish rolling "latest" release
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          cd userspace
+          api="${{ forgejo.server_url }}/api/v1/repos/${{ github.repository }}"
+          auth="Authorization: token $TOKEN"
+          old="$(curl -sf -H "$auth" "$api/releases/tags/latest" | jq -r '.id' || true)"
+          if [ -n "$old" ] && [ "$old" != "null" ]; then
+            curl -sf -X DELETE -H "$auth" "$api/releases/$old"
+          fi
+          curl -s -o /dev/null -X DELETE -H "$auth" "$api/tags/latest" || true
+          rel="$(curl -sf -X POST -H "$auth" -H 'Content-Type: application/json' \
+            --data "$(jq -n --arg sha "$GITHUB_SHA" \
+              '{tag_name: "latest", name: "Latest firmware", target_commitish: $sha}')" \
+            "$api/releases" | jq -r '.id')"
+          for f in *.uf2 checksums.txt; do
+            curl -sf -X POST -H "$auth" -H 'Content-Type: application/octet-stream' \
+              --data-binary "@$f" "$api/releases/$rel/assets?name=$f" >/dev/null
+          done
+```
+
+The job clones upstream in full every run; caching it would need either Node.js in the job or a host-side cache.
+
+### Variants of one keymap
+
+`erfi_cast` is `erfi` with Win and Menu blanked on the base layers, for a period when stray presses on those two keys kept opening the Start menu. Rather than copy the keymap, the variant includes it:
+
+```c
+// keymaps/erfi_cast/keymap.c
+#define ERFI_CAST
+#include "../erfi/keymap.c"
+```
+
+The base keymap switches the two keys on that define, and puts them on RAISE in the cast build so Win+L still works on purpose:
+
+```c
+#ifdef ERFI_CAST
+#    define B_GUI KC_NO
+#    define B_APP KC_NO
+#    define R_GUI KC_LGUI
+#    define R_APP KC_APP
+#else
+#    define B_GUI KC_LGUI
+#    define B_APP KC_APP
+#    define R_GUI _______
+#    define R_APP _______
+#endif
+```
+
+A quoted `#include` is resolved relative to the file that contains it. Each variant still needs its own `rules.mk` and `config.h`.
+
+### VIA keeps the old keymap after a same-day flash
+
+VIA stores the keymap in EEPROM and only reloads the compiled one when the EEPROM magic stops matching. `via_eeprom_is_valid()` in `quantum/via.c` derives that magic from the year, month and day of `QMK_BUILDDATE`, so flashing a build from the same day as the previous one keeps the old keys. Both variants from one CI run share a date. This hook in the base keymap reloads the compiled keymap once per build, keyed on the full build timestamp plus the variant:
+
+```c
+#include "version.h"
+
+void keyboard_post_init_user(void) {
+    uint32_t    id = 2166136261u; // FNV-1a over build timestamp + variant
+    const char *p  = QMK_BUILDDATE;
+    while (*p) {
+        id = (id ^ (uint8_t)*p++) * 16777619u;
+    }
+    id = (id ^ ERFI_VARIANT) * 16777619u; // 'c' for cast, 'n' otherwise
+    if (eeconfig_read_user() != id) {
+        dynamic_keymap_reset();
+        eeconfig_update_user(id);
+    }
+}
+```
+
+Edits made in VIA afterwards persist until the next flash. The board took the first `erfi_cast` build on 2026-10-30, flashed over a build from the old fork; the same-day swap this hook exists for has not been exercised on hardware yet.
+
+### Check the keymap in the binary
+
+A green build does not prove the right keys landed. The compiled `keymaps` array is `layers x 60 x 2` bytes on a 5x12 board, so the bottom row of layer `n` starts at byte `n*120 + 96`. Inside the container:
+
+```bash
+arm-none-eabi-gdb -q -batch -ex 'x/5hx (char*)&keymaps+96' \
+  .build/boardsource_equals_60_erfi_cast.elf
+```
+
+```
+0x1000fcc8 <keymaps+96>:	0x00e0	0x0000	0x00e2	0x0000	0x5223
+```
+
+`0x00e3` (LGUI) and `0x0065` (APP) in the `erfi` build are `0x0000` (`KC_NO`) in `erfi_cast`.
+
+---
+
 ## Flashing your keyboard
 
 ### Put keyboard in bootloader mode
@@ -632,7 +834,9 @@ make boardsource/5x12:vial:flash
 
 ### Boardsource equals 60
 
-The Equals 60 uses RP2040, which supports UF2 flashing. Compile and copy the `.uf2` file:
+Since 2026-10-30 the Equals 60 keymaps live in an External Userspace (see [Keeping keymaps outside qmk_firmware](#keeping-keymaps-outside-qmk_firmware-external-userspace)): `erfi` (Colemak Mod-DH, VIA on) and `erfi_cast`. CI publishes `boardsource_equals_60_erfi.uf2` and `boardsource_equals_60_erfi_cast.uf2`; flashing is a copy onto the `RPI-RP2` drive. The board enumerates as USB `4273:7688` and exposes VIA's raw HID interface (usage page `0xFF60`).
+
+The older fork-based commands, kept for the 5x12 and for reference:
 
 ```bash
 # Standard QMK (qmk_firmware)
@@ -814,6 +1018,8 @@ For additional help, see [QMK Discord](https://discord.gg/qmk).
 | VIA sees the board | flash, then open [usevia.app](https://usevia.app) | detected automatically; if not, `VIA_ENABLE = yes` is in `rules.mk` and the firmware was rebuilt |
 | Vial sees the board | flash, then open [vial.rocks](https://vial.rocks) or the desktop app | detected with no JSON sideload; a miss points at `VIAL_KEYBOARD_UID` or `vial.json` |
 | Key presses arrive | `CONSOLE_ENABLE = yes` in `rules.mk` and `qmk console` | `Pressed: 0x....` lines as keys are hit |
+| The userspace is valid | `qmk userspace-doctor` in the container | `Userspace enabled: True`; a schema error names the bad `build_targets` entry |
+| The intended keys are in the firmware | `arm-none-eabi-gdb -batch -ex 'x/12hx (char*)&keymaps+<n*120+96>' <elf>` | the keycodes you expect on that row |
 
 ## Gotchas and lessons learned
 
@@ -826,6 +1032,10 @@ For additional help, see [QMK Discord](https://discord.gg/qmk).
 - **`make`, not `qmk compile`, with vial-qmk.**
 - **`VIAL_INSECURE` disables the unlock-combo protection.**
 - **RP2040 flashing is a file copy.** The `.uf2` is left in `.build/` and dropped onto the `RPI-RP2` drive that appears in bootloader mode.
+- **Userspace keymap names are `[0-9a-z_]` only.** Hyphens fail the `qmk.json` schema.
+- **VIA only reloads the compiled keymap on a new build date**, so a same-day reflash keeps the old keys unless the keymap resets them (see above).
+- **RGB Matrix keycodes were renamed.** Current QMK defines `RM_TOGG`, `RM_NEXT` and `RM_PREV` in `quantum/keycodes.h`; `RGB_TOG` survives only in the legacy keycode data, so a 2024 keymap needs the new names.
+- **The `qmk_cli` image has no Node.js**, so a CI job running inside it cannot use JavaScript actions.
 
 ## File reference
 
@@ -837,3 +1047,5 @@ For additional help, see [QMK Discord](https://discord.gg/qmk).
 | `vial.json` | Vial only: the physical layout the Vial UI draws, keyed on matrix positions |
 | `.build/<keyboard>_<keymap>.uf2` | The RP2040 build output, copied to the `RPI-RP2` drive |
 | the `qmk_firmware` and `~/vial-qmk` clones | The two checkouts; vial-qmk must not be nested inside qmk_firmware |
+| `qmk.json` | External Userspace only: `userspace_version` and the `build_targets` list |
+| `.forgejo/workflows/build.yml` | External Userspace only: the CI build and rolling release |
