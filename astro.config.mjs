@@ -36,6 +36,7 @@ const fmHash = (/** @type {string} */ f) => {
 // Renders dist/thumbnail.jpg (og:image) from src/lib/og-card.mjs at build
 // time - doc counts on the card are measured from src/content/docs, so they
 // cannot drift. public/thumbnail.jpg is not committed.
+/** @type {import("astro").AstroIntegration} */
 const ogCard = {
   name: "og-card",
   hooks: {

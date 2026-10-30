@@ -55,3 +55,5 @@ try {
   // fail the deploy - the site is already live; the cache ages out on its own.
   console.warn(`purge-cache: ${e instanceof Error ? e.message : e} - continuing without purge`);
 }
+
+export {};
