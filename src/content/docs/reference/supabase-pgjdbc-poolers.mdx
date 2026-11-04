@@ -1,0 +1,367 @@
+---
+title: pgjdbc and HikariCP on Supabase connection paths
+description: What a Java app on pgjdbc 42.7.14 and HikariCP 7.1.0 saw on direct 5432, Supavisor session and transaction mode, and the dedicated PgBouncer - named statements, results for the wrong row with no error, reads that never returned, Hikari pools against the session pool, and queued transactions.
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+A Java service that reaches Supabase Postgres through pgjdbc and HikariCP
+has four connection paths to choose from, and pgjdbc's defaults behave
+differently on each. This reference covers what a pooled JDBC workload saw
+on each path and the settings each path needs, for anyone moving an API
+layer onto JDBC or sizing its pools.
+
+The measurements come from module PC08 of the
+[pooler-checkout experiment](https://github.com/erfianugrah/supabase-lab/tree/aba0ed1/experiments/pooler-checkout)
+in [supabase-lab](https://github.com/erfianugrah/supabase-lab): three runs
+on 2026-11-04 against one Small project (`max_connections` 90, Postgres
+17.11) on a Pro organization in `ap-northeast-1`, with the IPv4 add-on on,
+from an IPv4-only client in Singapore.[^lab-pc08] The client was one JVM
+(`eclipse-temurin` 21.0.13 in Docker) running `org.postgresql:postgresql`
+42.7.14 and `com.zaxxer:HikariCP` 7.1.0. An "app instance" below is one
+`HikariDataSource` in that JVM, so four instances are four pools in one
+process, not four hosts. In each iteration a worker borrowed a connection
+per operation for a parameterised point `SELECT`, an `UPDATE ... RETURNING`
+in an explicit transaction and a 5-row batch `INSERT` in an explicit
+transaction, and checked every result against the row id it asked for.
+Every latency includes the Singapore-Tokyo round trip, about five round
+trips per iteration. Anything not marked measured is cited to the docs.
+
+## TL;DR
+
+- Supavisor transaction mode (port 6543 on the pooler host) needs
+  `prepareThreshold=0`. With pgjdbc's default threshold of 5, 603 of 4522
+  finished iterations ran without an error at 12 connections and 516 of
+  11572 at 40 (run 11); with `prepareThreshold=0` the same pooler, project
+  and load ran 6000 of 6000 and 20000 of 20000, in both runs that tried it.
+  The Supabase docs give the same setting for JDBC.[^sb-txn-limits]
+- The default threshold also returned results for the wrong row with no
+  error. In run 12 an
+  `UPDATE ... RETURNING` sent for id 4673 came back with row 367, a `SELECT`
+  for id 8774 with row 6202, and three 5-row batch `INSERT`s reported
+  `[0, 0, 0, 0, 0]`, each without an exception. No `prepareThreshold=0` row
+  had one.
+- Direct 5432, Supavisor session mode and the dedicated PgBouncer ran clean
+  with pgjdbc's defaults. The dedicated pooler did so while 5262 of 6000
+  `SELECT`s came back from a different backend than the connection's
+  previous one.
+- pgjdbc's `socketTimeout` defaults to 0, no read timeout.[^pgjdbc-use]
+  Left there on Supavisor transaction mode with the default threshold, 11
+  of 12 workers had been inside an `UPDATE` for 180584 to 243074 ms when a
+  240 s cap (plus a 5 s join grace) stopped the cell.
+- The session pool was 15. A Hikari pool larger than that filled to 15 and
+  kept retrying the rest in the background; a worker learned of it only
+  after waiting `connectionTimeout` (30 s), with `EMAXCONNSESSION` as the
+  cause.
+- Both transaction pools queue a transaction that finds no free backend: 40
+  connections running 1 s transactions were all served on each. A
+  transaction still queued after 60 s on Supavisor or 80 s on the dedicated
+  pooler ended FATAL and the connection was closed.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  app [label="JVM\nHikariCP pools + pgjdbc"];
+  direct [label="direct\ndb host :5432"];
+  sess [label="Supavisor session\npooler host :5432"];
+  txn [label="Supavisor transaction\npooler host :6543"];
+  ded [label="dedicated PgBouncer\ndb host :6543"];
+  pg [label="Postgres\nmax_connections 90 on Small"];
+  app -> direct;
+  app -> sess;
+  app -> txn;
+  app -> ded;
+  direct -> pg [label="one backend per connection"];
+  sess -> pg [label="15 clients, backend kept"];
+  txn -> pg [label="16 backends, per transaction"];
+  ded -> pg [label="15 to 16 backends, per transaction"];
+}
+```
+
+## Which path, and what it needs
+
+| Path | Endpoint | pgjdbc server-side prepare | Pool ceiling (Small) | When the pool is full | From an IPv4-only network |
+|---|---|---|---|---|---|
+| Direct | `db.<ref>.supabase.co:5432` | default works | `max_connections` 90 (read back, not filled) | not run | needs the IPv4 add-on |
+| Supavisor session | pooler host, port 5432 | default works | 15 clients | the 16th is refused at connect with `EMAXCONNSESSION` | reachable |
+| Supavisor transaction | pooler host, port 6543 | `prepareThreshold=0` or `preferQueryMode=simple` | 16 active backends | queues; FATAL `ECHECKOUTTIMEOUT` after 60 s | reachable |
+| Dedicated PgBouncer | `db.<ref>.supabase.co:6543` | default works | 15 to 16 active backends | queues; FATAL `query_wait_timeout` after 80 s | needs the IPv4 add-on |
+
+The docs give 15 as the default pool size on Micro, Small and Medium and 20
+on Large and XL,[^sb-compute] and say the dedicated pooler supports prepared
+statements on PgBouncer 1.21 and later and is reachable over IPv6, or over
+IPv4 once the project has the add-on.[^sb-dedicated] From an IPv4-only client without the add-on,
+direct 5432 answered `ENOTFOUND` in 6 of 6 trials (PC02). The pool ceilings
+in the table are active `pg_sleep` backends counted through the Management
+API, and the `EMAXCONNSESSION` text, which names `pool_size: 15`. The
+transaction pool held 16 against the documented 15; PC01b counted the same
+16 on Micro.
+
+## Named server-side statements on each path
+
+pgjdbc switches a `PreparedStatement` to a named server-side statement on
+its fifth execution by default (`prepareThreshold` 5; the loaded driver
+reported 5).[^pgjdbc-use] The name exists on the backend that parsed it.
+Direct and session mode keep one backend per connection for its life, so
+the name is there on the next execution. Transaction mode hands each
+transaction whichever backend is free: at 12 connections with the default
+threshold, 2914 of 4234 `SELECT`s that returned the requested row came back
+from a different `pg_backend_pid()` than the same connection's previous one.
+
+Run 11, 500 iterations per worker. Shape M is 4 instances x
+`maximumPoolSize` 3 with 3 workers each (12 connections); shape H is 4 x 10
+with 10 workers each (40 connections, Hikari's default pool size per
+instance). Before every cell except one the module terminated the
+`Supavisor` and `pc08-probe` backends through the Management API and waited
+3 s, so one cell's named statements did not carry into the next.
+
+| Path | Arm | Shape | Iterations ok / attempted | Wrong results | Backend switches / `SELECT`s with the requested row |
+|---|---|---|---|---|---|
+| Direct 5432 | default (5) | M | 6000 / 6000 | 0 | 0 / 6000 |
+| Direct 5432 | default (5) | H | 20000 / 20000 | 0 | 0 / 20000 |
+| Supavisor session | default (5) | M | 6000 / 6000 | 0 | 0 / 6000 |
+| Supavisor transaction | default (5) | M | 603 / 4522 | 0 | 2914 / 4234 |
+| Supavisor transaction | default (5), previous cell's backends kept | M | 566 / 4562 | 1 | 2864 / 4243 |
+| Supavisor transaction | default (5) | H | 516 / 11572 | 14 | 8795 / 10664 |
+| Supavisor transaction | `extendedCacheEverything` | M | 570 / 4830 | 1 | 3150 / 4548 |
+| Supavisor transaction | `prepareThreshold=0` | M | 6000 / 6000 | 0 | 5228 / 6000 |
+| Supavisor transaction | `prepareThreshold=0` | H | 20000 / 20000 | 0 | 16601 / 20000 |
+| Supavisor transaction | `preferQueryMode=simple` | M | 6000 / 6000 | 0 | 5261 / 6000 |
+| Dedicated PgBouncer | default (5) | M | 6000 / 6000 | 0 | 5262 / 6000 |
+| Dedicated PgBouncer | default (5) | H | 20000 / 20000 | 0 | 18601 / 20000 |
+| Dedicated PgBouncer | `extendedCacheEverything` | M | 6000 / 6000 | 0 | 5213 / 6000 |
+
+The `prepareThreshold=0` arm was clean on direct (M and H), session (M) and
+the dedicated pooler (M and H) as well. Run 12 repeated the four Supavisor
+transaction-mode cells of shapes M and H with a 240 s cap: the default
+threshold ran 276 of 2253 (M) and 283 of 4356 (H) without an error, and
+`prepareThreshold=0` 6000 of 6000 and 20000 of 20000.
+
+What the failing cell saw at 12 connections (run 11, default threshold),
+the most frequent errors grouped by SQLSTATE:
+
+- `26000 prepared statement "S_n" does not exist`: 2027 batch `INSERT`s and
+  938 `UPDATE`s, plus 219 batch `INSERT`s reported as
+  `BatchUpdateException [26000]`.
+- `42P05 prepared statement "S_n" already exists`: 320 batch `INSERT`s as
+  `BatchUpdateException` and 90 as `PSQLException`, 243 `UPDATE`s, 134
+  `SELECT`s.
+- `25P02 current transaction is aborted, commands ignored until end of
+  transaction block`: 143 `SELECT`s (autocommit statements), 143 `UPDATE`s,
+  125 batch `INSERT`s; pgjdbc attached the earlier `26000` or `42P05` as the
+  cause.
+- `08P01 bind message supplies 0 parameters, but prepared statement "S_9"
+  requires 1` and the same shape with other counts: 38 `UPDATE`s, 48 batch
+  `INSERT`s, 13 `SELECT`s.
+- `08006 An I/O error occurred while sending to the backend`, caused by
+  `SocketTimeoutException: Read timed out`: 102 `UPDATE`s after 30150.16 to
+  30209.44 ms (the 30 s `socketTimeout`).
+
+Postgres logged 3835 `does not exist`, 1333 `already exists`, 423
+`current transaction is aborted`, 163 `bind message supplies N parameters`
+and 52 `there is already a transaction in progress` lines for that window.
+Hikari replaced the connections it marked broken: 276 physical connects in
+the cell against 12 in the clean M rows. How Supavisor forwards a named
+`Parse` and `Bind` was not traced; the errors say a named statement was
+missing, already present, or held different parameters on the backend the
+statement reached.
+
+Prisma showed the same split on a Medium project: 7 of 500 iterations ok on
+Supavisor transaction mode without `pgbouncer=true` at 20 concurrent
+clients, 500 of 500 on the dedicated pooler with or without it
+(medium-serverless MS10). A single client's SQL `PREPARE`/`EXECUTE`
+succeeded on the dedicated PgBouncer on 6543, reached through a PrivateLink
+endpoint (privatelink-aws T11). It did not touch Supavisor, and it says
+nothing about concurrent clients or about pgjdbc's protocol-level named
+statements.
+
+## Results for the wrong row, with no error
+
+Run 12 recorded the text of each result that failed its check in the
+40-connection cell with the default threshold. Times are from the start of
+the workers:
+
+- `2565ms update id 4673: got (id=367, tag=upd)`
+- `3072ms update id 2707: got (id=5130, tag=upd)`
+- `3895ms select id 8774: got (id=6202, k=1, v=i2w2n393, tag=sel, pid=17829)`
+- `2767ms`, `3562ms` and `3971ms insert batch: counts [0, 0, 0, 0, 0]`
+
+Two readings fit, and the run cannot separate them: the statement ran with
+another statement's or another client's parameters (for the first
+`UPDATE`, row 367 would then have been changed in place of 4673), or the
+client received a reply that belonged to another statement. What reached
+the database per statement was not logged. Run 11 counted 1, 14 and 1 such
+results in the backends-kept, 40-connection and `extendedCacheEverything` cells
+without recording their text. No `prepareThreshold=0` row in either run had
+one.
+
+## Reads that never return
+
+pgjdbc's `socketTimeout` is in seconds and 0 disables it.[^pgjdbc-use] With
+it left at 0 and the default threshold on Supavisor transaction mode (run
+11), 11 of 12 workers were still inside the `UPDATE` of an explicit
+transaction when the 240 s cap (plus a 5 s join grace; the summary came at
+245006 ms) stopped the cell, the longest for 243074 ms and the shortest for
+180584 ms. With `socketTimeout` 30 the same kind of
+wait became a counted `08006` after 30150.16 to 30209.44 ms. In a smoke run
+before that, a thread dump showed workers waiting in
+`QueryExecutorImpl.processResults` while Postgres listed two probe backends,
+both `idle` (the dump is not in an artifact). No `prepareThreshold=0` row hit
+the 30 s timeout.
+
+## Hikari pools against the session pool
+
+Hikari's defaults as the loaded jar reported them: `maximumPoolSize` 10,
+`connectionTimeout` 30000 ms, and `minimumIdle` unset, so each pool tries to
+fill to `maximumPoolSize`. Session mode on this project allowed 15 clients.
+
+| Shape | What happened (run 11) |
+|---|---|
+| 1 pool of 20, 20 workers, 100 iterations each | The pool held 15 connections. 22 of 37 physical connects failed in 297.46 to 471.93 ms with `XX000 FATAL: (EMAXCONNSESSION) max clients reached in session mode - max clients are limited to pool_size: 15`. 2000 of 2000 iterations ok, p99 4157.83 ms, max 10056.18 ms, while workers queued inside Hikari for the 15 connections. |
+| 4 pools of 10, 10 workers each, 100 iterations each | The pools started with 6, 4, 3 and 2 connections. 192 of 207 physical connects failed with the same `EMAXCONNSESSION`. 3976 of 4000 iterations ok; 33 borrows timed out after 30000.38 to 30010.18 ms with `SQLTransientConnectionException [XX000] ... request timed out after 30001ms`, the `EMAXCONNSESSION` error as the cause. The smaller the pool, the more of its borrows timed out: 0, 4, 11 and 18 of the 33. |
+| 1 pool of 20, each of 20 workers holding `pg_sleep(40)` once | 15 holds ran. 5 borrows failed after 30021.7 to 30021.99 ms with `Connection is not available, request timed out after 30005ms`, SQLSTATE `XX000` from the last `EMAXCONNSESSION`. |
+
+No pool failed to start: each got its first connection. A check that only
+opens one connection at startup would pass (reasoned, not measured). The
+refusal at connect matches what node-postgres saw in PC05a.
+
+## Forty connections against the transaction pools
+
+Four pools of 10, each worker on its own connection, so Hikari did no
+waiting; the wait was inside the pooler.
+
+| Path | Hold per worker | Outcome (run 11) |
+|---|---|---|
+| Supavisor transaction | 10 x `pg_sleep(1)` | 400 of 400 served, p50 2057.94 ms, max 3045.7 ms; 16 active sleepers at +5 s |
+| Dedicated PgBouncer | 10 x `pg_sleep(1)` | 400 of 400 served, p50 2944.92 ms, max 3141.39 ms; 15 active sleepers at +5 s |
+| Supavisor transaction | one `pg_sleep(45)` | 32 of 40 served; 8 failed 60075.2 to 60085.68 ms after the statement was sent, with `XX000 FATAL: (ECHECKOUTTIMEOUT) unable to check out connection from the pool after 60000ms in Transaction mode`; 2 of 40 follow-up `select 1` failed on replacement connects that did not complete in 30 s |
+| Dedicated PgBouncer | one `pg_sleep(45)` | 32 of 40 served; 8 failed after 80337.73 to 80344.87 ms with `08P01 FATAL: query_wait_timeout` (the config reads back `query_wait_timeout` 80, in seconds); all 40 follow-ups ok |
+
+Both errors are FATAL, so the server closes pgjdbc's connection and Hikari
+replaces it. Hikari's `connectionTimeout` plays no part in the queued
+statements: the connection was already open. It did end the 2 failed
+follow-up borrows after the Supavisor wait, on replacement connects. The 60 s
+Supavisor wait (PC01, PC05) and the separate 15 s one (PC06) are measured
+with node-postgres in
+[Supabase incidents: what a client can do](/reference/supabase-incident-resilience/).
+
+## Reading the numbers
+
+- One Small project, one region, one client vantage, one JVM. Separate
+  hosts per app instance were not run.
+- An iteration is ok when nothing in it threw, so an ok iteration can hold
+  a wrong result. Attempted counts finished iterations; workers still
+  inside an operation at the cap are not in it. Cells with errors ran into
+  the 480 s cap (240 s for the `socketTimeout` 0 cell in run 11 and for
+  every cell in run 12), so their attempted counts are smaller.
+- Backend switches count `SELECT`s that came back from a different
+  `pg_backend_pid()` than the same connection's previous `SELECT`, over the
+  `SELECT`s that returned the requested row.
+- n: run 11 ran each row once; the four Supavisor transaction-mode cells of
+  shapes M and H ran twice (runs 11 and 12). The session-pool and
+  40-connection rows ran once.
+- Not run: fewer than 12 or more than 40 connections on the transaction
+  poolers,
+  `prepareThreshold` values other than 0 and 5, `autosave`,
+  `reWriteBatchedInserts`, other pgjdbc or HikariCP versions, other compute
+  sizes and regions, an in-region client. Why named statements fail through
+  Supavisor transaction mode was not traced: only client errors and
+  Postgres's log were observed.
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  start [label="JDBC app on Supabase"];
+  net [label="IPv6 reachable,\nor IPv4 add-on on?"];
+  fits [label="total connections fit\nmax_connections?"];
+  few [label="total connections at or\nunder the session pool?"];
+  direct [label="direct 5432\npgjdbc defaults"];
+  ded [label="dedicated PgBouncer 6543\npgjdbc defaults"];
+  sess [label="Supavisor session 5432\npgjdbc defaults"];
+  txn [label="Supavisor transaction 6543\nprepareThreshold=0, socketTimeout"];
+  start -> net;
+  net -> fits [label="yes"];
+  net -> few [label="no"];
+  fits -> direct [label="yes"];
+  fits -> ded [label="no"];
+  few -> sess [label="yes"];
+  few -> txn [label="no"];
+}
+```
+
+1. If the client network reaches IPv6 or the project has the IPv4 add-on,
+   and the sum of `maximumPoolSize` across instances fits under
+   `max_connections`: direct 5432 with pgjdbc's defaults.
+2. Same network, more connections than that: the dedicated PgBouncer on
+   `db.<ref>.supabase.co:6543`, with pgjdbc's defaults (measured clean at 12
+   and 40 connections only, below `max_connections` 90).
+3. IPv4-only without the add-on, and the sum of `maximumPoolSize` at or
+   under the session pool (15 on Small): Supavisor session mode on 5432,
+   with pgjdbc's defaults.
+4. IPv4-only without the add-on, and more connections than that: Supavisor
+   transaction mode on 6543 with `prepareThreshold=0` and a `socketTimeout`.
+
+The ordering is a design choice built on the rows above; the
+`max_connections` budget also has to leave room for the platform's own
+services, which this experiment did not measure.
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Set `prepareThreshold=0` on every JDBC URL that reaches Supavisor on port 6543. | The default (5) ran 603 of 4522 (12 connections) and 516 of 11572 (40 connections) iterations without an error in run 11, and returned 14 results for the wrong row at 40 connections; `prepareThreshold=0` ran 6000 of 6000 and 20000 of 20000 in runs 11 and 12. The docs give the same setting.[^sb-txn-limits] | PC08 |
+| Do not use `preferQueryMode=extendedCacheEverything` on Supavisor transaction mode. | 570 of 4830 iterations ok and 1 wrong result; `simple` ran 6000 of 6000. | PC08 |
+| Set `socketTimeout` above your longest statement plus the 60 s checkout wait. | With the default 0, 11 of 12 workers waited 180584 to 243074 ms for a reply until a 240 s cap (plus a 5 s join grace) stopped them; 30 s turned the same wait into an `08006`. The value is a design choice. | PC08 |
+| Keep the sum of `maximumPoolSize` across instances at or under the session pool. | 15 on Small: excess connects got `EMAXCONNSESSION`, and workers saw it only after the 30 s `connectionTimeout`; 4 pools of 10 split the 15 as 6/4/3/2. | PC08, PC05 |
+| Size transaction-mode connections by how long each transaction holds a backend. | 40 connections running 1 s transactions were all served, on 16 active backends (Supavisor) and 15 (dedicated, sampled at +5 s); a transaction that cannot start within 60 s (Supavisor) or 80 s (dedicated) ends FATAL. Sizing by hold time is a design choice. | PC08, PC01 |
+| Retry `XX000 ECHECKOUTTIMEOUT` and `08P01 query_wait_timeout` on a new connection. | Both are FATAL, so the server closes the connection and Hikari replaces it. After the Supavisor wait 2 of 40 follow-up `select 1` failed on replacement connects that did not complete in 30 s; after the dedicated wait all 40 were ok (n=1). Treating them as retryable is a design choice. | PC08 |
+| Use the dedicated PgBouncer for named statements on a transaction pooler. | pgjdbc's defaults ran clean at 12 and 40 connections while switching backends on 5262 of 6000 and 18601 of 20000 `SELECT`s; Supavisor transaction mode with `prepareThreshold=0` also ran clean. Preferring the dedicated pooler is a design choice: no latency benefit of named statements was measured from this off-region client. The docs give PgBouncer 1.21 and later.[^sb-dedicated] | PC08 |
+| Turn on the IPv4 add-on before an IPv4-only network uses direct or the dedicated pooler. | Direct 5432 answered `ENOTFOUND` without it (6 of 6). With it switched on, an A record came after 10 s and the first direct connect 12 s after the PATCH in run 10 (10 s poll step), against an IPv4 address after 80 s and a direct connect at 81 s in both PC02 runs (5 s poll step). | PC02, PC08 |
+
+## Evidence
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| Default threshold on Supavisor transaction mode: 603 / 4522 (M) and 516 / 11572 (H) ok in run 11, 276 / 2253 and 283 / 4356 in run 12; `prepareThreshold=0` 6000 / 6000 and 20000 / 20000 in both | measured, 2026-11-04, n=2 | [PC08](https://github.com/erfianugrah/supabase-lab/blob/aba0ed1/experiments/pooler-checkout/tests/pc08-pgjdbc-hikari.ts) - four Hikari pools in one JVM, 500 iterations per worker, every result checked against the requested id; [run 11](https://github.com/erfianugrah/supabase-lab/blob/aba0ed1/experiments/pooler-checkout/out/2026-11-04/run-2026-11-04T09-24-08-535Z.facts.md), [run 12](https://github.com/erfianugrah/supabase-lab/blob/aba0ed1/experiments/pooler-checkout/out/2026-11-04/run-2026-11-04T11-18-37-198Z.facts.md) |
+| Six results for the wrong row or count, with no error, at 40 connections with the default threshold | measured, run 12, n=1 | [PC08](https://github.com/erfianugrah/supabase-lab/blob/aba0ed1/experiments/pooler-checkout/tests/pc08-pgjdbc-hikari.ts) `wrong_examples`; [run 12](https://github.com/erfianugrah/supabase-lab/blob/aba0ed1/experiments/pooler-checkout/out/2026-11-04/run-2026-11-04T11-18-37-198Z.facts.md) |
+| Direct, session and the dedicated pooler clean with pgjdbc's defaults; the dedicated pooler switching backends on 5262 of 6000 `SELECT`s | measured, run 11, n=1 | [run 11](https://github.com/erfianugrah/supabase-lab/blob/aba0ed1/experiments/pooler-checkout/out/2026-11-04/run-2026-11-04T09-24-08-535Z.facts.md) |
+| `socketTimeout` 0: 11 of 12 workers inside an `UPDATE` for 180584 to 243074 ms at the cap | measured, run 11, n=1 | [run 11](https://github.com/erfianugrah/supabase-lab/blob/aba0ed1/experiments/pooler-checkout/out/2026-11-04/run-2026-11-04T09-24-08-535Z.facts.md) |
+| Session pool 15; `EMAXCONNSESSION` at fill; 33 borrow timeouts at 30 s across 4 pools of 10 | measured, run 11, n=1 | [run 11](https://github.com/erfianugrah/supabase-lab/blob/aba0ed1/experiments/pooler-checkout/out/2026-11-04/run-2026-11-04T09-24-08-535Z.facts.md) |
+| 40 connections queue on both transaction pools; FATAL after 60 s (Supavisor) and 80 s (dedicated) | measured, run 11, n=1 | [run 11](https://github.com/erfianugrah/supabase-lab/blob/aba0ed1/experiments/pooler-checkout/out/2026-11-04/run-2026-11-04T09-24-08-535Z.facts.md) |
+| IPv4 add-on: first direct connect 12 s after the PATCH | measured, run 10, n=1 | [run 10](https://github.com/erfianugrah/supabase-lab/blob/aba0ed1/experiments/pooler-checkout/out/2026-11-04/run-2026-11-04T09-11-22-458Z.facts.md) |
+| JDBC `prepareThreshold=0` on the shared pooler in transaction mode; prepared statements on the dedicated pooler from PgBouncer 1.21; default pool size 15 on Small | documented | the Connecting to Postgres and Compute and Disk pages, read 2026-11-04 |
+| pgjdbc `prepareThreshold` default 5 and `socketTimeout` default 0 | documented; the loaded driver reported 5 | the pgJDBC "Initializing the Driver" page (connection parameters), read 2026-11-04; PC08 `PC08-env` |
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| MS10 | medium-serverless | [`ms10-prisma6-paths.ts`](https://github.com/erfianugrah/supabase-lab/blob/ab47c63/experiments/medium-serverless/tests/ms10-prisma6-paths.ts) | [`out/2026-09-30`](https://github.com/erfianugrah/supabase-lab/blob/ab47c63/experiments/medium-serverless/out/2026-09-30/run-2026-09-30T04-44-42-666Z.facts.md) |
+| PC01 | pooler-checkout | [`pc01-checkout-timeout.ts`](https://github.com/erfianugrah/supabase-lab/blob/b292b6b/experiments/pooler-checkout/tests/pc01-checkout-timeout.ts) | [`run-2026-10-10T01-53-22-718Z`](https://github.com/erfianugrah/supabase-lab/blob/ddd41b2/experiments/pooler-checkout/out/2026-10-10/run-2026-10-10T01-53-22-718Z.facts.md), [`run-2026-10-10T02-40-11-359Z`](https://github.com/erfianugrah/supabase-lab/blob/ddd41b2/experiments/pooler-checkout/out/2026-10-10/run-2026-10-10T02-40-11-359Z.facts.md) |
+| PC02 | pooler-checkout | [`pc02-fallback.ts`](https://github.com/erfianugrah/supabase-lab/blob/b292b6b/experiments/pooler-checkout/tests/pc02-fallback.ts) | [`run-2026-10-10T02-40-11-359Z`](https://github.com/erfianugrah/supabase-lab/blob/ddd41b2/experiments/pooler-checkout/out/2026-10-10/run-2026-10-10T02-40-11-359Z.facts.md), [`run-2026-10-10T03-09-14-920Z`](https://github.com/erfianugrah/supabase-lab/blob/ddd41b2/experiments/pooler-checkout/out/2026-10-10/run-2026-10-10T03-09-14-920Z.facts.md) |
+| PC05 | pooler-checkout | [`pc05-checkout-matrix.ts`](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/pooler-checkout/tests/pc05-checkout-matrix.ts) | [`run-2026-10-23T08-11-43-542Z`](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/pooler-checkout/out/2026-10-23/run-2026-10-23T08-11-43-542Z.facts.md), [`run-2026-10-23T08-11-48-633Z`](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/pooler-checkout/out/2026-10-23/run-2026-10-23T08-11-48-633Z.facts.md) |
+| PC06 | pooler-checkout | [`pc06-login-delay.ts`](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/pooler-checkout/tests/pc06-login-delay.ts) | [`run-2026-10-23T08-11-43-542Z`](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/pooler-checkout/out/2026-10-23/run-2026-10-23T08-11-43-542Z.facts.md), [`run-2026-10-23T08-11-48-633Z`](https://github.com/erfianugrah/supabase-lab/blob/fb257e4/experiments/pooler-checkout/out/2026-10-23/run-2026-10-23T08-11-48-633Z.facts.md) |
+| PC08 | pooler-checkout | [`pc08-pgjdbc-hikari.ts`](https://github.com/erfianugrah/supabase-lab/blob/aba0ed1/experiments/pooler-checkout/tests/pc08-pgjdbc-hikari.ts) | [`run-2026-11-04T09-11-22-458Z`](https://github.com/erfianugrah/supabase-lab/blob/aba0ed1/experiments/pooler-checkout/out/2026-11-04/run-2026-11-04T09-11-22-458Z.facts.md), [`run-2026-11-04T09-24-08-535Z`](https://github.com/erfianugrah/supabase-lab/blob/aba0ed1/experiments/pooler-checkout/out/2026-11-04/run-2026-11-04T09-24-08-535Z.facts.md), [`run-2026-11-04T11-18-37-198Z`](https://github.com/erfianugrah/supabase-lab/blob/aba0ed1/experiments/pooler-checkout/out/2026-11-04/run-2026-11-04T11-18-37-198Z.facts.md) |
+| T11 | privatelink-aws | [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/privatelink-aws/RUNLOG.md) | - |
+
+## Related docs
+
+- [Supabase incidents: what a client can do](/reference/supabase-incident-resilience/) - the 60 s and 15 s pooler checkout waits, the fallback to session mode, and driver pools after a reset, measured with node-postgres, postgres.js and Prisma (PC01 to PC07).
+- [AWS PrivateLink to Supabase](/reference/supabase-aws-privatelink/) - the single-client prepared-statement probe (T11) and Prisma at 20 clients (MS10).
+- [Supabase compute and disk sizing](/reference/supabase-compute-disk/) - `max_connections` and pooler client limits per compute size.
+- [Supabase resilience runbook](/guides/supabase-resilience-runbook/) - reading an `ECHECKOUTTIMEOUT` in production.
+
+[^lab-pc08]: supabase-lab, "Pooler-checkout experiment," supabase-lab runlog, section "PC08 - pgjdbc + HikariCP on each path, server-side prepare on and off (runs 10 to 12, 2026-11-04)". https://github.com/erfianugrah/supabase-lab/blob/aba0ed1/experiments/pooler-checkout/RUNLOG.md
+[^sb-txn-limits]: Supabase, "Connecting to Postgres - Transaction mode limitations," Supabase Docs. https://supabase.com/docs/guides/database/connecting-to-postgres#transaction-mode-limitations
+[^sb-dedicated]: Supabase, "Connecting to Postgres - Dedicated pooler," Supabase Docs. https://supabase.com/docs/guides/database/connecting-to-postgres#dedicated-pooler
+[^sb-compute]: Supabase, "Compute and Disk," Supabase Docs. https://supabase.com/docs/guides/platform/compute-and-disk
+[^pgjdbc-use]: pgJDBC, "Initializing the Driver," jdbc.postgresql.org. https://jdbc.postgresql.org/documentation/use/

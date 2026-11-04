@@ -1916,6 +1916,7 @@ const practicePages: Array<[doc: string, heading: RegExp]> = [
   ["reference/supabase-multi-tenant-placement", PRACTICES_HEADING],
   ["reference/supabase-pg-cron-behaviour", PRACTICES_HEADING],
   ["reference/supabase-pg-net-under-load", PRACTICES_HEADING],
+  ["reference/supabase-pgjdbc-poolers", PRACTICES_HEADING],
   ["reference/supabase-platform-operation-cost", PRACTICES_HEADING],
   ["reference/supabase-read-replicas", PRACTICES_HEADING],
   ["reference/supabase-rls-policy-cost", PRACTICES_HEADING],
