@@ -1,0 +1,283 @@
+---
+title: "Postgres full-text search: ranking only what the rare words match"
+description: "Why an OR-joined websearch query makes Postgres ts_rank score every match, what that costs on a 1.65M-row message table with 5.3 GB of TOAST, two fixes that did not work (more parallel workers, a recency cap), and the one that did: let the OR operands with a lexeme outside pg_stats.most_common_elems pick the candidates. Measured on a live store with 25 real queries."
+author: Erfi Anugrah
+category: supabase
+group: architecture
+---
+
+A Postgres full-text query of the form `a OR b OR c` matches every row that
+holds any one of the words, and `ts_rank` then reads the `tsvector` of every
+one of those rows before `ORDER BY rank LIMIT 10` keeps ten. This page measures
+that cost on a real table and describes a ranking change that cut the slow tail
+from seconds to under a second without losing results.
+
+Everything here was measured on 2026-11-05 on the live
+[agent memory store](/reference/agent-memory-store/): one Postgres 18 database
+(the `pgvector/pgvector:0.8.7-pg18` image) on a home server, a `messages`
+table of 1,651,545 rows with a generated `tsvector` column and a GIN index,
+queried through PostgREST. The heap is 2787 MB and the TOAST table 5279 MB.
+The queries are 25 real searches agents ran through the `session_search` tool,
+taken from the session-fts measurement of the same day (see
+[resuming agent sessions](/reference/resume-agent-sessions/)). Quality is
+scored against a second engine: for each query, how many of the ten sessions
+that a local SQLite FTS5 index ranks first also appear in the Postgres top 10
+(101 such sessions over 24 queries; one query had none). The measurement
+scripts and output live in the private memledger repository
+(`docs/research/lab/2026-11-05-search-rank/`), so the tables below are pasted
+from that output, not linked.
+
+## TL;DR
+
+- One broad query, `git OR credential OR forgejo OR lfs OR pre OR push`,
+  matched 183,494 of the table's `pi` rows. The old function ranked all of
+  them: 4686 ms in `EXPLAIN ANALYZE`, a top-N heapsort on top of a bitmap heap
+  scan over 125,538 heap blocks.
+- Postgres's ranking functions use no corpus-wide statistics[^pg-rank], so a
+  common word counts as much as a rare one. The rare words carry the meaning
+  of a query anyway.
+- The fix reads the planner's own list of common lexemes,
+  `pg_stats.most_common_elems`[^pg-stats], which held 1000 lexemes on this
+  column, each in at least 1.6% of rows. OR operands with a lexeme outside
+  that list pick the candidate rows; the full query ranks them; a short result
+  is topped up from the newest matches.
+- Over the 25 queries the slow tail fell from p90 5557 ms and a 16965 ms
+  maximum to p90 576 ms and a 1318 ms maximum, with 40 of 101 reference
+  sessions found against 39 before. Through the live HTTP API: p50 78 ms,
+  p90 409 ms.
+- Two cheaper ideas failed: four parallel workers did not make the old query
+  faster (5937 ms against 5407 ms with two), and ranking only the newest 2000
+  matches was fast but found 31 of 101.
+
+## Where the time goes
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  q [label="a OR b OR c\n(websearch_to_tsquery)"];
+  gin [label="GIN bitmap\n254,171 rows"];
+  src [label="source btree bitmap\n1,102,881 rows"];
+  and [label="BitmapAnd\n183,494 rows"];
+  heap [label="heap + TOAST\nread every tsvector"];
+  rank [label="ts_rank x 183,494"];
+  top [label="top-N heapsort\nkeep 10"];
+  q -> gin; gin -> and; src -> and; and -> heap; heap -> rank; rank -> top;
+}
+```
+
+The plan for the broad query, read top to bottom:
+
+1. The GIN index returns 254,171 candidate rows for the six OR'd lexemes.
+2. The planner ANDs that bitmap with a scan of the `(source, ts)` btree for
+   `source = 'pi'`, which returns 1,102,881 rows. The intersection is 183,494:
+   the source filter removed only the other clients' rows, and it cost a scan
+   of a bitmap six times the size of the result.
+3. The bitmap heap scan visits 125,538 heap blocks and fetches each row's
+   `tsvector`, which for any message of more than a few lines lives in TOAST.
+4. `ts_rank` runs once per row. The sort is a top-N heapsort using 33 kB, so
+   the sort itself is cheap; reading and scoring 183,494 vectors is the work.
+
+The Postgres documentation says this outright: ranking "requires consulting
+the tsvector of each matching document, which can be I/O bound and therefore
+slow", and is "almost impossible to avoid since practical queries often result
+in large numbers of matches"[^pg-rank]. `ts_headline` was not the problem: it
+runs only on the ten rows the `LIMIT` keeps.
+
+The OR query is the common case here. The agent tools join the words of a
+multi-word query with `OR` (always in one tool, as a retry after a zero-hit
+search in the others, see
+[two retrieval modes](/reference/agent-memory-store/#two-retrieval-modes-one-database)),
+so every common word in a query adds tens of thousands of matches.
+
+## What did not work
+
+| Attempt | Result | Why |
+|---|---|---|
+| More parallel workers (`max_parallel_workers_per_gather` 2 -> 4) | 5407 ms -> 5937 ms on the broad query, same run | The per-row work splits across workers, but every worker still reads its share of 5.3 GB of TOAST; on this host the extra workers bought nothing |
+| Rank only the newest 2000 matches per source | p90 725 ms, but 31 of 101 reference sessions (39 before) | A date cut keeps whatever is recent, so a rare-word hit in an older session falls outside it |
+| Filter source after the GIN scan instead of the BitmapAnd | Kept in the final version (an `OFFSET 0` fence) | It saves the btree scan, but on its own the row count to rank stays 183,494 |
+
+The recency cap is the instructive failure. It is the obvious fix and its
+latency was fine, but it lost results on exactly the OR lists that mix one
+rare word with common ones: `agent OR driven OR KiCad` went from 2 reference
+sessions to 0, `Lamzu OR key` from 1 to 0, `sks8300 OR autorebase OR patch OR
+id` from 2 to 0.
+
+## Rank what the rare words match
+
+`ts_rank` gives no weight to rarity, so for an OR query the rows that matter
+are the ones holding the uncommon words. Postgres already keeps a list of the
+common ones: `ANALYZE` stores the most frequent elements of a `tsvector` column
+in `pg_stats.most_common_elems`, with their frequencies in
+`most_common_elem_freqs`[^pg-stats]. On this table the list held 1000 lexemes,
+the rarest at a frequency of 0.016, about 26,000 rows. `autovacuum` keeps it
+current, and it costs no new index or table.
+
+The new `search_messages` (migration 037 in the memledger repository) does
+this:
+
+1. Parse the query with `websearch_to_tsquery`. If it is not a plain OR list
+   (it has `&`, `!`, a prefix match or parentheses), rank every match exactly
+   as before.
+2. Split the OR list into operands. An operand is selective if at least one of
+   its lexemes is missing from `most_common_elems`; a quoted phrase counts as
+   one operand.
+3. Fetch the rows matching only the selective operands, rank them with the
+   full query, and keep the top `lim`.
+4. If that gave fewer than `lim` rows, or no operand was selective, add the
+   best of the newest 2000 rows per source that match the full query and were
+   not already returned.
+
+With no statistics on the column, as on a freshly loaded database, every
+operand is selective and the function behaves like the old one.
+
+```sql
+-- step 2: an operand is selective when a lexeme is missing from the stats
+SELECT s.most_common_elems::text::text[] INTO mce
+  FROM pg_catalog.pg_stats s
+ WHERE s.schemaname = 'public' AND s.tablename = 'messages' AND s.attname = 'fts';
+FOREACH op IN ARRAY string_to_array(tq::text, ' | ') LOOP
+  IF EXISTS (SELECT 1 FROM regexp_matches(op, $re$'((?:[^']|'')+)'$re$, 'g') AS m(x)
+              WHERE NOT (replace(m.x[1], $q$''$q$, $q$'$q$) = ANY (mce))) THEN
+    sel := sel || op;
+  END IF;
+END LOOP;
+```
+
+For the broad query, `forgejo`, `lfs` and `credenti` are selective and `git`,
+`pre` and `push` are in the list, so only the rows holding one of the three
+rare lexemes are ranked, and they are ranked with all six words.
+
+The same idea ships in other projects. Hindsight's tsvector search backend
+reads `most_common_elems` for the same reason, OR-joined recall queries timing
+out in ranking, and keeps only the N tokens with the lowest
+frequency[^hindsight]. The difference here is that the common words are not
+dropped: they still score the candidates, and they still fill the result when
+the rare words match fewer than `lim` rows.
+
+## Reading the numbers
+
+Over the 25 queries, run inside Postgres, one run per variant per query:
+
+| Variant | p50 | p90 | Max | Reference sessions found |
+|---|---|---|---|---|
+| old: rank every match | 442 ms | 5557 ms | 16965 ms | 39 / 101 |
+| cap: newest 2000 per source | 308 ms | 725 ms | 1191 ms | 31 / 101 |
+| live: rare operands pick candidates | 81 ms | 576 ms | 1318 ms | 40 / 101 |
+
+Through the live PostgREST endpoint over HTTPS from a workstation, median of
+three runs per query: p50 78 ms, p90 409 ms, maximum 1279 ms, 40 of 101.
+
+Selected rows, same run:
+
+| Query | Old | Live |
+|---|---|---|
+| `"can't type" OR "cannot type" OR ...` (5 phrases and words) | 16965 ms | 24 ms |
+| `git OR credential OR forgejo OR lfs OR pre OR push` | 6706 ms | 525 ms |
+| `gridlock OR name OR 5x12 OR repo` | 6247 ms | 96 ms |
+| `Lamzu OR key` | 3400 ms | 54 ms |
+| `lockstep OR rebuffer OR BBR OR buffering` | 352 ms | 1318 ms |
+| `wise` | 8 ms | 69 ms |
+
+Three cautions on these numbers:
+
+- For each query the variants ran in the order live, cap, old, so the old
+  function always ran on the warmest cache. The comparison favours the old
+  function.
+- Single queries vary between runs: the broad query took 9.4 s in an earlier
+  `EXPLAIN ANALYZE` the same day and 4686 ms in the one quoted above. The
+  distribution is the result; one row is not.
+- The new function is slower on some queries whose words are all uncommon
+  but not rare: it is PL/pgSQL with a `pg_stats` lookup, it ran first on a
+  colder cache, and a selective operand can still match many rows. The p50
+  across all 25 queries still fell from 442 ms to 81 ms.
+
+Forty of 101 reference sessions sounds low, and the old function scored the
+same: the two engines rank differently (FTS5 uses BM25 with IDF, Postgres
+`ts_rank` does not). In the session-fts lab, reading the Postgres results 200
+rows deep together with a plain-text scan of the files found 95 of the 101.
+The metric here only checks that the change lost nothing, and it did not.
+
+## Testing it
+
+A small test database defeats the check. With only a few thousand rows and
+few distinct words, `ANALYZE` puts every lexeme into `most_common_elems`, the
+"rare" word included, and the function takes the all-common path. The
+end-to-end test therefore seeds 3000 rows sharing one common word plus about
+3000 distinct filler words, adds one old row holding the rare word and one new
+row repeating the common word 50 times, and asserts the statistics first:
+
+| Check | Expected |
+|---|---|
+| `commonword` in `most_common_elems`, `rareword` not | `t` and `f`, else the test fails before querying |
+| `rareword OR commonword`, `lim=5` | the rare-word row first, then four common rows, no duplicates |
+| `commonword` alone | three rows, all from the newest 2000 |
+| An AND query no row satisfies | no rows |
+| `src=claude` and an empty query | no rows |
+
+Before migration 037 the second check failed: the row repeating the common
+word 50 times outranked the single rare-word row, which is `ts_rank` without
+IDF doing what it is documented to do.
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  slow [label="FTS query slow?"];
+  plan [label="EXPLAIN ANALYZE:\nrows into ts_rank?"];
+  few [label="a few thousand:\nlook elsewhere\n(index, headline, I/O)"];
+  orq [label="query is an OR list\nwith common words?"];
+  sel [label="rank what the\nselective operands match"];
+  other [label="AND or phrase query:\nrank all, or order\nnewest first above\na match-count threshold"];
+  slow -> plan;
+  plan -> few [label="small"];
+  plan -> orq [label="10^5 and up"];
+  orq -> sel [label="yes"];
+  orq -> other [label="no"];
+}
+```
+
+1. Run `EXPLAIN ANALYZE` and read the row count entering the sort. A few
+   thousand rows is not this problem.
+2. Hundreds of thousands of rows from an OR query with common words: let the
+   operands holding a lexeme outside `most_common_elems` pick the candidates,
+   rank them with the full query, top up from a recency window.
+3. An AND or phrase query that still matches that many rows has no rare
+   operand to lean on: rank everything, or order newest first above a
+   match-count threshold.
+
+## Evidence
+
+| Claim | How it was checked |
+|---|---|
+| 1,651,545 rows, 2787 MB heap, 5279 MB TOAST | `pg_relation_size` on the table and its TOAST relation, live store |
+| 1000 lexemes in `most_common_elems`, minimum frequency 0.016 | `pg_stats` for `messages.fts`, live store |
+| Broad query: 183,494 matches, 125,538 heap blocks, 4686 ms | `EXPLAIN (ANALYZE)` of the old function body as a temp function |
+| Parallel workers: 5407 ms (2) vs 5937 ms (4) | Same query, `max_parallel_workers_per_gather` raised in-session |
+| Variant table and selected rows | One run, 25 queries, temp functions for old and cap, `public.search_messages` for live |
+| HTTP p50 78 / p90 409 / max 1279 ms | `curl` against the live RPC, 3 runs per query, median |
+| Reference sessions (FTS5 top 10) | From the session-fts lab, the same 25 queries |
+| Test fails before 037, passes after | memledger end-to-end test `TestSearchMessagesSelective`, run on both trees |
+| Postgres ranking uses no global statistics and consults every match | Postgres documentation, cited inline |
+| Same technique elsewhere | Hindsight source, read 2026-11-05 at the cited commit |
+
+Measured on one host and one corpus. The 2000-row recency window is this
+table's choice and the 1000-lexeme list is this column's statistics; another
+corpus needs its own query set to confirm the recall result.
+
+## Related docs
+
+- [A cross-client memory store for coding agents](/reference/agent-memory-store/) - the system this search serves.
+- [Resuming any coding-agent session from any directory](/reference/resume-agent-sessions/) - where the session-fts measurement is summarised.
+- [Redundant writes in Postgres: what an unchanged upsert costs](/reference/postgres-redundant-writes/) - another measured Postgres cost, on the write side.
+
+[^pg-rank]: PostgreSQL Global Development Group, "12.3. Controlling Text Search," PostgreSQL Documentation. https://www.postgresql.org/docs/current/textsearch-controls.html
+[^pg-stats]: PostgreSQL Global Development Group, "pg_stats," PostgreSQL Documentation. https://www.postgresql.org/docs/current/view-pg-stats.html
+[^hindsight]: vectorize-io, "bm25_term_selection.py," hindsight (GitHub). https://github.com/vectorize-io/hindsight/blob/a544b196/hindsight-api-slim/hindsight_api/engine/search/bm25_term_selection.py
