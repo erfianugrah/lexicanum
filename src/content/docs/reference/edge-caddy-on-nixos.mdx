@@ -73,33 +73,29 @@ In standard NixOS environments, custom Caddy binaries are built with `pkgs.caddy
 
 This mechanism fails when packaging custom in-house plugins that live in private repositories or local flake inputs. `pkgs.caddy.withPlugins` cannot access private authentication tokens during the build phase and cannot accept arbitrary filesystem paths for module code.
 
-To resolve this, `pkgs/caddy-edge.nix` replaces the standard helper with a custom build derivation:
+To resolve this, `pkgs/caddy-edge/default.nix` replaces the standard helper with a sandboxed `buildGoModule` derivation. The module graph is resolved once, off the build, by `pkgs/caddy-edge/update.sh`, which commits `go.mod` and `go.sum` next to the derivation:
 
 ```nix
-{ lib, buildGoModule, fetchFromGitHub, runCommand, flakeInputs }:
-
-let
-  caddyVersion = "2.11.4";
-  caddySrc = fetchFromGitHub {
-    owner = "caddyserver";
-    repo = "caddy";
-    rev = "v${caddyVersion}";
-    hash = "sha256-J0v9v0n68pS8+0F2r4bFhGz3x8jWwR4k1l2m3n4o5p6=";
-  };
-
-  policyEngine = flakeInputs.caddy-policy-engine;
-  bodyMatcher = flakeInputs.caddy-body-matcher;
-  ddosMitigator = flakeInputs.caddy-ddos-mitigator;
-  souinFork = flakeInputs.souin;
-in
-buildGoModule {
+(buildGoModule.override { go = go_1_26_10; }) {
   pname = "caddy-edge";
-  version = caddyVersion;
-  src = caddySrc;
+  version = "2.11.4";
+  src = fetchFromGitHub { owner = "caddyserver"; repo = "caddy"; tag = "v2.11.4"; hash = "..."; };
 
-  # Network required during buildPhase to resolve public plugin modules
-  __noChroot = true;
-  # ...
+  # Runs in both the vendor fixed-output derivation and the build.
+  postPatch = ''
+    cp ${./go.mod} go.mod
+    cp ${./go.sum} go.sum
+    mkdir -p plugged private
+    cp ${./main.go} plugged/main.go
+    cp -r ${bodyMatcher} private/bodyMatcher
+    cp -r ${policyEngine} private/policyEngine
+    cp -r ${ddosMitigator} private/ddosMitigator
+    cp -r ${souinFork} private/souinFork
+    chmod -R u+w private
+  '';
+
+  vendorHash = "sha256-...";
+  subPackages = [ "plugged" ];
 }
 ```
 
@@ -109,15 +105,16 @@ The derivation addresses several Go module packaging constraints:
 
 1. **Subdirectory entrypoint:** The build creates a `plugged/main.go` file inside a subdirectory rather than at the root of the source tree. Because the root of `caddyserver/caddy` declares `package caddy` as a library, placing a `package main` entrypoint at the root breaks Go module parsing. The entrypoint imports `github.com/caddyserver/caddy/v2/cmd` to run the standard CLI interface.
 2. **Explicit standard modules:** The entrypoint must import `_ "github.com/caddyserver/caddy/v2/modules/standard"`.[^caddy-standard] Without this explicit blank import, Caddy registers only approximately 45 base modules out of roughly 197 standard modules. Basic directives such as `file_server`, `reverse_proxy`, `encode`, and standard log encoders fail during Caddyfile adaptation.
-3. **Flake input directory replacement:** Private plugins are injected using Go module replacement directives pointing to the Nix store paths of the flake inputs:
+3. **Relative directory replacement:** Private plugins are flake inputs, copied into the source tree at `./private/<input>`. The committed `go.mod` replaces each private module with that relative path:
    ```bash
    go mod edit \
-     -replace github.com/erfianugrah/caddy-policy-engine=$policyEngine \
-     -replace github.com/erfianugrah/caddy-body-matcher=$bodyMatcher \
-     -replace github.com/erfianugrah/caddy-ddos-mitigator=$ddosMitigator \
-     -replace github.com/darkweak/souin=$souinFork
+     -replace github.com/erfianugrah/caddy-policy-engine=./private/policyEngine \
+     -replace github.com/erfianugrah/caddy-body-matcher=./private/bodyMatcher \
+     -replace github.com/erfianugrah/caddy-ddos-mitigator=./private/ddosMitigator \
+     -replace github.com/darkweak/souin=./private/souinFork
    ```
-4. **Relaxed sandboxing:** Public plugins are resolved via `go get` during `buildPhase`. This requires network access, enabled by setting `__noChroot = true;` in the derivation and configuring `nix.settings.sandbox = "relaxed"` on the router build host.
+   Relative paths matter: a replace pointing at a `/nix/store` path would end up in `vendor/modules.txt`, and a fixed-output derivation may not reference store paths. The consequence is that `vendorHash` covers the private plugin sources, so every plugin bump needs a new hash.
+4. **No network in the build:** Until 2026-11-05 the derivation ran `go get` and `go mod tidy` during `buildPhase`, which needed `__noChroot = true;` plus `nix.settings.sandbox = "relaxed"` on the router. The output was then not a function of its inputs, and an outage of the Go module proxy or GitHub failed the router deploy. The network step now lives in `update.sh`; the build only reads the vendored module set. The same change gave the build its own Go 1.26.10 (a `go.overrideAttrs` on the pinned 1.26.5), because the old `GOTOOLCHAIN=go1.26.10` download is impossible in the sandbox.
 
 ### Module inventory
 
@@ -142,18 +139,19 @@ Transitive Go dependencies pulled in by plugins can introduce build breakage or 
 
 ### The 2026-09-29 security replacements
 
-On 2026-09-29, fleet vulnerability audits identified open Dependabot alerts across transitive dependencies in `caddy-policy-engine` and `caddy-ddos-mitigator`. The derivation applies explicit `-replace` directives during module preparation:
+On 2026-09-29, fleet vulnerability audits identified open Dependabot alerts across transitive dependencies in `caddy-policy-engine` and `caddy-ddos-mitigator`. `update.sh` writes explicit `-replace` directives into the committed `go.mod`:
 
 ```bash
 go mod edit \
   -replace google.golang.org/grpc=google.golang.org/grpc@v1.84.0 \
   -replace golang.org/x/crypto=golang.org/x/crypto@v0.57.0 \
-  -replace golang.org/x/text=golang.org/x/text@v0.39.0
+  -replace golang.org/x/net=golang.org/x/net@v0.60.0
 ```
 
 - **gRPC `v1.84.0`:** Replaced `v1.82.1` to clear high-severity gRPC transport vulnerabilities resolved in upstream releases 1.82.2 and 1.83.1.[^grpc-release]
 - **x/crypto `v0.57.0`:** Bumped to satisfy security scanner requirements regarding SSH channel denial-of-service vulnerabilities.
-- **x/text `v0.39.0`:** Bumped for parity across the Go networking toolchain.
+- **x/net `v0.60.0`:** Added 2026-10-22 for CVE-2026-78669.
+- **No x/text replace:** an earlier `v0.39.0` pin was removed on 2026-10-22. The module graph resolves `v0.42.0` on its own, so the pin had become a downgrade into CVE-2026-56851.
 
 ### The CEL-Go v0.28.1 hold
 
@@ -248,7 +246,7 @@ The control plane interaction handles data persistence and service boundaries:
 1. **Permission isolation:** `edgectl` runs under its own system user (`edgectl`) but belongs to supplementary group `caddy`. The directory `/var/lib/caddy/waf` is set to mode `2775` (setgid `caddy`), allowing `edgectl` to write configuration files that `caddy` reads.
 2. **Storage transition:** On 2026-09-30, `edgectl` cut over from flat JSON files to PostgreSQL 18 (`postgres:///edgectl?host=/run/postgresql`) via Unix socket peer authentication. PostgreSQL stores rule definitions, managed lists, and security events. A dedicated local Valkey instance (`/run/edgectl-valkey/valkey.sock`) mirrors active jail entries.
 3. **Decoupled file sync:** Caddy does not communicate with PostgreSQL or Valkey directly. `edgectl` exports compiled rule sets to `/var/lib/caddy/waf/policy-rules.json` and active IP jail entries to `/var/lib/caddy/waf/jail.json`. Caddy hot-reloads these files asynchronously. If `edgectl` or the database stops, Caddy continues serving traffic using the last written state on disk.
-4. **Dashboard interface:** The static frontend (built with Astro 7 and React 19) is located at `/var/lib/edgectl/ui`. When accessed via its LAN-only dashboard hostname, Caddy reverse proxies the API and serves static assets directly.
+4. **Dashboard interface:** The static frontend (Astro 7 and React 19) is built by Nix from the same pinned `caddy-compose` revision as `edgectl` (`pkgs/edgectl-ui.nix`, `buildNpmPackage`), and `EDGE_UI_DIR` points at its store path. Caddy reverse proxies the LAN-only dashboard hostname to `edgectl`, which serves both the API and the static files. Before 2026-11-05 the files were copied by hand out of the CI image into `/var/lib/edgectl/ui`, so a rebuilt router came up without a dashboard and the live copy drifted: it still carried nine pages the September pruning had removed from the source.
 
 ## Durable runtime mechanics
 
