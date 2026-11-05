@@ -73,6 +73,11 @@ export const TAXONOMY = [
     blurb: "Where credentials live, how they are encrypted, rotated, and kept out of agent transcripts.",
   },
   {
+    id: "hardware",
+    label: "Hardware design",
+    blurb: "Designing, ordering and bringing up open hardware: the auspex Hall-effect keyboard series.",
+  },
+  {
     id: "workstations",
     label: "Workstations and tooling",
     blurb: "Hardware tuning and the tooling around the machines.",
