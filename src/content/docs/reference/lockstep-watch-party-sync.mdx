@@ -1,0 +1,118 @@
+---
+title: "Lockstep: watch-party sync for Jellyfin"
+description: "Architecture of lockstep, a self-hosted watch-party system for Jellyfin: a token-minting plugin, a Rust session server, a browser client and a Flutter port, built on scheduled commands and a room that waits instead of speeding anyone up."
+author: Erfi Anugrah
+category: homelab
+---
+
+Lockstep lets one person host and everyone else watch the same Jellyfin item at the same moment: play, pause, seek and the next episode follow the host, whether a viewer direct-plays, remuxes or transcodes. It coordinates timing only. Jellyfin still serves every byte of video, and there is no chat; people talk over whatever voice app they already use.
+
+It exists because the two obvious options did not fit. Plex dropped Watch Together from its rewritten apps in February 2025 and it now survives only in the Plex web app.[^plex-forum] Jellyfin's own SyncPlay corrects drift by changing playback speed or skipping, and lets members ignore waits.[^syncplay-group] Lockstep took a stricter rule instead, described below. The repository is private; this page describes it as built on 2026-11-05.
+
+**TL;DR:**
+
+- Four parts: a Jellyfin plugin that mints tokens and injects the client, a Rust session server, a TypeScript client inside jellyfin-web, and a port of the client to the Fladder Flutter app.
+- Clients sync their clocks to the server, and every play, pause and seek is scheduled at a future server time, so network latency does not turn into drift.
+- Nobody is ever sped up, slowed down or jumped forward. A member who falls behind or stalls makes the room wait for them.
+- Members see each other under per-room pseudonyms; only a Jellyfin administrator sees real names and can invite people.
+- Every lag and buffering threshold is a server-wide setting that an administrator edits live from the panel.
+
+## Components
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.4; ranksep=0.8;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box, style=rounded];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  subgraph cluster_jf {
+    label="Jellyfin"; style=dashed; fontsize=10;
+    plugin [label="Lockstep plugin (C#)\nGET /Lockstep/Token\nGET /Lockstep/ClientScript"];
+    web [label="jellyfin-web\n+ injected client (TS)"];
+  }
+  fladder [label="Fladder app\n(lib/lockstep, Dart)"];
+  server [label="Session server (Rust)\nrooms, clock, scheduling"];
+  plugin -> web [label="script tag\nin index.html"];
+  web -> plugin [label="HS256 token"];
+  fladder -> plugin [label="HS256 token"];
+  web -> server [label="WebSocket + JSON"];
+  fladder -> server [label="WebSocket + JSON"];
+}
+```
+
+- **Plugin** (C#, Jellyfin 12.2). Mints a short-lived HS256 JWT for the signed-in user, serves the client bundle, and appends one `<script>` tag to jellyfin-web's `index.html`. Jellyfin stays the identity provider; the session server never sees a Jellyfin password or API key, only the shared signing secret.
+- **Session server** (Rust, Tokio and Axum). One binary, WebSocket and HTTP on one port. It owns rooms, the authoritative playback position, the clock oracle and the scheduled-command broadcast. Rooms live in memory.
+- **Browser client** (TypeScript, no framework, one Vite bundle). Wires the WebSocket transport, clock sync, the lag and buffering logic and a plain-DOM panel into jellyfin-web.
+- **Fladder port** (Dart). The same protocol and the same sync rules in the author's fork of the Fladder Jellyfin client, for Windows, Android and Google TV. Its Windows builds come from the setup in [Building Windows releases on a Linux-only Forgejo runner](/guides/windows-build-vm-forgejo-ci/).
+
+The wire protocol is typed JSON, one message per frame, defined twice: Rust enums on the server and zod schemas in the browser client. Both change in the same commit. New fields are optional on the client side, so an older client keeps parsing a newer server's messages; the server is always deployed first.
+
+The server runs as one more container beside Jellyfin on the media NAS described in [Docker networking patterns for the arr stack](/guides/arr-stack-docker-patterns/), reachable through the edge reverse proxy under a path prefix on the Jellyfin site, so browsers connect same-origin.
+
+## Clock and scheduled commands
+
+Each client measures its offset from server time with NTP-style ping/pongs: `offset = server_ts - (client_send_ts + rtt / 2)`, smoothed with an exponential average. The clock counts as synced after three samples; after that, a sample whose round trip is more than twice the p95 cannot move the offset.
+
+When the host presses play, the server does not tell everyone to play now. It broadcasts `ScheduledPlay` with a `target_server_ts` in the future, and each client starts at that server time rather than when the message arrived. The lead is the largest participant pipeline delay plus 50 ms, clamped to 300-1000 ms. A viewer on a slow link raises the lead for everyone by a few hundred milliseconds; in exchange the start is simultaneous. The clamp bounds are settings (below).
+
+Two smaller corrections sit on top. A player takes a moment to really start after `play()`, so each client measures how far behind it ran shortly after each scheduled play and starts that much earlier next time. And a viewer whose sound arrives late, through Bluetooth or TV speakers, sets an audio delay; their video then runs that far ahead of the room so what they hear lines up.
+
+## The room waits
+
+The original design corrected drift the way game netcode does: speed nudges, a square-root correction curve and hard seeks. That model was dropped on 2026-10-30 after a real session: on an audio-track switch, the switching viewer caught up by audibly speeding up. The rule since then is that nobody is ever sped up, slowed down or jumped forward. The room waits.
+
+- **Behind**: a member more than 0.3 s behind for two loop ticks reports `Buffering`. The room pauses, others see "Waiting for" that member, the member plays on to the pause position and reports ready, and everyone resumes together.
+- **Ahead**: a member more than 0.3 s ahead pauses itself for the difference. The room keeps playing.
+- **Stalled**: a video element starved for 700 ms is treated like a member behind.
+- **Bad connection**: after a stall the member resumes only with a buffer ahead of it. The target starts at 2 s, doubles with each stall up to 20 s and halves after every 5 min without one. The waiting room sees that member's buffer progress.
+- **Server patience**: the server stops waiting after 10 s without buffer growth or 2 min in total. The room resumes and that member cannot pause it again for 30 s, so one bad link cannot stop-start the room indefinitely.
+- **Settle windows**: no lag action right after a join, reconnect, scheduled command or while the viewer scrubs.
+
+The cost of the rule is that the slowest member paces the room. For a host in Singapore and a viewer in Europe, that question gets its own page: [Synchronized playback with far-away viewers](/reference/synchronized-playback-far-viewers/) compares this model with how live-sports streaming and other co-watching products keep distant viewers together, and [Blind playback-rate listening test](/guides/playback-rate-listening-test/) is the test that decides whether a small, inaudible speed change could ever come back as an opt-in.
+
+## Settings an administrator can change live
+
+Every number in the previous section is the default of one server-wide settings set (lockstep#66, 2026-11-05): lag threshold and confirm ticks, buffering report delay, resume buffer start, maximum and decay, the server's give-up times and cooldown, and the scheduling lead bounds. Each has a validated range in the server's settings table.
+
+| Setting | Default | Range |
+|---|---|---|
+| Lag threshold | 300 ms | 100-5000 ms |
+| Confirm ticks | 2 | 1-20 |
+| Buffering report delay | 700 ms | 0-10000 ms |
+| Resume buffer start / max | 2000 / 20000 ms | 500-60000 / 500-120000 ms |
+| Give up without progress | 10000 ms | 1000-120000 ms |
+| Longest wait | 120000 ms | 5000-900000 ms |
+| Lead min / max | 300 / 1000 ms | 100-5000 ms each |
+
+Every client receives the values in its first server message, `Hello`, and the server pushes a `SyncSettings` message to every connection when they change; rooms that already exist pick the change up at once. Only an administrator may send `SetSyncSettings`. An update is all-or-nothing: an unknown key, an out-of-range value or a broken cross-field rule (minimum above maximum) rejects the whole update. The browser panel shows administrators a form generated from the server's table, so labels and ranges live in one place. The Fladder app only obeys the values. Clients keep their own copy of each default for any key the server does not send, so either side can be upgraded first. The server persists the set to a JSON file when one is configured and falls back to the defaults on a missing or unreadable file.
+
+## Privacy
+
+Friends an administrator invites are not necessarily friends of each other, so lockstep does not show members each other's Jellyfin names (lockstep#61). The plugin adds an `adm` claim to the token of a Jellyfin administrator. The server gives every other member a pseudonym per room, such as "Teal Otter", stable for that user within that room and unrelated across rooms. Real names travel in separate fields that one function, `redact_for`, strips from every outgoing message unless the recipient is an administrator or the entry is the recipient's own. Listing online users and inviting a named user are administrator-only; anyone can share the room link. The server never sends IP addresses, and clients only ever connect to the server, not to each other.
+
+## Testing
+
+The repository has three layers of tests:
+
+- Unit tests on both sides, with the browser client running against in-memory doubles of the WebSocket, the `HTMLMediaElement` and the DOM under fake timers.
+- Offline acceptance probes: seven Rust test files that drive a real server over WebSockets (the original v1 contract, hardening, playback state, rooms, Plex parity, privacy and settings).
+- 24 live probes against a throwaway Jellyfin 12.2 and lockstep server in Docker, driven through headless Chromium (and headless Firefox): real jellyfin-web, real playback, scripted second participants. They cover invites, lag waits, slow buffering, track switches, next-episode autoplay, the admin settings form and more.
+
+Each worktree can run its own dev stack: a slot number offsets every port by 100, so parallel branches do not collide. The acceptance probes are sha256-pinned for the automated agent loops that built much of the code, and a loop that edits a probe fails its integrity sensor; the source has to change instead. The general pattern is in [Subagents, worktrees, and parallel agent work](/reference/agent-subagents-and-worktrees/).
+
+## Limitations
+
+- Subtitle, audio track and quality are each viewer's own choice; the host does not push them.
+- Live probes run in Chromium and Firefox. Safari and TV clients are untested by the probes.
+- Server metrics are deferred, and automatically widening the tolerance on bad links was deferred in favour of the administrator settings.
+
+## Related docs
+
+- [Synchronized playback with far-away viewers](/reference/synchronized-playback-far-viewers/)
+- [Blind playback-rate listening test](/guides/playback-rate-listening-test/)
+- [Docker networking patterns for the arr stack](/guides/arr-stack-docker-patterns/)
+- [Building Windows releases on a Linux-only Forgejo runner](/guides/windows-build-vm-forgejo-ci/)
+
+[^plex-forum]: Plex Forums, "An important Watch Together change," 2025-02-24. https://forums.plex.tv/t/an-important-watch-together-change/906796
+
+[^syncplay-group]: Jellyfin, "Emby.Server.Implementations/SyncPlay/Group.cs," jellyfin repository. https://github.com/jellyfin/jellyfin/blob/master/Emby.Server.Implementations/SyncPlay/Group.cs
