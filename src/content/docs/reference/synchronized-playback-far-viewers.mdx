@@ -1,0 +1,270 @@
+---
+title: "Synchronized playback with far-away viewers"
+description: "How large-scale streaming, co-watching products, inter-destination media sync standards and perception research handle viewers thousands of kilometres apart, and what that means for a self-hosted watch party."
+author: Erfi Anugrah
+category: homelab
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+A self-hosted watch party whose host is in Singapore and whose viewer is in Europe: does the room stop every time the far viewer's stream stalls, and how much leeway does it take to feel smooth?
+
+This doc surveys how the problem is solved at scale (Akamai/dash.js for live sports, co-watching products, IDMS standards, perception research), lists the options for a self-hosted setup, and records the design choices made for lockstep, a watch-party system for Jellyfin.[^lockstep-readme]
+
+All numbers below are cited from the public primary sources in [References](#footnote-label). Where a claim is unverified against its source, it is labelled as such.
+
+**TL;DR:**
+
+- Distance itself is cheap. SG-EU round-trip time is about 155-169 ms; half that, about 80-85 ms, is the worst clock error from an asymmetric path, under the 0.3 s threshold lockstep already uses.
+- The stop-starts come from stalls on the far viewer's stream: TCP throughput scales inversely with RTT, so a 200 ms link delivers roughly a quarter of what a 50 ms link does at the same loss rate.
+- Akamai/dash.js solves this with a shared clock, a common latency target, playback-rate catch-up (0.96x-1.04x in the recommended band), and a seek fallback. Each viewer converges on the target independently; a stalled viewer rebuffers alone.
+- Co-watching products split into two camps: group-waits (Jellyfin SyncPlay, Syncplay, lockstep) and independent buffering with rate correction or seek (OpenWatchParty, Watch Party Sync Engine, Disney+ GroupWatch, Teleparty).
+- Perception: viewers on a voice call do not notice about 1 s of drift and get annoyed at about 4 s. A rate change under about 5% is nearly imperceptible for video. Lockstep's 0.3 s detection threshold is about 3x stricter than the 1 s noticeability floor.
+- Lockstep's rule (nobody is sped up, slowed down, or jumped forward; the room waits) is the sync-to-slowest reference policy from RFC 7272. It is the most conservative choice and the one that never leaves anyone behind.
+- The options ranked: fix delivery first (bitrate cap, BBR congestion control, HTTP/3), then widen the deadband, then a deeper buffer for far viewers, then tiered imperceptible rate catch-up. The thresholds were made admin-tunable first (lockstep#66); rate catch-up is gated on a blind listening test.
+
+---
+
+## Why distance itself is cheap
+
+Lockstep uses an NTP-style clock sync: each client measures the offset from server time with ping/pongs, computing `offset = server_ts - (client_send_ts + rtt / 2)`.[^lockstep-readme] This is the same RTT/2 correction dash.js uses against its default timing source, `time.akamai.com`.[^dashjs-clock]
+
+SG-EU round-trip time is about 155 ms to Amsterdam and about 167-169 ms to Frankfurt or London, measured from Singapore.[^coloprice] Residential last-mile adds 5-30 ms, so a real viewer's RTT is about 160-200 ms. Half that, about 80-100 ms, is the worst-case clock error from a fully asymmetric path. Real NTP accuracy on intercontinental paths is 2-5 ms median, tens of ms worst-case.[^ntp-mills]
+
+So the clock error is well under lockstep's 0.3 s lag threshold, and the scheduled-command mechanism (play/pause/seek are broadcast with a future server timestamp, acted on simultaneously) absorbs the rest of the latency. Distance itself does not cause drift.
+
+---
+
+## The real cost: stalls on the far viewer's stream
+
+TCP throughput scales inversely with RTT and with the square root of packet loss (the Mathis formula): `Rate <= (MSS/RTT) * (1 / sqrt(p))`.[^mathis] At 200 ms RTT with 0.1% loss, a single TCP flow caps near 15 Mbps. At 0.5-1.0% loss, common on intercontinental consumer links, throughput drops to the low single-digit Mbps, below a 1080p transcode.
+
+The far viewer's stream stalls. In lockstep, when one member's video starves for 700 ms, the whole room pauses and waits until that member has buffered enough to resume. One viewer on a lossy long-haul link can stop the room repeatedly.
+
+The delivery-side fixes are in [Options, cheapest first](#options-for-a-self-hosted-setup-cheapest-first) below.
+
+---
+
+## How Akamai/dash.js does it (World Cup scale)
+
+Live sports at Akamai scale never makes one viewer wait for another. Each player runs on its own, converging on a shared latency target.[^dashjs-low-latency]
+
+1. **Shared clock.** dash.js uses `time.akamai.com` by default and computes the offset from the midpoint of the round trip.[^dashjs-clock]
+2. **Common latency target.** Every player aims to sit the same number of seconds behind the live edge. The DASH-IF example: `<Latency max="6000" min="2000" target="4000"/>`, target 4 s with 2-6 s allowed.[^dashjs-low-latency]
+3. **Catch-up by playback rate.** Within a band, e.g. `<PlaybackRate max="1.04" min="0.96"/>`, a 4% band. The actual dash.js default is more aggressive: up to 1.5x, hard-capped at 2.0x.[^dashjs-constants] While a player is stalled, dash.js holds the rate at 1.0 until the buffer is back above half the target, rather than racing ahead into another stall.[^dashjs-low-latency]
+4. **Seek fallback.** If drift exceeds `maxDrift` (default 12 s), the player seeks to the live edge.[^dashjs-constants]
+5. **Delivery close to the viewer.** Servers inside ISP networks, adaptive bitrate for whatever the last mile will support.[^akamai-worldcup]
+
+Akamai's Chief Architect Will Law put it as "Combining an external time source with aggressive catch-up and a latency target gives you synchronization", measured at +/- 3 frames across laptops, desktops and mobile devices.[^law-dvb2020] Across the general audience, viewers spread over seconds: UK online streams of the 2018 World Cup ran 20 s or more behind TV.[^bbc-worldcup]
+
+### Where lockstep differs
+
+| Layer | Akamai / dash.js | Lockstep |
+|---|---|---|
+| Clock | External time server, RTT/2 midpoint | Same (ping/pong, RTT p95 window) |
+| Commands | n/a (tracking the live edge) | Scheduled at a future server time, lead 300-1000 ms |
+| Leeway | Seconds of buffer behind the live edge | Buffer ahead of the playhead (VOD can prefetch) |
+| Drift fix | Rate 0.96-1.04 (default up to 1.5x), seek past maxDrift | None: room waits (behind) or member pauses itself (ahead) |
+| One viewer stalls | That viewer rebuffers alone; its latency target may rise | Whole room pauses (up to 10 s without progress, 120 s cap) |
+| Act on drift at | Deadband, `minPlaybackRateChange` 0.02 | 0.3 s for 2 ticks |
+| Reference policy | Independent convergence on target latency | Sync-to-slowest |
+
+Lockstep swaps the rate-change and seek levers for group waiting. The trade: nobody is ever sped up or jumped, but the slowest member paces the room.
+
+---
+
+## How co-watching products handle drift and buffering
+
+These fall into two camps: group-wait (one member buffers, everyone pauses) and independent (each viewer handles its own buffering, with rate correction or seek for drift). Numbers from source code and public docs, fetched 2026-11-05.
+
+| Product | One member buffers -> | Drift tolerance | Rate adjust? | Source |
+|---|---|---|---|---|
+| **Lockstep** | Room waits. 10 s without progress or 120 s cap, then resumes without that member. 30 s cooldown. | 0.3 s for 2 ticks | No | [lockstep README and settings.rs] |
+| **Jellyfin SyncPlay** | Group waits (WaitingGroupState). 30 s timeout, then continues without buffering member. "Ignore wait" toggle per member. | SpeedToSync: 50-3000 ms. SkipToSync: >400 ms. Server MaxPlaybackOffset: 500 ms. | Yes: rate 0.2x-2.0x over 1000 ms (SpeedToSync), or hard seek (SkipToSync) | [^jellyfin-syncplay] |
+| **Syncplay.pl** | Users mark "not ready" -> others pause. User leaves -> others pause (toggleable). | Slowdown: 1.5 s -> rate 0.95. Rewind: 4 s. Fast-forward: 5 s. Seek threshold: 1 s. | Slowdown only (0.95x). Hard seek for large gaps. | [^syncplay-constants] |
+| **OpenWatchParty** | Ready/pending: server holds play until all clients ready (2 s timeout). No mid-session group pause for buffering. | Deadzone: 40 ms. Soft max: 2.0 s (force seek). Drift gain: 0.15. | Yes: sqrt curve, rate 0.90-1.15. | [^openwatchparty] |
+| **Watch Party Sync Engine** | No explicit buffering handler. | Three tiers: `&lt;`100 ms deadzone, 100 ms-1 s rate 1.00 +/- 0.02, `&gt;`1 s hard seek. | Yes, 2% band (1.02x/0.98x). | [^watch-party-sync-engine] |
+| **Lumastra Watch Together** | Buffer-gated: every client pauses, buffers, reports "ready". Server waits for all or 5 s timeout. | Optional: up to +/-5% rate. ~300 s sync window. | Optional. | UNVERIFIED: developer blog, URL unavailable |
+| **Disney+ GroupWatch** | No group pause. Each client buffers independently. | Tolerates several seconds drift (UNVERIFIED, user reports). | No. | [^disney-groupwatch] |
+| **Prime Video Watch Party** | No group pause. Each client buffers independently. | Loose; frequent resync needed. | No. | UNVERIFIED: reverse-engineered, no public docs |
+| **Teleparty** | No group pause. | Up to ~500 ms drift. | No. | [^teleparty] |
+| **Discord Watch Together** | No group pause. Each client pulls from YouTube independently. | Designed to tolerate latency. | No. | [^discord-watch] |
+| **Twitch Watch Parties** | VOD: each viewer buffers independently. | VOD: loosely synced. | No. | [^twitch-watch] |
+| **Apple SharePlay** | Group waits for suspended participants (configurable). Automatic suspension on network stall. | System-level media clock sync. No explicit drift threshold in docs. | Yes (AVFoundation internal). Range not documented. | [^shareplay] |
+
+The divide is clear. Group-wait products (Jellyfin SyncPlay, Syncplay, lockstep, Lumastra, SharePlay) sacrifice independence for a guarantee that nobody falls behind. Independent products (OpenWatchParty, Watch Party Sync Engine, Disney+, Teleparty) keep playback smooth for the majority at the cost of letting a struggling viewer drift or rebuffer alone. Lockstep sits in the first camp, with the strictest rule: no rate change at all, only waiting.
+
+---
+
+## Standards: inter-destination media sync (IDMS)
+
+The literature identifies three control schemes:[^montagud2012]
+
+1. **Master/Slave (M/S).** One master multicasts its playout timing. Slaves adjust to match. Best interactivity (lowest detection latency).
+2. **Synchronization Maestro Scheme (SMS).** A central maestro gathers timing from all receivers, computes a reference, sends control messages. Highest delay (~2x network) but most flexible reference policy.
+3. **Distributed Control Scheme (DCS).** All receivers multicast timing; each decides the reference independently. Highest robustness.
+
+Lockstep implements M/S: the server is the master, scheduling play/pause at a future server timestamp. The reference policy is sync-to-slowest: the room waits for the most lagged member, which is the example policy in RFC 7272.[^rfc7272]
+
+The reference choices from the literature:
+
+- **Sync to slowest**: the most conservative. Nobody is left behind; the slowest member paces the room. Used by lockstep, Jellyfin SyncPlay, Syncplay.
+- **Sync to master**: a designated participant is the absolute reference. Used by lockstep's host-led model (the host's actions are the truth; the server schedules them).
+- **Sync to mean**: converge to the average position. No co-watching product in the table above uses it.
+- **Sync to fastest**: all speed up to match. Unused in co-watching; equivalent to dash.js's independent convergence on a target ahead of the live edge.
+
+RFC 7272's accuracy guidance: "For social TV, synchronization accuracy should be achieved on the order of hundreds of milliseconds."[^rfc7272] DVB-CSS targets about 1 ms wall-clock accuracy on a LAN and about 40 ms for frame-accurate or lip-sync use.[^dvb-css] Social TV is the least demanding case: "If there is no audio crosstalk, users won't notice delay differences of less than a second, and often they do not even notice a four-second difference."[^vandeventer2016]
+
+---
+
+## What people notice: drift and rate change
+
+### Drift perception
+
+Geerts et al., CHI 2011: 36 participants, quiz show, 5 sync levels (0 s, 0.5 s, 1 s, 2 s, 4 s), voice chat and text chat conditions.[^geerts2011]
+
+- Voice chatters noticed differences at about 1 s and above, and were annoyed at 4 s.
+- Text chatters did not reliably notice 0-4 s differences. Active text chatters (>400 words/session) behaved like voice chatters.
+- Play-out differences did not have a statistically meaningful effect on perceived togetherness.
+- Recommendation: "synchronization of approximately 1 second (which was not noticeable by this group) for a shared experience with no perceptible lag."
+
+Mekuria et al., EuroITV 2012: hearing a neighbour cheer for a goal seconds before you see it is very annoying. Field measurements of 19 receivers showed up to 5 s of relative delay across IPTV, cable, satellite, terrestrial and web TV.[^mekuria2012]
+
+### Rate change perception
+
+- de'Sperati & Baud-Bovy, 2017: 100 naive observers, soccer match, speed modifications with pitch-compensated audio. None spontaneously noticed speed changes up to 12%. Just Noticeable Difference: about 18% (naive), about 9% (trained).[^desperati2017]
+- Stifelman, 1994: speech rate JND of about 5.3% at 1x playback, measured on paired A/B comparisons over headphones.[^stifelman1994]
+- Browsers preserve pitch by default: `preservesPitch` defaults to `true` on `HTMLMediaElement`.[^mdn-preservespitch]
+
+A 4% rate band (0.96x-1.04x) is below all measured thresholds for video and marginally perceptible for speech in a controlled A/B test. Akamai's 2018 dash.js proposal argued the same: "small increases in playback rate are usually not noticeable to viewers."[^dashjs-issue2600]
+
+### Implications for lockstep
+
+Lockstep's 0.3 s detection threshold is about 3x stricter than the 1 s noticeability floor. The 300-1000 ms scheduled-command lead falls at or below the recommended ceiling. The no-rate-change rule is the strictest possible position: the literature says a subtle rate change (under about 5%) is nearly imperceptible, but lockstep forbids it anyway.
+
+---
+
+## Options for a self-hosted setup, cheapest first
+
+The options below assume a Jellyfin server on a NAS in Singapore, behind an edge reverse proxy, with a viewer in Europe. All numbers are collected rather than measured on this specific path.
+
+### 1. Delivery: stop the stalls before they start
+
+No lockstep code changes. These remove the root cause rather than handling it.
+
+- **Cap the EU user's Jellyfin remote bitrate.** Jellyfin's per-user "Internet streaming bitrate limit" forces a transcode at a bitrate the link can sustain. A lower bitrate means the player buffer survives longer on the same throughput.[^jellyfin-streaming-decision]
+- **Enable BBR congestion control on the router.** BBR models the path's bandwidth and RTT separately from loss, so random packet loss does not halve the congestion window the way CUBIC does. Google's YouTube deployment: 4% higher throughput globally, 14% in some countries, 33% lower median RTT.[^bbr] Needs `sysctl net.ipv4.tcp_congestion_control=bbr` and the `fq` qdisc on the egress interface.
+- **HTTP/3 is on by default** in the edge reverse proxy (Caddy binds 443/udp).[^caddy-h3] This eliminates TCP head-of-line blocking: with HTTP/2, one lost packet stalls every segment fetch; with QUIC, only the affected stream is held up.[^quic-hol] The QoE improvement for video is modest in most conditions,[^qomex2019] but it is free and already running.
+
+### 2. Widen the deadband
+
+Act on drift at about 1 s instead of 0.3 s, matching the Geerts et al. recommendation. A far member may sit up to about 1 s off from the room, which is below the noticeability floor for voice chatters. No rule conflict: lockstep's lag threshold is an admin-tunable sync setting (`lag_threshold_ms`, range 100-5000 ms), and the confirm-ticks count is also tunable (`lag_confirm_ticks`, range 1-20).[^lockstep-settings]
+
+### 3. Deeper buffer for far viewers
+
+Start the buffer target higher when RTT is high, and keep the learned value per user. The current resume-buffer defaults (2 s start, doubling per stall up to 20 s, halving after 5 min calm) are also tunable per setting (`buffer_target_min_ms`, `buffer_target_max_ms`, `buffer_target_decay_ms`).[^lockstep-settings] Raising the floor for a high-RTT viewer gives more runway before the next stall.
+
+### 4. Tiered imperceptible rate catch-up (gated on a listening test)
+
+The Akamai model, adapted to lockstep's constraints:
+
+- Drift within a deadband (e.g. 0.3-1.0 s) is closed with a small rate change, e.g. 0.97x-1.03x (a 3% band, below every measured threshold).
+- The rate ramp is bounded (no jump from 1.0x to 1.03x in one step; apply it over a few hundred ms so the transition is not a discontinuity).
+- A short stall lets that member rebuffer alone, then catch up by rate.
+- The room waits only when the gap passes the deadband or the stall runs long (the existing 10 s / 120 s give-up still applies).
+- Hold rate at 1.0 while recovering from a stall (the dash.js buffer-stall guard).
+- Only for small gaps; large gaps still trigger a room wait or a member seek.
+
+This is the only option where one far viewer's stall leaves the other viewers' playback untouched. It relaxes the no-rate-change rule. The gating decision is a blind listening test: can viewers on a voice call detect 3-4% rate changes in a watch-party context? The test guide is in [Playback rate listening test](/guides/playback-rate-listening-test/).
+
+### 5. Pause budget
+
+One member may pause the room N times per period; beyond that, they catch up alone. This bounds the damage a lossy link can do to the group without changing the sync mechanism itself.
+
+### 6. Edge cache / TCP termination near the viewer
+
+A VPS reverse proxy in Frankfurt splits the long TCP pipe: the loss-recovery loop is decoupled from the transcontinental path. This is the largest per-packet throughput win but adds infrastructure. Not pursued.
+
+---
+
+## Decision taken
+
+The first step was making every threshold admin-tunable: lockstep#66 shipped server-wide sync settings editable live from the Jellyfin panel, covering the lag threshold, confirm ticks, buffering report delay, resume buffer targets (start, max, decay), server patience (give-up without progress, hard cap, cooldown), and scheduling lead bounds.[^lockstep-settings] That makes options 2 and 3 configurable without a code change.
+
+The second step, rate catch-up, is gated on the listening test. The literature says a sub-5% rate change is nearly imperceptible, but the literature measured isolated video viewing or paired A/B speech comparisons, not a watch party with voice chat. The test guide is [Playback rate listening test](/guides/playback-rate-listening-test/).
+
+The architecture of lockstep, how its clock sync, scheduled commands, drift controller, and room state machine work, is in [Lockstep: synchronized watch-party playback for Jellyfin](/reference/lockstep-watch-party-sync/).
+
+---
+
+## References
+
+[^lockstep-readme]: Lockstep README, "How sync works." Described from the project's README.md; the repository is private.
+
+[^lockstep-settings]: Lockstep `server/src/domain/settings.rs`, the `SyncSettings` struct and `specs()` table. The repository is private.
+
+[^dashjs-clock]: DASH-IF, "Clock Synchronization," dash.js docs. https://dashif.org/dash.js/pages/usage/clock-sync.html
+
+[^dashjs-low-latency]: DASH-IF, "Low Latency Streaming," dash.js docs. https://dashif.org/dash.js/pages/usage/low-latency.html
+
+[^dashjs-constants]: DASH-IF, "streaming/MediaPlayerModel.js," dash.js source. https://cdn.dashjs.org/latest/jsdoc/streaming_models_MediaPlayerModel.js.html
+
+[^akamai-worldcup]: SVG Europe, "World Cup leads to unprecedented IP traffic," 2014. https://www.svgeurope.org/blog/headlines/world-cup-leads-to-unprecedented-ip-traffiic/
+
+[^law-dvb2020]: Will Law, "Meeting live broadcast requirements - the latest on DASH Low Latency," DVB World, March 2020. https://dvb.org/wp-content/uploads/2020/03/Latest-on-DASH-low-latency.pdf
+
+[^bbc-worldcup]: SportsPro, "BBC World Cup streaming delay fixed," 2018. https://www.sportspro.com/news/bbc-world-cup-streaming-delay-fixed/
+
+[^coloprice]: ColoPrice, "Latency," accessed 2026-11-05. https://coloprice.com/latency/
+
+[^ntp-mills]: David L. Mills, "NTP accuracy expectations," University of Delaware. Described from the NTP project documentation.
+
+[^mathis]: Mathis, Semke, Mahdavi & Ott, "The Macroscopic Behavior of the TCP Congestion Avoidance Algorithm," Computer Communication Review 27(3), July 1997. https://cseweb.ucsd.edu/classes/wi01/cse222/papers/mathis-tcpmodel-ccr97.pdf
+
+[^jellyfin-syncplay]: Jellyfin, "SyncPlay/Group.cs," jellyfin repository. https://github.com/jellyfin/jellyfin/blob/master/Emby.Server.Implementations/SyncPlay/Group.cs
+
+[^syncplay-constants]: Syncplay, "syncplay/constants.py," syncplay repository. https://github.com/Syncplay/syncplay/blob/master/syncplay/constants.py
+
+[^openwatchparty]: OpenWatchParty, "Technical: Sync," openwatchparty.com. https://openwatchparty.com/technical/sync/
+
+[^watch-party-sync-engine]: Kutsi Balci, "watch-party-sync-engine," GitHub. https://github.com/kutsibalci/watch-party-sync-engine
+
+[^disney-groupwatch]: Disney+, "GroupWatch," Disney+ Help. https://help.disneyplus.com/article/disneyplus-groupwatch
+
+[^teleparty]: Teleparty. https://www.teleparty.com
+
+[^discord-watch]: Discord, "Watch Together FAQ," Discord Support. https://support.discord.com/hc/en-us/articles/4409342945687
+
+[^twitch-watch]: Twitch, "Twitch Watch Parties," Twitch Help. https://help.twitch.tv/s/article/twitch-watch-parties
+
+[^shareplay]: Apple, "AVPlaybackCoordinator," Apple Developer Documentation. https://developer.apple.com/documentation/avfoundation/avplaybackcoordinator
+
+[^montagud2012]: Montagud, Boronat, Stokking, van Brandenburg, "Inter-destination multimedia synchronization: schemes, use cases and standardization," Multimedia Systems 18, 459-482, 2012. https://doi.org/10.1007/s00530-012-0278-9
+
+[^rfc7272]: van Brandenburg, Stokking, van Deventer, Boronat, Montagud, "Inter-Destination Media Synchronization (IDMS) Using the RTP Control Protocol (RTCP)," RFC 7272, June 2014. https://www.rfc-editor.org/rfc/rfc7272.html
+
+[^dvb-css]: ETSI TS 103 286-2 V1.3.1, "Digital Video Broadcasting (DVB); Companion Screens and Streams; Part 2: Content Identification and Media Synchronization." https://www.etsi.org/deliver/etsi_ts/103200_103299/10328602/01.03.01_60/ts_10328602v010301p.pdf
+
+[^vandeventer2016]: van Deventer, Stokking, Hammond, Le Feuvre, Cesar, "Standards for multi-stream and multi-device media synchronization," IEEE Communications Magazine 54(3), 2016. https://doi.org/10.1109/mcom.2016.7432166
+
+[^geerts2011]: Geerts, Vaishnavi, Mekuria, van Deventer, Cesar, "Are we in sync? Synchronization requirements for watching online video together," CHI 2011. https://dl.acm.org/doi/10.1145/1978942.1978986
+
+[^mekuria2012]: Mekuria, Cesar, Bulterman, "Digital TV: the effect of delay when watching football," EuroITV 2012. https://dl.acm.org/doi/10.1145/2325616.2325632
+
+[^desperati2017]: de'Sperati & Baud-Bovy, "Low perceptual sensitivity to altered video speed in viewing a soccer match," Scientific Reports 7, 2017. https://www.nature.com/articles/s41598-017-15619-8
+
+[^stifelman1994]: Stifelman, "The cocktail party effect in auditory interfaces: a study of simultaneous presentation," MIT Media Lab, 1994. The 5.3% speech-rate JND is from this work, cited via the standards-perception research dump.
+
+[^mdn-preservespitch]: MDN, "HTMLMediaElement: preservesPitch property," MDN Web Docs. https://developer.mozilla.org/en-US/docs/Web/API/HTMLMediaElement/preservesPitch
+
+[^dashjs-issue2600]: Will Law, "Low latency catch-up feature using playback rate," dash.js issue #2600, 2018. https://github.com/Dash-Industry-Forum/dash.js/issues/2600
+
+[^jellyfin-streaming-decision]: Jellyfin Web, "Streaming Decision Engine," DeepWiki. https://deepwiki.com/jellyfin/jellyfin-web/4.5-streaming-decision-engine
+
+[^bbr]: Cardwell et al., "BBR: Congestion-Based Congestion Control," ACM Queue 14(5), 2016. https://research.google/pubs/bbr-congestion-based-congestion-control/
+
+[^caddy-h3]: Caddyserver, "Caddyfile Options," Caddy Docs. https://caddyserver.com/docs/caddyfile/options
+
+[^quic-hol]: Sander, "HTTP/3 and QUIC: prioritization and head-of-line blocking," APNIC Blog, 30 Nov 2022. https://blog.apnic.net/2022/11/30/http-3-and-quic-prioritization-and-head-of-line-blocking/
+
+[^qomex2019]: Seufert et al., "Is QUIC becoming the New TCP?," QoMEX 2019. https://doi.org/10.1109/qomex.2019.8743223
