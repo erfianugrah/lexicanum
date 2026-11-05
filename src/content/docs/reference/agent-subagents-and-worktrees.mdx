@@ -15,7 +15,8 @@ Every mechanism below is read from the harness source. Incidents come from sessi
 
 - `task` blocks the parent and returns the result. `bg_task`, `bg_bash` and `bg_loop` return a handle at once and push a completion nudge later.
 - At most 4 `task` workers run at once (`PI_TASK_MAX_PARALLEL`, default 4); extra calls queue. `bg_task` pi workers have a separate pool per session tree (`PI_BG_MAX_PARALLEL`, default 4) that refuses extra spawns instead of queueing, and `llmc/` workers are exempt from it. A 402 on OpenRouter's in-flight credit budget killed one of six workers on 2026-10-19, and the cap shipped on 2026-10-20 (d5fb627).
-- A `task` worker hit by a transient provider error is resumed up to 2 times, after a 30 s, 60 s or Retry-After backoff capped at 180 s.
+- A `task` worker hit by a transient provider error is resumed up to 2 times, after a 30 s, 60 s or Retry-After backoff capped at 180 s, plus up to 50 % jitter so workers given the same Retry-After do not resume together (added 2026-11-05 after four expensive-model workers failed both resumes in lockstep).
+- A repo with large submodules can run several workers in its main tree instead of worktrees, if each has an explicit file list and none runs a tree-wide regenerator.
 - Workers never run mutating git (dotfiles#140, 2026-10-20). They edit files in a worktree the main session created, and the main session commits, merges and pushes.
 - `/btw` forks the session into a read-only worker that answers while the main turn keeps running.
 - `/undo` restores the files the agent changed together with the conversation.
@@ -162,7 +163,13 @@ Transient-error resume: when a worker's last request fails with a retryable prov
 | 401, 403, 400 | No, fails at once |
 | 402 without in-flight wording (out of credits) | No, fails at once |
 
-Backoff is the `Retry-After` value when the message has one, otherwise 30 s then 60 s, clamped between 5 s and 180 s.
+Backoff is the `Retry-After` value when the message has one, otherwise 30 s then 60 s, clamped between 5 s and 180 s, plus up to 50 % random jitter (never earlier than the provider asked).
+
+### The second 402 (2026-11-05): an expensive model and lockstep resumes
+
+The cap of 4 assumes a cheap model. OpenRouter reserves credit for each in-flight request's whole `max_tokens` at the model's output price (`max-tokens-cap.ts` header, 131072 tokens by default), so the same budget fits fewer requests on a pricier model. Four `openai/gpt-5.5` fact-checkers each ran about 6 minutes (49 to 61 tool calls) and then all got `402 in_flight_budget_exhausted` with `Retry-After: 120`. The retry worked as designed and that was the problem: all four waited exactly 120 s, resumed together, filled the budget again and failed; the second resume failed the same way. Each worker's session log shows three prompts and three errors. The fifth worker, queued behind the cap, started later and finished with two errors.
+
+Two changes followed (dotfiles 59702f24): the jitter above, so workers given the same `Retry-After` spread out, and a routing rule to run wide fan-outs of expensive models on `anthropic/` models or two at a time. The rerun on Anthropic models finished all four checks.
 
 ### Error surfacing in the stream
 
@@ -205,6 +212,20 @@ Finish, by the main session:
 
 The pages in this series are written this way: one worktree per writer, no commits from the writer, and the parent reviews the diff, merges and removes the worktree.
 
+### Sharing one tree instead
+
+A worktree starts with empty submodules. In a repo with large ones (KiCad libraries, firmware, reference designs), `git submodule update --init --reference` per worktree took more than 25 s per module and timed out (2026-11-05). There the workers shared the main tree instead, with rules the worktree no longer enforces:
+
+| Rule | Why |
+|---|---|
+| Only when the dispatching session owns the round: no loop and no other session in the repo | Otherwise the hazards above apply, and a worktree is the answer |
+| Each worker gets an explicit list of files it may edit and files it must not touch | The file list is the isolation |
+| No tree-wide regenerators in a worker (`make repro`, a full `make pcb`, a repo-wide formatter) | They rewrite every worker's files; one worker ran `make repro` by mistake and only luck kept it harmless |
+| One worker owns the Makefile and CI file for the round; the others return their lines as text | Two workers editing one Makefile is the classic collision |
+| The parent runs the full gate set after the last batch lands, then commits per batch | A worker's local test run does not see the others' changes |
+
+Four workers ran this way on one repo with no clash.
+
 ---
 
 ## Main-session-only git
@@ -230,9 +251,9 @@ if (!ctx.hasUI) {
 }
 ```
 
-The same gate blocks no-UI `write`, `edit` and `apply_patch` calls that target `.git/` paths. `HEADLESS_WORKER_PREAMBLE` repeats the rule in every `bg_task` prompt: "Mutating git ... is blocked here: leave all git operations to the parent and describe what to commit in your final message."
+The same gate blocks no-UI `write`, `edit` and `apply_patch` calls that target `.git/` paths. "Mutating" includes `git add`, `git stash` and `git mv`: a worker that renames files uses plain `mv`, and the parent's `git add -A` records the renames. `HEADLESS_WORKER_PREAMBLE` repeats the rule in every `bg_task` prompt: "Mutating git ... is blocked here: leave all git operations to the parent and describe what to commit in your final message."
 
-In the main session, routine local git (commit, push without force or delete, worktree add and remove, merge, switch, cherry-pick, revert, stash pop) runs without an approval prompt while the global git hooks are active. The pre-push gate runs gitleaks, blocked terms and sensitive-file checks on every push, and on public targets adds identifier shapes, provenance wording and an llmc review. Every auto-allowed command is logged. The tiers are in [Running agent git commands without per-command approval prompts](/reference/agent-git-without-prompts/) and the push checks in [Agent leak gates](/guides/agent-leak-gates/).
+In the main session, routine local git (commit, push without force or delete, worktree add and remove, merge, switch, cherry-pick, revert, stash pop) runs without an approval prompt while the global git hooks are active. `git worktree remove --force` and `git branch -D` are not routine and still ask (`isRoutineGit` in `lib/git-gh-gate-core.ts`). On 2026-11-05 both prompts went unanswered while the user was away, the audit log recorded them as denied, and four empty worktrees stayed behind until the next session. For a clean worktree whose branch never moved, plain `git worktree remove` and `git branch -d` run unprompted. The pre-push gate runs gitleaks, blocked terms and sensitive-file checks on every push, and on public targets adds identifier shapes, provenance wording and an llmc review. Every auto-allowed command is logged. The tiers are in [Running agent git commands without per-command approval prompts](/reference/agent-git-without-prompts/) and the push checks in [Agent leak gates](/guides/agent-leak-gates/).
 
 ---
 
