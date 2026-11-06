@@ -1,38 +1,29 @@
 ---
 title: "A personal knowledge graph with a local LLM"
-description: "Scanning a personal document archive, extracting entities and relations with a local model, and querying the graph from a coding agent - all without sending data to a cloud model. Design decisions, throughput, the large-backlog drain, and an extraction model that shipped before it was evaluated."
+description: "A personal document archive scanned, extracted, graphed with a local model, entity-resolved and served read-only to a browser explorer and a shared MCP server, with no document content sent to a cloud model. The whole pipeline end to end, what was measured at each step, and the mistakes along the way: a model that shipped before it was evaluated, a full-text index sized from a compressed du, and a library of published books graphed by accident."
 author: Erfi Anugrah
 category: workstations
 ---
 
 import { Aside } from "@astrojs/starlight/components";
 
-A knowledge graph over a personal document archive, built on local hardware. The pipeline walks a mounted archive, extracts text, mines entities and relations with a local LLM under constrained JSON output, stores the graph in Postgres, and exposes it to a coding agent through read-only MCP tools. No document content goes to a hosted model.
+A knowledge graph over a personal document archive, built on local hardware. The pipeline walks a mounted archive, extracts text, mines entities and relations with a local LLM under constrained JSON output, resolves duplicate entities, stores everything in Postgres and serves it read-only through a query layer to a browser explorer and a shared MCP server. No document content goes to a hosted model.
 
-This page describes the system as of 2026-10-20, read from its source. The pipeline was measured on a local GPU (RTX 5090, 32 GB VRAM, one model at a time). The chat-history lane (structured ingest, no LLM) is described near the end.
-
-<Aside type="caution" title="Out of date since 2026-10-23 (updated 2026-11-06)">
-The extraction model and where it runs changed after this page was written. Read from the repository's AGENTS.md and the bake-off write-up:
-
-- A second bake-off round picked gumshoe's `gemma-4-12b-it-Q4_K_M` on servarr's 3080 Ti over `qwen38-swift-ninfer`, because the Qwen preset only ran while the dev box GPU was free.
-- The drain runs 24/7 in the `mnemosyne-worker` container on servarr (`mnemo drain`), not as `drain.sh` under an llmc lock on the dev box.
-- Worker v0.4.0 (2026-10-24) keeps every relation. The Person-to-Person filter described under Storage is gone.
-- The full drain finished on 2026-10-30 (9,594 documents graphed). An entity resolution pass shipped on 2026-11-06: name variants are merged by stored alias rules (pg_trgm and initial-form candidates, judged by the local models), and relation predicates map onto a 45-name vocabulary. The bridging rate rose from 28.3% to 31.4%. Both rule sets apply at merge time, so a rebuild from the stored model output (`mnemo remerge`) replays them without the GPU.
-
-Sections below that name the Qwen model, the dev box or `drain.sh` describe the 2026-10-20 arrangement. The design choices and the bake-off hold. The model was still changed under the same rule: a different model means a graph reset.
-</Aside>
+This page describes the system as of 2026-11-06, read from the repository and its research notes. It started as a dev-box pipeline measured on a local GPU (RTX 5090, 32 GB VRAM, one model at a time) and now runs unattended on the NAS. Sections that describe the earlier dev-box arrangement say so. The chat-history lane (structured ingest, no LLM) is described near the end.
 
 The [agent session-memory store](/reference/agent-memory-store/) and the [Vikunja kanban board](/reference/kanban-board-for-coding-agents/) run as separate Postgres clusters on the same storage host, not as databases inside the graph's cluster. The graph queries below do not use the memory store's vector or full-text search indexes.
 
 **TL;DR:**
 
-- The archive is an SMB share with ~470k files, of which ~12.6k are documents.
-- Ingest is gated by a 17-extension allowlist and a sensitive-filename exclusion regex.
-- Text extraction is per file type and sha256-cached, so each file is read once.
-- Extraction runs on the local llmc engine at `reasoning_effort: none` and `temperature: 0`. llama-server presets get a `json_schema` response format, NInfer presets get none.
-- The graph is one Postgres database. Entities are keyed by `(type, canonical_key)`, so "Jane Doe" across forty documents is one node.
-- An MCP server exposes 10 read-only tools.
-- The extraction model was picked for continuity on 2026-10-04, ran 719 documents by 2026-10-14 and had never been compared with an alternative. The [bake-off](#the-extraction-model-was-not-evaluated) closed that gap.
+- The archive is an SMB share with ~470k files, of which ~12.6k were documents when the allowlist had 17 extensions. EPUB left the list on 2026-11-06, so it has 16.
+- Ingest is gated by the allowlist, a sensitive-filename exclusion regex and one excluded top-level tree. A scan forgets files that vanished, with guards against a bulk delete and an incomplete walk.
+- Text extraction is per file type and sha256-cached, with an OCR lane for scanned PDFs.
+- Extraction runs 24/7 in a worker container on the NAS, on a 12 GB GPU that a photo-ML service can preempt. The model was picked by a second bake-off round for being always on: 132 docs/hr, 0.40 relation correctness under both judges. The first pick was never evaluated, and the [bake-off](#the-extraction-model-was-not-evaluated) closed that gap.
+- The model's raw answer per chunk is stored, so any change to the merge rules replays without the GPU (`mnemo remerge`).
+- Entity resolution merges name variants through stored alias rules and maps 54,305 raw predicates onto 46. Both rule sets apply at merge time, so deleting a rule and re-running the merge undoes it. The bridging rate went from 28.3% to 31.4%.
+- Postgres functions in one `api` schema are the only read contract. PostgREST serves them to an Astro explorer and to an MCP server that forwards the caller's token and holds no credential.
+- The corpus is reachable only on the LAN and tailnet, over HTTPS through the edge proxy. The MCP server is registered disabled, so a cloud model sees archive content only when the user asks for it in that session.
+- A library of published books was graphed by mistake: 12% of documents, 36% of mentions, 50% of relations. [Removing it](#the-library-of-published-books) took the share of entities in two or more documents from 31.4% to 42.1%.
 
 ---
 
@@ -47,41 +38,58 @@ digraph {
 
   archive [label="document archive\n(SMB share, 470k files)"];
 
-  subgraph cluster_pipeline {
-    label="pipeline (dev box)"; style=rounded; fontsize=12; margin=12;
-    scan [label="scan\nwalk + sha256"];
-    extract [label="extract\nper type, cached"];
+  subgraph cluster_worker {
+    label="worker (NAS, 24/7 drain)"; style=rounded; fontsize=12; margin=12;
+    scan [label="scan\nwalk + sha256 + forget"];
+    extract [label="extract + OCR\nper type, cached"];
     chunk [label="chunk\n6,000 chars"];
-    llm [label="local LLM\n2 in flight"];
+    llm [label="local LLM\n12 GB GPU, shared"];
+    er [label="incremental\nentity resolution"];
   }
 
   subgraph cluster_store {
-    label="Postgres (storage host)"; style=rounded; fontsize=12; margin=12;
+    label="Postgres (NAS)"; style=rounded; fontsize=12; margin=12;
     ledger [label="document ledger"];
-    graphdb [label="graph\nentities, mentions,\nrelations"];
+    fts [label="full-text chunks"];
+    extractions [label="stored model output\n(extractions)"];
+    graphdb [label="graph\nentities, mentions,\nrelations, rules"];
+    apis [label="api schema\nread-only functions"];
   }
 
-  mcp [label="MCP server\n(stdio, read-only)"];
+  subgraph cluster_read {
+    label="read side (NAS)"; style=rounded; fontsize=12; margin=12;
+    rest [label="PostgREST\nJWT"];
+    web [label="explorer UI"];
+    mcp [label="MCP server\n(token pass-through)"];
+  }
+
   agent [label="coding agent", style=rounded];
 
   archive -> scan;
   scan -> extract [label="new or changed"];
+  extract -> fts [label="2,000-char chunks"];
   extract -> chunk [label="cached text"];
   chunk -> llm;
-  llm -> graphdb;
-  llm -> ledger [label="stage"];
-  graphdb -> mcp;
-  ledger -> mcp;
-  mcp -> agent [label="10 tools"];
+  llm -> extractions [label="raw JSON"];
+  extractions -> graphdb [label="merge + rules"];
+  graphdb -> er [dir=both];
+  scan -> ledger [label="stage"];
+  graphdb -> apis;
+  fts -> apis;
+  apis -> rest;
+  rest -> web;
+  rest -> mcp;
+  mcp -> agent [label="12 tools, on request"];
 }
 ```
 
-1. The archive sits on a network share, read over WSL drvfs (9p). The walker uses `os.walk` with directory pruning, so the 470k paths are never held at once.
-2. Extraction is per file type (PDF, docx, EPUB, email, plaintext, legacy Office formats through headless LibreOffice) and cached by sha256, so later stages never touch the slow mount.
-3. Chunking splits text at 6,000 characters with a 400-character overlap, at paragraph boundaries where possible.
-4. The local LLM extracts entities and relations per chunk, 2 requests in flight, at temperature 0 with thinking disabled.
-5. Postgres holds the document ledger (stage, timestamps, errors) and the graph. The cluster is on a separate machine, and extraction writes to it across the tailnet.
-6. The MCP server gives the agent read-only entity search, dossier, cross-document entities, level-set neighbourhoods, timeline and chat-message search.
+1. The archive sits on a network share. The worker reads it read-only.
+2. Extraction is per file type (PDF, docx, email, plaintext, legacy Office formats through headless LibreOffice) and cached by sha256, so later stages never touch the slow mount. Scanned PDFs go to an OCR lane.
+3. Chunking splits text at 6,000 characters with a 400-character overlap, at paragraph boundaries where possible. A separate, non-overlapping 2,000-character chunking feeds the full-text index.
+4. The local LLM extracts entities and relations per chunk, at `temperature: 0` with thinking disabled. Its raw answer is stored per chunk.
+5. A merge step turns stored answers into graph rows, applying alias and predicate rules. The same merge runs for new documents and for `mnemo remerge`.
+6. Postgres holds the document ledger (stage, timestamps, errors), the graph, the rules, the full-text chunks and the chat history in one database on the same machine as the worker.
+7. The `api` schema is the only thing the read side may call. PostgREST serves it, and both the explorer and the MCP server go through PostgREST.
 
 ---
 
@@ -89,27 +97,33 @@ digraph {
 
 | Decision | Choice | Reason |
 |---|---|---|
-| Scan scope | Extension allowlist | Photos, app bundles and code are most of the 470k files and would dominate a denylist. 17 extensions cover ~12.6k documents. |
+| Scan scope | Extension allowlist | Photos, app bundles and code are most of the 470k files and would dominate a denylist. 17 extensions covered ~12.6k documents; 16 remain since EPUB left. |
 | Extraction model location | Local only | Medical, tax and identity documents are in scope. A cloud model is an opt-in per folder. |
+| Where the drain runs | A container on the NAS, 24/7 | The dev-box GPU was free too rarely: the week after the first model pick graphed 0 documents. |
 | Text caching | sha256-keyed file cache | A 9p mount is slow. Re-running a stage on unchanged files does no work, and a NAS outage blocks only new files. |
 | Chunking | Characters, paragraph-boundary preference | Semantic chunking matters for retrieval, not for per-chunk entity extraction. |
-| Entity identity | `(type, canonical_key)` | Normalised for case and whitespace. The type keeps "Apple" the org apart from "Apple" the topic. |
+| Per-document chunk cap | 40 (was 20) | 1487 of 7826 unique documents exceeded 20 chunks. The extra 20 cost ~26k chunks, about 2 days; no cap would cost ~179k, about 15 days. |
+| Entity identity | `(type, canonical_key)` | Normalised for case, accents and light punctuation. The type keeps "Apple" the org apart from "Apple" the topic. |
+| Merge input | The model's stored raw answer per chunk | A merge-rule change replays from Postgres without the GPU. |
+| Entity resolution | Rules in tables, applied at merge time | Replayable and reversible: delete a rule, run the merge again. |
 | Output format | `json_schema` on llama-server, none on NInfer | NInfer presets return empty extractions with any response format. |
-| Graph traversal | Level-set `UNION` | The archive owner is in every document, a mega-hub. See Storage for the measurement. |
-| Concurrency | 2 workers, one DB connection | One GPU, so 2 in flight keeps the queue shallow. No DB call spans an await, so psycopg is safe. |
-| Agent access | MCP over stdio, read-only | `default_transaction_read_only=on` per session, connection opened per call. |
+| Graph traversal | Level-set `UNION` | The archive owner is in every document, a mega-hub. See [Storage](#storage) for the measurement. |
+| Concurrency | `llm_concurrency` workers, one DB connection | One GPU slot. No DB call spans an await, so psycopg is safe. |
+| Read contract | Postgres functions in one `api` schema | A query fix lands once and the UI and MCP server agree. The reader role has no table access. |
+| Agent access | MCP over HTTP, token forwarded, disabled by default | Results are private archive content, and a cloud model sees them only on request. |
+| Exposure | LAN and tailnet only, HTTPS through the edge proxy | Tax, immigration and health documents. No public record and no anonymous role. |
 
 ---
 
 ## The archive and the scan stage
 
-The source is a personal document archive on a network share, mounted read-only on the dev box. A scan walks every file, hashes it with sha256 and compares the hash with the document ledger. New and changed files enter the pipeline and unchanged files skip every later stage.
+The source is a personal document archive on a network share, mounted read-only on the machine that scans it. A scan walks every file, hashes it with sha256 and compares the hash with the document ledger. New and changed files enter the pipeline and unchanged files skip every later stage.
 
-The `ALLOWED_EXTENSIONS` allowlist selects 17 document types:
+The `ALLOWED_EXTENSIONS` allowlist selects 16 document types (17 until EPUB was dropped on 2026-11-06, see [below](#the-library-of-published-books)):
 
 | Group | Extensions |
 |---|---|
-| Documents | pdf, docx, doc, odt, rtf, epub |
+| Documents | pdf, docx, doc, odt, rtf |
 | Presentations and sheets | pptx, ppt, xlsx, xls, xlsm, csv |
 | Text and mail | txt, md, html, htm, eml |
 
@@ -121,23 +135,36 @@ An exclusion list covers files that match a document extension but must never be
 - PKCS#12 certificate bundles
 - private keys
 - BitLocker recovery keys
-- filenames matching a sensitive-name regex (`password`, `credential`, `secret`, `api key`, `private key`)
+- filenames matching a sensitive-name regex (`password`, `credential`, `secret`, `api key`, `private key`, and since the list grew, `recovery key` and the bare word `key`)
 
-The exclusions are a security boundary, and over-exclusion is the safe direction. The walker streams through `os.walk` instead of `sorted(rglob())`, which would build all 470k paths before yielding the first.
+The exclusions are a security boundary, and over-exclusion is the safe direction. Tests pin them. The walker streams through `os.walk` instead of `sorted(rglob())`, which would build all 470k paths before yielding the first.
 
-## Text extraction
+Filenames that Windows cannot present (reserved characters, invalid UTF-8 from older encodings) reach the mount as 8.3 short names that list but cannot be opened. The walker skips them with a message, and a rename script on the NAS fixes them at the source. The 2026-10-14 run renamed 322 files and unblocked 78 documents.
 
-One extractor per file type, dispatched by extension through a registry. Each writes to a text cache on local NVMe, keyed by sha256. After the first full scan, a re-scan of unchanged files hits the cache at every stage.
+### Forgetting vanished files
+
+A scan that only adds rows leaves a deleted or renamed file in the graph for ever, with its mentions and relations. Since 2026-11-06 a scan also forgets files the walk no longer finds: it deletes the ledger row, then the document's mentions and relations and any entity left with no mention. Two guards decide whether it may:
+
+- A walk in which any directory failed to list forgets nothing. A flapping mount would otherwise make half the archive look deleted.
+- If more than max(50, 5%) of the ledger vanished in one scan, it forgets nothing and prints the count. `mnemo scan --forget-limit N` confirms and `--forget-limit 0` is a dry run.
+
+The output is counts only, because a path can be private. The [Calibre removal](#the-library-of-published-books) is the case that needed the confirm flag.
+
+## Text extraction and OCR
+
+One extractor per file type, dispatched by extension through a registry. Each writes to a text cache keyed by sha256 (on local NVMe on the dev box, then on the NAS from 2026-10-23). After the first full scan, a re-scan of unchanged files hits the cache at every stage.
 
 - An extractor that fails raises `ExtractionError`, and the CLI marks the file `failed` in the ledger and moves on.
-- A scanned PDF (under 270 characters of extracted text per page) raises `ScannedPDFError` and goes to an `ocr_pending` lane for a later tesseract pass.
+- A scanned PDF (under 270 characters of extracted text per page) raises `ScannedPDFError` and goes to an `ocr_pending` lane.
 - Legacy Office formats (.doc, .ppt, .xls) go through headless LibreOffice with a 120-second timeout. They take ~1-2 seconds per file and an occasional file hangs the process.
+
+The OCR lane (`mnemo ocr`) runs `pdftoppm` and tesseract on the CPU. It reads at most 60 pages per document, because a scanned book would take hours and 60 pages covers letters, forms and reports. A scan with under 50 characters of recognised text is `skipped` (blank pages, photos) and the rest move to `extracted`.
 
 A junk gate runs before the LLM sees a document. A document above 10,000 characters whose lines are more than 90% delimiter-dense (three or more commas, tabs, semicolons or pipes) is marked `skipped`. These are marketing recipient spreadsheets and lead-list CSVs, which would otherwise cost hundreds of LLM calls for no knowledge. The 10,000-character floor keeps small real tables (grade sheets, address books) in, since below it a document costs at most two chunks.
 
 ## Entity and relation extraction
 
-Each document's cached text is split into 6,000-character chunks with a 400-character overlap, at paragraph boundaries where possible. Each chunk goes to the local LLM at temperature 0 with thinking disabled (`reasoning_effort: none`, `chat_template_kwargs: {enable_thinking: false}`). Strict-JSON extraction gains nothing from chain-of-thought, and thinking traces cost 5-10x latency on the default preset.
+Each document's cached text is split into 6,000-character chunks with a 400-character overlap, at paragraph boundaries where possible, up to 40 chunks per document. Each chunk goes to the local LLM at temperature 0 with thinking disabled (`reasoning_effort: none`, `chat_template_kwargs: {enable_thinking: false}`). Strict-JSON extraction gains nothing from chain-of-thought, and thinking traces cost 5-10x latency on the default preset.
 
 The prompt:
 
@@ -151,6 +178,8 @@ The type vocabulary stays small because exotic types become resolution debt late
 ### Output contract
 
 llama-server presets get a `json_schema` response format derived from the pydantic model, with `additionalProperties: false` and both `entities` and `relations` required, so the grammar cannot let the model answer `{}`. NInfer presets return empty extractions with any response format when `reasoning_effort: none` is also set, confirmed by live probe on 2026-10-16. On those presets the `response_format` field is omitted and per-item validation in the client is the only schema guard.
+
+Replies are capped at 8192 tokens. A model looping at temperature 0 with no cap produced 46 documents that timed out four times each (300 seconds per attempt) before the cap existed. A chunk that hits the cap is stored empty and the rest of the document is graphed.
 
 ### Validation and failure handling
 
@@ -176,82 +205,11 @@ digraph {
 }
 ```
 
-The graph stage runs 2 requests in flight over one database connection. That is safe because no database call spans an await within a worker, so a psycopg connection is never shared across concurrent tasks.
+1. The call is retried up to 4 times with 5, 15 and 45 second backoff.
+2. On success the items are validated and written.
+3. If every attempt fails, a 1-token probe decides: a working endpoint means the chunk is marked `failed` and the run continues, and a dead endpoint aborts the run with the documents left at `extracted`.
 
-## Storage
-
-The graph, the document ledger and the chat history are separate tables in one Postgres database.
-
-The document ledger (`documents`) has one row per scanned file:
-
-- relative path, extension, size in bytes, sha256, modification time in nanoseconds
-- the pipeline stage: `new`, `extracted`, `graphed`, `failed`, `skipped` or `ocr_pending`
-- an error column
-
-Each stage writes its outcome back to the same row, so the drain is resumable.
-
-| Table | Columns | Notes |
-|---|---|---|
-| `entities` | `(id, type, key, name)` | Unique on `(type, key)`, where `key = canonical_key(name)` (case and whitespace normalised). A re-mention upserts the name and returns the existing id. |
-| `mentions` | `(document, entity_id, role)` | Unique on `(document, entity_id)`. Links an entity to a document, with an optional role. |
-| `relations` | `(subject_id, predicate, object_id, source)` | Person-to-Person only at 2026-10-20. The LLM's free-text predicates are not yet canonicalised, so other entity types wait for that pass. |
-
-The owner entity is seeded once and linked from chat identities across sources. Every other entity comes from document extraction. The graph is reset whenever the extraction model changes, because mixing models in one graph gives inconsistent relations. The 719 documents graphed under the previous model were reset to `extracted` before the current model ran.
-
-### Hub-safe traversal
-
-Traversal uses level-set recursive CTEs with `UNION` deduplication on `(id, depth)`, never `UNION ALL`. The owner entity appears in every document, so it is a hub of degree N for N documents, and any depth-2 neighbourhood from it reaches every other entity. Path enumeration there explodes: 65,721 ms on a degree-917 hub in the earlier demo corpus, against 155-159 ms for the level-set form. Both figures were measured in that demo and recorded in the source notes.
-
-## Agent access: MCP server
-
-A read-only MCP server over stdio exposes the graph to the coding agent. It connects per call with `default_transaction_read_only=on`, so the server has no write path. Schema application lives in the main pipeline, which this server never calls. Connecting per call means a Postgres connection flap fails one tool call and does not wedge the MCP session.
-
-| Tool | Returns |
-|---|---|
-| Status | Pipeline stage counts, entity, mention and relation totals |
-| Search entities | Entities matching a name substring, with type filter and mention counts |
-| Dossier | One entity's type, dated mentions across documents, relations in and out |
-| Cross-document entities | Entities appearing in N or more documents, with the corpus bridging rate |
-| Related entities | One-hop edges or a two-hop level-set neighbourhood |
-| Timeline | One entity's mentions ordered by document modification time |
-| Document | One ledger row: stage, size, modification time, error, extracted entities |
-| Search messages | Full-text search over chat history |
-| Conversation | One conversation by id or title substring, oldest first |
-| Person history | Chat identities matching a name across all sources |
-
-The server is registered in the agent's configuration with deferred exposure, so its tools appear only when the agent searches for them and the per-turn prompt stays smaller. The database connection string is injected through a `sops -d --extract` substitution at process start, so no secret sits in a tracked configuration file.
-
-## Chat history lane
-
-A separate ingestion path, structured only, with no LLM extraction. Chat-history exports are parsed into a source-neutral model and written to the same database:
-
-| Table | Holds |
-|---|---|
-| `identities` | One row per handle per source |
-| `conversations` | One per chat |
-| `participants` | Join table |
-| `messages` | Message text, with a generated `search_tsv` column and a GIN index for `websearch_to_tsquery` |
-
-Ingestion is idempotent. Re-running a source deduplicates on a hash of the raw source values, or on per-message ids where the source has them. The owner's identity across sources links to the same Person entity in the document graph, so a person who appears in both chat history and documents resolves through one entity id.
-
-## Privacy: no hosted endpoint
-
-At 2026-10-20 every stage ran on the dev box. The LLM endpoint was the local llmc proxy at `127.0.0.1:11434`, an OpenAI-compatible HTTP API over the llama-server engine on the local GPU. The extraction model was Qwen3.8 27B dense, loaded as a preset on that proxy.
-
-No hosted LLM endpoint (OpenRouter, Anthropic or any cloud API) receives document content by default. The configuration points at the local proxy, and a cloud endpoint is a documented opt-in per folder set, not a config switch. Agent work that touches document content runs in local-model background workers, never in a cloud-model parent session. The parent sees aggregates only: pipeline status, counts, and error classes with the model's output stripped.
-
-The text cache and the Postgres database both live on the local network. The database port is tailnet-only, and the archive is read-only over its mount.
-
-## Throughput and the drain
-
-The pipeline was measured on a local RTX 5090 (32 GB VRAM) with two requests in flight. The extraction model was `qwen38-swift-ninfer` (Qwen3.8 27B dense, NVFP4 on NInfer), picked on 2026-10-16 in a three-model bake-off (next section). The bake-off measured documents per hour under the production chunking and junk gate: 485 for `qwen38-swift-ninfer`, 409 for `summarizer`, 107 for `gemma4`. These are end-to-end, including extraction, chunking and graph writes.
-
-The August 2026 partial drain ran ~45 docs/hr with one request in flight. The graph stage was single-request then because its semaphore never admitted a second request, leaving the preset's second slot idle. The current pipeline runs two. The model changed as well as the concurrency, so 45 -> 485 is not a clean before/after.
-
-The archive holds ~12.6k documents, so a full drain at 485 docs/hr is roughly 26 hours. `drain.sh` was resumable: it ran scan and extract, then a `while` loop on the graph stage under an llmc preset lock, renewed every 5 minutes and released on exit. A crash or Ctrl-C re-ran from where it stopped, and scan and extract were cache hits after the first run.
-
-- The extraction preset must stay locked during the drain. Another llmc client can otherwise evict it mid-run, which wipes the prompt cache and forces a full re-prefill on the next request. The script locked the preset with an owner tag.
-- An LLM outage is recoverable. The 1-token probe described above decides between aborting the run and marking one document `failed`, and the `until` loop in the script retried the graph stage on any non-zero exit.
+The graph stage keeps `llm_concurrency` documents in flight over one database connection. That is safe because no database call spans an await within a worker, so a psycopg connection is never shared across concurrent tasks.
 
 ## The extraction model was not evaluated
 
@@ -272,17 +230,446 @@ Both judges agreed that the Qwen model had the most correct relations and no rev
 
 The sequence was: pick for continuity, drain ~720 documents without evaluation, then measure and find a quarter of the relations reversed. A config value, a commit and a plan document all record a choice, and none of them shows it was compared. The [agent guard extensions page](/reference/agent-guard-extensions/) covers the epistemic guard rule that follows from this ("a recorded choice is not an evaluated one"), and the [agent model routing page](/reference/agent-model-routing/) covers the effort rule for high-stakes work.
 
+### Round 2: the model that is always on
+
+The Qwen pick had a second problem. It needs the dev-box GPU, which is down or in use most of the time, and in the week after 2026-10-16 the Qwen drain graphed 0 documents. The only always-on GPU is the NAS's 12 GB 3080 Ti (sm_86, so NVFP4 and a 27B model are out), already serving a 12B Gemma 4 model (`gemma-4-12b-it-Q4_K_M`) to a research stack. A second round on 2026-10-23 ran the same 30-document sample through the same harness, with the 12B at one request in flight (one slot). Both judges re-scored all four models with the recall prompt fixed for four lists, so the recall column is not comparable with round 1.
+
+| | 12B (NAS) | `qwen38-swift-ninfer` | `summarizer` | `gemma4` |
+|---|---|---|---|---|
+| Entities / relations per document | 41.2 / 25.0 | 25.6 / 14.8 | 38.4 / 20.4 | 36.7 / 18.5 |
+| Empty extractions | 0 | 4 | 0 | 0 |
+| Entity names grounded (fraction) | 0.85 | 0.75 | 0.87 | 0.86 |
+| Documents per hour | 132 (24/7) | 485 (dev-box hours) | 409 | 107 |
+| Relations correct, Qwen / Gemma judge (fraction) | 0.40 / 0.40 | 0.51 / 0.44 | 0.27 / 0.24 | 0.30 / 0.28 |
+| Relations with reversed direction (fraction) | 0.01 / 0.01 | 0.00 / 0.00 | 0.25 / 0.24 | 0.17 / 0.08 |
+| Missed entities per short document | 1.06 / 1.00 | 1.44 / 1.18 | 0.61 / 0.65 | 1.00 / 0.94 |
+
+The Gemma-family judge gave the 12B exactly what the Qwen judge gave it, so family preference did not lift it. It trails Qwen on correct relations (11 points under one judge, 4 under the other, on n = 29) and beats it on entities. The user chose the 12B: equal-enough quality, and about 3 days of unattended graphing instead of about a week of dev-box GPU time. The 156 documents Qwen had graphed on 2026-10-23 were reset.
+
+The sample is 29 documents, and the judge sees one sentence per relation, so relations drawn across sentences score as unsupported (about 0.5 for every model). Read that column as relative.
+
+## Throughput and the drain
+
+### The drain on the NAS
+
+The drain is one container, `mnemosyne-worker`, running `mnemo drain` forever: scan, extract, OCR, graph, then a rescan every 6 hours. The LLM is the NAS's llama-server behind a GPU router on the same host. The router hands the single 3080 Ti to a photo-ML service on demand and preempts the drain when that happens. The drain retries (an `LLMOutage` waits 60 seconds) and carries on. Every stage persists per document, so a kill or a preemption loses at most one document's work, and no monitor loop is needed.
+
+Two things protect the graph from the shared GPU:
+
+- Before graphing, `mnemo drain` asks llama-server which GGUF it serves and refuses to run if that is not the configured model. A swap on the shared server would otherwise mix two models in one graph.
+- The research stack on the same server shares the single slot, so concurrency is 1.
+
+The first full drain ran from 2026-10-24 to 2026-10-30 and finished with 9,546 documents graphed. By the 2026-11-06 review the ledger held 10,240 documents scanned: 9,594 graphed, 345 skipped as tabular junk and 301 failed (269 encrypted PDFs, 17 OCR failures, 11 PDF parse failures, 8 spreadsheet parse failures).
+
+A production judge pass on 60 documents (stratified by top folder and extension, duplicates once, built from the stored chunk output) used a judge outside the 12B's family:
+
+| | production (n=60) | bake-off round 2, same judge (n=29) |
+|---|---|---|
+| Entity names grounded in text | 0.82 | 0.85 |
+| Relations correct | 0.50 | 0.40 |
+| Relations with reversed direction | 0.00 | 0.01 |
+| Relations unsupported by the one sentence the judge sees | 0.48 | 0.59 |
+| Relations wrong | 0.01 | 0.01 |
+
+The production graph matches the bake-off: relations are essentially never reversed, and about half are confirmed by the single supporting sentence the judge sees. The whole graph at that point held 194,334 entities, 479,055 mentions and 314,353 relations, with 39,320 distinct relation predicates (789 used 50 or more times) and a bridging rate of 35.2% by distinct files or 27.1% by distinct content (duplicates once).
+
+### The dev-box arrangement (2026-10-20)
+
+The pipeline was first measured on the RTX 5090 with two requests in flight and `qwen38-swift-ninfer` (Qwen3.8 27B dense, NVFP4 on NInfer). The bake-off measured documents per hour under the production chunking and junk gate: 485 for `qwen38-swift-ninfer`, 409 for `summarizer`, 107 for `gemma4`, end to end including extraction, chunking and graph writes.
+
+The August 2026 partial drain ran ~45 docs/hr with one request in flight. The graph stage was single-request then because its semaphore never admitted a second request, leaving the preset's second slot idle. The model changed as well as the concurrency, so 45 -> 485 is not a clean before/after. At 485 docs/hr a drain of the ~12.6k documents would take roughly 26 hours.
+
+`drain.sh` was resumable: it ran scan and extract, then a `while` loop on the graph stage under an llmc preset lock, renewed every 5 minutes and released on exit. The preset had to stay locked, because another llmc client could otherwise evict it mid-run, which wipes the prompt cache and forces a full re-prefill on the next request. The script's `until` loop retried the graph stage on any non-zero exit. That script is gone, replaced by `mnemo drain`, and the model check above does the job the lock did. The lock still exists for a run pointed at an llmc proxy.
+
+An LLM outage is recoverable in both arrangements: the 1-token probe decides between aborting the run and marking one document `failed`.
+
+### Hardening after the first drain
+
+The 2026-11-06 project review found four defects in the drain loop and they were fixed in the same phase:
+
+- The loop caught only three exception classes around the graph run and nothing around scan, extract and OCR, so a Postgres error exited `mnemo drain`. Docker restarted it, so the risk was a crash loop on a persistent fault.
+- A 200 response with a non-JSON body escaped the retry.
+- Predicate classification skipped a failed batch without retrying or saying which.
+- `failed` is terminal, so a transient tool failure needs a manual stage reset.
+
+The drain now survives any per-stage exception and logs the class only. The review also recorded claims from its two code reviews that did not hold when re-checked against the code: a race in the graph worker queue (asyncio switches tasks only at an await, and there is none between `empty()` and `get_nowait()`), a JSON parse failure in an environment variable (it parses), and full-text search being done (only `messages` had a tsvector).
+
+## Storage
+
+The graph, the document ledger and the chat history are separate tables in one Postgres database, on the NAS next to the worker.
+
+The document ledger (`documents`) has one row per scanned file:
+
+- relative path, extension, size in bytes, sha256, modification time in nanoseconds
+- the pipeline stage: `new`, `extracted`, `graphed`, `failed`, `skipped` or `ocr_pending`
+- an error column
+
+Each stage writes its outcome back to the same row, so the drain is resumable.
+
+| Table | Columns | Notes |
+|---|---|---|
+| `entities` | `(id, type, key, name)` | Unique on `(type, key)`, where `key = canonical_key(name)`. A re-mention upserts and returns the existing id. The display name is the commonest raw spelling. |
+| `mentions` | `(document, entity_id, role)` | Unique on `(document, entity_id)`. Links an entity to a document, with an optional role. |
+| `relations` | `(subject_id, predicate, object_id, source)` plus `raw_predicate` | Every relation with resolved endpoints is kept. The model's text is kept in `raw_predicate` and `predicate` holds the canonical one. |
+| `extractions` | chunk content hash, model, raw answer | The model's reply per chunk. The graph stage reuses it before calling the model. |
+| `entity_aliases`, `predicate_map` | see [Entity resolution](#entity-resolution) | Rules applied at merge time. |
+
+At 2026-10-20 only Person-to-Person relations were stored, because the free-text predicates were not yet canonicalised. Worker v0.4.0 (2026-10-24) removed that filter and keeps every relation with resolved endpoints, and entity resolution later made predicate-level queries workable.
+
+The owner entity is seeded once and linked from chat identities across sources. Every other entity comes from document extraction. The graph is reset whenever the extraction model changes, because mixing models in one graph gives inconsistent relations.
+
+### Stored output and remerge
+
+The graph stage stores the model's raw answer per chunk in `extractions`, keyed by the chunk's content hash and the model. Two things follow:
+
+- A duplicate file is free: its chunks hash to answers already stored.
+- Any change to how answers become graph rows replays from Postgres without the GPU. `mnemo remerge` rebuilds the graph from stored output in about 11 minutes on the NAS, where the text cache and Postgres are both local.
+
+A Postgres advisory lock serialises the graph stage and remerge. Remerge exits 2 if a graph stage is running. A document that fails part-way leaves nothing behind (before the fix it left 2,887 mentions, which the next remerge removed). A later commit added a prune for the stored output of documents that no longer exist, run each drain cycle.
+
+### Hub-safe traversal
+
+Traversal uses level-set recursive CTEs with `UNION` deduplication on `(id, depth)`, never `UNION ALL`. The owner entity appears in every document, so it is a hub of degree N for N documents, and any depth-2 neighbourhood from it reaches every other entity. Path enumeration there explodes: 65,721 ms on a degree-917 hub in the earlier demo corpus, against 155-159 ms for the level-set form. Both figures were measured in that demo and recorded in the source notes.
+
+## Entity resolution
+
+Extraction gives one node per spelling. "R. Tan" and "Robert Tan" are two entities, an acronym and its long form are two, and a company can be an Org in one document and a Topic in another. Lower-casing and stripping honorifics and punctuation merged only about 3% of Person and Org entities in the baseline (Person 54,972 -> 53,166; Org 33,099 -> 32,418), and 7,064 keys existed under more than one type. The relation side had 39.3k distinct predicates, of which 790 used 50 or more times covered 64.2% of the 314k relations.
+
+The design rule is that resolution is data, not edits. Every decision is a row in a table keyed by `(type, key)`, because entity ids are reassigned by every remerge. The graph tables are derived state, rebuilt by remerge, so a rule that turns out wrong is deleted and the merge is run again.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  extractions [label="extractions\n(stored output)"];
+  merge [label="merge\nkey rules + aliases +\npredicate map"];
+  graphdb [label="entities, mentions,\nrelations"];
+  cand [label="candidate pairs"];
+  judge [label="local adjudication\nsame / different / unsure"];
+  rules [label="entity_aliases\npredicate_map"];
+  review [label="review queue\n(user terminal)"];
+
+  extractions -> merge;
+  rules -> merge;
+  merge -> graphdb;
+  graphdb -> cand;
+  cand -> judge;
+  judge -> rules [label="same"];
+  judge -> review [label="unsure"];
+  review -> rules [label="user rule"];
+}
+```
+
+1. Stored output and the rule tables feed the merge, which writes the graph.
+2. Candidate pairs are generated from the graph and judged by a local model.
+3. SAME verdicts become alias rules. UNSURE verdicts go to a review queue that only the user works, and a user decision becomes a rule too.
+
+### Key normalisation and candidates
+
+The entity key is computed by lower-casing, removing accents, stripping a leading honorific (for a Person with at least two words left), removing light punctuation (periods, commas, quotes; a hyphen becomes a space) and collapsing whitespace. Two raw names with the same key and type are one entity.
+
+Candidate pairs come from three rules, all in Postgres:
+
+- pg_trgm similarity of 0.6 or more between keys within a type (the threshold was proposed in the spec and not tuned)
+- an initialled Person form against a full name
+- the same key under two types
+
+The 2026-11-06 run produced 108,945 pairs from the first two rules, and 7,519 automatic type rules for non-Person type conflicts. Each pair stores up to 3 context snippets per side, so adjudication does not need the text cache.
+
+### Adjudication
+
+A local model sees the two names and their snippets and answers SAME, DIFFERENT or UNSURE. SAME writes an alias rule with the entity that has more mentions as canonical. DIFFERENT records the pair as rejected so it is not asked again. UNSURE writes no rule and queues the pair for the user. Three guards sit around that:
+
+- No model rule may target the owner entity, so a shared first name cannot make the owner swallow other people. Owner aliases exist only as user rules.
+- `write_alias` refuses a rule that would close a cycle. A chain resolves to its final target.
+- A user rule beats a model rule for the same key.
+
+The production run used the NAS's 12B for adjudication, and the Person SAME verdicts got a second check from a different model family (`mnemo er confirm`). A separate audit re-judged a random sample.
+
+### Predicate vocabulary
+
+Raw predicates are mapped to a fixed vocabulary plus a flip flag (swap subject and object), from a stored map, and the raw text stays on the relation. The model drafted the vocabulary from the common predicates and mapped every raw predicate used twice or more. An unmapped predicate keeps its normalised raw text until the map has rows, `other` after.
+
+The drafting needed three fixes. The first attempt returned nothing until reasoning was turned off and list parsing made tolerant. Then it returned 80-307 predicates after two consolidation rounds, and the prompt had to ask for exactly 45 numbered predicates, because "at most 60" was ignored. Consolidation now runs up to 5 rounds.
+
+### Result
+
+Before is a remerge with the new key rules and no alias or predicate rules (2026-11-03, after the cap-40 regraph). After is a remerge with all rules (2026-11-06).
+
+| | before | after | change |
+|---|---|---|---|
+| Person entities | 71,546 | 64,957 | -9.2% |
+| Org | 41,099 | 34,278 | -16.6% |
+| Place | 20,917 | 17,961 | -14.1% |
+| Topic | 107,730 | 87,089 | -19.2% |
+| Date | 11,461 | 11,412 | -0.4% |
+| Mentions | 626,049 | 591,297 | -5.6% (merged duplicates in one document) |
+| Relations | 468,179 | 419,138 | -10.5% (duplicates after canonicalising) |
+| Distinct predicates | 54,305 | 46 | 45 canonical plus `other` |
+| Relations with a canonical predicate | - | 48.7% | the rest are `other`, raw text kept |
+| Bridging rate (entities in 2 or more distinct documents) | 28.3% | 31.4% | +3.1 points |
+
+Adjudication returned SAME for 37,086 pairs, DIFFERENT for 67,810 and UNSURE for 4,049. The final rule set was 30,067 model aliases, 6,991 automatic type rules and 0 user rules, because the user review has not been done. The checks on the model's verdicts:
+
+- A different model re-judged 100 random SAME pairs: 87 agreed, 7 disagreed, 6 were unsure.
+- The second check re-judged all 8,601 Person SAME verdicts: 7,744 agreed, 508 were unsure (kept) and 349 were different. The merge was dropped for those 349 and the pairs went to review.
+- The predicate map covers all 22,851 raw predicates used twice or more, and 1,350 of the mappings flip subject and object.
+
+The original spec said the effect would be checked by re-running the 60-document judge sample. That was replaced: entity resolution does not change the stored extractions the sample scores, so a second model re-judging a seeded sample of SAME verdicts measures the thing that changed.
+
+These figures describe the graph before the [Calibre removal](#the-library-of-published-books).
+
+### Incrementally, in the drain
+
+A full pass is a batch job, and new documents arrive every 6 hours. Since 2026-11-06 the drain runs an incremental pass after any graph run that graphed something. It takes a try-lock on the graph lock (and skips if an `er` batch or remerge holds it), generates candidates only for entities above a high-water mark (the largest entity id already resolved), adjudicates them with the drain's own model, writes aliases for SAME verdicts and re-merges just the affected documents. UNSURE pairs go to the review queue and are never merged. The first run only sets the mark, and a full remerge moves it. `MNEMO_ER_INCREMENTAL=false` turns the pass off, and it logs counts only.
+
+### Operating incidents
+
+Both incidents cost hours and both are now covered by a test or a rule:
+
+- On 2026-11-02 the NAS's weekly `docker system prune` deleted the stopped llama-server container, and a 10-hour adjudication run returned UNSURE for everything. The container now carries a keep label and the prune a filter for it.
+- On 2026-11-05 two model verdicts formed an alias cycle. The worker crash-looped for 4.5 hours and took the adjudication run down, because the run executed inside the worker. `write_alias` now refuses a cycle, the drain waits on one, and long jobs run in their own container.
+
+## The read-only query layer
+
+By the 2026-11-06 review the read paths had grown three copies of the same SQL: the MCP server carried its own queries, `er/stats.py` duplicated some, and an API or UI would have been a third. The fix was to move every read into Postgres functions that every surface calls.
+
+### One contract
+
+A schema named `api` holds the read functions. They are the only things the browser explorer and the MCP server may call, and neither gets to issue SQL or read a table.
+
+- Three roles: `api_owner` (NOLOGIN, owns the schema and every function, holds SELECT on the tables the functions read), `api_reader` (NOLOGIN, USAGE on `api` and EXECUTE on its functions, nothing else) and `authenticator` (LOGIN, no inherited privileges, member of `api_reader`).
+- Every function is `STABLE` and `SECURITY DEFINER` with a pinned `search_path`, builds no SQL from input strings, and caps every list at 1000 rows.
+- `api_reader` has a 5-second `statement_timeout`.
+- To add a read, add a function. The reader never gets a table grant.
+- `db.connect` re-applies the `api` file only when its sha256 changes, under an advisory lock, so two connects never race on `CREATE OR REPLACE FUNCTION`.
+- Tests call every function as `api_reader` and check that the role cannot select a table, write or call a function outside `api`. A SQL port of `canonical_key` is checked against the Python one on a fixture list (accents, honorifics, punctuation, Cyrillic, CJK).
+
+The functions cover entity search and name resolution, the entity dossier (aliases, dated documents, relations grouped by predicate), one- and two-hop neighbourhoods, discovery (entities in N or more documents, the bridging rate), the document view and its text, document search, chat search, conversations, identities and status. A function's result shape changes in the same commit as the UI and MCP tool that use it.
+
+### Auth
+
+PostgREST serves schema `api` with no anonymous role: a request with no valid token gets 401 and no data. A token is an HS256 JWT with `role = api_reader`, signed with a secret that lives only in the sops-encrypted compose environment. `mnemo token --name <label> --days <n>` mints one on the dev box (standard-library HMAC, no new dependency). Rotating the secret invalidates every token. Tokens are minted without printing them into a session, because one reads the whole archive. The explorer takes one in the browser (kept in localStorage) and the MCP client takes another, each with a 365-day expiry from 2026-11-06.
+
+### Latency, and the three fixes
+
+The first bench on the production graph (215k entities, 591k mentions, 419k relations) missed the 500 ms budget badly: `search_entities` p95 1623.0 ms and `resolve_entity` p95 3522.2 ms (max 7352.6 ms, past the 5-second timeout), with `bridging` p50 945.6 ms and `cross_document` p50 881.5 ms. Three fixes:
+
+1. **Per-entity document counts as a materialized view** (`entity_counts`, refreshed after every graph run and remerge). The functions had counted mentions per matched entity at query time, which for a 2-character query meant tens of thousands of count subqueries. `bridging` p50 went from 945.6 to 9.4 ms and `cross_document` from 881.5 to 84.9 ms.
+2. **`resolve_entity` in plpgsql, one tier per query**, with a `text_pattern_ops` index on `entities.key` for the exact and prefix tiers. p95 went from 3522.2 to 14.2 ms.
+3. **`plan_cache_mode = force_custom_plan` on every function.** After fix 1, `search_entities` was fast for the first 5 calls of a query string and slow from the 6th: the two 2-character strings took 1711, 1802, 1957 and 1589 ms on calls 6-10. Postgres 18 caches plans for SQL-language functions[^pg-sqlfn-plan-cache], and the generic plan for `LIKE '%' || $1 || '%'` cannot adapt to a 2-character pattern, which no trigram can filter. Forcing custom plans costs a planning step per call, and the same strings then took 26-33 ms on every call. A generic plan that cannot tell a 2-character pattern from a long one is invisible in a bench that runs each query five times, and it shows up on the sixth call.
+
+Final bench (warm cache, one session, no concurrent load, from the dev box over the tailnet, so each sample includes a client round trip), over the 10 entities with the most document mentions (522 to 1137 documents each) and 20 fixed search strings:
+
+| function | p50 (ms) | p95 (ms) | max (ms) |
+|---|---:|---:|---:|
+| `search_entities` | 10.7 | 34.1 | 43.2 |
+| `resolve_entity` | 1.0 | 14.2 | 29.5 |
+| `entity` | 6.1 | 20.8 | 23.9 |
+| `entity_relations` (hops=1) | 7.0 | 42.5 | 48.1 |
+| `neighbours` (hops=2) | 69.1 | 184.7 | 200.9 |
+| `document` | 1.9 | 7.0 | 30.1 |
+| `search_messages` | 1.5 | 10.7 | 20.7 |
+| `cross_document` | 84.9 | 85.3 | 85.3 |
+| `bridging` | 9.4 | 17.0 | 17.0 |
+| `status` | 146.8 | 199.7 | 199.7 |
+
+All entity-search, dossier, hop-1 and document functions are under 50 ms at p95. The bench does not include PostgREST's own hop (the post-deploy smoke test shows it works, not how fast), and it covers the top 10 entities by document count, so an entity with many relations and few documents could have a slower `neighbours` call. `entity_counts` lags the live graph by one run, while `entity` counts live.
+
+## Full-text search
+
+Document search needed its own index. Only chat `messages` had a tsvector, and the graph answers "who" and "what" but not "which document says this".
+
+### The index
+
+Each extracted document's text is stored in Postgres as non-overlapping chunks of 2,000 characters keyed by `(sha256, ordinal)`, with a generated tsvector and a GIN index. 2,000 characters keeps snippets local and each tsvector far under the 1 MB limit. The extract and OCR stages write the chunks in the same transaction as the stage change. A duplicate file shares one set of chunks, and a prune at the end of each drain cycle drops chunks whose sha256 no longer appears in `documents`. `mnemo fts backfill` fills gaps from the text cache.
+
+### The sizing mistake
+
+The spec estimated the index at +0.6-0.8 GB. That number was wrong, and so was its input. The 657 MB figure for the text corpus was `du -sh` on a ZFS dataset with compression on, so it measured compressed blocks. The real size is the sum of file sizes: `du -sb` gives 1,256,104,892 bytes across 8,007 files. Books were the dominant class:
+
+| extension | documents | MB | share |
+|---|---:|---:|---:|
+| .epub | 959 | 673.2 | 53.8% |
+| .pdf | 3373 | 244.3 | 19.5% |
+| .txt | 807 | 125.1 | 10.0% |
+| .csv | 56 | 88.1 | 7.0% |
+| .rtf | 19 | 50.8 | 4.1% |
+| .xlsx | 200 | 26.6 | 2.1% |
+| .xls | 75 | 14.5 | 1.2% |
+| .docx | 821 | 9.8 | 0.8% |
+
+The largest 100 documents held 32.3% of the text and the largest 500 held 66.2%. The tabular-junk documents (114, 83.9 MB, 6.7%) were not the dominant class.
+
+A sample backfill of 500 documents (481 indexed, 34,441 chunks, 65,117,236 bytes of text) compared three layouts on exactly those chunks, in temporary tables on the production server, timing 15 fixed queries on a warm second pass:
+
+| layout | table MB | index MB | total MB | query p50 ms | p95 ms | max ms |
+|---|---:|---:|---:|---:|---:|---:|
+| stored tsvector, `simple` | 163.9 | 42.4 | 206.2 | 4.4 | 349.9 | 487.2 |
+| expression GIN, no stored tsvector | 64.7 | 44.5 | 109.3 | 131.3 | 5487.6 | 5681.1 |
+| stored tsvector, `simple` plus English stop words, lz4, `toast_tuple_target` 128 | 133.3 | 39.3 | 172.6 | 9.5 | 16.6 | 24.7 |
+
+With plain `simple`, the word "the" matched 29,583 of the 34,441 chunks, and ranking every match made the p95 slow on a 1/19 sample of the corpus, and it would grow with the corpus. The expression index halves the storage but re-parses every matching chunk to rank it, which is unusable at full size. Removing English stop words keeps phrase queries working ("terms and conditions" still matches) and cut the slowest of the 15 queries to 1,619 matching chunks. That layout is the `mnemo_simple` text-search configuration.
+
+The sample scaled to roughly 3.3 GB (2.65x the text). The full backfill, about 9 minutes in its own container, indexed 7,940 documents, 667,026 chunks and 1,249,221,554 bytes of text, and used 2,886,049,792 bytes for table plus indexes (2.31x the text). The database went from 1,122,162,367 to 4,008,081,087 bytes.
+
+### The ranking change
+
+The first `search_documents` scored every matching chunk with `ts_rank_cd`. On the full index its cost was linear in matches, about 0.1 ms per matching chunk because each tsvector is decompressed: 2,933 ms for a word matching 30,451 chunks (mostly books), p95 1909.4 ms over the 20 bench queries, while matching alone took 1-26 ms.
+
+The document score is now matching chunks divided by the square root of the document's chunk count, both read from indexes. `ts_rank_cd` only picks the snippet chunk for the returned page (from the first 50 matching chunks per document). The square root stops a long book winning on volume alone: a 1-chunk note with the word scores 1.0, a 15-chunk document with 3 matching chunks 0.77. Over the same 20 queries: p50 273.4 ms, p95 541.0 ms, max 671.2 ms, and the 30,451-chunk word took 683 ms. That meets the 1-second p95 target for document search.
+
+Snippet highlights are marked with control-character delimiters and the API never returns HTML. The UI splits on the delimiters and renders the marks as elements around text nodes.
+
+## The shared MCP server
+
+The first MCP server was a stdio process per agent session on the dev box, with a database connection string injected through a `sops -d --extract` substitution. The stdio server connected per call with `default_transaction_read_only=on`, so it had no write path and a Postgres connection flap failed one tool call instead of wedging the session. It was registered in `mcp.json` as the `mnemo` entry with `"exposure": "deferred"`, so its tools appeared only when the agent searched for them, and it read its connection string from `MNEMO_PG_DSN`. The shared server replaced it on 2026-11-06 and the stdio code was deleted.
+
+- It serves MCP over streamable HTTP, stateless, as `mnemo mcp` in a container built from the worker image.
+- Every tool is a call to an `api` function through PostgREST. The server reads the caller's `Authorization` header and forwards it unchanged. It holds no database credential and no token of its own, and a call without a token fails with an authentication error and returns nothing.
+- It has 12 read-only tools. Every tool description states that results are private archive content.
+
+| Tool | Returns |
+|---|---|
+| Status | Pipeline stage counts, entity, mention and relation totals |
+| Search entities | Entities matching a name substring, with type filter and mention counts |
+| Dossier | One entity's type, dated mentions across documents, relations in and out |
+| Cross-document entities | Entities appearing in N or more documents, with the corpus bridging rate |
+| Related entities | One-hop edges or a two-hop level-set neighbourhood |
+| Timeline | One entity's mentions ordered by document modification time |
+| Document | One ledger row: stage, size, modification time, error class, extracted entities |
+| Document text | The extracted text of one document, paged |
+| Search documents | Full-text hits ranked as above, with a highlighted snippet |
+| Search messages | Full-text search over chat history |
+| Conversation | One conversation by id or title substring, oldest first |
+| Person history | Chat identities matching a name across all sources |
+
+The server is registered in the agent's configuration disabled. An agent turns it on only when the user asks for the archive in that session, because the results are private content and a cloud model would see them. That switch keeps the privacy rule meaningful now that a query surface exists: extraction and every pipeline stage are local, and a cloud model reads the archive only through an explicit, per-session opt-in.
+
+## The explorer UI
+
+The browser explorer is a static Astro build with React islands, served by a small Caddy container that also proxies the API and the MCP path. It is static because every read needs the token in the browser, so server rendering buys nothing.
+
+- Six pages: search (entities, documents, messages), entity, document, conversation, discovery, status. Every entity, document and conversation links to its page, and page state lives in the URL so reload and back work.
+- A token field appears when no token is stored. A 401 clears the stored token and shows the field again.
+- The Content-Security-Policy has no `unsafe-inline` for scripts. Astro emits inline island scripts, so a build step moves them to files and fails the build if any remain.
+- Corpus text (names, document text, message bodies, paths) is only ever rendered as text nodes, never as HTML. Search highlights are elements the UI builds itself from the delimiters.
+- The SMB path of a document is shown with a copy button, and the file opens from the share. The UI never serves originals.
+- A Playwright smoke runs against mocked API responses, never the live API.
+
+## Exposure: LAN and tailnet only
+
+Tax, immigration and health documents make this the part where a default would hurt. The explorer, the API and the MCP path share one address.
+
+1. The web container serves plain HTTP on a LAN address, and nothing publishes a port on the tailnet address (an earlier stack had a boot race there).
+2. The edge proxy terminates TLS for an internal hostname with a LAN-only site block. The certificate comes from a DNS-01 challenge against the authoritative DNS server, so the name never needs a public record, and the edge access log is off because URLs carry search terms.
+3. The name resolves through a split-horizon record on the LAN resolver. It is not in the public zone. A client that does not use the LAN resolver reaches the service by address.
+4. The tailnet reaches it through the router's existing subnet route.
+
+The first version of this was plain HTTP. The 2026-11-06 spec records that as a user decision (no edge hostname, no certificate, port 80 on the LAN), and the same day a browser's HTTPS-only mode refused the address, so the edge proxy and DNS-01 certificate shipped hours later. The pattern the rest of the stack uses for a LAN or tailnet service is HTTPS through the edge proxy with DNS-01 and a split-horizon record, with no public A record. Plain HTTP was a departure from that pattern that nobody had a reason for. The MCP server also had to be changed to allow https origins.
+
+## Chat history lane
+
+A separate ingestion path, structured only, with no LLM extraction. Chat-history exports are parsed into a source-neutral model and written to the same database:
+
+| Table | Holds |
+|---|---|
+| `identities` | One row per handle per source |
+| `conversations` | One per chat |
+| `participants` | Join table |
+| `messages` | Message text, with a generated `search_tsv` column and a GIN index for `websearch_to_tsquery` |
+
+Ingestion is idempotent. Re-running a source deduplicates on a hash of the raw source values, or on per-message ids where the source has them. The owner's identity across sources links to the same Person entity in the document graph, so a person who appears in both chat history and documents resolves through one entity id.
+
+At the 2026-11-06 review the lane held 607 conversations, 524k messages and 635 identities from three sources. Only the owner's 3 identities link to a graph entity. Linking everyone else is planned (see [What is planned](#what-is-planned)), and until then "everything about person X" stops at whichever lane you query.
+
+## Privacy: no hosted endpoint
+
+At 2026-10-20 every stage ran on the dev box. The LLM endpoint was the local llmc proxy at `127.0.0.1:11434`, an OpenAI-compatible HTTP API over the llama-server engine on the local GPU, and the extraction model was Qwen3.8 27B dense, loaded as a preset on that proxy. Since 2026-10-23 every stage runs on the NAS against the NAS's llama-server, and the dev box is not involved at all.
+
+No hosted LLM endpoint (OpenRouter, Anthropic or any cloud API) receives document content by default. The configuration points at the local server, and a cloud endpoint is a documented opt-in per folder set, not a configuration switch. Agent work that touches document content runs in local-model background workers, never in a cloud-model parent session. The parent sees aggregates only: pipeline status, counts, and error classes with the model's output stripped, because a stored error can quote document text and so can a path. Entity resolution follows the same rule: the review command prints names and runs only in the user's own terminal.
+
+The text cache, the Postgres database and the query layer all live on the local network. The database port is tailnet-only, the archive is read-only over its mount, and the read side is reachable only as described above.
+
+## CI
+
+Forgejo Actions runs on every push and pull request: ruff and the full pytest suite against a pgvector Postgres 18 service container (the same image as production, so `pg_trgm` and the vector extension are present), and a separate job that type-checks, lints and builds the explorer. The test job installs the OCR tools, because the OCR tests skip without them and a skip would hide a broken lane. It fails on any skipped test for the same reason: a skipped Postgres test would mean the service was not reached. A `v*` tag builds and pushes the worker and web images after both jobs pass. The worker does not run the checkout, so code reaches the NAS only this way, and the tag in the compose stack is bumped by hand before the deploy (a human gate before a deploy that can change the graph).
+
+Four things CI taught:
+
+- A tag-only push of an already-built commit does not fire on Forgejo. Tag a new commit.
+- CI resolved Python 3.15 where the worker image uses 3.13, and `psycopg-binary` had no wheel for it, so the version is pinned.
+- On 2026-11-06 two test jobs hung for 11 minutes when they ran side by side. They most likely reached the same Postgres service and blocked each other's `DROP SCHEMA`. Runs are now queued one at a time with job timeouts, and queueing also keeps the image job from being cancelled.
+- Before CI existed, tests ran only on the dev box and the worker image was built and pushed by hand.
+
+## Mistakes and what caught them
+
+Each of these shipped, and each was caught by a measurement or a review, not by the code that caused it.
+
+| Mistake | What caught it | Fix |
+|---|---|---|
+| Extraction model picked for continuity, never compared | A three-model bake-off, 719 documents in | Model replaced, graph reset |
+| A model that only runs while a gaming PC's GPU is free | 0 documents graphed in the week after the pick | Second bake-off round, always-on GPU, drain moved to the NAS |
+| A model looping without an output cap | 46 documents, empty error reason, four 300-second timeouts each | 8192-token cap, runaway chunk stored empty |
+| Full-text index sized from a compressed `du` | A sample backfill and `du -sb` | Re-estimate (3.3 GB), layout bench, stop words |
+| Ranking every matching chunk | 2,933 ms for one word on the full index | Score by matching chunks over the square root of length |
+| Query counts computed per request, a generic cached plan | The first bench, then call 6 of a repeated query | Materialized view, plpgsql tiers, `force_custom_plan` |
+| An alias cycle and a worker that crash-looped for 4.5 hours | The adjudication run died with it | Cycle refusal, drain waits, long jobs in their own container |
+| A weekly prune deleted a stopped container | 10 hours of UNSURE verdicts | Keep label and prune filter |
+| Two CI jobs on one Postgres service | An 11-minute hang | Queued runs, timeouts |
+| Plain HTTP for a private archive | The browser refused it the same day | HTTPS through the edge proxy |
+| Published books in the graph | An entity list full of fictional characters | See below |
+
+### The library of published books
+
+A Calibre library (published books and manga) sat inside the archive and was ingested and graphed like personal documents. It was 12% of documents but 36% of mentions and 50% of relations, and its book characters, places and topics crowded the entity lists. The sizing numbers above had already pointed at it: EPUB was 959 of the 7,970 cached documents and 53.8% of the text, and the full-text index size was dominated by the same books.
+
+The fix was a top-level exclusion in the scan rules, matched on the first path component only so a personal books folder elsewhere is unaffected. The next scan saw the library's documents as vanished, the bulk guard refused, and a confirmed `mnemo scan --forget-limit 1210` forgot them (mentions, relations, orphaned entities). `mnemo fts prune` then dropped their search chunks. A database dump was taken first.
+
+| | before | after |
+|---|---:|---:|
+| documents | 10,237 | 9,032 |
+| entities | 215,697 | 121,523 |
+| mentions | 591,292 | 377,056 |
+| relations | 419,134 | 210,100 |
+| `doc_text_chunks` | 667,026 | 253,013 |
+| entities in 2+ documents | 31.4% | 42.1% |
+
+The database size did not shrink: deleted rows are reused, not returned to the filesystem. The stored model output for the book chunks was still in `extractions`, which the later prune of output for vanished documents addressed. The entity-resolution figures above describe the graph before this removal. The same commit made forgetting refresh display names and entity counts.
+
+The guard worked as designed: removing over 1,200 documents exceeded the bulk limit and needed a typed confirmation, so the removal was a decision and not a side effect of editing a rule.
+
+EPUB left the allowlist the same day (17 extensions to 16). The remaining EPUBs are published books, either the library or books sent as chat attachments, not personal documents.
+
+## What is planned
+
+Phase C of the plan, from the 2026-11-06 spec:
+
+- **Automation.** Vanished-file forgetting and incremental entity resolution are shipped. A scheduled Discord ingest and an optional release without a hand-edited tag are not. The default for the release is no, because a human gate before a deploy that can change the graph is worth keeping.
+- **Identity linking.** Propose links between chat identities and Person entities with the same pattern as entity resolution: pg_trgm blocking, local-model adjudication with context from both sides, unsure pairs queued for the user, a user-set link never overwritten. A Person page would then list the chats with that person.
+- **Embeddings.** Chunks and chat sessions (split at 30 minutes of silence or 2,000 characters, because 297,140 of the 524,439 messages are under 20 characters and a line is never embedded alone) stored as `halfvec` with an HNSW cosine index. The model is chosen by a bake-off on a fixed query set that the user labels, scoring recall@10 and nDCG@10 plus throughput on the NAS. The candidates include a small multilingual model, because the corpus mixes four languages, and a 384-dimension English model that already runs on the NAS CPU. None is chosen.
+- **Hybrid retrieval.** An `api` function fuses full-text rank and vector similarity with reciprocal rank fusion (score 1/(60 + rank) over the top 50 of each ranker), computed in SQL. The database makes no network calls, so the caller embeds the query and passes the vector in. Retrieval returns ranked passages and answering stays with the caller, so there is no ask box.
+
+The bake-off query set stays local, because it is private text, and only aggregate scores are committed. A retrieval change that lowers recall@10 by more than 0.05 fails review, a threshold chosen to be revisited after the first bake-off.
+
 ---
 
 ## What carries over
 
 The archive size, the model and the GPU belong to this setup. These choices do not:
 
-- An extension allowlist beats a denylist on a personal archive that is mostly non-documents.
+- An extension allowlist beats a denylist on a personal archive that is mostly non-documents. When a bulk source turns out not to be personal, exclude the tree and remove it through a guarded forget.
 - A sha256-keyed cache means a restart or a model change re-runs only what changed.
-- Identity by `(type, canonical_key)` handles case and whitespace variation and keeps types apart.
+- Storing the model's raw answer per chunk turns every later merge-rule change into a replay that needs no GPU.
+- Identity by `(type, canonical_key)` handles case and whitespace variation and keeps types apart. Resolution rules in tables, keyed by that identity, survive every rebuild and delete cleanly.
 - Per-item validation keeps the good items from a chunk that also holds a malformed one.
-- Evaluate the extraction model on a sample, with a judge from another model family, before draining the corpus.
+- Evaluate the extraction model on a sample, with a judge from another model family, before draining the corpus. Pick a model that is available when the work needs to run.
+- One Postgres function contract for every reader means a fix lands once, and a reader role with no table grants cannot leak a table it was never given.
+- Count the corpus with `du -sb`, never `du -sh` on a compressed dataset, and bench a repeated query more than five times.
+- Look at the top of the entity list after the first full drain. A source that is not yours shows up there first.
 
 ---
 
@@ -301,6 +688,7 @@ digraph {
   r_local [label="Extract on the local model.\nA hosted endpoint only as an\nexplicit opt-in per folder set.", shape=box, style=rounded];
   r_any [label="Either endpoint works;\nlocal stays the default", shape=box, style=rounded];
   r_worker [label="Run it in local-model workers.\nA cloud session sees aggregates only\n(status, counts, error classes).", shape=box, style=rounded];
+  r_mcp [label="A cloud model that must search the archive\nuses an MCP server that is\noff until the user asks for it.", shape=box, style=rounded];
 
   start -> q_priv;
   q_priv -> r_local [label="yes"];
@@ -308,44 +696,73 @@ digraph {
   r_local -> q_agent;
   r_any -> q_agent;
   q_agent -> r_worker [label="yes"];
+  q_agent -> r_mcp [label="needs archive\nsearch"];
 }
 ```
 
-1. Sensitive documents (medical, insurance, identity) in scope: extraction runs on the local model. A hosted endpoint is an explicit, documented opt-in per folder set, never a config default.
+1. Sensitive documents (medical, insurance, identity) in scope: extraction runs on the local model. A hosted endpoint is an explicit, documented opt-in per folder set, never a configuration default.
 2. No sensitive documents: either endpoint works, and local stays the default.
 3. Agent work that reads document content (failure triage, extraction spot checks, judge passes) runs in local-model workers. A cloud session sees aggregates only: status, counts and error classes with the model's output stripped, because a stored error can quote document text.
+4. A cloud model that needs to search the archive goes through the shared MCP server, which is registered disabled and switched on by the user for that session.
 
 ---
 
 ## Evidence
 
+Source paths are repository-relative, in the project's own private repository (described, not linked).
+
 | Claim | How it was checked | Status |
 |---|---|---|
 | Archive is 470k files, ~12.6k documents | Counts in `scan/rules.py` comments and the AGENTS.md walker note | read from source |
-| 17 allowed extensions, directory pruning in `os.walk` | `scan/rules.py` `ALLOWED_EXTENSIONS` and `_EXCLUDED_DIRS`; walker design in `scan/walker.py` | read from source |
-| Exclusion regex catches password/credential/secret/api key/private key filenames | `scan/rules.py` `_SENSITIVE_NAME_RE` | read from source |
-| Extraction is sha256-cached, text cache on local NVMe | `extract/__init__.py` registry design; cache path in `config.py` `text_dir` | read from source |
+| 17 allowed extensions until 2026-11-06, 16 after EPUB left | `scan/rules.py` `ALLOWED_EXTENSIONS` (counted: 16) and the commit that dropped `.epub`, with `tests/test_rules.py` `test_epub_is_not_ingested` | read from source |
+| Directory pruning in `os.walk` | `scan/rules.py` `_EXCLUDED_DIRS`; walker design in `scan/walker.py` | read from source |
+| Exclusion regex catches password/credential/secret/api key/private key/recovery key filenames | `scan/rules.py` `_SENSITIVE_NAME_RE` | read from source |
+| Forget after a complete walk, bulk limit max(50, 5%), `--forget-limit`, counts only | `pipeline.py` `_forget_vanished`, `FORGET_MAX`, `FORGET_MAX_SHARE`; AGENTS.md scan note | read from source |
+| Unreadable Windows filenames: 322 renamed, 78 documents unblocked | AGENTS.md gotcha for 2026-10-14 | read from source |
+| Extraction is sha256-cached | `extract/__init__.py` registry design; cache path in `config.py` `text_dir` | read from source |
 | Scanned-PDF threshold 270 chars/page | `extract/pdf.py` and the postgres-entity-graphs lab G09 measurement recorded in TODO.md | read from source |
+| OCR: 60 pages, 50-character minimum, CPU tesseract | `config.py` `ocr_max_pages`, `ocr_min_chars`; AGENTS.md OCR note | read from source |
 | Junk gate at 10,000 chars, 0.9 tabular density | `nlp/chunk.py` `tabular_density`; threshold in `config.py` `junk_min_chars` | read from source |
 | Chunk size 6,000 chars, 400 overlap, paragraph-boundary preference | `config.py` `chunk_chars`, `chunk_overlap`; `nlp/chunk.py` `chunk_text` | read from source |
+| Cap 40 chunks per document (was 20): 1487 of 7826 unique docs over 20; ~26k extra chunks; ~179k with no cap | `config.py` `max_chunks_per_doc` comment | read from source |
 | `json_schema` response format, pydantic-derived, per-item validation | `nlp/llm.py` `_build_response_format`, `Extraction`, `_valid_items` | read from source |
 | NInfer preset returns empty extractions with any response format when reasoning_effort is none | `config.py` `llm_structured_output` comment recording the 2026-10-16 live probe | read from source |
 | Temperature 0, thinking disabled, reasoning_effort none | `nlp/llm.py` `extract_entities` body fields | read from source |
-| 2 requests in flight, one DB connection | `config.py` `llm_concurrency`; design note in AGENTS.md | read from source |
+| 8192-token reply cap; 46 documents timed out 4 times at 300 s without it | The output-token cap in `nlp/llm.py`; `docs/research/2026-10-30-production-graph-judge.md` failures section | read from source |
+| `llm_concurrency` documents in flight, one DB connection | `config.py` `llm_concurrency`; design note in AGENTS.md | read from source |
+| 1-token probe after retry exhaustion distinguishes outage from document failure | AGENTS.md architecture section on `nlp/`; test in `tests/test_graph_outage.py` | read from source |
 | Entity identity by `(type, canonical_key)` | `graph/store.py` `canonical_key` and `_entity_id` ON CONFLICT upsert | read from source |
-| Only Person-Person relations stored | `graph/store.py` `merge_extraction` type check in the relation loop | read from source |
-| Level-set UNION traversal, 65,721 ms -> 155-159 ms on degree-917 hub | `mcp/mnemo-server.py` `tool_related` hops=2 CTE; measurement from the earlier demo recorded in TODO.md and the MCP module docstring | read from source, design-note from earlier measurement |
-| 10 read-only MCP tools, connect-per-call, read-only session | `mcp/mnemo-server.py` `TOOLS` list and `db()` connect function | read from source |
-| LLM endpoint is localhost:11434 (llmc proxy) | `config.py` `llm_base_url` default | read from source |
+| Only Person-Person relations stored at 2026-10-20; every relation kept from worker v0.4.0 (2026-10-24) | `graph/store.py` `merge_extraction` type check at that date; AGENTS.md architecture `graph/` note | read from source (as of 2026-10-20) |
+| Raw output per chunk in `extractions`, `mnemo remerge` ~11 min, advisory lock, exit 2 | AGENTS.md `graph/` note; `docs/specs/2026-10-30-entity-resolution.md` baseline | read from source |
+| Level-set UNION traversal, 65,721 ms -> 155-159 ms on degree-917 hub | `mcp/mnemo-server.py` `tool_related` hops=2 CTE at the time; measurement from the earlier demo recorded in TODO.md and the MCP module docstring | read from source, design-note from earlier measurement |
+| LLM endpoint was localhost:11434 (llmc proxy) at 2026-10-20 | `config.py` `llm_base_url` default at that date | read from source (as of 2026-10-20) |
 | `scripts/mnemo` decrypts sops .env per run; bare `uv run mnemo` reads ciphertext | README.md pipeline example and AGENTS.md gotcha | read from source |
 | Drain script locked the preset with an owner tag, renewed every 5 min (2026-10-20 arrangement) | `scripts/drain.sh` lock/unlock/heartbeat pattern; the script no longer exists in the repository, replaced by `mnemo drain` | read from source (as of 2026-10-20) |
-| Out-of-date note: second bake-off round picked `gemma-4-12b-it-Q4_K_M` on servarr; drain runs 24/7 in `mnemosyne-worker`; worker v0.4.0 keeps every relation | AGENTS.md extraction-model and drain notes, TODO.md 2026-10-24 entry, `docs/research/2026-10-16-extraction-model-bakeoff.md` header and round 2 table | read from source (2026-10-31) |
-| MCP server registered with deferred exposure; connection string via `sops -d --extract` | `mcp.json` entry for `mnemo` (`"exposure": "deferred"`, `MNEMO_PG_DSN`) | read from source |
-| 1-token probe after retry exhaustion distinguishes outage from document failure | AGENTS.md architecture section on `nlp/`; test in `tests/test_graph_outage.py` | read from source |
+| Drain runs 24/7 in `mnemosyne-worker`, 6 h rescans, GGUF check, retries on `LLMOutage` | AGENTS.md drain note | read from source |
 | Throughput matrix (485/409/107 docs/hr) | `docs/research/2026-10-16-extraction-model-bakeoff.md` results table | measured |
 | Bake-off: 29 documents, stratified, seed 7, two judges from different families | `docs/research/2026-10-16-extraction-model-bakeoff.md` method section | measured |
+| Round 2: 12B at 132 docs/hr, 0.40 / 0.40 correct, 0.01 / 0.01 reversed; 156 documents reset; 0 documents graphed in the week after 10-16 | `docs/research/2026-10-16-extraction-model-bakeoff.md` "Round 2" | measured |
 | `summarizer` ran 719 documents before evaluation; picked 2026-10-04 for continuity | `docs/research/2026-10-16-extraction-model-bakeoff.md` preamble; `config.py` `llm_model` comment; the epistemics rule in `~/.pi/agent/APPEND_SYSTEM.md` | read from source |
 | 719 documents reset to `extracted` after model change | AGENTS.md extraction-model note and TODO.md v1.5 done log | read from source |
+| First drain finished 2026-10-30 with 9,546 documents graphed; whole-graph totals; production sample (n=60) grounded 0.82, correct 0.50, reversed 0.00 | `docs/research/2026-10-30-production-graph-judge.md` | measured |
+| 10,240 scanned, 9,594 graphed, 345 skipped, 301 failed; 607 conversations, 524k messages, 635 identities; four verified defects; claims that did not hold | `docs/research/2026-11-06-project-review.md` | measured / reviewed |
+| Entity resolution before/after table, pair counts, verdicts, audit and second-check counts, predicate map, incidents | `docs/research/2026-11-06-entity-resolution-run.md` | measured |
+| Baseline: ~3% merged by normalisation; 7,064 multi-type keys; 39.3k predicates, 790 used 50+ times covering 64.2% of 314k relations | `docs/specs/2026-10-30-entity-resolution.md` baseline | measured |
+| Spec amendments: accents in Python, honorific rule, exact-count vocabulary prompt, audit replaces the judge re-run | `docs/specs/2026-10-30-entity-resolution.md` amendments | read from source |
+| Incremental entity resolution: try-lock, high-water mark, unsure to review, `MNEMO_ER_INCREMENTAL` | AGENTS.md incremental entity resolution note; `docs/plans/2026-11-06-memory-phase-c.md` | read from source |
+| `api` schema: three roles, STABLE security-definer functions, pinned search_path, 1000-row cap, 5 s statement timeout, reader has no table access | `api.sql` header and role grants; AGENTS.md `api.sql` note | read from source |
+| `api` latency table and the three fixes | `docs/research/2026-11-06-api-bench.md` | measured |
+| Token: HS256, `role = api_reader`, `mnemo token`, 365-day stored tokens | `docs/specs/2026-11-06-query-layer-explorer-mcp.md` R3; AGENTS.md read-API note | read from source |
+| FTS corpus size, extension table, three-layout comparison, full backfill, ranking change | `docs/research/2026-11-06-fts-sizing.md` | measured |
+| Shared MCP server, token pass-through, 12 tools, private-content notice | `mcp_server.py` tool registrations and `PRIVATE` text; spec R14, R15 | read from source |
+| Earlier stdio server: 10 read-only tools, connect-per-call, read-only session, deferred exposure, DSN via sops | `mcp/mnemo-server.py` `TOOLS` list and `db()` connect function; `mcp.json` entry for `mnemo` (`"exposure": "deferred"`, `MNEMO_PG_DSN`) at that date | read from source (as of 2026-10-20) |
+| MCP entry registered disabled; enabled only when the user asks | AGENTS.md shared-MCP note | read from source |
+| Explorer: Astro static, six pages, CSP without `unsafe-inline` for scripts, text nodes only, mocked smoke | AGENTS.md explorer note; `web/Caddyfile`; spec R13 | read from source |
+| Exposure: LAN-only through the edge proxy, DNS-01, split-horizon record, no public record; first shipped as plain HTTP | AGENTS.md read-API note; spec decision 4 and the two commits that changed it | read from source |
+| CI: ruff + pytest on a pgvector service, skips fail, queued runs, image on `v*` tag, 11-minute hang | `.forgejo/workflows/ci.yml` comments and structure | read from source |
+| Calibre removal: 12% / 36% / 50%, 1210 forgotten, before/after table | `docs/research/2026-11-06-calibre-removal.md`; `scan/rules.py` `_EXCLUDED_TOP` | measured |
+| Phase C: embeddings, RRF, thresholds | `docs/specs/2026-11-06-memory-phase-c.md` | design only |
+| Out-of-date note (2026-10-23 and 2026-10-31): second bake-off round picked the 12B; worker v0.4.0 keeps every relation | AGENTS.md extraction-model and drain notes; bake-off header and round 2 table | read from source |
 | Chat history has no LLM pass; three sources, structured only | README.md chat section; AGENTS.md architecture `chat/` context; TODO.md memory bank section | read from source |
 
 ---
@@ -356,6 +773,8 @@ digraph {
 - [Scheduling one GPU between LLM, image and training work](/reference/llmc-single-gpu-stack/) - the llmc proxy that serves the extraction model, and what happens when another client evicts it
 - [Which model runs which agent work](/reference/agent-model-routing/) - the rule that extraction and document-content work stays on the local model
 - [Entity graphs on managed Postgres](/reference/postgres-entity-graphs/) - the earlier demo that proved the graph query patterns on Supabase before this pipeline moved them to local hardware
-- [Declarative homelab backups](/reference/declarative-homelab-backups/) - the servarr Postgres cluster (Nix `pg_dump` timer + ZFS snapshots) that this system's database runs on
+- [Declarative homelab backups](/reference/declarative-homelab-backups/) - the NAS Postgres cluster (Nix `pg_dump` timer + ZFS snapshots) that this system's database runs on
 - [Appdata tiering on ZFS](/reference/appdata-tiering-zfs/) - which tier the Postgres data directory lives on, and why
 - [The pi harness journey](/reference/pi-harness-journey/) - the coding agent that queries the graph through the MCP server
+
+[^pg-sqlfn-plan-cache]: PostgreSQL commit "Change SQL-language functions to use the plan cache" (0dca5d68), pgsql-committers. https://www.postgresql.org/message-id/E1u02Tn-002Kp0-0Q%40gemulon.postgresql.org
