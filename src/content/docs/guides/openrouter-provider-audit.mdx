@@ -1,0 +1,192 @@
+---
+title: Auditing which OpenRouter provider served your agent's requests
+description: "How to find out which upstream host OpenRouter actually routed a coding agent's calls to, what each host charged for cached input, and how to pin the model to the hosts you want - with a probe for hosts that drop replayed reasoning. Worked example: deepseek-v4-pro, where an unpinned model sent 40% of sampled calls to a 4-bit host charging 4.5x the cached-input price, and pinning cut the same calls from 1.52 to 0.64 USD."
+author: Erfi Anugrah
+category: workstations
+---
+
+An open-weight model on OpenRouter is served by many hosts at different prices and precisions, and the model id alone does not tell you which one answered. For an agent that re-sends a long context every turn, the host's cached-input price decides most of the bill. This guide samples real calls from session logs, asks OpenRouter which host served each one and what it cost, reprices the same calls at the host you would rather use, and pins the model. A last part probes whether a host feeds the model's own earlier reasoning back to it.
+
+Prerequisites: a harness that logs OpenRouter's generation id per assistant turn (pi writes it as `responseId` in its session jsonl), an OpenRouter API key, `jq` and `curl`. The worked example is the pi harness described in [Which model runs which agent work](/reference/agent-model-routing/). Everything below was measured on 2026-11-06 and 2026-11-07.
+
+## Constants preamble
+
+Per-host prices for `deepseek/deepseek-v4-pro`, USD per million tokens, from OpenRouter's endpoints API on 2026-11-07 (`/api/v1/models/deepseek/deepseek-v4-pro/endpoints`). Prices move; the StreamLake cached-input price was about 0.057 a day earlier.
+
+| Host | Precision | Input | Output | Cached input |
+|---|---|---|---|---|
+| Baidu | fp8 | 0.657 | 1.315 | 0.0545 |
+| StreamLake | fp8 | 0.659 | 1.318 | 0.0549 |
+| Relace | fp4 | 0.90 | 1.50 | 0.25 |
+| GMICloud | fp8 | 0.957 | 1.914 | 0.0798 |
+
+| Fact | Value | Source |
+|---|---|---|
+| Share of prompt tokens served from cache, 40 sampled deepseek-v4-pro calls | 93.3% | generation API, Part 2 |
+| Same, 40 sampled kimi-k3.1-pro calls | 97.9% | generation API, Part 2 |
+| What OpenRouter's default routing weighs | effective price, throughput, time to first token, rate limits, reliability, tool-call quality | [Provider routing](https://openrouter.ai/docs/features/provider-routing) |
+| Sticky routing | keeps a session on the host that holds its cache; not used when `provider.order` is set; expires after 60 minutes idle | [Prompt caching](https://openrouter.ai/docs/features/prompt-caching) |
+
+With over 90% of prompt tokens served from cache, a cached-input price 4.5x higher costs more than any difference in the input or output price.
+
+## Part 1: collect generation ids
+
+pi stores the OpenRouter generation id on each assistant message. Pull a random sample per model from recent sessions:
+
+```bash
+cd ~/.pi/agent/sessions
+for m in deepseek/deepseek-v4-pro moonshotai/kimi-k3.1-pro; do
+  rg --files -g '*.jsonl' . | xargs ls -t | head -400 \
+    | xargs rg -o --no-filename "\"model\":\"$m\".{0,700}" \
+    | rg -o '"responseId":"gen-[^"]+"' | cut -d'"' -f4 \
+    | shuf -n 40 > "/tmp/ids-$(basename "$m").txt"
+done
+```
+
+Forty calls per model is enough to see a routing split; it is not enough to estimate a monthly bill.
+
+## Part 2: ask OpenRouter who served each call
+
+`GET /api/v1/generation?id=` returns the host, the billed cost and the native token counts for one call:
+
+```bash
+while read -r id; do
+  curl -s -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+    "https://openrouter.ai/api/v1/generation?id=$id" \
+  | jq -c '{p: .data.provider_name, c: .data.total_cost,
+            np: .data.native_tokens_prompt, nc: .data.native_tokens_cached,
+            no: .data.native_tokens_completion, s: (.data.session_id != null)}'
+  sleep 0.2
+done < /tmp/ids-deepseek-v4-pro.txt > /tmp/gen-deepseek.jsonl
+```
+
+Then reprice the same tokens at another host's rates (uncached input, output, cached input; StreamLake's 2026-11-06 rates here):
+
+```bash
+jq -s 'def cost(p): ((.np-.nc)*p[0] + .no*p[1] + .nc*p[2])/1e6;
+  {billed: (map(.c)|add),
+   at_streamlake: (map(cost([0.689,1.378,0.0574]))|add),
+   hosts: (group_by(.p)|map({(.[0].p): length})|add)}' /tmp/gen-deepseek.jsonl
+```
+
+Results for the two models (Moonshot priced at 2 / 10 / 0.20):
+
+| Model | Hosts that served the 40 calls | Billed | Same calls at the reference host |
+|---|---|---|---|
+| deepseek-v4-pro | Relace 16, Novita 8, StreamLake 8, Alibaba 4, Crusoe 4 | 1.52 USD | 0.64 USD at StreamLake |
+| kimi-k3.1-pro | InferenceNet 20, Moonshot AI 8, Parasail 5, Modal 3, Together 3, Sail Research 1 | 3.34 USD | 3.48 USD at Moonshot AI |
+
+All 80 calls carried a session id, so sticky routing was active. For deepseek-v4-pro the 4-bit Relace endpoint took 16 of 40 calls even though its input price is higher than StreamLake's; the documented routing inputs include throughput and latency, and I did not find out which one tipped it. For kimi-k3.1-pro the unpinned split was 4% cheaper than pinning to Moonshot AI, and OpenRouter lists Moonshot's own endpoint as mxfp4 too, so a pin there buys a single consistent host, not higher precision.
+
+## Part 3: pin the model
+
+pi passes a `compat.openRouterRouting` object on a model override straight through as OpenRouter's `provider` field. In `~/.pi/agent/models.json`:
+
+```json
+"modelOverrides": {
+  "deepseek/deepseek-v4-pro": {
+    "compat": {
+      "openRouterRouting": {
+        "order": ["streamlake", "baidu", "gmicloud"],
+        "allow_fallbacks": true,
+        "ignore": ["relace", "venice", "digitalocean", "atlas-cloud"]
+      }
+    }
+  }
+}
+```
+
+`order` replaces default routing and sticky routing with your list, so the first host takes every call while it is up and its cache stays warm. `allow_fallbacks` lets an outage fall through to the next host instead of failing, and `ignore` keeps the unwanted hosts out of that fallback. With `ignore` alone and no `order`, default routing still picks among the hosts that remain.
+
+The host slugs are the lowercase provider names. A one-off request confirms them before you rely on the pin:
+
+```bash
+curl -s https://openrouter.ai/api/v1/chat/completions \
+  -H "Authorization: Bearer $OPENROUTER_API_KEY" -H 'content-type: application/json' \
+  -d '{"model":"deepseek/deepseek-v4-pro","max_tokens":20,
+       "messages":[{"role":"user","content":"say ok"}],
+       "provider":{"order":["streamlake"],"allow_fallbacks":false}}' \
+  | jq -c '{provider, err: .error}'
+```
+
+## Part 4: probe whether a host keeps replayed reasoning
+
+A thinking model sees its own earlier reasoning only if the client sends it back and the host's chat template keeps it. Hosts differ here. The probe below asks the model to choose a secret code in its reasoning and call a no-op tool, then replaces the code in the reasoning with a random one before replaying it. The model can only answer with the replaced code if the host fed that reasoning to it.
+
+```python
+import json, os, random, re, urllib.request
+
+URL = "https://openrouter.ai/api/v1/chat/completions"
+HDR = {"content-type": "application/json",
+       "Authorization": "Bearer " + os.environ["OPENROUTER_API_KEY"]}
+TOOLS = [{"type": "function", "function": {"name": "noop", "description": "Does nothing.",
+          "parameters": {"type": "object", "properties": {}}}}]
+ASK = ("Step 1: silently choose a random 6-digit code in your private reasoning. Do NOT write it "
+       "in your reply or tool arguments. Then call the noop tool. Step 2: after the tool result, "
+       "reply with exactly the code you chose, or UNKNOWN.")
+
+def call(body):
+    req = urllib.request.Request(URL, data=json.dumps(body).encode(), headers=HDR)
+    return json.load(urllib.request.urlopen(req, timeout=300))
+
+def probe(host, model="qwen/qwen3.8-27b"):
+    base = {"model": model, "tools": TOOLS, "max_tokens": 8000, "reasoning": {"effort": "medium"},
+            "provider": {"order": [host], "allow_fallbacks": False}}
+    msgs = [{"role": "user", "content": ASK}]
+    m1 = call({**base, "messages": msgs})["choices"][0]["message"]
+    code = str(random.randint(100000, 999999))
+    reasoning = re.sub(r"(?<!\d)\d{6}(?!\d)", code, m1.get("reasoning") or "")
+    msgs += [{"role": "assistant", "content": m1.get("content") or "",
+              "tool_calls": m1["tool_calls"], "reasoning": reasoning},
+             {"role": "tool", "tool_call_id": m1["tool_calls"][0]["id"], "content": "ok"}]
+    answer = call({**base, "messages": msgs})["choices"][0]["message"].get("content") or ""
+    return code in answer
+```
+
+A second variant puts the reasoning on an assistant turn before an earlier user message instead of inside a tool loop. Qwen's chat template drops that reasoning unless the server sets `preserve_thinking`.
+
+Results for `qwen/qwen3.8-27b`, 2026-11-07:
+
+| Host | Reasoning inside a tool loop | Reasoning from an earlier user turn |
+|---|---|---|
+| DeepInfra | kept | kept |
+| Chutes | kept | kept |
+| StreamLake | kept | kept |
+| Alibaba | kept | kept |
+| Parasail | kept | kept |
+| Novita | kept | kept |
+| PrimeIntellect | kept | dropped |
+| Near AI | kept | dropped |
+| Darkbloom | 429 on the injected-code run | not run |
+
+The first run of the tool-loop probe did not replace the code, and every host passed it; a model can recover a code it chose by recomputing it, so only the injected-code run counts. PrimeIntellect is the cheapest host for this model and serves a 131072-token window against 262144 at most others, so an unpinned session can land on the host that loses both.
+
+## Verification
+
+After pinning, start a fresh session, make two calls, and look up their generation ids as in Part 2. The deepseek-v4-pro pin on 2026-11-07 returned StreamLake for both calls, with 54,105 of 71,091 and 66,172 of 72,050 prompt tokens served from cache. A `qwen/qwen3.8-27b` pin to DeepInfra returned DeepInfra on all three calls of a session, with 68,992 of 71,957 tokens cached on the second.
+
+## Gotchas and lessons learned
+
+- A harness's own cost figure is an estimate from its price table, not the bill. On the same 80 calls pi's per-call estimate matched the billed cost for deepseek-v4-pro (1.02x) and was 19% low for kimi-k3.1-pro, whose hosts charge different rates. Reconcile against the billed total (`GET /api/v1/key` reports daily, weekly and monthly usage) before trusting a per-model split.
+- The quantisation label on a host is self-reported. Moonshot's own kimi-k3.1-pro endpoint is listed as mxfp4, so "pin the first-party host" is not the same as "pin full precision".
+- `provider.order` turns sticky routing off. That is what you want when the first host in the list is the one you chose; with a long list of near-equal hosts and no stickiness, consecutive calls could land on different hosts and miss the cache.
+- Prices are per host and they move. Re-run the endpoints query before quoting one, and date it.
+- A session id on every request (all 80 sampled calls carried one) only keeps a session on whichever host it started on. It does not choose that host.
+
+## Evidence
+
+| Claim | How it was checked | Status |
+|---|---|---|
+| Host split and billed cost per model | 40 random recent generations per model looked up one by one in the generation API, 2026-11-06 | measured |
+| Reprice at StreamLake and Moonshot AI | same token counts multiplied by endpoint prices from the endpoints API | derived |
+| Per-host prices in the preamble | endpoints API, 2026-11-07 | read from API |
+| Default routing inputs, sticky routing rules | OpenRouter documentation, fetched 2026-11-07 | documented |
+| Pin takes effect | fresh session, generation ids looked up after the change, 2026-11-07 | observed |
+| Reasoning replay per host | injected-code probe above, one run per host and variant, 2026-11-07 | measured, single run |
+| pi estimate vs billed cost | the 80 sampled calls matched to `usage.cost.total` in pi's session jsonl | measured |
+
+## Related docs
+
+- [Which model runs which agent work: model routing in a coding-agent harness](/reference/agent-model-routing/) - where these pins sit in the harness.
+- [Diagnosing a reasoning cliff in an agentic model](/guides/diagnosing-llm-reasoning-cliffs/) - the same session-log method, applied to a model that stopped reasoning.
+- [Agent context and the prompt cache](/reference/agent-context-and-prompt-cache/) - why the cached-input price dominates an agent's bill.
