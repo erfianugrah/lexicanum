@@ -1,13 +1,13 @@
 ---
 title: "slskarr: one process for Soulseek, the PIA tunnel, and the Lidarr import"
-description: "A single Go process that replaced slskd, the wg-pia-slskd WireGuard container, and soularr on the music pipeline: native Soulseek transfer state, an in-process PIA tunnel with port-forward and kill switch, why it runs as root and how downloads still land owned by Lidarr's user, and the ManualImport pipeline with its data-loss guards."
+description: "A single Go process that replaced slskd, the wg-pia-slskd WireGuard container, and soularr on the music pipeline: native Soulseek transfer state, an in-process PIA tunnel with port-forward and kill switch, non-root execution with ambient NET_ADMIN, and the ManualImport pipeline with its data-loss guards."
 author: Erfi Anugrah
 category: homelab
 ---
 
 import { Aside } from "@astrojs/starlight/components";
 
-slskarr is a single Go binary that runs the Soulseek client, its own PIA WireGuard tunnel, and the bridge that hands finished albums to Lidarr. It replaced three containers - `slskd`, the `wg-pia-slskd` tunnel container, and `soularr` - on the servarr NAS on 2026-09-30. This doc covers why the three-container design was retired, what the in-process tunnel and the root-owned download tree cost, and how the import pipeline is arranged so a failed import never loses a library file.
+slskarr is a single Go binary that runs the Soulseek client, its own PIA WireGuard tunnel, and the bridge that hands finished albums to Lidarr. It replaced three containers - `slskd`, the `wg-pia-slskd` tunnel container, and `soularr` - on the servarr NAS on 2026-09-30. This doc covers why the three-container design was retired, how the in-process tunnel runs without root, and how the import pipeline is arranged so a failed import never loses a library file. The current release is v0.2.2; the root-era incident remains below because its filesystem and import-ordering lessons still apply.
 
 <Aside type="note" title="Provenance">
   One host: the servarr NAS (NixOS, Docker Compose via composer). The three-container design ran until 2026-09-30; slskarr has been the production pipeline since, deployed by image tag. Figures below are read from the design record and from live runs between 2026-09-30 and 2026-10-02: 4032 wanted albums at first sync, 10 SQLite `database is locked` errors in the first production hour, 33 folders falsely marked imported, 385 quarantined folders requeued after the artist-id fix, and 186 tracks across 12 albums imported through `ManualImport` on 2026-10-01. slskarr is a private repository, so no source link is given; the claims are attributed to the component that produced them.
@@ -17,8 +17,8 @@ slskarr is a single Go binary that runs the Soulseek client, its own PIA WireGua
 
 - Transfers are native in-memory state. There is no REST API to poll and no in-memory mirror that can desync, which was the failure mode that let a completed download become invisible.
 - The PIA WireGuard session, the port-forward lease, and the tunnel-liveness probe all run inside slskarr. The Soulseek session starts only from the tunnel's up callback, so a failed tunnel means no Soulseek connection at all.
-- slskarr runs as root because the in-process WireGuard needs `CAP_NET_ADMIN`; run as `--user 1000:100` the effective capability set is empty and `ip link add ... type wireguard` returns `Operation not permitted`.
-- Root writes are corrected at the point of writing (`internal/config/perm.go`: directories `0775`, files `0664`, owner `SLSKARR_FILE_UID`/`SLSKARR_FILE_GID`), with a one-time marker-gated walk over trees written before the owner was configured.
+- slskarr starts through a small entrypoint, chowns `/data`, then execs as uid 1000:100 with `CAP_NET_ADMIN` in the inherited and ambient sets. The live process has exactly that capability, and the PIA tunnel and port-forward work without root.
+- Download writes use directories `0775`, files `0664`, owner `SLSKARR_FILE_UID`/`SLSKARR_FILE_GID` (`internal/config/perm.go`). The download tree was migrated to the same owner before the non-root rollout.
 - Imports go through Lidarr's `ManualImport` command with the artist id passed explicitly. The older `DownloadedAlbumsScan` command parses the artist from the folder name, so a folder named `c<id>` imports as `Unknown Artist c72`.
 - Lidarr deletes the library file it is replacing before it moves the new one in. When the move failed on a root-owned download, three library tracks were permanently deleted. Every guard in the import path exists because of that ordering.
 
@@ -32,7 +32,7 @@ slskarr is a single Go binary that runs the Soulseek client, its own PIA WireGua
 | `slskd` | `.16` | `slskarr` | The Soulseek protocol client is now in-process, not a daemon behind REST |
 | `wg-pia-slskd` | `.16` | `slskarr` | PIA session, WireGuard netlink setup, and port-forward lease are all in-process |
 
-`beets` stayed in the stack. Its fingerprinting half is duplicated by the bundled `fpcalc`, but its library-wide acoustic dedup has no replacement yet, so the container is still there.
+`beets` stayed in the stack. slskarr now has a six-hour detection-only hygiene tick with structural detectors and cached Chromaprint comparison for duplicate album groups. Destructive actions still require an operator; there is no automatic library cleanup.
 
 ```dot
 digraph {
@@ -82,10 +82,10 @@ Text fallback for the diagram:
 | A large share index | The scan runs in-process; the API stays up | The HTTP listener serves nothing until the share scan finishes[^slskd-1160] |
 | Cross-container port-forward | The lease is a goroutine and a session field | A bash sidecar PATCHes a second container; a failed PATCH is silent |
 | Quality and delay profiles | Scored natively against Lidarr's profile mirror | Not modelled unless the bridge implements it |
-| Interest in running non-root | Not possible: in-process WireGuard needs `CAP_NET_ADMIN` | Possible, if you do not mind the extra hop |
+| Interest in running non-root | Runs as uid 1000:100 with ambient `CAP_NET_ADMIN` | Possible, if you do not mind the extra hop |
 | Upgrades | One image, one migration set, one state model | Three projects, three release cadences, three state models |
 
-The tradeoff is one-directional: consolidation gives a single state model and removes the privilege separation the three-container design had. The ownership section below is what replaces that separation.
+Consolidation gives a single state model. The current image keeps privilege to one ambient capability rather than a root process; the ownership rules below keep the shared tree usable by Lidarr.
 
 ---
 
@@ -128,17 +128,19 @@ The keypair lifecycle is the reason the tunnel cannot be left to idle. WireGuard
 
 ---
 
-## Running as root, and keeping the library owned by Lidarr
+## Running non-root, and keeping the library owned by Lidarr
 
-### Why root
+### Ambient NET_ADMIN
 
-`CAP_NET_ADMIN` covers interface configuration, routing tables, and firewall administration,[^cap-net-admin] which is exactly what creating and configuring `wg0` needs. Docker's `--user 1000:100` leaves a process with an empty effective capability set, so the netlink call to create the WireGuard interface fails with `Operation not permitted`. The capability is added to the container (`cap_add: [NET_ADMIN]`), and the process runs as root so it is in the effective set.
+`CAP_NET_ADMIN` covers interface configuration, routing tables, and firewall administration,[^cap-net-admin] which is exactly what creating and configuring `wg0` needs. The container still starts with that capability. `docker/entrypoint.sh` chowns `/data`, then uses `setpriv` to enter uid 1000:100 with the capability in the inherited and ambient sets. It does not retain root. Live checks show uid/gid 1000:100, exactly `0x1000` in `CapInh`, `CapPrm`, `CapEff`, and `CapAmb`, plus a working WireGuard interface and PIA port-forward lease.
+
+The original root design failed because Docker's `--user 1000:100` leaves an empty effective capability set. The ambient set is what lets the non-root process, and the `ip`/`wg` children it execs, retain the capability.
 
 Two sysctls come with that: `net.ipv4.conf.all.rp_filter=2` and `net.ipv4.conf.all.src_valid_mark=1`. The second is what makes the fwmark-based policy routing survive strict reverse-path filtering, and omitting it drops inbound packets on the tunnel.[^pia-wg]
 
-### Why that is not the end of it
+### Why ownership still matters
 
-Root writes root-owned files. Lidarr's containers run with `PUID=1000 PGID=100 UMASK=0002`, so Lidarr could read what slskarr wrote and could not move it. Its import then failed with `UnauthorizedAccessException` - after it had already deleted the library file it was replacing. That is the whole reason the ownership rules exist.
+The earlier root process wrote root-owned files. Lidarr's containers run with `PUID=1000 PGID=100 UMASK=0002`, so Lidarr could read what slskarr wrote and could not move it. Its import then failed with `UnauthorizedAccessException` - after it had already deleted the library file it was replacing. That is the whole reason the ownership rules exist.
 
 `internal/config/perm.go` applies one policy at every write into the download tree:
 
@@ -242,7 +244,7 @@ One tick converges the whole pipeline, on a 60 second cadence:
 
 Every step is gated on durable rows rather than memory, so a tick that dies mid-way leaves a consistent state and the next tick resumes. Re-running on unchanged state performs no actions. Each action carries the tick's request id, and transfer events also stream over a WebSocket for the UI.
 
-Two caps bound the loop. The import trigger cap is 10 per tick because the Lidarr command queue is serial - a large backlog fired at once would stall the resolves owed to earlier triggers behind it, so the rest of the backlog keeps its pending row and waits for the next tick. A re-search after a successful enqueue backs off from 6 hours, doubling per attempt up to a 7 day cap. The 6 hour hygiene tick (filesystem scan, detectors, queued actions) is designed but not built; the fast tick is the whole loop today.
+Two caps bound the loop. The import trigger cap is 10 per tick because the Lidarr command queue is serial - a large backlog fired at once would stall the resolves owed to earlier triggers behind it, so the rest of the backlog keeps its pending row and waits for the next tick. A re-search after a successful enqueue backs off from 6 hours, doubling per attempt up to a 7 day cap. The 6 hour hygiene tick now runs the filesystem scan and detectors in dry-run mode. A durable inventory snapshot suppresses unchanged orphan, missing, and safety events across restarts; stages slower than 30 seconds are logged with their duration. New UI surfaces cover release detail, delay-policy editing, filtered audit pages, and the shadow MusicBrainz catalogue. Direct placement is implemented behind `SLSKARR_DIRECT_IMPORT=false`; ManualImport remains the live import path and `/music` stays read-only.
 
 ---
 
