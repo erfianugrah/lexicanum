@@ -1,6 +1,6 @@
 ---
 title: "Postgres full-text search: ranking only what the rare words match"
-description: "Why an OR-joined websearch query makes Postgres ts_rank score every match, what that costs on a 1.65M-row message table with 5.3 GB of TOAST, two fixes that did not work (more parallel workers, a recency cap), and the one that did: let the OR operands with a lexeme outside pg_stats.most_common_elems pick the candidates. Measured on a live store with 25 real queries."
+description: "Why an OR-joined websearch query makes Postgres ts_rank score every match, what that costs on a 1.65M-row message table with 5.3 GB of TOAST, two fixes that did not work (more parallel workers, a recency cap on all matches), and the one that did: let the OR operands with a lexeme outside pg_stats.most_common_elems pick the candidates. A follow-up two days later found TOAST reads for ranking were 80% of the remaining pages, capped the rank pool after the rare-word filter, and resized shared_buffers. Measured on a live store with 25 real queries."
 author: Erfi Anugrah
 category: supabase
 group: architecture
@@ -25,7 +25,9 @@ that a local SQLite FTS5 index ranks first also appear in the Postgres top 10
 (101 such sessions over 24 queries; one query had none). The measurement
 scripts and output live in the private memledger repository
 (`docs/research/lab/2026-11-05-search-rank/`), so the tables below are pasted
-from that output, not linked.
+from that output, not linked. The
+[follow-up of 2026-11-07](#follow-up-toast-reads-and-the-buffer-pool) has its
+own lab (`docs/research/lab/2026-11-07-search-cold-cache/`).
 
 ## TL;DR
 
@@ -48,6 +50,13 @@ from that output, not linked.
 - Two cheaper ideas failed: four parallel workers did not make the old query
   faster (5937 ms against 5407 ms with two), and ranking only the newest 2000
   matches was fast but found 31 of 101.
+- Follow-up, 2026-11-07: an `OFFSET 0` fence added with the fix had become
+  pure overhead and was removed (lab p90 1192 -> 759 ms). The remaining cost
+  was TOAST: for a 23,467-match query, `ts_rank` added about 98,000 TOAST page
+  reads to 26,337 heap blocks. Ranking only the newest 8000 matches of the
+  rare operands kept recall (38 of 101, unchanged; 4000 gave 33) and cut p90
+  from 873 to 346 ms. `shared_buffers` went from 512 MB to 1536 MB after
+  pg-analyser showed a 23.17% cache hit ratio.
 
 ## Where the time goes
 
@@ -98,7 +107,7 @@ so every common word in a query adds tens of thousands of matches.
 |---|---|---|
 | More parallel workers (`max_parallel_workers_per_gather` 2 -> 4) | 5407 ms -> 5937 ms on the broad query, same run | The per-row work splits across workers, but every worker still reads its share of 5.3 GB of TOAST; on this host the extra workers bought nothing |
 | Rank only the newest 2000 matches per source | p90 725 ms, but 31 of 101 reference sessions (39 before) | A date cut keeps whatever is recent, so a rare-word hit in an older session falls outside it |
-| Filter source after the GIN scan instead of the BitmapAnd | Kept in the final version (an `OFFSET 0` fence) | It saves the btree scan, but on its own the row count to rank stays 183,494 |
+| Filter source after the GIN scan instead of the BitmapAnd | Kept in the first version (an `OFFSET 0` fence), removed two days later | It saved the btree scan then; on Postgres 18 the planner stopped building the BitmapAnd, and the fence only forced every candidate row to be materialised (see the follow-up) |
 
 The recency cap is the instructive failure. It is the obvious fix and its
 latency was fine, but it lost results on exactly the OR lists that mix one
@@ -221,6 +230,66 @@ same: the two engines rank differently (FTS5 uses BM25 with IDF, Postgres
 rows deep together with a plain-text scan of the files found 95 of the 101.
 The metric here only checks that the change lost nothing, and it did not.
 
+## Follow-up: TOAST reads and the buffer pool
+
+Two days later the same queries were slow again during a review: 7 to 15
+seconds on a first run, 2 to 8 seconds on a second. Three findings, all
+measured read-only on the live store (1.70 million rows by then, heap 2787 MB,
+TOAST 5856 MB):
+
+1. The fence had turned into overhead. `EXPLAIN ANALYZE` showed no BitmapAnd
+   any more, even with a parameterised statement: the planner applied the
+   source filter inside the bitmap heap scan. The `OFFSET 0` subquery now only
+   forced a materialisation of every candidate before the top-N sort.
+   Removing it moved the lab p90 from 1192 ms to 759 ms and the maximum from
+   1519 ms to 901 ms.
+2. The 7-15 s first runs coincided with a large backfill writing to the
+   same database. On a quiet store, six broad queries never run before took
+   0.31 to 2.60 s. What remained was page reads, and most of them were TOAST:
+
+   | Same 23,467-match query | Buffers | Execution time |
+   |---|---|---|
+   | Heap only (`max(ts)` over the matches) | 26,399 | 269.716 ms |
+   | With `ts_rank` (detoasts every matched `tsvector`) | 124,706 | 797.460 ms |
+
+   A slimmer side table with only keys and the `tsvector` would not help: the
+   heap scan is the cheap part, and the `tsvector` is what lives in TOAST
+   (1633 bytes on average, 19,941 at the 99th percentile in a 2% sample).
+3. The buffer pool was too small for this workload. pg-analyser in no-PAT
+   mode reported a 23.17% cache hit ratio, a 22.7% heap hit ratio on
+   `messages`, and client backends that had evicted 1,335,908,345 buffers and
+   written 22,938,725 dirty ones themselves since the statistics reset. With
+   `shared_buffers` at 512 MB (65,536 buffers), one broad search touching
+   about 125,000 buffers cycled the whole pool, and a read query paid for
+   writes.
+
+The fix ranks fewer rows after the rare-word filter: collect only keys and
+timestamps for the selective matches (heap pages, no TOAST), keep the newest
+8000, join them back by primary key and rank those. This is a recency cap,
+which failed in the first round, but it is applied to a different set: the
+first attempt kept the newest 2000 of all matches, common words included, so
+older rare-word hits fell out; this one keeps the newest 8000 of the rare
+operands' matches only.
+
+| Variant, 25 real queries + 4 broad ones | Reference sessions | p50 | p90 | Max |
+|---|---|---|---|---|
+| live (fence removed) | 38 / 101 | 73 ms | 873 ms | 1212 ms |
+| rank pool 8000 | 38 / 101 | 166 ms | 346 ms | 814 ms |
+| rank pool 4000 | 33 / 101 | 207 ms | 410 ms | 474 ms |
+
+Each query ran the variants in the order 4000, 8000, live, so the live
+function got the warmest cache. The 8000 pool returned the same top-10 rows as
+live on 24 of the 25 real queries; only queries with more than 8000 selective
+matches rank differently, within the newest 8000. The rare-word queries got
+slower at the median (the CTE and the join cost a little when there is
+nothing to cap), the tail got faster.
+
+`shared_buffers` went to 1536 MB and `effective_cache_size` to 8 GB (the
+host's ZFS ARC can hold 16 GiB, the container limit is 4 GB, and the
+container's memory peak was 1.8 GB). Right after the restart, with an empty
+buffer pool, six broad queries took 0.22 to 1.92 s on their first run and
+about 0.22 s on the second.
+
 ## Testing it
 
 A small test database defeats the check. With only a few thousand rows and
@@ -237,6 +306,7 @@ row repeating the common word 50 times, and asserts the statistics first:
 | `commonword` alone | three rows, all from the newest 2000 |
 | An AND query no row satisfies | no rows |
 | `src=claude` and an empty query | no rows |
+| 8001 weak recent matches and one strong old match, an AND query | the old row is not returned (it is outside the newest 8000); a small match set still ranks the strong row first |
 
 Before migration 037 the second check failed: the row repeating the common
 word 50 times outranked the single rare-word row, which is `ts_rank` without
@@ -272,6 +342,11 @@ digraph {
 3. An AND or phrase query that still matches that many rows has no rare
    operand to lean on: rank everything, or order newest first above a
    match-count threshold.
+4. Still slow after that: compare `EXPLAIN (ANALYZE, BUFFERS)` with and
+   without `ts_rank`. If ranking adds several times the heap pages, the
+   `tsvector`s live in TOAST: cap the rank pool after the selective filter
+   (collect keys and timestamps first), and size `shared_buffers` so one
+   query does not cycle the pool.
 
 ## Evidence
 
@@ -287,6 +362,12 @@ digraph {
 | Test fails before 037, passes after | memledger end-to-end test `TestSearchMessagesSelective`, run on both trees |
 | Postgres ranking uses no global statistics and consults every match | Postgres documentation, cited inline |
 | Hindsight: same statistic, drops common tokens, first-N fallback, 60-second hang | Hindsight source, read 2026-11-05 at the cited commit; not run here |
+| Fence overhead and its removal (p90 1192 -> 759 ms) | `EXPLAIN (ANALYZE, BUFFERS)` with and without the fence, lab set rerun on production, 2026-11-07 |
+| TOAST share: 26,399 vs 124,706 buffers, 269.716 vs 797.460 ms | `EXPLAIN (ANALYZE, BUFFERS)` of the same query with and without `ts_rank`, live store, 2026-11-07 |
+| Cache hit 23.17%, 22,938,725 backend writes | pg-analyser 0.12.0, no-PAT superuser mode, 2026-11-07 |
+| Rank pool table (38 / 38 / 33 of 101) | One run, temp function for the capped variants, 2026-11-07 |
+| Pool cap applied, small sets unchanged | memledger end-to-end test `TestSearchMessagesRankPool`, fails without migration 048 |
+| First runs 0.22-1.92 s after the restart | `curl` against the live RPC, new queries, 2026-11-07 |
 
 Measured on one host and one corpus. The 2000-row recency window is this
 table's choice and the 1000-lexeme list is this column's statistics; another
