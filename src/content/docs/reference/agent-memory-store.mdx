@@ -300,6 +300,18 @@ embedding IS NULL ORDER BY ts DESC LIMIT n` has no index that matches it, and
 to what is left rather than to the table, and empties itself when the queue
 does.
 
+It was left unbuilt because the queue drained, and that turned out to be the
+expensive call. A new backlog of 143,000 rows appeared later, and because
+`FOR UPDATE SKIP LOCKED` blocks the top-N sort, every poll sorted all pending
+rows with an external merge on disk: 8.1 TB of temporary files on the host's
+NVMe in 46 days, on a drive rated for 600 TBW. The index was built then
+(memledger migration 038), with a predicate copied literally from the worker's
+query so the planner can use it. The hourly snapshot refreshes had the same
+disk problem at a smaller scale: at the default 16 MB `work_mem` each run spilled
+about 1.5 GB of sorts, fixed by `SET work_mem = '256MB'` on the refresh
+functions only (migration 039). A `CREATE OR REPLACE FUNCTION` resets such a
+per-function setting, so every later redefinition has to repeat it.
+
 ## The silent worker
 
 The backfill worker was started from a framework startup hook. When an MCP
@@ -369,6 +381,28 @@ is long, the idle spells are not.
 `transaction_timeout` would catch it and is the wrong instrument at server
 scope: `pg_dump` holds a long transaction by design, so the nightly backup
 becomes the casualty. The fix belongs in the worker loop.
+
+## Snapshots inside a 60-second budget
+
+Every PostgREST call runs with a 60-second `statement_timeout`, and the hourly
+maintenance sweep refreshes the derived snapshots (usage per call, card
+references, task classes, session signals) through PostgREST. A refresh that
+crosses 60 seconds is cancelled and rolls back, so a snapshot that grows with
+history fails silently one day and stays stale from then on. By 2026-11-07
+three of them were at a third to two thirds of the budget:
+
+| Snapshot | Before | Change | After (first live run) |
+|---|---|---|---|
+| usage facts + card references | 33 s in one call | one call per snapshot (migration 043) | 15.0 s and 9.7 s |
+| task classes, 60 days | about 32 s; the query body alone 27.5 s, spilling 301 MB | plain table, recompute only the last computed day through today, drop days past 60 (046) | 2.8 s |
+| session signals, 90 days | about 21 s warm, 39.5 s cold | plain table, recompute only sessions whose `updated_at` moved, 50 per call, the sweep loops (047) | 0.05 s with nothing changed |
+
+The incremental versions rest on one property each. A task class is fixed once
+its turn closes (the next user message), so only the last day or two can still
+change; a session's signal rows depend only on that session, so an unchanged
+session needs no work. Both conversions were checked against the old
+materialised views before shipping: the parameterised body over 13 complete
+days, and over 50 sessions, gave zero differing rows.
 
 ## Access model
 
@@ -524,7 +558,9 @@ The same decision as a list:
 | Index path loses no recall under a broad filter | Its top-10 diffed against the exact top-10 at `ef_search` 40 and 100; search endpoint output diffed before and after the change | Measured |
 | HNSW index earns its 1,041 MB | Top-10 timed with the index and with index scans disabled, cold and warm | Measured |
 | `ef_search` caps rows below `LIMIT` | `LIMIT 50` returned 40 rows at `ef_search` 40 and 50 rows at 100 | Measured |
-| Partial index fixes the drain-time select | Reasoned from the query plan shape; not built, because the queue drained first | Design only |
+| Partial index fixes the drain-time select | Reasoned from the query plan shape at first; built after 8.1 TB of temporary files from the unindexed poll (migration 038) | Measured |
+| Snapshot refresh times before and after | Hourly sweep log and timed RPC calls on the live store, read-only `EXPLAIN (ANALYZE, BUFFERS)` of the old bodies, 2026-11-07 | Measured |
+| Incremental snapshots equal the old views | Parameterised body vs the live materialised view: 13 complete days (task classes), 50 sessions (signals), zero differing rows | Measured |
 | Half-precision index is 597 MB against 1,043 MB | Built both, compared `pg_relation_size`; database went 4,415 MB -> 3,946 MB after dropping the full-precision one | Measured |
 | Recall 183/200 full, 185/200 half | 20 query vectors pinned by primary key, top-10 diffed against exact search (`enable_indexscan = off`) | Measured |
 | Earlier "identical to exact" recall claim | Withdrawn - the query vector was drawn with `OFFSET` and no `ORDER BY`, so each run sampled a different row | Corrected |
