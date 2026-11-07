@@ -75,7 +75,7 @@ export const TAXONOMY = [
   {
     id: "hardware",
     label: "Hardware design",
-    blurb: "Designing, ordering and bringing up open hardware: the auspex Hall-effect keyboard series.",
+    blurb: "Designing, ordering and bringing up open hardware: the GRIDDLE LX Hall-effect keyboard series.",
   },
   {
     id: "workstations",
