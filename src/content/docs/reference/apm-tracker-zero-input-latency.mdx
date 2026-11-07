@@ -1,0 +1,182 @@
+---
+title: "apm: counting APM without touching input latency"
+description: How a gaming APM/eAPM tracker can count every key and click without adding latency or CPU load to the game - why low-level hooks and background raw-input mouse listeners are out on Windows 10, what a 125 Hz button poll gated on the game's focus costs instead, and the measurements on an 8 kHz mouse that show the old Python tracker halving another app's mouse report rate while the Rust rewrite leaves it alone.
+author: Erfi Anugrah
+category: workstations
+---
+
+apm is my APM (actions per minute) and eAPM (effective APM) counter for RTS games: a Rust rewrite of an older Python/Tk tracker called apmpy. The one requirement is that it must not affect the game: no added input latency, no CPU time taken while the game runs, no wakeups at all when nothing is happening. This page explains how the capture is built to meet that, and what was measured on the gaming PC to check it. The code is in a private repo, so this page carries the design and the numbers rather than links into it.
+
+Measured on 2026-11-07 on one Windows 10 22H2 machine (Ryzen 7 7800X3D, the rig in [Fixing merged reports from an 8 kHz mouse on Windows](/guides/8khz-mouse-merged-reports-windows/)) with an Endgame Gear OP1 8k v2 at 8000 and 2000 Hz. Every idle number below comes from a window in which a raw-input probe saw no input at all. Each movement condition was one 8 s run with hand-moved mouse, so only large differences count.
+
+**TL;DR:**
+
+- Global low-level hooks (`WH_MOUSE_LL`, which Python's pynput uses) sit in the input path: Windows calls the hook before any app gets the event[^ms-llmouse]. The Python tracker cut a second raw-input reader's report rate from 5078 Hz to 2872 Hz at 8 kHz and doubled its median report gap.
+- A background raw-input mouse listener does not slow other readers, but on Windows 10 it receives every report[^boosterx-raw]. The Rust tracker in that mode used 5-8 % of a core while the mouse moved.
+- The default now registers no mouse listener at all. Clicks come from sampling button state at 125 Hz, and only while the target game has focus. With the game focused that is 8,394 wakeups a minute on one thread with CPU time too small to measure over 20 s; otherwise 0.
+- Everything else blocks in the OS with no timeout: 0 wakeups a minute on every thread when idle, against 536 for the Python tracker.
+- The process and its capture thread run below normal priority, so the game always wins the CPU.
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  os [label="Windows input\n(keyboard raw input,\nbutton state)"];
+  cap [label="capture thread\nbelow normal\nGetMessageW / timer"];
+  ring [label="SPSC ring\n(wait-free)"];
+  eng [label="consumer thread\nengine: 60 s windows,\neAPM rules, peaks"];
+  hub [label="latest snapshot\n(condvar)"];
+  http [label="loopback HTTP\nSSE, <= 4 pushes/s"];
+  ui [label="dashboard / OBS source /\nnative overlay"];
+  log [label="session log\n(writer thread)"];
+  os -> cap [label="press edges"];
+  cap -> ring;
+  ring -> eng;
+  eng -> hub;
+  eng -> log [label="batched"];
+  hub -> http -> ui;
+}
+```
+
+1. The capture thread turns OS input into press events (no releases, no key auto-repeat, no mouse movement) and timestamps them.
+2. It pushes into a wait-free single-producer ring; it never waits for the rest of the program.
+3. One consumer thread owns the engine and wakes only for a new action or the next moment a 60 s window can change.
+4. The UI gets the latest snapshot over Server-Sent Events from a loopback-only HTTP server, at most 4 times a second, and only when a number changed.
+5. A writer thread appends each session to disk in batches; the consumer never touches the disk.
+
+The daemon links no GUI toolkit. The dashboard renders in a browser tab, the stream overlay as an OBS browser source, so drawing happens in another process.
+
+## Which capture method costs what
+
+| Method | In the input path | Wakes on mouse movement | Measured cost | Used |
+|---|---|---|---|---|
+| Low-level hooks (`WH_KEYBOARD_LL`, `WH_MOUSE_LL`) | yes, every event waits for the hook | yes | second reader 5078 -> 2872 Hz at 8 kHz | no (the Python tracker did) |
+| Raw input, background mouse listener (`RIDEV_INPUTSINK`) | no | yes, every report on Windows 10 | 5-8 % of a core while moving | opt-in only (`--mouse raw`) |
+| Raw input, keyboard only | no | no | 0 wakeups when idle | yes, for keys |
+| Button-state poll, 125 Hz, while the game is focused | no | no | 8,394 wakeups/min while focused, 0 otherwise | yes, for clicks |
+
+### Why hooks are out
+
+A `WH_MOUSE_LL` hook runs before the system passes the event on, and Microsoft documents that a hook which takes longer than `LowLevelHooksTimeout` is "silently removed without being called" on Windows 7 and later[^ms-llmouse]. pynput installs these hooks on Windows and its mouse handler is Python code[^pynput], so every mouse report, movement included, enters the Python interpreter and returns before any other app sees it. At 8 kHz that showed up in another app's input:
+
+| 8000 Hz, one 8 s run each | Second reader report rate | Median gap | Gaps over 0.4 ms per minute |
+|---|---|---|---|
+| no tracker | 5078 Hz | 0.148 ms | 14,084 |
+| Python tracker (hooks) | 2872 Hz | 0.291 ms | 34,066 |
+| Rust, raw mouse listener | 5684 Hz | 0.149 ms | 5,437 |
+| Rust, 250 Hz button poll | 6602 Hz | 0.131 ms | 4,110 |
+
+The second reader was `latctl capture`, a raw-input recorder standing in for the game. The no-tracker run already lost 10.85 % of report slots and hand speed was not controlled, so the Rust rows read as "no worse than baseline" rather than "better". At 2000 Hz none of the three trackers changed the second reader's rate (2000 Hz, median 0.499-0.500 ms in every row).
+
+### Why the raw mouse listener is opt-in
+
+Raw input is a copy of the event, so it does not delay anyone else. The cost is to the tracker's own process: Windows 10 delivers every report to a background listener[^boosterx-raw]. Measured over 8 s of movement:
+
+| Rate | Tracker | Wakeups per minute | CPU time over 8 s |
+|---|---|---|---|
+| 8000 Hz | Python (hooks) | 636,382 | 1188 ms |
+| 8000 Hz | Rust raw listener | 1,010,018 | 672 ms |
+| 8000 Hz | Rust 250 Hz poll | 45,352 | 16 ms |
+| 2000 Hz | Python (hooks) | 251,752 | 484 ms |
+| 2000 Hz | Rust raw listener | 666,165 | 422 ms |
+| 2000 Hz | Rust 250 Hz poll | 36,202 | 16 ms |
+
+The poll's cost is set by its timer, so it does not grow with the mouse's polling rate. These runs used a 250 Hz poll; the default is now 125 Hz. A raw-listener rewrite after these runs has not been re-measured.
+
+### How the poll stays off the desktop
+
+Clicks are counted by reading the button state (`GetAsyncKeyState` for left, right, middle and the two side buttons) on a waitable timer and recording press edges. The timer runs only while the target program, set by its exe name, owns the foreground window. A WinEvent hook for foreground changes (out of context, so it is not in the input path) arms and disarms it. Without a target the mouse is not captured at all and the dashboard says that clicks are not counted.
+
+The ceiling: a click shorter than one 8 ms period can be missed. A human click is held far longer than that, and the poll can be raised to 1000 Hz if needed, but the default stays at 125 Hz.
+
+`SetWaitableTimer` takes the first due time in 100-nanosecond intervals and the period in milliseconds, and fails on a negative period[^ms-setwaitabletimer]. An early version passed the 100 ns due time as the period, so the poll fired once and never again; the Windows integration tests now cover it.
+
+## Zero wakeups when idle
+
+Every thread blocks in an OS call with no timeout: `GetMessageW` on the capture thread, `park` on the consumer, a condvar for each SSE connection, `accept` for the HTTP listener, a channel receive on the log writer. The consumer computes the next instant a 60 s window can drop a value and sleeps exactly until then, so once the window has drained it sleeps until the next keypress.
+
+| Hands off, no input in the window | Wakeups per minute |
+|---|---|
+| Python tracker as released | 536 |
+| Python tracker after fixes | 302 |
+| Rust, default, no target | 0 |
+| Rust, target set but not focused | 0 |
+| Rust, target focused (poll running) | 8,394, all on the capture thread |
+
+The first idle run read 23,000-31,000 wakeups a minute for all three trackers. Input had happened during it. Every idle number since was taken with a raw-input probe registered for keyboard, mouse and pointer in the same window, and only windows where the probe saw nothing count.
+
+## Yielding to the game
+
+- `SetPriorityClass(BELOW_NORMAL_PRIORITY_CLASS)` at start; the capture thread is `THREAD_PRIORITY_BELOW_NORMAL`. A late poll sample still catches a click that lasts longer than the delay.
+- No global timer-resolution change (no `timeBeginPeriod`).
+- UI pushes are throttled to 4 a second, and the dashboard tells the user to close the tab while playing: a visible browser tab repaints on every push.
+- The native overlay is a separate process, a click-through layered window that repaints only when a number changes. It stays the second choice until a PresentMon comparison with a game open shows the game's present mode unchanged with the overlay visible. Until then the recommended display is the OBS browser source.
+
+## What eAPM means here
+
+The old tracker's eAPM model is kept exactly: a 50 ms gap between effective actions, 200 ms before a recognised hotkey sequence counts, and weights per category. The Rust engine is held to the Python one by a fixture of 5,522 recorded events: every verdict and every snapshot must match.
+
+A second model, `spam-filter-v2`, comes from the replay-analyser definitions. Those need game state (selected units, command types) that a tracker reading only keys and clicks does not have, so what remains is timing: a 50 ms global gap, a 200 ms cooldown per key or button, and one exception, a double tap on a control-group key, which Sc2gears counts as effective because it centres the group[^sc2gears-apm]. Changing the model starts a new session, so one session's numbers come from one model.
+
+## Bugs the measurements found
+
+| Bug | How it showed up | Fix |
+|---|---|---|
+| Keyboard eAPM was always 0 in the Python tracker | the hook passed no key to the rules | pass the normalised key |
+| Python tracker peaks missed bursts | peaks were sampled by the GUI every 2.5 s | exact peaks on insertion |
+| Raw-input drain lost every report | injected `q 1 w Ctrl+2 click` reached the engine as nothing | read the report that raised `WM_INPUT` with `GetRawInputData` before draining `GetRawInputBuffer`; the buffer holds only further queued reports |
+| Poll mode never stopped | stop re-posted `WM_QUIT` inside the poll loop | return on `WM_QUIT` |
+| A settings request failed about 1 time in 4 | the server closed the socket with request bytes unread, the kernel sent a reset | shut down the write side, drain the request, then close |
+
+The injection test (`SendInput` into the test's own window, with the cursor restored afterwards) is skipped by default and run by hand, because it types into the live desktop.
+
+## Evidence
+
+| Claim | How it was checked | Status |
+|---|---|---|
+| Hooks slow another reader at 8 kHz | `latctl capture` alongside each tracker, 8 s per condition | measured, one run each |
+| Raw listener costs 5-8 % of a core while moving | process CPU time and per-thread context switches over 8 s | measured before the raw-path rewrite |
+| 0 wakeups idle | per-thread context-switch counters over 20-30 s, raw-input probe empty | measured |
+| 8,394 wakeups/min while the target is focused | same, with the foreground app as target, probe empty | measured |
+| Default capture registers no mouse listener | Windows integration test reads the thread's raw-input registrations | tested |
+| Injected sequence reaches the engine in order | `SendInput` test, 6 events | measured |
+| Overlay leaves the game's present mode alone | PresentMon A/B script | not run yet |
+| Linux capture (evdev, movement masked out in the kernel) | unit tests; device tests need a real Linux box | design only |
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  q1 [label="Counting clicks for one game?"];
+  q2 [label="Need clicks shorter than 8 ms\nor clicks outside the game?"];
+  poll [label="--target game.exe\n(125 Hz poll while focused)"];
+  raw [label="--mouse raw\n(5-8 % of a core while moving)"];
+  keys [label="no target: keys only,\nclicks not counted"];
+  q1 -> q2 [label="yes"];
+  q1 -> keys [label="no"];
+  q2 -> poll [label="no"];
+  q2 -> raw [label="yes"];
+}
+```
+
+1. Counting one game's clicks: set the target. The poll runs only while that game has focus.
+2. Clicks shorter than 8 ms, or clicks in every app: `--mouse raw`, and accept the per-report cost.
+3. No target: keys are counted, clicks are not, and nothing listens to the mouse.
+
+## Related docs
+
+The interrupt and DPC tuning that keeps the same 8 kHz mouse's reports on time is in [Fixing merged reports from an 8 kHz mouse on Windows](/guides/8khz-mouse-merged-reports-windows/). The subagent and worktree setup that built most of the Rust code is in [Subagents, worktrees, and parallel agent work](/reference/agent-subagents-and-worktrees/).
+
+[^ms-llmouse]: Microsoft, "LowLevelMouseProc callback function," Microsoft Learn. https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelmouseproc
+[^boosterx-raw]: BoosterX, "Background Raw Input listeners in Windows 10 and Windows 11," BoosterX Wiki. https://wiki.boosterx.org/en/windows-research/input/background-raw-input-throttling/
+[^pynput]: Moses Palmer, "pynput," PyPI. https://pypi.org/project/pynput/
+[^ms-setwaitabletimer]: Microsoft, "SetWaitableTimer function (synchapi.h)," Microsoft Learn. https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-setwaitabletimer
+[^sc2gears-apm]: Sc2gears, "APM types," Sc2gears site. https://sites.google.com/site/sc2gears/features/replay-analyzer/apm-types
