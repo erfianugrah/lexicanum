@@ -14,7 +14,7 @@ ZFS manages its own mountpoints. So does systemd. On NixOS both are active at on
 This reference covers the three sanctioned patterns, what each does at boot and during a reconfiguration, and the pool and dataset design underneath. [Migrating a NAS without losing a byte](/guides/nas-bulk-data-migration/) covers how the data got onto this pool, and [Three NixOS hosts, one deploy interface](/reference/nixos-fleet/) how the configuration reaches the machine.
 
 <Aside type="note" title="Provenance">
-  One host: a 7-wide raidz2 HDD pool plus two NVMe pools, 64GB RAM, NixOS 26.05, OpenZFS 2.4.3, migrated off Unraid in August 2026. Every number and unit name below was read off that machine on 2026-09-02 unless marked otherwise, and the failure modes are ones it hit - each is dated. Behaviour attributed to OpenZFS or nixpkgs is cited to the man page or the module source; behaviour seen only on this host is labelled measured. The [evidence table](#evidence) splits the two.
+  One host: a 7-wide raidz2 HDD pool plus two NVMe pools, 64GB RAM, NixOS 26.05, OpenZFS 2.4.3, migrated off Unraid in August 2026. Every number and unit name below was read off that machine on 2026-09-02 unless marked otherwise, and the failure modes are ones it hit - each is dated. The [import-restart section](#the-import-restart-trap) was read on 2026-11-08, after a nixpkgs bump to OpenZFS 2.4.4. Behaviour attributed to OpenZFS or nixpkgs is cited to the man page or the module source; behaviour seen only on this host is labelled measured. The [evidence table](#evidence) splits the two.
 </Aside>
 
 **TL;DR:**
@@ -22,6 +22,7 @@ This reference covers the three sanctioned patterns, what each does at boot and 
 - A `fileSystems` entry is not only a mount declaration. nixpkgs derives the set of pools to import from those entries, so a pool with no entry and no `boot.zfs.extraPools` is never imported at boot.
 - On a non-legacy dataset the mount unit needs `options = [ "zfsutil" ]`. Without it the unit silently adopts the mount ZFS already made at boot, and works - until something restarts it.
 - `nixos-rebuild switch` can trigger a systemd reexec, which restarts every loaded mount unit: unmount, then remount. The remount runs `mount(2)`, which the ZFS kernel handler refuses for a non-legacy dataset. Three datasets went down for ten minutes this way on 2026-09-02.
+- A nixpkgs bump that changes the generated `zfs-import-<pool>.service` makes `switch` stop it, and every mount of that pool depends on it. On 2026-11-08 that left every container on the host looking at empty directories in the pool root dataset until a reboot. `restartIfChanged = false` on the import and mount services defers such changes to the next boot.
 - Snapshotting the dataset you declared is not the same as snapshotting the one the data is on. This host snapshotted two empty datasets for two weeks while 35GB of live databases sat on the pool root with no coverage.
 - NVMe pools created without an explicit `ashift` can land on `ashift=9`. Both of this host's NVMe pools did. It is fixed only by recreating the pool.
 
@@ -181,6 +182,63 @@ In either pattern, if the dataset is busy, with a container holding a file open 
 
 ---
 
+## The import-restart trap
+
+<Aside type="caution" title="Measured, 2026-11-08">
+  A nixpkgs bump changed the generated `zfs-import-tank.service`. `nixos-rebuild switch` stopped and restarted it, and for about ten minutes every container on the host saw empty directories where the four `tank` child datasets belong. No data was lost. A reboot put the mounts back.
+</Aside>
+
+The import unit is `requiredBy` every mount unit of its pool, which is the `requiredBy = getPoolMounts ...` binding in the module.[^nixpkgs-zfs] `switch-to-configuration` stops and restarts a changed service unless the service opts out, and stopping a unit that mounts require stops those mounts too. The journal:
+
+```
+09:26:43  zfs-mount.service: Deactivated successfully.
+09:26:43  Unmounting /tank/media...
+09:26:43  umount[...]: umount: /tank/media: not mounted.
+09:26:43  tank-media.mount: Mount process exited, code=exited, status=32/n/a
+09:26:43  zfs-import-tank.service: Deactivated successfully.
+09:27:06  Reexecution requested from client PID ... ('.switch-to-conf')
+09:27:10  zfs-import-tank-start[...]: Successfully imported tank
+09:27:10  Starting Mount ZFS filesystems...
+```
+
+After the switch, each child path resolved to the pool root dataset: `stat -c %d /tank/media` returned the same device number as `/tank`. The same switch restarted the Docker daemon, whose package had changed, so every container came back bind-mounting the empty directories. A read-only, non-recursive bind of `/tank` shows the root dataset alone, without its children, and it dates the damage: `media/music`, `media/torrents` and `media/usenet` were created there at 09:27, and nothing else in it is newer than September.
+
+The journal does not show how `/tank` came to sit on top of children that were still in the mount table. Each child's `umount` reported `not mounted`, and nothing unmounted `/tank` itself. The fix does not depend on that detail, because it stops the switch from touching these services at all:
+
+```nix
+systemd.services = {
+  zfs-import-tank.restartIfChanged = false;
+  zfs-import-scratch.restartIfChanged = false;
+  zfs-mount.restartIfChanged = false;
+};
+```
+
+A changed import or mount unit now takes effect at the next boot, and the switch reports it instead of acting on it. `switch-to-configuration dry-activate`, run against the built system before deploying, prints the plan:
+
+```
+would NOT stop the following changed units: zfs-import-scratch.service, zfs-import-tank.service, zfs-mount.service
+```
+
+This host's deploy now prints that plan on every build, so a stop of a storage unit is visible before anything is activated. The nixpkgs module already sets `restartIfChanged = false` on its own snapshot services;[^nixpkgs-zfs] the import and mount services do not get it by default.
+
+### Declare the pool root
+
+The same kind of race exists at boot. Without a `fileSystems` entry for the pool root, `/tank` is mounted only by `zfs mount -a` in `zfs-mount.service`, while its children are fstab mount units. The children already carry `After=tank.mount` through `RequiresMountsFor=/tank`, but with no fstab entry systemd has no configuration to mount `/tank` from, so the ordering has nothing to wait for. The `scratch` pool on this host lost that race on the 2026-11-08 boot: `/proc/1/mountinfo` lists `/scratch` after both of its children, which leaves them hidden under the root.
+
+Declaring the root makes it an fstab unit that the children wait for, and `zfs mount -a` then finds it mounted and skips it:
+
+```nix
+fileSystems."/tank" = {
+  device = "tank";
+  fsType = "zfs";
+  options = [ "nofail" "zfsutil" ];
+};
+```
+
+Check what the root dataset holds before declaring it. On `scratch` the working data had been written into the root dataset, under the directories where the empty child datasets mount, so mounting the children in the correct order would hide it from the applications. That pool stays undeclared until its data moves.
+
+---
+
 ## Pool roles and the backup-not-redundancy model
 
 | Pool | Hardware | Holds | Redundancy | Recovery if the disk dies |
@@ -284,6 +342,8 @@ The incident the classifier is built against is the 2026-09-21 SATA link fault. 
 - `networking.hostId` is mandatory; `forceImportRoot` is a judgement call. The default is moving to `false`, which is right for shared storage and can strand a single-host machine after an unclean export.
 - Verify snapshots against the dataset holding the data, instead of the configuration that says which dataset should hold it.
 - Changing `mountpoint` to `legacy` unmounts immediately and takes the mountpoint directory with it.
+- Set `restartIfChanged = false` on `zfs-import-<pool>` and `zfs-mount`, and read `switch-to-configuration dry-activate` before a switch. A changed import unit otherwise takes every mount of its pool with it.
+- Declare the pool root in `fileSystems` when children are declared, unless the root dataset itself holds data under the child mountpoints. Otherwise `zfs mount -a` and the fstab units race at boot.
 - `du` under-reports Postgres directories for a non-root user: the 700-mode data directory returns EACCES and the total silently excludes it. One measurement here read 3.1GB for a 6.1GB directory. Use `zfs list`, or measure as root.
 
 ---
@@ -337,6 +397,10 @@ For an ordinary NixOS host with data pools, the middle path is the default: syst
 | `forceImportRoot=false` blocked boot after a foreign hostid | 2026-08-21 incident notes; recovered with `zfs_force=1` | Measured, not re-tested |
 | ARC capped at 16GiB on 64GB RAM | `/proc/spl/kstat/zfs/arcstats`: `c_max` 17179869184, no throttle events | Measured |
 | ZED notifications reach Alertmanager; clean scrubs notify once per pool per month | The unsolicited resilver_finish alert email on 2026-09-22, after the zedlet shipped | Measured |
+| A changed `zfs-import-<pool>` unit is stopped by `switch` and takes the pool's mounts with it | `journalctl` around the 2026-11-08 activation, quoted above; `requiredBy` in the module[^nixpkgs-zfs] | Measured and documented |
+| After that switch the child paths resolved to the pool root dataset | `stat -c %d` on each child equal to `/tank`; a read-only bind of `/tank` showing directories created at 09:27 | Measured |
+| `restartIfChanged = false` keeps the switch off the import and mount units | `dry-activate` printed `would NOT stop` for all three; the next switch logged `NOT restarting the following changed units: zfs-import-tank.service` | Measured |
+| An undeclared pool root can mount over its children at boot | `/proc/1/mountinfo` order for `scratch` on the 2026-11-08 boot | Measured; the `/tank` declaration is not yet tested across a reboot |
 | Autoclear heals only the SMART-transient case; link and media faults page instead | The zedlet and its classification table in `modules/telemetry.nix`; the 2026-09-21 incident's SMART table matches the link branch | Configuration read; incident measured |
 
 ## Related docs
