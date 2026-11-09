@@ -188,6 +188,7 @@ export function buildSidebar() {
       const items = category.groups
         .map((group) => ({
           label: group.label,
+          collapsed: true,
           items: inCategory
             .filter((d) => d.group === group.id)
             .sort(byTypeThenOrder)
@@ -196,9 +197,9 @@ export function buildSidebar() {
         .filter((group) => group.items.length > 0);
       // A category whose groups all filtered out would render as a bare
       // label with nothing under it; drop it entirely instead.
-      return items.length > 0 ? { label: category.label, items } : null;
+      return items.length > 0 ? { label: category.label, collapsed: true, items } : null;
     }
     const items = inCategory.sort(byTypeThenOrder).map(entry);
-    return items.length > 0 ? { label: category.label, items } : null;
+    return items.length > 0 ? { label: category.label, collapsed: true, items } : null;
   }).filter((c) => c !== null);
 }

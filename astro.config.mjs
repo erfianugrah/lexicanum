@@ -135,7 +135,32 @@ function rehypeFootnoteLabelToReferences() {
     }
     node.children?.forEach(walk);
   };
-  return (/** @type {any} */ tree) => walk(tree);
+  // A doc that writes its own "## References" above its footnote definitions
+  // gets an empty heading there (GFM moves the definitions into the footnote
+  // section) and a second "References" in the table of contents. When the
+  // footnote section exists, drop such a hand-written heading.
+  const text = (/** @type {any} */ n) =>
+    n.type === "text" ? n.value : (n.children ?? []).map(text).join("");
+  const dropManual = (/** @type {any} */ node) => {
+    if (!node.children) return;
+    node.children = node.children.filter(
+      (/** @type {any} */ c) =>
+        !(
+          c.type === "element" &&
+          c.tagName === "h2" &&
+          c.properties?.id !== "footnote-label" &&
+          text(c).trim() === "References"
+        ),
+    );
+    node.children.forEach(dropManual);
+  };
+  const hasFootnotes = (/** @type {any} */ n) =>
+    (n.type === "element" && n.properties?.id === "footnote-label") ||
+    (n.children ?? []).some(hasFootnotes);
+  return (/** @type {any} */ tree) => {
+    walk(tree);
+    if (hasFootnotes(tree)) dropManual(tree);
+  };
 }
 
 import react from "@astrojs/react";
