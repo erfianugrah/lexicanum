@@ -1,5 +1,5 @@
 // @ts-check
-import { defineConfig, fontProviders } from "astro/config";
+import { defineConfig } from "astro/config";
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -146,52 +146,28 @@ export default defineConfig({
   // renaming or moving a doc is a frontmatter change on the doc itself. An
   // alias colliding with a live doc or another alias fails the build.
   redirects: buildRedirects(),
-  fonts: [
-    {
-      name: "IBM Plex Sans",
-      cssVariable: "--font-plex-sans",
-      provider: fontProviders.fontsource(),
-      // Variable font: single woff2 per subset, weight axis 100-700
-      weights: ["100 700"],
-      styles: ["normal", "italic"],
-      subsets: ["latin"],
-      fallbacks: [
-        "system-ui",
-        "-apple-system",
-        "Segoe UI",
-        "Roboto",
-        "sans-serif",
-      ],
-    },
-    {
-      name: "IBM Plex Mono",
-      cssVariable: "--font-plex-mono",
-      provider: fontProviders.fontsource(),
-      // Static font — only the weights we actually use
-      weights: [400, 600],
-      styles: ["normal"],
-      subsets: ["latin"],
-      fallbacks: [
-        "ui-monospace",
-        "SFMono-Regular",
-        "Menlo",
-        "Consolas",
-        "monospace",
-      ],
-    },
-  ],
   integrations: [sitemap(), taxonomyWatcher, ogCard, starlight({
     title: "Erfi's Lexicanum",
-    favicon: "/ea_favicon.png",
-    customCss: ["./src/styles/custom.css"],
+    // Tool mark (house mark L), not the ea monogram: ea is only the footer
+    // signature. public/ea_favicon.png stays for the social card.
+    favicon: "/brand/favicon.svg",
+    // house tech frame (lexicanum#77): tokens + house block, then the
+    // Starlight bridge, then site-specific rules.
+    customCss: ["./src/styles/house.css", "./src/styles/house-starlight.css", "./src/styles/custom.css"],
     components: {
       Head: './src/components/Head.astro',
       MarkdownContent: './src/components/MarkdownContent.astro',
+      Header: './src/components/house/Header.astro',
+      SiteTitle: './src/components/house/SiteTitle.astro',
+      ThemeSelect: './src/components/house/ThemeSelect.astro',
+      Footer: './src/components/house/Footer.astro',
     },
     editLink: {
       baseUrl: "https://github.com/erfianugrah/erfi-dev-docs/edit/main/",
     },
     head: [
+      { tag: "link", attrs: { rel: "icon", href: "/brand/favicon.ico", sizes: "any" } },
+      { tag: "link", attrs: { rel: "apple-touch-icon", href: "/brand/apple-touch-icon.png" } },
       {
         tag: "meta",
         attrs: {
@@ -269,11 +245,6 @@ export default defineConfig({
         }),
       },
     ],
-    social: [{
-      icon: "github",
-      label: "GitHub",
-      href: "https://github.com/erfianugrah",
-    }],
     // Provider-grouped sidebar, derived from doc frontmatter at config-load
     // (category/group per doc; taxonomy and generator in src/lib/taxonomy.mjs).
     // A flat alphabetical autogenerate is sequential access: it only helps a

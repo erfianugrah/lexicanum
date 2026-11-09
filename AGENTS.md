@@ -46,7 +46,19 @@ the build/test gate only, no deploy.
   hand. Not run in dev.
 - A custom rehype pass (`rehypeFootnoteLabelToReferences`) renames the GFM
   "Footnotes" heading to a visible **References** section. Do not rename it back.
-- `src/styles/custom.css` styles `.footnotes` dense (small type, tight leading).
+- Look and frame are the house tech frame (lexicanum#77), from the `house`
+  CLI's Starlight kit: `src/styles/house.css` (house tokens as plain CSS plus
+  the vendored house block - never edit the block, run `house sync`),
+  `src/styles/house-starlight.css` (palette -> `--sl-*`, Starlight element
+  styling) and `src/components/house/` (Header, SiteTitle, ThemeSelect,
+  Footer overrides). Kit source and install steps: `house assets cat
+  starlight/README.md`. Fonts: Overpass Mono for titles, nav and labels,
+  Inconsolata for prose and code (@fontsource); no sans face, no social
+  links, ea only as the footer signature. Gate: `house check .` (CI runs
+  `--static` before build-and-deploy; preview URLs in `.house.json`).
+- `src/styles/custom.css` holds site-specific rules only (layout widths,
+  diagrams, print, references); it styles `.footnotes` dense (small type,
+  tight leading).
 - Navigation is frontmatter-driven. Each doc declares `category:` (required;
   one of the providers in `TAXONOMY` in `src/lib/taxonomy.mjs`), `group:`
   (required when the category has subcategories), and optional
@@ -284,6 +296,9 @@ Cite the source path when answering from docs.erfi.io in chat, too.
     node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
     edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
   ```
+  The Helvetica fontname only sizes the boxes: house-starlight.css renders all
+  SVG text in Inconsolata (narrower, so labels still fit; the house has no
+  sans face). Keep the boilerplate as is.
   Without `bgcolor="transparent"` Graphviz emits a white graph polygon and the
   diagram renders as a white card with low-contrast text in dark mode. Never set
   color/fill/fontcolor attributes on individual nodes or edges.
