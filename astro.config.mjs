@@ -10,6 +10,8 @@ import sitemap from "@astrojs/sitemap";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import rehypeGraphviz from "@beoe/rehype-graphviz";
+// house Starlight kit: lay Graphviz out for a monospace face.
+import rehypeGraphvizMonoLayout from "./src/lib/graphviz-mono-layout.mjs";
 import { getCache } from "@beoe/cache";
 
 // Build-cache for rendered diagrams so unchanged dot blocks are not re-rendered
@@ -161,6 +163,8 @@ export default defineConfig({
       SiteTitle: './src/components/house/SiteTitle.astro',
       ThemeSelect: './src/components/house/ThemeSelect.astro',
       Footer: './src/components/house/Footer.astro',
+      PageTitle: './src/components/house/PageTitle.astro',
+      Sidebar: './src/components/house/Sidebar.astro',
     },
     editLink: {
       baseUrl: "https://github.com/erfianugrah/erfi-dev-docs/edit/main/",
@@ -281,6 +285,10 @@ export default defineConfig({
         // Renders ```dot / ```graphviz fences to inline SVG at build time via
         // @hpcc-js/wasm (no system Graphviz binary, so CI needs no install step).
         // Diagrams are theme-adaptive line art; dark mode is handled in custom.css.
+        // Lay diagrams out for a monospace face: the site renders labels in
+        // Inconsolata (no sans face), which is wider than the Helvetica the
+        // dot sources name, so Helvetica-sized boxes clipped labels.
+        rehypeGraphvizMonoLayout,
         [rehypeGraphviz, {
           strategy: "inline",
           class: "not-content",
