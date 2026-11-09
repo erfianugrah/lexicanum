@@ -33,8 +33,11 @@ Provenance: this page describes documented behaviour - the repository's `README.
 `docs/RUNBOOK.md`, `docs/MIGRATION-SCOPE.md`, `CHANGELOG.md` and `src/cli.ts` at
 commit [`ba5f88c`](https://github.com/erfianugrah/pgmig/tree/ba5f88c) - plus the
 live cross-region measurements published in the two companion guides and their
-supabase-lab modules (W05, W09, W14, W15). Nothing here was re-run for this page;
-the evidence table at the end splits documented from measured.
+supabase-lab modules (W05, W09, W14, W15). The Supabase `statement_timeout` caution
+and the [Postgres 15 to 17 section](#postgres-15-to-17-live-runs-2026-11-09) come
+from pgmig's live runs on 2026-11-09 and the fix that followed them, at a later
+commit than `ba5f88c`.[^pgmig-pg17-live] Nothing else here was re-run for this
+page; the evidence table at the end splits documented from measured.
 
 **TL;DR**
 
@@ -51,6 +54,15 @@ the evidence table at the end splits documented from measured.
 - **The gates are a lag drain to zero, a clean chunked checksum, and a
   quiescent source.** `watch` aborts on WAL bloat or a lost slot on its own; the
   lag gate refuses to close if writes are still arriving.
+- **From a Supabase source, the subscription connection needs
+  `statement_timeout=0`.** The `postgres` role is capped at 2 min, the target's
+  tablesync worker runs the initial COPY outside pgmig's pinned settings, and a
+  table whose copy takes longer restarts forever. pgmig has added the option
+  itself since 2026-11-09; any other subscriber needs it added by hand.
+- **At 3.65 GB from Postgres 15 to 17, pgmig's cutover took 1.6 s with no writer
+  running (measured 2026-11-09).** The copy took 196.9 s and reconciled
+  identical. The in-place upgrade at the same size lost 52 of 691 acknowledged
+  probe writes sent during it, so writes have to stop for its whole run.
 - **The point of no return is repointing the app, not the cutover.** Before it,
   `teardown` plus re-enabled source writes is lossless. After it, rollback loses
   every write the target took unless reverse replication was set up first.
@@ -141,7 +153,7 @@ before you start; `bootstrap --with-auth-data` is the fix.
 | `bootstrap` | Target preparation: extensions, roles, schema, optionally auth rows | preview by default; `--confirm` mutates |
 | `preflight` | Hard-gate checks: `CREATE SUBSCRIPTION` grant, replication capacity, a replica identity on every published table | fails closed |
 | `replicate` | Empty publication plus `ADD TABLE` (never `FOR ALL TABLES`, which needs superuser), slot, subscription with `copy_data=true` | re-running issues `REFRESH PUBLICATION` for a newly added table |
-| `watch` | Polls `pg_subscription_rel` until every table is `r`, with live copy percentage | aborts on retained WAL over the watchdog threshold, slot `wal_status='lost'`, or rising error counts |
+| `watch` | Polls `pg_subscription_rel` until every table is `r`, with live copy percentage | aborts on retained WAL over the watchdog threshold or slot `wal_status='lost'`; rising apply or sync error counts only log a warning, and the sync timeout (`watchdog.syncTimeoutMin`, 240 min by default) ends the wait |
 | `reconcile` | Chunked checksum, 256 buckets by default: one scan per side, bucket by primary-key hash, drill only the mismatched buckets | authoritative only after writes stop |
 | `cutover` | Samples WAL LSN twice, drains lag, `setval()`s every owned sequence, drops the subscription | refuses without the writes-stopped assertion on the autonomous path |
 | `teardown` | Drops subscription, slot, publication in that order | idempotent |
@@ -150,6 +162,43 @@ before you start; `bootstrap --with-auth-data` is the fix.
 `run` chains the phases for automation: `run --through reconcile --json` exits 0
 only if preflight, replicate, watch and reconcile all passed, and `status
 --require-synced` is the wait loop for a script that needs the copy ready.
+
+<Aside type="caution" title="A Supabase source cancels any initial copy that runs past two minutes">
+
+On a Supabase source the `postgres` role has no `statement_timeout` of its own,
+and the timeouts page gives its default as "`postgres`: none (capped by default
+global timeout to be 2min)".[^sb-timeouts] The subscription CONNECTION is dialled
+by the target's tablesync worker, outside the pgmig pools that pin
+`statement_timeout = 0`, so a table whose initial COPY runs longer than two
+minutes is cancelled and starts again, indefinitely. It never reaches
+`srsubstate='r'`. The target logs `could not receive data from WAL stream: ERROR:
+canceling statement due to statement timeout`, the source logs `canceling
+statement due to statement timeout`, and `sync_error_count` in
+`pg_stat_subscription_stats` rises with each restart. On 2026-11-09, at
+4,000,000 documents on 20 GB disks, `documents` never synced in two runs. In the
+second, which read the logs before teardown, the cancellations came every 120 s
+from 08:43:58 to 09:14:02 UTC: 16 restarts (`sync_error_count` 16), the other
+three tables `r`, and `watch` warning until the harness's 30 min sync
+limit.[^pgmig-pg17-live]
+
+pgmig's `replicate`[^pgmig-replicate] now passes the CONNECTION through
+`withNoStatementTimeout()`,[^pgmig-no-timeout] which adds
+`options=-c statement_timeout=0` unless the string already sets a
+`statement_timeout`. On an older pgmig, put `?options=-c%20statement_timeout%3D0`
+on `SOURCE_REPLICATION_URL` (set it to the source direct URL if unset; pgmig
+otherwise dials `SOURCE_DB_URL`). With any other tool, or a hand-rolled
+`CREATE SUBSCRIPTION`, add it to the connection string yourself. Both halves of
+the cause sit outside pgmig - the cap on the Supabase source, the tablesync
+worker in Postgres - so any logical replication from a Supabase source whose
+initial COPY of a table runs past two minutes meets the cap. That is reasoned from the mechanism; only pgmig's subscription was run.
+
+```sql
+CREATE SUBSCRIPTION my_sub
+  CONNECTION 'postgresql://postgres:<password>@db.<ref>.supabase.co:5432/postgres?options=-c%20statement_timeout%3D0'
+  PUBLICATION my_pub;
+```
+
+</Aside>
 
 ## The schema pre-step
 
@@ -227,7 +276,10 @@ The row hash is taken over the row's text form, which depends on `TimeZone`,
 `DateStyle`, `IntervalStyle`, `extra_float_digits` and `bytea_output`. Every
 connection in both pools therefore pins those settings identically and sets
 `statement_timeout = 0`, so a cross-region run compares values and not two
-machines' display conventions.[^pgmig-skill]
+machines' display conventions.[^pgmig-skill] The subscription's CONNECTION is
+dialled by the target and belongs to neither pool, which is why it carries its own
+`statement_timeout=0` from a Supabase source (the caution under
+[the pipeline](#the-pipeline)).
 
 Two consequences: timestamptz comparisons are stable across regions, and a STORED
 generated column has to be excluded from the hash - the subscriber recomputes it,
@@ -267,6 +319,84 @@ Set it up after `reconcile` passes and before the repoint; roll back inside the
 window by stopping writes on the target, draining the reverse lag, repointing at
 the source, and tearing down both directions. It is not active-active: only one
 side ever takes application writes.
+
+## Postgres 15 to 17 live runs, 2026-11-09
+
+pgmig's research note records a move from Postgres 15 to 17 at two sizes, and
+the platform's in-place upgrade at the same sizes for comparison.[^pgmig-pg17-live]
+Shape: throwaway projects on a Team-plan organisation, ap-southeast-1, Small
+compute. The source and the in-place subject were created with
+`postgres_engine: "15"` (PostgreSQL 15.19); the pgmig target took the platform
+default (PostgreSQL 17.11). The seed puts a STORED tsvector on `documents`, the
+copy bottleneck the evidence table names. One run per size, so every figure
+below is n = 1 (a first 3.65 GB in-place attempt reached ACTIVE_HEALTHY at
+695.5 s and lost its survival check to `getaddrinfo ENOTFOUND`).
+
+pgmig, 15.19 to 17.11, with no writer running and no app repoint in the harness:
+
+| Step | 50,000 documents (0.06 GB) | 4,000,000 documents (source 3.65 GB) |
+|---|---|---|
+| Seed | not recorded | 643.1 s |
+| Initial copy (`replicate` + `watch`) | 5.4 s | 196.9 s; 4 of 4 tables `r`, WAL retained 10MB at the end |
+| Reconcile, 256 buckets | 0.8 s, identical (4 tables) | 62.6 s, identical: `users` 50000, `documents` 4000000, `events` 4000000, `audit` 400000 |
+| Cutover (the write-stop window before the app repoint) | 1.6 s | 1.6 s; lag drained to 0.0 KB |
+| Insert after cutover | id 50001: the sequence resync prevented a collision | id 4000001 |
+
+The 50,000-document run predates the `statement_timeout` fix; its 5.4 s copy
+stayed under the 2 min cap. The 4,000,000-document column is the re-run with the
+fix, 09:16 to 09:40 UTC on 20 GB disks. Before it, on the default disk the seed failed
+after about 6 minutes with `cannot execute INSERT in a read-only transaction`
+(SQLSTATE 25006), the platform making the database read-only as the volume
+filled; two runs on 20 GB disks without the fix never finished `documents`
+(the caution under [the pipeline](#the-pipeline)). In the 50,000-document run,
+`doctor` warned on the Small 17 target: `max_worker_processes=6` (asks for 16 or more),
+`max_logical_replication_workers=4` for 4 tables (asks for 5 or more), and
+`pg_stat_statements` 1.10 on the source against 1.11 on the target.
+
+The in-place runs upgraded 15.19 to 17.11 (target image
+`supabase-postgres-17.11.0.018`). Eligibility answered `eligible: true`,
+`duration_estimate_hours: 1` at both sizes. A 1 s probe writer inserted numbered
+rows through the session pooler throughout, and a 2 s sampler opened a fresh
+pooler connection each time. At 3.65 GB the project reached ACTIVE_HEALTHY
+633.1 s after the POST (337.4 s at 0.06 GB). 53 of 458 acknowledged probe writes
+at 0.06 GB and 52 of 691 at 3.65 GB were absent on 17, every one acknowledged by
+the last 15.19 restart before 17.11 answered, which matches supabase-lab
+upgrade-integrity UI03 on Micro (2026-10-23 and 10-26,
+[RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/upgrade-integrity/RUNLOG.md)).
+The time from `9_completed_upgrade` to ACTIVE_HEALTHY grew from 20.4 s at
+0.06 GB to 296 s at 3.65 GB while 17.11 was already answering; what that tail
+is was not separated.
+
+Side by side at 3.65 GB, one run each:
+
+| | pgmig | In-place upgrade |
+|---|---|---|
+| Writes must stop for | 1.6 s of cutover, plus the app repoint | the whole upgrade, from before the POST: the first lost write was acknowledged at +272.9 s and 17.11 first answered at +344.6 s |
+| Client-visible outage in the run | none measured (no writer, no repoint in the harness) | longest failed sample run 35.1 s (+235.3 s to +270.4 s) |
+| Acknowledged writes lost | none possible after a drained cutover (reconcile identical) | 52 of 691 |
+| What changes for the app | new project URL, keys and connection strings | nothing |
+
+Not measured:
+
+- An app writing through the pgmig cutover, a repoint, or a source with Auth
+  users or Storage objects to carry.
+- Any compute larger than Small, any region but ap-southeast-1, more than one
+  completed run per size, databases larger than 3.65 GB.
+- Whether the in-place tail scales linearly past 3.65 GB, and what the Data API
+  does during it.
+
+Every project was deleted by its harness's teardown; cost was not metered.
+
+## What to do about it
+
+The pipeline's own practices are the gates and the rollback table above. These
+three rows come from the 2026-11-09 runs.
+
+| Practice | Evidence | Rests on |
+|---|---|---|
+| Put `statement_timeout=0` on the subscription CONNECTION from a Supabase source | The `postgres` role is capped at the 2 min global timeout. Without the option the initial COPY of 4,000,000 documents was cancelled every 120 s and restarted 16 times; with it the copy finished in 196.9 s. That any subscriber meets the cap is reasoned from the mechanism; only pgmig's subscription was run | 2026-11-09 run, 4,000,000 documents ([research note](https://github.com/erfianugrah/pgmig/blob/cd29532/docs/research/2026-11-09-pg15-to-17-live.md)); [`withNoStatementTimeout()`](https://github.com/erfianugrah/pgmig/blob/cd29532/src/db.ts); [Supabase timeouts page](https://supabase.com/docs/guides/database/postgres/timeouts) |
+| Grow the disk before a multi-GB seed or copy on a small project | On the default disk the 4,000,000-document seed failed after about 6 minutes with `cannot execute INSERT in a read-only transaction` (SQLSTATE 25006) as the volume filled; on 20 GB disks the seed took 643.1 s to 3.65 GB. Only the seed failed on the default disk; a target receiving the same copy was not run on one | 2026-11-09 run, default disk, then both disks grown to 20 GB ([research note](https://github.com/erfianugrah/pgmig/blob/cd29532/docs/research/2026-11-09-pg15-to-17-live.md)) |
+| Stop writers before an in-place major upgrade | 52 of 691 acknowledged probe writes (3.65 GB) and 53 of 458 (0.06 GB) were absent on 17.11, all acknowledged by the last 15.19 restart; the first lost write was acknowledged +272.9 s after the POST. The procedure is in the [upgrade guide](/guides/supabase-postgres-major-upgrade-e2e/#run-the-production-upgrade) | 2026-11-09 in-place runs, both sizes ([research note](https://github.com/erfianugrah/pgmig/blob/cd29532/docs/research/2026-11-09-pg15-to-17-live.md)); supabase-lab upgrade-integrity UI03, Micro, 2026-10-23 and 10-26 ([RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/upgrade-integrity/RUNLOG.md)) |
 
 ## Decision guide
 
@@ -315,6 +445,11 @@ Text fallback:
 | A STORED generated column is the initial-copy bottleneck | pgmig's large-scale rehearsal, reported in `README.md` and repeated in the companion upgrade guide (about 7x slower copy) |
 | Cross-region row hashes match only because the GUCs are pinned | pgmig `skills/pgmig/SKILL.md` and the reconcile implementation; the cross-region pass itself is the region guide's measured run |
 | DDL on the source stalls the stream until the same DDL is applied on the target | supabase-lab W15, cited in both companion guides (about 6.1 s to resume with backfill) |
+| `watch` warns on rising apply or sync error counts and does not abort on them | [`src/steps/watch.ts`](https://github.com/erfianugrah/pgmig/blob/ba5f88c/src/steps/watch.ts) at `ba5f88c` (a `log.warn`, then the sync timeout); measured 2026-11-09, when `watch` warned through `sync_error_count` 16 until the harness's 30 min limit ([research note](https://github.com/erfianugrah/pgmig/blob/cd29532/docs/research/2026-11-09-pg15-to-17-live.md)) |
+| From a Supabase source, a subscription without `statement_timeout=0` cancels an initial COPY longer than 2 min and restarts it | Measured 2026-11-09, 4,000,000 documents, two runs on 20 GB disks that never synced `documents`; the second read the logs: the target and source log lines every 120 s, `sync_error_count` 16; the re-run with [`withNoStatementTimeout()`](https://github.com/erfianugrah/pgmig/blob/cd29532/src/db.ts) synced in 196.9 s ([research note](https://github.com/erfianugrah/pgmig/blob/cd29532/docs/research/2026-11-09-pg15-to-17-live.md)). The 2 min cap is documented on the [Supabase timeouts page](https://supabase.com/docs/guides/database/postgres/timeouts); that it hits any subscriber is reasoned from the mechanism |
+| pgmig's write-stop window from 15.19 to 17.11 was 1.6 s at 0.06 GB and at 3.65 GB, reconcile identical | Measured 2026-11-09, one run per size, Team-plan organisation, Small, ap-southeast-1, no writer running and no app repoint ([research note](https://github.com/erfianugrah/pgmig/blob/cd29532/docs/research/2026-11-09-pg15-to-17-live.md)) |
+| The in-place upgrade loses writes acknowledged by the last 15.19 restart | Measured 2026-11-09, 2 of 2 runs with a completed survival check, one per size (53 of 458 at 0.06 GB, 52 of 691 at 3.65 GB); agrees with supabase-lab upgrade-integrity UI03 ([RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/upgrade-integrity/RUNLOG.md)) |
+| A multi-GB seed on a default-size disk turns the database read-only (SQLSTATE 25006) | Measured 2026-11-09, the 4,000,000-document seed, failed after about 6 minutes ([research note](https://github.com/erfianugrah/pgmig/blob/cd29532/docs/research/2026-11-09-pg15-to-17-live.md)) |
 
 The rollout mechanics that vary by environment - how long a paused source stays
 useful, the watchdog threshold, whether to match target compute with `provision` -
@@ -327,6 +462,10 @@ are operator decisions in the RUNBOOK. No run set them.
 [^pgmig-runbook]: pgmig, "docs/RUNBOOK.md," GitHub, commit `ba5f88c`. https://github.com/erfianugrah/pgmig/blob/ba5f88c/docs/RUNBOOK.md
 [^pgmig-scope]: pgmig, "docs/MIGRATION-SCOPE.md," GitHub, commit `ba5f88c`. https://github.com/erfianugrah/pgmig/blob/ba5f88c/docs/MIGRATION-SCOPE.md
 [^pgmig-skill]: pgmig, "skills/pgmig/SKILL.md," GitHub, commit `ba5f88c`. https://github.com/erfianugrah/pgmig/blob/ba5f88c/skills/pgmig/SKILL.md
+[^pgmig-pg17-live]: pgmig, "docs/research/2026-11-09-pg15-to-17-live.md," GitHub, commit `cd29532`. https://github.com/erfianugrah/pgmig/blob/cd29532/docs/research/2026-11-09-pg15-to-17-live.md
+[^pgmig-replicate]: pgmig, "src/steps/replicate.ts," GitHub, commit `cd29532`. https://github.com/erfianugrah/pgmig/blob/cd29532/src/steps/replicate.ts
+[^pgmig-no-timeout]: pgmig, "src/db.ts (withNoStatementTimeout)," GitHub, commit `cd29532`. https://github.com/erfianugrah/pgmig/blob/cd29532/src/db.ts
+[^sb-timeouts]: Supabase, "Timeouts," Supabase Docs. https://supabase.com/docs/guides/database/postgres/timeouts
 [^pg-logical]: PostgreSQL Global Development Group, "Logical replication," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/current/logical-replication.html
 [^pg-upgrade]: PostgreSQL Global Development Group, "pg_upgrade," PostgreSQL 17 Documentation. https://www.postgresql.org/docs/current/pgupgrade.html
 [^region-guide]: Anugrah, "Migrate a Supabase project to another region, end to end." https://erfi.dev/guides/supabase-region-migration-e2e/

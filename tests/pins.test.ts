@@ -1895,6 +1895,7 @@ const practicePages: Array<[doc: string, heading: RegExp]> = [
   ["guides/supabase-tenant-promotion", PRACTICES_HEADING],
   ["reference/cloudflare-supabase-architecture", PRACTICES_HEADING],
   ["reference/pbkdf2-supabase-auth-migration", PRACTICES_HEADING],
+  ["reference/pgmig-logical-replication-migrator", PRACTICES_HEADING],
   ["reference/postgres-entity-graphs", PRACTICES_HEADING],
   ["reference/postgres-redundant-writes", PRACTICES_HEADING],
   ["reference/rls-without-supabase-auth", PRACTICES_HEADING],
