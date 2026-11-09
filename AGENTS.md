@@ -47,15 +47,22 @@ the build/test gate only, no deploy.
 - A custom rehype pass (`rehypeFootnoteLabelToReferences`) renames the GFM
   "Footnotes" heading to a visible **References** section. Do not rename it back.
 - Look and frame are the house tech frame (lexicanum#77), from the `house`
-  CLI's Starlight kit: `src/styles/house.css` (house tokens as plain CSS plus
-  the vendored house block - never edit the block, run `house sync`),
-  `src/styles/house-starlight.css` (palette -> `--sl-*`, Starlight element
-  styling) and `src/components/house/` (Header, SiteTitle, ThemeSelect,
-  Footer overrides). Kit source and install steps: `house assets cat
-  starlight/README.md`. Fonts: Overpass Mono for titles, nav and labels,
-  Inconsolata for prose and code (@fontsource); no sans face, no social
-  links, ea only as the footer signature. Gate: `house check .` (CI runs
-  `--static` before build-and-deploy; preview URLs in `.house.json`).
+  CLI's Starlight kit. CSS stack: `src/styles/house.css` (house tokens as
+  plain CSS plus the vendored house block - never edit the block, run
+  `house sync`), `src/styles/house-starlight.css` (palette -> `--sl-*`,
+  Starlight element styling, plus the generic kit rules: Newsreader serif
+  prose at 18px/1.75, category-hue wayfinding via `data-hue` attributes
+  mapped to `--house-hue-1` through `--house-hue-9` from
+  `src/house.categories.mjs`, the `house-kicker` page breadcrumb, and the
+  full article-body clarity rules), and `src/styles/custom.css`
+  (lexicanum-only: layout widths, homepage, diagrams, print, references).
+  Components under `src/components/house/` (Header, SiteTitle, ThemeSelect,
+  Footer, PageTitle, Sidebar) use the generic kit conventions. Kit source
+  and install steps: `house assets cat starlight/README.md`. Fonts: Overpass
+  Mono for titles, nav and labels, Inconsolata for code, tables and data
+  (@fontsource); no sans face, no social links, ea only as the footer
+  signature. Gate: `house check .` (CI runs `--static` before
+  build-and-deploy; preview URLs in `.house.json`).
 - `src/styles/custom.css` holds site-specific rules only (layout widths,
   diagrams, print, references); it styles `.footnotes` dense (small type,
   tight leading).
@@ -296,9 +303,11 @@ Cite the source path when answering from docs.erfi.io in chat, too.
     node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
     edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
   ```
-  The Helvetica fontname only sizes the boxes: house-starlight.css renders all
-  SVG text in Inconsolata (narrower, so labels still fit; the house has no
-  sans face). Keep the boilerplate as is.
+  Keep the boilerplate as is: at build, `src/lib/graphviz-mono-layout.mjs`
+  (from the house kit, registered before rehype-graphviz) rewrites every
+  fontname to Courier so Graphviz sizes boxes for a monospace face, and
+  house-starlight.css renders the labels in Inconsolata (0.5em advance vs
+  Courier's 0.6em, so they fit; the house has no sans face).
   Without `bgcolor="transparent"` Graphviz emits a white graph polygon and the
   diagram renders as a white card with low-contrast text in dark mode. Never set
   color/fill/fontcolor attributes on individual nodes or edges.
