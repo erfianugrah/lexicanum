@@ -195,7 +195,7 @@ export default defineConfig({
       baseUrl: "https://github.com/erfianugrah/erfi-dev-docs/edit/main/",
     },
     head: [
-      { tag: "link", attrs: { rel: "icon", href: "/brand/favicon.ico", sizes: "any" } },
+      { tag: "link", attrs: { rel: "icon", href: "/brand/favicon.ico", sizes: "32x32" } },
       { tag: "link", attrs: { rel: "apple-touch-icon", href: "/brand/apple-touch-icon.png" } },
       {
         tag: "meta",
