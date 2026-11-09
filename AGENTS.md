@@ -44,6 +44,10 @@ the build/test gate only, no deploy.
   are measured from `src/content/docs`, so adding docs needs no card edit.
   `public/thumbnail.jpg` is not committed; there is nothing to regenerate by
   hand. Not run in dev.
+- Favicon: `brand/icon.svg` (open book, red ribbon; house icon grammar) is
+  the source; `house icon build` writes `public/brand/` (favicon.svg/.ico,
+  PNGs). Edit the source and rebuild, never the PNGs - `house check` fails a
+  stale build. `public/ea_favicon.png` is only the social card's mark.
 - A custom rehype pass (`rehypeFootnoteLabelToReferences`) renames the GFM
   "Footnotes" heading to a visible **References** section. Do not rename it back.
 - Look and frame are the house tech frame (lexicanum#77), from the `house`
