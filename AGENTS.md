@@ -66,7 +66,11 @@ the build/test gate only, no deploy.
   Mono for titles, nav and labels, Inconsolata for code, tables and data
   (@fontsource); no sans face, no social links, ea only as the footer
   signature. Gate: `house check .` (CI runs `--static` before
-  build-and-deploy; preview URLs in `.house.json`).
+  build-and-deploy; preview URLs in `.house.json`). The rendered `type`
+  step (house v0.1.21) fails on erfi.dev as of 2026-11-10: prose runs
+  110-202 characters per line and body/link colours are below APCA Lc 90
+  for Newsreader 18px. Fixes: lexicanum#81 (measure), house#11 (kit
+  colours); evidence `docs/research/2026-11-10-typography.md`.
 - `src/styles/custom.css` holds site-specific rules only (layout widths,
   diagrams, print, references); it styles `.footnotes` dense (small type,
   tight leading).
