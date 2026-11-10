@@ -65,8 +65,21 @@ the build/test gate only, no deploy.
   and install steps: `house assets cat starlight/README.md`. Fonts: Overpass
   Mono for titles, nav and labels, Inconsolata for code, tables and data
   (@fontsource); no sans face, no social links, ea only as the footer
-  signature. Gate: `house check .` (CI runs `--static` before
-  build-and-deploy; preview URLs in `.house.json`). The rendered `type`
+  signature. Gate: `house check .`; preview URLs in `.house.json`. CI
+  runs it twice before build-and-deploy, which needs both jobs:
+  `house-gate` (`--static`) and `house-rendered` (house#18), which builds
+  the site in the Playwright image (`mcr.microsoft.com/playwright`, its
+  Chromium as `HOUSE_CHROME`; act-22.04 has no Chromium and its libraries
+  come only from apt) and runs `scripts/ci/house-rendered.sh dist`:
+  serves dist on 127.0.0.1:23161, optical/live/type on the `.house.json`
+  pages, layout on every sitemap page in 4 parallel shards, and fails on
+  any SKIP as well as FAIL (house exits 0 on an unreachable URL). Same
+  script locally after `bun run build`: about 50 s on the dev box
+  (2026-11-10), against 205 s for one unsharded `house check --sitemap`.
+  Tools the image lacks (bun, jq, d2) come from GitHub releases via
+  `scripts/ci/playwright-tools.sh`; `bun install --ignore-scripts` there
+  skips better-sqlite3's implicit node-gyp build (no make in the image;
+  13.x loads its bundled prebuild). The rendered `type`
   step (house v0.1.21) holds running text to <= 100 characters per line
   (80 until v0.1.25, 90 until v0.1.28) and APCA Lc 90 at Newsreader
   18px. Body text is full ink (was 78%, Lc 69.9
@@ -82,9 +95,9 @@ the build/test gate only, no deploy.
   `docs/research/2026-11-10-typography.md`,
   `docs/research/2026-11-10-layout.md`; public write-up
   `reference/docs-reading-column-and-wide-tables`. Run before a CSS
-  change, on a built `dist/` served locally: `house check . --url <page>
-  --sitemap http://127.0.0.1:<port>/sitemap-index.xml` (house v0.1.27
-  layout step: every page at 390/1280/1920/2560px, ~4.5 min), plus
+  change, on a built `dist/`: `bash scripts/ci/house-rendered.sh`, the
+  CI job's own sweep (house v0.1.27 layout step: every page at
+  390/1280/1920/2560px), plus
   screenshots at those widths, before showing anyone; the full procedure
   is house-ui `core.md` "Changing layout or type". The homepage is one
   column with one left edge (owner 2026-11-10; kit 0.1.28 had regressed
