@@ -89,10 +89,11 @@ fi
 
 static=tokens,block,frame,icon
 pids=()
-house check . --json --skip "$static,layout" > "$work/pages.json" &
+house check . --json --skip "$static,type,layout" > "$work/pages.json" &
 pids+=($!)
+# layout and type on every page: since house 0.1.30 --sitemap feeds both.
 for ((i = 0; i < shards; i++)); do
-  house check . --json --skip "$static,optical-light,optical-dark,live,type" \
+  house check . --json --skip "$static,optical-light,optical-dark,live" \
     --sitemap "$base/house-shard-$i.xml" > "$work/shard-$i.json" &
   pids+=($!)
 done
@@ -101,8 +102,8 @@ for p in "${pids[@]}"; do wait "$p" || true; done  # verdict comes from the JSON
 python3 - "$work" "$shards" <<'PY'
 import json, os, sys
 work, n = sys.argv[1], int(sys.argv[2])
-want = {"pages.json": ["optical-light", "optical-dark", "live", "type"]}
-want.update({"shard-%d.json" % i: ["layout"] for i in range(n)})
+want = {"pages.json": ["optical-light", "optical-dark", "live"]}
+want.update({"shard-%d.json" % i: ["type", "layout"] for i in range(n)})
 bad = 0
 for f, steps in want.items():
     try:
