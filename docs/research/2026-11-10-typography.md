@@ -8,8 +8,10 @@ say about each?
 > Status 2026-11-10: changes 1 and 2 below shipped (house v0.1.22 kit,
 > lexicanum b5aee69; full ink body, prose links at Lc 91+, 34rem measure,
 > References 17px) and are enforced by the `house check` type step (house
-> v0.1.21). Changes 3 and 4 (body size or face, inline-code box) are not
-> done: house#13. The numbers in "What the page does now" are the
+> v0.1.21). Changes 3 and 4 were decided by owner A/B on 2026-11-10
+> (house#13, `house preview` of Newsreader / Source Serif 4 / Literata,
+> 18 / 19 / 20px, strong / hairline / no code box): keep Newsreader at
+> 18px with the strong inline-code box. No change shipped. The numbers in "What the page does now" are the
 > pre-change state.
 
 Method: four parallel research workers (raw dumps in
