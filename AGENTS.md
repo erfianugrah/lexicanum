@@ -71,8 +71,9 @@ the build/test gate only, no deploy.
   the site in the Playwright image (`mcr.microsoft.com/playwright`, its
   Chromium as `HOUSE_CHROME`; act-22.04 has no Chromium and its libraries
   come only from apt) and runs `scripts/ci/house-rendered.sh dist`:
-  serves dist on 127.0.0.1:23161, optical/live/type on the `.house.json`
-  pages, layout on every sitemap page in 4 parallel shards, and fails on
+  serves dist on 127.0.0.1:23161, optical/live on the `.house.json`
+  pages, type and layout on every sitemap page in 4 parallel shards (about
+  1.8 min on the dev box; layout alone was 48 s), and fails on
   any SKIP as well as FAIL (house exits 0 on an unreachable URL). Same
   script locally after `bun run build`: about 50 s on the dev box
   (2026-11-10), against 205 s for one unsharded `house check --sitemap`.
