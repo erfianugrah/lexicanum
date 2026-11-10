@@ -9,9 +9,11 @@ say about each?
 > prose links at Lc 91+, References 17px; house kit 0.1.22+). Change 1 (the
 > measure) shipped as a 34rem cap, then a centred reading axis (kit
 > 0.1.23); the owner rejected both and the layout was reverted to the
-> single wide column (kit 0.1.24, lexicanum 822f96b). The measure is to be
-> redone from screenshots of established docs sites (lexicanum#82). The
-> `house check` type step (house v0.1.21) enforces both rules. Changes 3 and 4 were decided by owner A/B on 2026-11-10
+> single wide column (kit 0.1.24, lexicanum 822f96b). It was redone from
+> research on established docs sites and shipped as a two-width fluid
+> layout (kit 0.1.25, lexicanum#82): see `2026-11-10-layout.md`. The
+> `house check` type step (house v0.1.21) enforces both rules; its measure
+> maximum is 90 characters since 0.1.25. Changes 3 and 4 were decided by owner A/B on 2026-11-10
 > (house#13, `house preview` of Newsreader / Source Serif 4 / Literata,
 > 18 / 19 / 20px, strong / hairline / no code box): keep Newsreader at
 > 18px with the strong inline-code box. No change shipped. The numbers in "What the page does now" are the

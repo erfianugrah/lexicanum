@@ -115,6 +115,24 @@ function rehypeGraphvizIntrinsicSize() {
   return (/** @type {any} */ tree) => walk(tree);
 }
 
+// Wrap every Markdown table in div.table-scroll (lexicanum#82). The house
+// kit fills the content column with the table; the wrapper scrolls the rare
+// table whose words cannot fit (long identifiers in plain text) instead of
+// pushing the page sideways or splitting short words.
+function rehypeTableScroll() {
+  const walk = (/** @type {any} */ node) => {
+    if (!node.children) return;
+    node.children = node.children.map((/** @type {any} */ c) => {
+      if (c.type === "element" && c.tagName === "table") {
+        return { type: "element", tagName: "div", properties: { className: ["table-scroll"] }, children: [c] };
+      }
+      walk(c);
+      return c;
+    });
+  };
+  return (/** @type {any} */ tree) => walk(tree);
+}
+
 // GFM renders the footnote section under a screen-reader-only
 // <h2 id="footnote-label">Footnotes</h2>. Rename it to "References" and drop the
 // sr-only class so it reads as a real visible section (and shows as "References"
@@ -323,6 +341,7 @@ export default defineConfig({
         rehypeGraphvizIntrinsicSize,
         // Rename the GFM "Footnotes" section heading to "References".
         rehypeFootnoteLabelToReferences,
+        rehypeTableScroll,
       ],
     }),
     syntaxHighlight: {
