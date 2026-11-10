@@ -69,7 +69,7 @@ the build/test gate only, no deploy.
   build-and-deploy; preview URLs in `.house.json`). The rendered `type`
   step (house v0.1.21) holds running text to <= 80 characters per line and
   APCA Lc 90 at Newsreader 18px. Body text is full ink (was 78%, Lc 69.9
-  in dark; house#11). Layout (kit 0.1.25, lexicanum#82, owner A/B
+  in dark; house#11). Layout (kit 0.1.25, tuned to 0.1.28, lexicanum#82, chosen by side-by-side preview
   2026-11-10): two widths, fluid by screen size - running text on a
   centred reading column (~79 characters at 1280px to ~95 at 2560px,
   body 18 -> 20px, line height 1.6, one empty line between paragraphs),
