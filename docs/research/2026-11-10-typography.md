@@ -5,10 +5,13 @@ Question from the owner, looking at the TL;DR of
 contrast, the font and the hierarchy right, and what does typography research
 say about each?
 
-> Status 2026-11-10: changes 1 and 2 below shipped (house v0.1.22 kit,
-> lexicanum b5aee69; full ink body, prose links at Lc 91+, 34rem measure,
-> References 17px) and are enforced by the `house check` type step (house
-> v0.1.21). Changes 3 and 4 were decided by owner A/B on 2026-11-10
+> Status 2026-11-10: change 2 below shipped and stays (full ink body,
+> prose links at Lc 91+, References 17px; house kit 0.1.22+). Change 1 (the
+> measure) shipped as a 34rem cap, then a centred reading axis (kit
+> 0.1.23); the owner rejected both and the layout was reverted to the
+> single wide column (kit 0.1.24, lexicanum 822f96b). The measure is to be
+> redone from screenshots of established docs sites (lexicanum#82). The
+> `house check` type step (house v0.1.21) enforces both rules. Changes 3 and 4 were decided by owner A/B on 2026-11-10
 > (house#13, `house preview` of Newsreader / Source Serif 4 / Literata,
 > 18 / 19 / 20px, strong / hairline / no code box): keep Newsreader at
 > 18px with the strong inline-code box. No change shipped. The numbers in "What the page does now" are the

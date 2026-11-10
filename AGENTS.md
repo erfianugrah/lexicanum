@@ -68,11 +68,15 @@ the build/test gate only, no deploy.
   signature. Gate: `house check .` (CI runs `--static` before
   build-and-deploy; preview URLs in `.house.json`). The rendered `type`
   step (house v0.1.21) holds running text to <= 80 characters per line and
-  APCA Lc 90 at Newsreader 18px: the kit caps prose at `--prose-measure`
-  (34rem) while tables, code and diagrams keep the wide column, and body
-  text is full ink (was 78%, Lc 69.9 in dark). Evidence
-  `docs/research/2026-11-10-typography.md`; lexicanum#81, house#11. Run it
-  before a CSS change: `house check . --url <page>` on a built `dist/`.
+  APCA Lc 90 at Newsreader 18px. Body text is full ink (was 78%, Lc 69.9
+  in dark; house#11). The line-length half FAILS on this site by design
+  for now: a 34rem prose cap and a centred reading axis (kit 0.1.22-0.1.23)
+  were rejected and reverted to the single wide column (kit 0.1.24,
+  2026-11-10); the layout is to be redone from research on real docs sites
+  (lexicanum#82), not iterated in place. Evidence
+  `docs/research/2026-11-10-typography.md`. Run it before a CSS change:
+  `house check . --url <page>` on a built `dist/`, and screenshot 1280,
+  1600, 1920 and 2560px plus phone before showing anyone.
 - `src/styles/custom.css` holds site-specific rules only (layout widths,
   diagrams, print, references); it styles `.footnotes` dense (small type,
   tight leading).
