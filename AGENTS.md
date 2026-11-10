@@ -79,10 +79,12 @@ the build/test gate only, no deploy.
   in `astro.config.mjs`, so a table whose words cannot fit scrolls
   instead of widening the page. Evidence:
   `docs/research/2026-11-10-typography.md`,
-  `docs/research/2026-11-10-layout.md`. Run before a CSS change:
-  `house check . --url <page>` on a built `dist/`, an overflow sweep over
-  every page at 390/1280/1920/2560px, and screenshots at those widths,
-  before showing anyone.
+  `docs/research/2026-11-10-layout.md`; public write-up
+  `reference/docs-reading-column-and-wide-tables`. Run before a CSS
+  change, on a built `dist/` served locally: `house check . --url <page>
+  --sitemap http://127.0.0.1:<port>/sitemap-index.xml` (house v0.1.27
+  layout step: every page at 390/1280/1920/2560px, ~4.5 min), plus
+  screenshots at those widths, before showing anyone.
 - `src/styles/custom.css` holds site-specific rules only (layout widths,
   diagrams, print, references); it styles `.footnotes` dense (small type,
   tight leading).
