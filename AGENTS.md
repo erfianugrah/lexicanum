@@ -71,9 +71,9 @@ the build/test gate only, no deploy.
   APCA Lc 90 at Newsreader 18px. Body text is full ink (was 78%, Lc 69.9
   in dark; house#11). Layout (kit 0.1.25, lexicanum#82, owner A/B
   2026-11-10): two widths, fluid by screen size - running text on a
-  centred reading column (~79 characters at 1280px to ~87 at 2560px,
+  centred reading column (~79 characters at 1280px to ~95 at 2560px,
   body 18 -> 20px, line height 1.6, one empty line between paragraphs),
-  tables, code, diagrams and card grids fill the content column (60-84rem),
+  tables, code, diagrams and card grids fill the content column (60-72rem),
   the right sidebar only as wide as its TOC. Every
   Markdown table is wrapped in `div.table-scroll` by `rehypeTableScroll`
   in `astro.config.mjs`, so a table whose words cannot fit scrolls
