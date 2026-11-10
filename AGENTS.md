@@ -67,10 +67,12 @@ the build/test gate only, no deploy.
   (@fontsource); no sans face, no social links, ea only as the footer
   signature. Gate: `house check .` (CI runs `--static` before
   build-and-deploy; preview URLs in `.house.json`). The rendered `type`
-  step (house v0.1.21) fails on erfi.dev as of 2026-11-10: prose runs
-  110-202 characters per line and body/link colours are below APCA Lc 90
-  for Newsreader 18px. Fixes: lexicanum#81 (measure), house#11 (kit
-  colours); evidence `docs/research/2026-11-10-typography.md`.
+  step (house v0.1.21) holds running text to <= 80 characters per line and
+  APCA Lc 90 at Newsreader 18px: the kit caps prose at `--prose-measure`
+  (34rem) while tables, code and diagrams keep the wide column, and body
+  text is full ink (was 78%, Lc 69.9 in dark). Evidence
+  `docs/research/2026-11-10-typography.md`; lexicanum#81, house#11. Run it
+  before a CSS change: `house check . --url <page>` on a built `dist/`.
 - `src/styles/custom.css` holds site-specific rules only (layout widths,
   diagrams, print, references); it styles `.footnotes` dense (small type,
   tight leading).
