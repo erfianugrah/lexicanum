@@ -117,8 +117,10 @@ would not show empty margins; that commit says the 96rem cap avoids
   threshold at 18px (worker-reported from the abstract; not re-read by the
   parent). That threshold is in CSS px of the tested face, and Newsreader's
   0.426 x-height makes 18px look smaller than 18px of a typical screen face.
-- Worker-measured x-heights of alternatives (not re-measured): Literata
-  0.507, Source Serif 4 0.475.
+- x-heights of alternatives, measured 2026-11-10 from the Google Fonts
+  default instance ('x' glyph top / em, fontTools): Literata 0.507,
+  Source Serif 4 0.492 (the worker's 0.475 was wrong), Newsreader 0.441.
+  At 18px they read as 17.5, 17.0 and 15.2px of the APCA reference face.
 - Newsreader is a static opsz-16 cut; the variable build would let the
   browser use opsz 18 at body size. Small effect; low priority.
 - Mono faces for headings and labels: no study tested short monospace or
@@ -179,5 +181,5 @@ scanning speed, Dyson & Kipping 1998 is the one result in its favour.
 
 Dyson and Rello full texts (paywalled; abstracts and secondary sources
 only), Arditi & Cho 2005/2007, Legge & Bigelow 2011, Material Design's
-dark-theme text opacity, the worker x-height figures for Literata and Source
-Serif 4, and every NN/g claim other than the two quoted above.
+dark-theme text opacity, and every NN/g claim other than the two quoted
+above.
