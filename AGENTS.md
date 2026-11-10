@@ -55,7 +55,7 @@ the build/test gate only, no deploy.
   plain CSS plus the vendored house block - never edit the block, run
   `house sync`), `src/styles/house-starlight.css` (palette -> `--sl-*`,
   Starlight element styling, plus the generic kit rules: Newsreader serif
-  prose at 18px/1.75, category-hue wayfinding via `data-hue` attributes
+  prose, fluid 18 -> 20px at line height 1.6, category-hue wayfinding via `data-hue` attributes
   mapped to `--house-hue-1` through `--house-hue-9` from
   `src/house.categories.mjs`, the `house-kicker` page breadcrumb, and the
   full article-body clarity rules), and `src/styles/custom.css`
@@ -67,8 +67,9 @@ the build/test gate only, no deploy.
   (@fontsource); no sans face, no social links, ea only as the footer
   signature. Gate: `house check .` (CI runs `--static` before
   build-and-deploy; preview URLs in `.house.json`). The rendered `type`
-  step (house v0.1.21) holds running text to <= 80 characters per line and
-  APCA Lc 90 at Newsreader 18px. Body text is full ink (was 78%, Lc 69.9
+  step (house v0.1.21) holds running text to <= 100 characters per line
+  (80 until v0.1.25, 90 until v0.1.28) and APCA Lc 90 at Newsreader
+  18px. Body text is full ink (was 78%, Lc 69.9
   in dark; house#11). Layout (kit 0.1.25, tuned to 0.1.28, lexicanum#82, chosen by side-by-side preview
   2026-11-10): two widths, fluid by screen size - running text on a
   centred reading column (~79 characters at 1280px to ~95 at 2560px,
@@ -84,7 +85,14 @@ the build/test gate only, no deploy.
   change, on a built `dist/` served locally: `house check . --url <page>
   --sitemap http://127.0.0.1:<port>/sitemap-index.xml` (house v0.1.27
   layout step: every page at 390/1280/1920/2560px, ~4.5 min), plus
-  screenshots at those widths, before showing anyone.
+  screenshots at those widths, before showing anyone; the full procedure
+  is house-ui `core.md` "Changing layout or type". The homepage is one
+  column with one left edge (owner 2026-11-10; kit 0.1.28 had regressed
+  it): `index.mdx` wraps its body in `div.lex-home` so the kit's
+  direct-child rules miss it, marked `data-house-layout="one-edge"` from
+  house v0.1.29 (opted out with `data-house-allow="type layout"` before),
+  and any kit change that targets direct children of
+  `.sl-markdown-content` is checked on `/` by name.
 - `src/styles/custom.css` holds site-specific rules only (layout widths,
   diagrams, print, references); it styles `.footnotes` dense (small type,
   tight leading).
