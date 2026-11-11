@@ -273,6 +273,128 @@ select cron.alter_job(<jobid>, active := false);
 The same caution applies to `pg_net`, `wrappers`, and anything else that
 performs external side effects.[^sb-clone]
 
+### TimescaleDB: plain hypertables only, and the conversion guide's order (PX01)
+
+`timescaledb` falls under the deprecated-extensions row of the table above,
+and its hypertables hold rows, so they are converted before the extension is
+dropped. The extension page says `timescaledb` is deprecated on Postgres 17
+and must be dropped before a 15 project is upgraded, and for hypertables points
+to a migration guide that converts them to native partitioning managed by
+`pg_partman`.[^sb-timescaledb] That guide renames the hypertable, creates
+`(like ... including all, primary key (sent_at, id)) partition by range
+(sent_at)`, copies with `insert ... select *`, drops the hypertable and then
+the extension once every hypertable is migrated, and only then, in an
+optional last step, calls `partman.create_parent`.[^sb-pg-partman] Both pages read that way on
+2026-11-10 and 2026-11-11.
+
+PX01 ran that guide, a corrected order and two logical-replication moves on
+2026-11-10, one run
+([RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/b339e99/experiments/pg17-extensions/RUNLOG.md)):
+a source on 15.19 (`postgres_engine: "15"`) and a target on 17.11, both at the
+compute size the API assigns when none is set (the artifact's title says Micro,
+which was not read back), in ap-southeast-1 on a Team-plan org. The source held
+two hypertables of 300,000 rows each in 1-day chunks over 30 days: `messages`
+(`id bigint generated always as identity`, primary key `(id, sent_at)`) and
+`events` (no primary key).
+
+- `create extension timescaledb with schema extensions` on 15.19 installed
+  2.16.1 with `timescaledb.license` `apache`, which matches the extension
+  page's statement that projects come with the Apache 2 Edition and that
+  Community Edition functionality is not available.[^sb-timescaledb]
+  Compression and a continuous aggregate were each refused with SQLSTATE 0A000
+  `functionality not supported under the current "apache" license`, and
+  `add_retention_policy` with 0A000 `function "add_retention_policy" is not
+  supported under the current "apache" license`. Changing the setting was not
+  tested. At `apache` a project holds plain hypertables only, so there is no
+  compressed data to expand and no aggregate to rebuild before a move. 17.11
+  does not list `timescaledb`; both list `pg_partman` 5.3.1 and `pg_cron` 1.6.4
+  (PX01a to PX01c).
+- With the extension installed, `GET /v1/projects/{ref}/upgrade/eligibility`
+  answered `eligible` false with `validation_errors`
+  `[{"type":"unsupported_extension","extension_name":"timescaledb"}]`; after the
+  drop it answered `eligible` true with `[]` (PX01d, PX01h).
+- A hypertable does not replicate as-is. A publication on `messages` listed 32
+  tables in `pg_publication_tables`, 31 of them the chunks in
+  `_timescaledb_internal`, and `create subscription` on 17.11 into a plain
+  `public.messages` failed with SQLSTATE 3F000 `schema "_timescaledb_internal"
+  does not exist`. The target held 0 rows 60 s later, and 0 of the 200 rows
+  written on the source after that (PX01e).
+- The guide as written failed on both shapes (PX01f). On `messages`, `create
+  table public.messages (like public.ht_messages including all, primary key
+  (sent_at, id)) partition by range (sent_at)` failed with SQLSTATE 42P16
+  `multiple primary keys for table "messages" are not allowed`. On `events` the
+  create succeeded, and the copy, which the guide runs before `create_parent`,
+  failed with SQLSTATE 23514 `no partition of relation "events" found for row`.
+
+Three changes made the conversion work on both tables (PX01g): call
+`create_parent` before the copy; when the hypertable already has a primary key,
+replace `including all` with `including defaults including constraints
+including identity including generated` and keep the guide's `primary key
+(sent_at, id)`; and for a `GENERATED ALWAYS` identity column, copy with
+`overriding system value` (a plain `insert ... select *` failed with SQLSTATE
+428C9) and move the sequence past `max(id)` afterwards. `events`, with the
+guide's `including all` create and `create_parent` first, took 300,000 rows in
+2178 ms into 39 child partitions including the default, with 0 rows in the
+default. `messages` took 300,200 rows in 1294 ms, 100 of them in the default
+partition: rows dated 10 days ahead, past the 7 premade days. The order for
+`messages`, as the module ran it:
+
+```sql
+-- Postgres 15 project; messages: id bigint generated always as identity,
+-- primary key (id, sent_at)
+alter table public.messages rename to ht_messages;
+
+create schema if not exists partman;
+create extension if not exists pg_partman with schema partman;
+
+-- with a primary key on the hypertable, the guide's "including all" gave 42P16
+create table public.messages (like public.ht_messages
+  including defaults including constraints including identity including generated,
+  primary key (sent_at, id)) partition by range (sent_at);
+
+-- before the copy (the guide's order gave 23514)
+select partman.create_parent(p_parent_table := 'public.messages',
+  p_control := 'sent_at', p_type := 'range', p_interval := '1 day',
+  p_premake := 7, p_start_partition := '<first day of the data>');
+
+-- a plain insert ... select * gave 428C9 on the GENERATED ALWAYS column
+insert into public.messages overriding system value
+  select * from public.ht_messages;
+
+select setval(pg_get_serial_sequence('public.messages', 'id'),
+  (select max(id) from public.messages));
+
+drop table public.ht_messages;
+drop extension if exists timescaledb;   -- once every hypertable is converted
+call partman.run_maintenance_proc();
+create extension if not exists pg_cron;
+select cron.schedule('@daily', $$call partman.run_maintenance_proc()$$);
+```
+
+Skipping the `setval` fails without an error: the next insert got id 1 while
+`max(id)` was 300200, 2 rows then had id 1, and the primary key `(sent_at, id)`
+accepted it. After the `setval` the next insert got 300201. Dropping both
+hypertables, `drop extension timescaledb`, `call partman.run_maintenance_proc()`
+and the guide's `cron.schedule` line (job 1) all succeeded.
+
+After the conversion the table replicates (PX01i). `create publication px_np
+for table public.messages with (publish_via_partition_root = true)` on the
+source and a subscription on 17.11 into a plain `public.messages` had every
+table `r` at the first 10 s check, with 300,202 rows on both. 100 rows dated
+3 days ahead (a premade partition) and 100 dated 30 days ahead (the default
+partition, which then held 200) reached the target within 30 s: 300,402 rows,
+100 and 100. On either path, then, the conversion happens on 15 first: Path A
+drops the extension and reads eligibility, and Path B publishes the partitioned
+table through its root.
+
+Not measured: a copy at production size (the 2178 ms and 1294 ms above are one
+sample each), what writers see between the guide's rename and the copy,
+application SQL that calls `time_bucket()` or other `timescaledb` functions,
+hypertables with foreign keys or space partitioning, what the 3 jobs in
+`timescaledb_information.jobs` were, `pg_partman` retention, dropping the
+guide's `primary key (sent_at, id)` clause instead of narrowing the `like`
+list, and an in-place upgrade after the conversion (eligibility only).
+
 ## Every task, three ways
 
 Every way of landing on a new Postgres major - or a new project - reduces to
@@ -538,6 +660,11 @@ holds the per-cell record.
 - [ ] If you use `pgcrypto`, run the wrong-passphrase scan for bf / blowfish /
       cast5 values now: on the old image it flags them, and after the upgrade it
       flags nothing by default (caveat table above; PG01).
+- [ ] If `timescaledb` is installed, convert every hypertable on 15 in the
+      order under [TimescaleDB](#timescaledb-plain-hypertables-only-and-the-conversion-guides-order-px01),
+      then drop the extension: eligibility lists it as `unsupported_extension`
+      until it is dropped, and the conversion guide as written failed on both
+      table shapes tried (PX01).
 - [ ] Pick the window: your users' quietest hours; avoid Friday/weekend.
 - [ ] Run your own readiness review: enabled extensions vs the deprecated
       list, `reg*` data types referencing system OIDs, logical replication
@@ -548,10 +675,16 @@ holds the per-cell record.
 #### T-1 day
 
 - [ ] Drop deprecated extensions (for PG 17: `pgjwt`, `plcoffee`, `plls`,
-      `plv8` - drop them from the dashboard's database extensions page).
+      `plv8`, `timescaledb` - convert hypertables first, see
+      [TimescaleDB](#timescaledb-plain-hypertables-only-and-the-conversion-guides-order-px01); drop them from the dashboard's database extensions page).
 - [ ] Delete read replicas (projects with replicas cannot be upgraded; you
       will recreate them after). Make sure the app tolerates reading from
-      the primary in the meantime.
+      the primary in the meantime. This is for the in-place path only: a
+      logical-replication move to 17 ran publication and copy with the
+      source's replica left in place, and on the target a replica added before its
+      subscription served in 182 s while one added after a finished copy
+      never served in 60 minutes (RR10, one run; [Path B, Step
+      2](#step-2-create-the-target-project)).
 - [ ] Take a fresh `pg_dump` logical backup - belt and braces on top of
       physical backups / PITR.
 - [ ] Prepare your write-stop (maintenance page, deploy freeze, queue
@@ -788,6 +921,23 @@ supabase projects create my-app-pg17 \
   --db-password "$(openssl rand -base64 24)"
 ```
 
+Read replicas can stay on the source for this path: the docs list deleting
+them as a prerequisite of the in-place upgrade,[^sb-upgrading] and in RR10
+(2026-11-10, one run: Team org, Small, `pitr_7`, 24 GB disks, a 15.19 source
+with a 3.9 GiB table, 17.11 targets) the source's replica was left in place
+while the publication and both slots worked and both copies delivered
+4,000,000 rows (one target's table never reached `r`, for the reason under
+[Step 5](#step-5-replicate--watch)). If the
+new project needs a replica, add it while the project is empty, before
+`replicate`: a replica added before its subscription accepted a first session
+after 182 s and followed the copy, with lag up to 81,396,272 bytes, while one
+added about 38 minutes after a finished copy got no pooler entry and never
+served in 60 minutes. Why the late one stalled was not read from outside. Both
+replicas that followed the 3.9 GiB write, the source's and the early target's,
+logged `No space left on device` while the primaries had 24 GB disks; the
+source replica's rows were not counted
+([RR10 RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/b339e99/experiments/replica-routing/RUNLOG.md)).
+
 ### Step 3: restore what replication does not carry
 
 Logical replication moves table rows only - no DDL, roles, sequences,
@@ -845,6 +995,28 @@ the same `ALTER` on the target resumed replication in about 6.1 s with the
 missed rows backfilled and no subscription recreation (edge-resilience W15,
 2026-08-16). If a migration must ship during the window, apply the DDL on the
 target first, then on the source.
+
+When several new targets subscribe to one source, subscribe them one at a
+time. Postgres names each
+table-sync slot on the source `pg_<subscription oid>_sync_<table oid>_<system identifier>`,
+and new 17 projects often share all three: 24 of 26 new 17.11 projects read in
+RR10 and RR11 reported one `system_identifier` and the other 2 shared a second
+one (one region and one org; one project's were not recorded), and the same
+setup steps gave 10 of 16 subscribed targets the same subscription and table
+OIDs. In 3 of 3 concurrent pairs with matching names, one target's table was
+still in `f` at the end of its wait bound (40 minutes in RR10, 10 in RR11),
+with a row count equal to the source's. In RR10 and RR11 run 3 that target
+still missed rows written afterwards; in RR11 run 4 it recovered, and the last
+target subscribed with the same names, started while an earlier one was stuck,
+missed them instead. Start the next subscription only after every table of the
+previous one is `r` in `pg_subscription_rel`, and confirm each target with a
+marker row written on the source after the copy, since a stuck target's count
+matched. That one at a time avoids the collision rests on the Postgres code,
+which drops a table-sync slot when its table reaches sync-done, and on one
+incidental RR11 run-2 case; RR11's reading of its run-4 states is that it
+protects only while no earlier target with the same names is stuck. Details are in the [pgmig
+reference](/reference/pgmig-logical-replication-migrator/); the runs are in the
+[RR11 RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/6b30084/experiments/replica-routing/RUNLOG.md).
 
 ### Step 6: cutover (the only downtime)
 
@@ -1014,8 +1186,9 @@ copy's worth of WAL on the source.
 ## What to do about it
 
 Module ids are edge-resilience drills, platform-facts probes and the
-compute-disk, data-api-defaults, pg-minor-17-11, restore-paths, storage-surface
-and upgrade-integrity modules in
+compute-disk, data-api-defaults, pg-minor-17-11, pg17-extensions,
+replica-routing, restore-paths, storage-surface and upgrade-integrity modules
+in
 [supabase-lab](https://github.com/erfianugrah/supabase-lab); "RUNBOOK" is
 pgmig's `docs/RUNBOOK.md`, a procedure rather than a measurement; "pgmig
 in-place harness" is the 2026-11-09 runs under [Measured in-place
@@ -1052,6 +1225,17 @@ upgrades](#measured-in-place-upgrades-2026-11-09).
   default (PG01, local Docker, 2026-10-10).
 - Compare the bucket's `storage.objects.name` values with the S3 endpoint's accepted key classes before an `aws s3 sync`: 22 of 40 keys tried were refused
   on put (SS02, 2026-10-10).
+
+**Before either path: TimescaleDB hypertables and read replicas**
+
+| Practice | Evidence | Rests on |
+|---|---|---|
+| Convert every hypertable to native partitioning on 15 before either path | With `timescaledb` installed, eligibility answered `eligible` false with `validation_errors` `[{"type":"unsupported_extension","extension_name":"timescaledb"}]`, and after the drop `eligible` true with `[]`. A publication on a hypertable listed 32 tables, 31 of them chunks in `_timescaledb_internal`, and the subscription on 17.11 failed with 3F000 `schema "_timescaledb_internal" does not exist`, 0 rows copied. The converted table, published with `publish_via_partition_root = true`, had every table `r` at the first 10 s check with 300,202 rows on both, and later rows in a premade and the default partition arrived. One run; an in-place upgrade after the conversion was not run. | PX01d, PX01e, PX01h, PX01i (2026-11-10) |
+| Run `create_parent` before the copy; narrow `including all` if there is a primary key | The pg_partman guide as written failed on both shapes: 42P16 `multiple primary keys for table "messages" are not allowed` on the hypertable with primary key `(id, sent_at)`, and 23514 `no partition of relation "events" found for row` on the copy into the one without. With `create_parent` first, and `including defaults including constraints including identity including generated` for the table with a primary key, 300,000 and 300,200 rows copied (2178 ms and 1294 ms, one sample each). | PX01f, PX01g (2026-11-10) |
+| After an identity copy with `overriding system value`, `setval` the sequence to `max(id)` | A plain `insert ... select *` into the `GENERATED ALWAYS` column failed with 428C9; with `overriding system value` it copied. Without the `setval` the next insert got id 1 while `max(id)` was 300200, 2 rows then had id 1, and the primary key `(sent_at, id)` raised no error; after it the next insert got 300201. | PX01g (2026-11-10) |
+| On the logical path, keep the source's read replica | With the 15.19 source's replica left in place, the publication and both slots worked and both copies of the 3.9 GiB table delivered 4,000,000 rows; the docs list deleting replicas as a prerequisite of the in-place upgrade. One run (Team org, Small, `pitr_7`, 24 GB disks). The source's replica logged `No space left on device` at 09:29:54 UTC, before the subscriptions (hand read), and its rows were not counted. | RR10 (2026-11-10) |
+| Add the target's read replica to the empty project before `replicate` | Added before the subscription, the replica accepted a first session after 182 s and followed the copy (lag up to 81,396,272 bytes). Added about 38 minutes after a finished copy, a replica got no pooler entry in 60 minutes and never served; why was not read from outside. One run. | RR10 (2026-11-10) |
+| Subscribe several targets from one source one at a time, each confirmed by a marker row | 24 of 26 new 17.11 projects (one region and org where recorded) reported one `system_identifier`, and 10 of 16 subscribed targets had the same subscription and table OIDs, so their table-sync slot names matched. In 3 of 3 concurrent pairs with matching names one target's table was still in `f` at the end of its wait bound (40 minutes in RR10, 10 in RR11) with a row count equal to the source's; in RR10 and RR11 run 3 that target missed later rows, and in RR11 run 4 it recovered while the last same-named target, started while an earlier one was stuck, missed them. That one at a time avoids the collision rests on the Postgres code (the sync slot is dropped at sync-done) and one incidental RR11 run-2 case. | RR10, RR11 (2026-11-10) |
 
 **In the in-place window**
 
@@ -1213,7 +1397,10 @@ upgrades](#measured-in-place-upgrades-2026-11-09).
 | PG03 | pg-minor-17-11 | [`pg03-btree-gist-nan.ts`](https://github.com/erfianugrah/supabase-lab/blob/b292b6b/experiments/pg-minor-17-11/tests/pg03-btree-gist-nan.ts) | [`run-2026-10-10T00-26-34-618Z`](https://github.com/erfianugrah/supabase-lab/blob/8ec7f86/experiments/pg-minor-17-11/out/2026-10-10/run-2026-10-10T00-26-34-618Z.facts.md), [`run-2026-10-10T00-29-13-701Z`](https://github.com/erfianugrah/supabase-lab/blob/8ec7f86/experiments/pg-minor-17-11/out/2026-10-10/run-2026-10-10T00-29-13-701Z.facts.md), [`run-2026-10-10T00-31-54-766Z`](https://github.com/erfianugrah/supabase-lab/blob/8ec7f86/experiments/pg-minor-17-11/out/2026-10-10/run-2026-10-10T00-31-54-766Z.facts.md) |
 | PG04 | pg-minor-17-11 | [`pg04-ltree-compare.ts`](https://github.com/erfianugrah/supabase-lab/blob/b292b6b/experiments/pg-minor-17-11/tests/pg04-ltree-compare.ts) | [`run-2026-10-10T00-26-34-618Z`](https://github.com/erfianugrah/supabase-lab/blob/8ec7f86/experiments/pg-minor-17-11/out/2026-10-10/run-2026-10-10T00-26-34-618Z.facts.md), [`run-2026-10-10T00-29-13-701Z`](https://github.com/erfianugrah/supabase-lab/blob/8ec7f86/experiments/pg-minor-17-11/out/2026-10-10/run-2026-10-10T00-29-13-701Z.facts.md), [`run-2026-10-10T00-31-54-766Z`](https://github.com/erfianugrah/supabase-lab/blob/8ec7f86/experiments/pg-minor-17-11/out/2026-10-10/run-2026-10-10T00-31-54-766Z.facts.md) |
 | PG05 | pg-minor-17-11 | [`pg05-ltree-casefold.ts`](https://github.com/erfianugrah/supabase-lab/blob/b292b6b/experiments/pg-minor-17-11/tests/pg05-ltree-casefold.ts) | [`run-2026-10-10T00-26-34-618Z`](https://github.com/erfianugrah/supabase-lab/blob/8ec7f86/experiments/pg-minor-17-11/out/2026-10-10/run-2026-10-10T00-26-34-618Z.facts.md), [`run-2026-10-10T00-29-13-701Z`](https://github.com/erfianugrah/supabase-lab/blob/8ec7f86/experiments/pg-minor-17-11/out/2026-10-10/run-2026-10-10T00-29-13-701Z.facts.md), [`run-2026-10-10T00-31-54-766Z`](https://github.com/erfianugrah/supabase-lab/blob/8ec7f86/experiments/pg-minor-17-11/out/2026-10-10/run-2026-10-10T00-31-54-766Z.facts.md) |
+| PX01 | pg17-extensions | [`px01-timescaledb.ts`](https://github.com/erfianugrah/supabase-lab/blob/b339e99/experiments/pg17-extensions/tests/px01-timescaledb.ts) | [`run-2026-11-10T09-16-49-541Z`](https://github.com/erfianugrah/supabase-lab/blob/b339e99/experiments/pg17-extensions/out/2026-11-10/run-2026-11-10T09-16-49-541Z.facts.md) |
 | RP01 | restore-paths | [`rp01-pro-surface.ts`](https://github.com/erfianugrah/supabase-lab/blob/b292b6b/experiments/restore-paths/tests/rp01-pro-surface.ts) | [`run-2026-10-10T01-27-07-341Z`](https://github.com/erfianugrah/supabase-lab/blob/ddd41b2/experiments/restore-paths/out/2026-10-10/run-2026-10-10T01-27-07-341Z.facts.md) |
+| RR10 | replica-routing | [`rr10-logical-target-replica.ts`](https://github.com/erfianugrah/supabase-lab/blob/b339e99/experiments/replica-routing/tests/rr10-logical-target-replica.ts) | [`run-2026-11-10T09-17-41-956Z`](https://github.com/erfianugrah/supabase-lab/blob/b339e99/experiments/replica-routing/out/2026-11-10/run-2026-11-10T09-17-41-956Z.facts.md), [`rr10-manual-reads.md`](https://github.com/erfianugrah/supabase-lab/blob/b339e99/experiments/replica-routing/out/2026-11-10/rr10-manual-reads.md) |
+| RR11 | replica-routing | [`rr11-sync-slot-collision.ts`](https://github.com/erfianugrah/supabase-lab/blob/6b30084/experiments/replica-routing/tests/rr11-sync-slot-collision.ts) | [`out/2026-11-10`](https://github.com/erfianugrah/supabase-lab/tree/6b30084/experiments/replica-routing/out/2026-11-10/) |
 | SS02 | storage-surface | [`ss02-s3-key-canary.ts`](https://github.com/erfianugrah/supabase-lab/blob/b292b6b/experiments/storage-surface/tests/ss02-s3-key-canary.ts) | [`out/2026-10-10`](https://github.com/erfianugrah/supabase-lab/tree/b292b6b/experiments/storage-surface/out/2026-10-10) |
 | UI01 | upgrade-integrity | [`ui01-create-old-major.ts`](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/upgrade-integrity/tests/ui01-create-old-major.ts) | [`out/2026-10-23`](https://github.com/erfianugrah/supabase-lab/tree/2f7df19/experiments/upgrade-integrity/out/2026-10-23/), [`out/2026-10-26`](https://github.com/erfianugrah/supabase-lab/tree/2f7df19/experiments/upgrade-integrity/out/2026-10-26/) |
 | UI03 | upgrade-integrity | [`ui03-upgrade.ts`](https://github.com/erfianugrah/supabase-lab/blob/2f7df19/experiments/upgrade-integrity/tests/ui03-upgrade.ts) | [`out/2026-10-23`](https://github.com/erfianugrah/supabase-lab/tree/2f7df19/experiments/upgrade-integrity/out/2026-10-23/), [`out/2026-10-26`](https://github.com/erfianugrah/supabase-lab/tree/2f7df19/experiments/upgrade-integrity/out/2026-10-26/) |
@@ -1240,3 +1427,5 @@ upgrades](#measured-in-place-upgrades-2026-11-09).
 [^pg-rel-18-2]: PostgreSQL Global Development Group, "E.4. Release 18.2," PostgreSQL 18 Documentation. https://www.postgresql.org/docs/current/release-18-2.html
 [^sb-s3-auth]: Supabase, "S3 Authentication," Supabase Docs. https://supabase.com/docs/guides/storage/s3/authentication
 [^sb-storage-errors]: Supabase, "Error Codes," Supabase Docs. https://supabase.com/docs/guides/storage/debugging/error-codes
+[^sb-timescaledb]: Supabase, "timescaledb: Time-Series data," Supabase Docs. https://supabase.com/docs/guides/database/extensions/timescaledb
+[^sb-pg-partman]: Supabase, "Migrate from TimescaleDB to pg_partman," Supabase Docs. https://supabase.com/docs/guides/database/migrating-to-pg-partman
