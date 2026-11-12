@@ -17,6 +17,7 @@ import {
   headlessTableRuns,
   markerLines,
   mathRiskLines,
+  mdxSyntaxError,
   smartPunctLines,
   splitTables,
 } from "./lib/mdx";
@@ -74,6 +75,12 @@ test("every grandfathered path still exists", () => {
 });
 
 describe.each(docs.map((d) => [d.path, d] as const))("%s", (_path, doc) => {
+  test("parses as MDX", () => {
+    // The same parse astro build runs; a bare <word> in prose otherwise passes
+    // every line check and fails the build (lexicanum#74).
+    expect(mdxSyntaxError(doc.raw)).toBeNull();
+  });
+
   test("no table renders as literal pipe text", () => {
     const splits = splitTables(doc).map(
       (s) => `rows ${s.first.startLine}-${s.first.endLine} then ${s.second.startLine}-${s.second.endLine}`,

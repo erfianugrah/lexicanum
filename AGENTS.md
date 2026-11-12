@@ -157,8 +157,9 @@ the build/test gate only, no deploy.
   unmatched one as a stale artifact.
 - **MDX reads `<` in prose as JSX.** `Micro <-> Small` or a bare `<ref>`
   outside a code span fails the build with "Unexpected character". Write the
-  words, or put the placeholder in backticks. `rg -n '<[a-z-]|<->'` on prose
-  lines before `bun run build`.
+  words, or put the placeholder in backticks. `bun test` catches it before
+  `astro build` does: the "parses as MDX" test runs the build's own parser
+  (`@mdx-js/mdx` with GFM and math) on every doc (lexicanum#74).
 
 ## Doc taxonomy
 

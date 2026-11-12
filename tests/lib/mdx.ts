@@ -15,6 +15,14 @@
  * that can pass vacuously.
  */
 
+// simplify: @mdx-js/mdx resolves through @astrojs/markdown-remark (Astro's own
+// dependency), so it is the version the build uses. A direct devDependency
+// re-hoisted @types/hast 3.0.4 over 3.0.5 and broke tsc on astro.config.mjs
+// (2026-11-12); add one only if Astro drops it.
+import { createProcessor } from "@mdx-js/mdx";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+
 export type LineKind = "frontmatter" | "fence" | "comment" | "prose" | "delimiter";
 
 export interface Line {
@@ -521,4 +529,28 @@ export function markerLines(doc: Doc): { line: Line; name: string; marker: strin
     }
   }
   return out;
+}
+
+// The parser astro build runs on every doc: @mdx-js/mdx with the GFM and math
+// syntax extensions astro.config.mjs enables. Built once; parse() only runs the
+// syntax stage, so this costs milliseconds per doc.
+const mdxParser = createProcessor({ remarkPlugins: [remarkGfm, remarkMath] });
+
+/**
+ * The MDX syntax error astro build would stop on, as "line:col message", or
+ * null. Catches what no line pattern can: a bare `<room>` or `<->` in prose
+ * is JSX to MDX, and the build fails with "Expected a closing tag" - after the
+ * test suite has already passed (lexicanum#74). Frontmatter is blanked rather
+ * than removed, so reported lines match the file.
+ */
+export function mdxSyntaxError(raw: string): string | null {
+  const fm = /^---\r?\n[\s\S]*?\r?\n---\r?\n/.exec(raw);
+  const body = fm ? fm[0].replace(/[^\n]/g, "") + raw.slice(fm[0].length) : raw;
+  try {
+    mdxParser.parse(body);
+    return null;
+  } catch (e) {
+    const err = e as { line?: number; column?: number; reason?: string; message?: string };
+    return `${err.line ?? "?"}:${err.column ?? "?"} ${err.reason ?? err.message}`;
+  }
 }
