@@ -21,6 +21,7 @@ This is a reference template for building similar systems. All patterns are deri
 - Component failures fail open - an unavailable ML Worker scores 0 risk for its component and its weight is redistributed to the remaining active signals - while token replay and Turnstile validation stay fail-secure.
 - Weights, thresholds and detection parameters live in a mergeable config and are auto-normalised to sum to 1.0 after any override; block/allow comes from deterministic floors and a corroboration bonus on top of the weighted score.
 - Decisions are written to a `ScoringDecision` audit trail, and the model behind them is a 20-tree Random Forest serialised as JSON in KV, guarded before deploy on accuracy, KV's 25 MB value limit and feature alignment.
+- On Supabase the same layers run in the project's Postgres behind Supabase Auth hooks, and the edge Worker hands the signup hook a signed summary of what only it can see (the Turnstile device ID, JA4). See [On Supabase: the same layers in Postgres](#on-supabase-the-same-layers-in-postgres).
 
 ---
 
@@ -1494,6 +1495,12 @@ many submissions - as the unit of work, and most of the rows below follow from t
 | **Outbound = inbound** | Blocking protects the platform; it does nothing for the victim downstream. | Report or reset harvested credentials and notify other providers in a distributed kit; a blocked payload is still live elsewhere. |
 | **External signal** | A self-generated blacklist only learns from abuse that already reached you. | Ingest external feeds (disposable-email lists, known-bad IPs/JA4) to act on abuse "seen elsewhere first". |
 
+forminator itself ships the footprint matcher as `src/lib/footprint.ts` (N-of-M
+bands, pivot and splash detection, update suggestions; added 2026-06-19), but the
+submission route does not call it, so on Workers it is a library rather than a
+running layer. The Supabase port below runs it as a scheduled sweep with
+retroactive matching and a review queue.
+
 ### What scoring-first already gets right
 
 A scorer built like this one already covers two principles.
@@ -1513,9 +1520,175 @@ fills it, so ship the log-only signal first and add the operator UI once the sig
 producing useful labels.
 </Aside>
 
+## On Supabase: the same layers in Postgres
+
+The Workers system protects a form it owns. Signups on Supabase go to Supabase
+Auth, and two facts stop the Workers system from simply sitting in front of it:
+
+- The project's own Auth endpoint (`https://<ref>.supabase.co/auth/v1/signup`)
+  keeps answering after a custom domain is set up[^sb-custom-domains], so a bot can
+  skip any proxy on the app's domain. [Locking down Supabase](/reference/supabase-data-surface-lockdown/)
+  measured this.
+- Supabase's hosted CAPTCHA verifies Turnstile but keeps only `success`,
+  `error-codes` and `hostname` from the response
+  ([`captcha.go` L18-L22](https://github.com/supabase/auth/blob/88725864802773ad4533e0cad28f7a2740c89a7e/internal/security/captcha.go#L18-L22)),
+  so the ephemeral device ID[^cf-ephemeral-id] - the signal that sees through
+  residential proxy rotation - never reaches the project.
+
+The port, a private kit called **abuse-kit**, moves the layers into the project's
+Postgres and enforces them where no request can bypass them: in Auth hooks. The
+edge Worker does what only it can do and signs the result.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  Browser [label="Browser"];
+  Worker  [label="Edge Worker\nTurnstile + JA4"];
+  Auth    [label="Supabase Auth"];
+  Hook    [label="before-user-created\nPostgres function", shape=hexagon];
+  PG      [label="abuse schema\nevents, blocklist, tiers", shape=cylinder];
+  Cron    [label="pg_cron\nscore, footprints"];
+  RLS     [label="RLS on app tables\nmy_tier()"];
+
+  Browser -> Worker  [label="Turnstile token"];
+  Worker  -> Browser [label="signed verdict"];
+  Browser -> Auth    [label="signUp(data)"];
+  Auth    -> Hook    [label="verify, record"];
+  Hook    -> PG;
+  Cron    -> PG      [label="decisions, tiers"];
+  PG      -> RLS     [style=dashed];
+}
+```
+
+1. The browser solves Turnstile and sends the token to the edge Worker.
+2. The Worker verifies the token itself (so it gets the ephemeral ID), reads JA4 and bot score, and returns a short-lived HMAC-signed verdict bound to the signup email.
+3. The browser signs up with the verdict in `options.data`, which reaches the before-user-created hook[^sb-before-user-created] as `user_metadata`.
+4. The hook verifies the verdict (signature, expiry, email, single-use nonce), checks the blocklist, records the event with capped velocity counts, and denies only on a blocklist hit or a missing verdict when verdicts are required.
+5. pg_cron scores each signup and sweeps campaign footprints; the resulting tier is read live by RLS policies on the app's own tables.
+
+With verdicts required, a signup posted straight to the Auth endpoint has none and
+is refused before any `auth.users` row exists. OAuth and SSO signups cannot carry
+`options.data` and are exempt.
+
+### Which piece runs where
+
+| Workers system | On Supabase | Notes |
+| --- | --- | --- |
+| D1 blacklist, progressive timeouts | `abuse.blocklist`, `abuse.escalate` (1h, 4h, 8h, 12h, 24h) | Emails and devices stored as HMAC hashes, never deleted, so a returning actor still matches. |
+| Turnstile ephemeral ID layer | Device ID from the signed verdict | Signups, validations and IPs per device feed forminator's ephemeral layer. |
+| `scoring.ts` | `abuse.score()` in SQL | Same inputs and outputs, number for number (see evidence). |
+| `ip-rate-limiting.ts` | Velocity counts in the hook | Recorded, capped at 50 per lookup, never a block on their own. |
+| markov-mail RPC | pg_net call to its `/validate` | Retried on 5xx, 429 and timeout, per [pg_net under load](/reference/supabase-pg-net-under-load/). |
+| `footprint.ts` (unwired) | Footprint sweep every 5 minutes, retroactive on add, review queue | Full match raises the tier; a pivot or splash waits for an analyst. |
+| Block, 429 | Tiers `allow < watch < quarantine < ban` | The custom-access-token hook[^sb-custom-access-token] adds a `risk_tier` claim; RLS reads the live tier because a claim changes only at token refresh. A ban also sets `auth.users.banned_until`. |
+| none | Password-verification hook[^sb-password-hook] | A valid password from an IP that failed for many other accounts is refused and the user watched; never logs the user out. Teams and Enterprise only. |
+| none | `abuse.send_guard` for send hooks | The send hooks replace Supabase's delivery[^sb-send-sms-hook], so the guard is called by the project's own hook: bans get nothing, quarantine gets no SMS, per-prefix SMS caps. |
+
+Everything installs in monitor mode: every hit is recorded as "would deny" and
+nothing is refused until the operator switches to enforce.
+
+### What the port does not decide
+
+Without the signed verdict a signup carries only an IP and an email. Two of the
+ten components are then live - email (0.14) and IP rate limit (0.07) - and the
+redistribution cap of 2.0x keeps the highest score without a trigger at
+(14 + 7) x 2 = 42, under the block threshold of 70 (arithmetic from the weights,
+not a measurement). Only an email classifier `block` crosses it, through the
+email-fraud floor. That is forminator's rule held as written: IP-derived signals
+never block alone. Signup-only signals (prefix and domain bursts) would need
+their own weights, set from real traffic.
+
+### Reading the numbers
+
+Measured 2026-11-12 on a Supabase CLI 3.1.0 local stack (Postgres 17) on a
+10-core laptop, load average 2.0-2.6. These are local numbers, not hosted ones.
+
+The replay sent 600 synthetic bot signups and about 1,200 legit ones per run through
+the hook, the scorer and the footprint sweep, 5 seeds per cell, 135 runs. Every
+event got a decision, none errored, and every verdict verified. Every bot holds a
+solved Turnstile token, so CAPTCHA catches none of them by construction, not by
+measurement. Bots are anonymous sign-ins from a fresh residential IP each; legit
+traffic is 85% one signup per device, 10% households (two accounts on one device)
+and 5% behind shared office IPs, signing in anonymously unless the row says email.
+
+| Bot farm devices | Kit | Bots flagged % | Legit flagged % |
+| --- | --- | --- | --- |
+| 5 / 50 / 600 | hook only, no verdict | 0.0 / 0.0 / 0.0 | 0.0 |
+| 5 / 50 / 600 | verdict, device threshold 2 | 99.2 / 91.7 / 37.0 | 10.2 (8.8-10.7) |
+| 5 / 50 / 600 | verdict, device threshold 3 | 98.3 / 83.3 / 10.5 | 0.0 |
+| any | threshold 2 + footprint on a distinct bot JA4 | 100.0 | 10.2 (8.8-10.7) |
+| any | threshold 2 + footprint on a copied Chrome JA4 | 100.0 | 55.8 (54.4-56.0) |
+| any | as above, legit users sign up with an email | 100.0 | 9.4 (8.8-10.4) |
+
+- Without the verdict the hook cannot see this campaign at all.
+- With it, the device layer flags every signup after a device's first, so recall
+  is the share of bot signups landing on a device already used. Its false
+  positives are the households' second accounts.
+- A footprint catches the rest only when the campaign has a tell the legit traffic
+  lacks. `{anonymous, ja4}` on a copied Chrome JA4 flags every anonymous Chrome
+  user; when legit users sign up with an email the same footprint adds no false
+  positives, and the 9.4% left is households.
+- What the replay cannot supply is how often a real solver farm reuses device
+  IDs. That number decides real-world recall.
+
+Sync cost of the signup hook, server-side per call, median of 5 runs of 500 calls
+(path and size order alternating run by run):
+
+| Path | Prior events | p50 ms | p95 ms |
+| --- | --- | --- | --- |
+| hook only | 0 / 10k / 100k | 0.204 / 0.139 / 0.200 | 0.262 / 0.166 / 0.219 |
+| with verdict | 0 / 10k / 100k | 0.345 / 0.275 / 0.286 | 0.481 / 0.300 / 0.324 |
+
+The p50 stays at or under 0.345 ms up to 100k prior events but is not flat: 10k
+was the fastest size on both paths. An email signup through the local Auth API
+with the hooks enabled took a median p50 of 50.9 to 60.0 ms across four
+invocations of 5 batches of 20; the slowest hook p50 above is under 0.7% of the
+fastest.
+
+### Evidence
+
+abuse-kit is private; the author is the guarantor of the rows marked tested.
+
+| Claim | How it was checked | Status |
+| --- | --- | --- |
+| The before-user-created hook runs outside the signup transaction; a deny returned (not raised) keeps the hook's own event row | [`signup.go` L180-L188](https://github.com/supabase/auth/blob/88725864802773ad4533e0cad28f7a2740c89a7e/internal/api/signup.go#L180-L188) and [`hooks.go` L35-L50](https://github.com/supabase/auth/blob/88725864802773ad4533e0cad28f7a2740c89a7e/internal/api/hooks.go#L35-L50); local e2e: 403 to the client, no `auth.users` row, the deny event present | tested locally |
+| `options.data` reaches the hook as `user_metadata` | local e2e with a verdict minted by the Worker's signer | tested locally; hosted not probed |
+| Anonymous sign-ins reach the hook with no `app_metadata.provider` | local e2e | tested locally |
+| `abuse.score()` matches forminator's `scoring.ts` | 1,000 seeded cases generated by forminator's own function at `138ee24`; a planted change to the 2.0x cap failed cases 11, 67, 81 and 107 | tested |
+| The SQL footprint matcher matches `footprint.ts` | 600 cases from forminator's own functions; a planted pivot-floor change failed cases 62, 104, 110 and 112 | tested |
+| A ban through `auth.users.banned_until` is honoured | local e2e: refresh 400, password sign-in `user_banned` | tested locally |
+| A quarantined user's write is refused at once while the old token is still valid | local e2e through the Data API: 403 | tested locally |
+| The password-verification hook receives the client IP, and a `reject` reaches the client with its message | local e2e through the password grant | tested locally; hosted needs Teams or Enterprise |
+| Hosted CAPTCHA discards the ephemeral ID | [`captcha.go` L18-L22](https://github.com/supabase/auth/blob/88725864802773ad4533e0cad28f7a2740c89a7e/internal/security/captcha.go#L18-L22) | code read |
+| GoTrue copies signup `options.data` into `auth.users` and `auth.identities`; a BEFORE trigger on each removes the verdict | local e2e: after a signup with a verdict, neither row holds it and the hook still saw it | tested locally |
+| The signup's first access token is built before the stored row is read back, so it still carries `options.data`; the custom-access-token hook removes the verdict from it | local e2e: the decoded signup JWT had the verdict in `user_metadata` until the token hook dropped it | tested locally |
+| GoTrue's hook statement timeout does not bound the before-user-created hook, so a lock on the kit's table would stall signups without the hook's own `lock_timeout` | [`hookspgfunc.go` L89-L114](https://github.com/supabase/auth/blob/88725864802773ad4533e0cad28f7a2740c89a7e/internal/hooks/hookspgfunc/hookspgfunc.go#L89-L114) (`set local` on a connection outside a transaction); local e2e with `lock_timeout` removed: a signup under the lock ran past 5 s, with it the signup returned 200 | tested locally |
+| Whether a client-supplied `X-Forwarded-For` reaches the hook's `ip_address` on hosted | not tested | open |
+
+<Aside type="caution" title="Gotchas">
+- Deny by returning the error object, never by raising: a raise rolls back the hook's event row with it.
+- Set `lock_timeout` on the hook function and catch `query_canceled` as well as `others`. GoTrue's own timeout does not apply to this hook, and `when others` does not catch a cancelled statement.
+- Anything passed in `options.data` is stored in `auth.users` and returned in the user's JWT unless something removes it.
+- An HTTP hook must reject with a 200 and an error body. GoTrue turns a 400 reply into a 500 and drops the message ([`hookshttp.go` L186-L251](https://github.com/supabase/auth/blob/88725864802773ad4533e0cad28f7a2740c89a7e/internal/hooks/hookshttp/hookshttp.go#L186-L251)); the documented HTTP example returns 400. Not filed upstream.
+- The second signup from one device triggers at forminator's default threshold of 2, which catches households. Read `proposed_tier` in monitor mode before enforcing.
+- RLS covers the Data API, Storage and Realtime; Edge Functions and anything on the secret key bypass it and must check the tier themselves.
+</Aside>
+
 ## Related docs
 
 - [Caching with Cloudflare Workers](/reference/caching/) - KV's 25 MB value limit and its eventual consistency, the two properties the serialised model artifact and the hot-reloaded config sit under.
+- [Locking down Supabase](/reference/supabase-data-surface-lockdown/) - the Auth levers the Supabase port builds on, measured: the before-user-created hook, CAPTCHA and Auth rate limits, and why a custom domain gates nothing.
+- [pg_net on Supabase under load](/reference/supabase-pg-net-under-load/) - the delivery behaviour behind the email-classifier bridge's retry design.
 
 [^cf-service-bindings]: Cloudflare, "Service bindings," Cloudflare Docs. https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/
 [^cf-workers-rpc]: Cloudflare, "Workers RPC," Cloudflare Docs. https://developers.cloudflare.com/workers/runtime-apis/rpc/
+[^sb-custom-domains]: Supabase, "Custom Domains," Supabase Docs. https://supabase.com/docs/guides/platform/custom-domains
+[^cf-ephemeral-id]: Cloudflare, "Ephemeral IDs," Cloudflare Turnstile Docs. https://developers.cloudflare.com/turnstile/additional-configuration/ephemeral-id/
+[^sb-before-user-created]: Supabase, "Before User Created Hook," Supabase Docs. https://supabase.com/docs/guides/auth/auth-hooks/before-user-created-hook
+[^sb-custom-access-token]: Supabase, "Custom Access Token Hook," Supabase Docs. https://supabase.com/docs/guides/auth/auth-hooks/custom-access-token-hook
+[^sb-password-hook]: Supabase, "Password Verification Hook," Supabase Docs. https://supabase.com/docs/guides/auth/auth-hooks/password-verification-hook
+[^sb-send-sms-hook]: Supabase, "Send SMS Hook," Supabase Docs. https://supabase.com/docs/guides/auth/auth-hooks/send-sms-hook
