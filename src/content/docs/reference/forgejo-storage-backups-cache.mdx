@@ -1,6 +1,6 @@
 ---
 title: "Where Forgejo's data lives: storage, backups and caches"
-description: "A per-subsystem map of where Forgejo's data actually lives, the migrate-storage direction trap that silently no-ops when run in the wrong order, the nightly backup and its 2026-09-23 restore drill, and the two unrelated build caches that grow without their own garbage collection."
+description: "A per-subsystem map of where Forgejo's data actually lives, the migrate-storage direction trap that silently no-ops when run in the wrong order, the nightly backup and its 2026-09-23 restore drill, the two unrelated build caches that grow without their own garbage collection, and the 2026-11-12 CI-docker-isolation change that moved the buildx builder and its caches onto a separate bounded-storage daemon."
 author: Erfi Anugrah
 category: forge
 featured: true
@@ -9,7 +9,13 @@ blurb: "Six kinds of data, three protection mechanisms, and a command that silen
 
 import { Aside } from "@astrojs/starlight/components";
 
-Forgejo's data is not one blob to back up. Git repositories, Postgres, release assets, Actions logs and artifacts, packages, LFS objects, avatars, and two build caches each live somewhere different and are protected by a different mechanism. This page maps each kind of data to where it lives and what protects it, then covers the two operational traps that matter most: running the storage-migration command in the wrong order, and the two caches that grow forever without garbage collection wired in separately. The forge's overall topology, hardening and restore-drill numbers are covered on [Forgejo as the primary forge](/reference/self-hosted-forgejo-router/); this page goes one level deeper on storage, backups and caches specifically.
+Forgejo's data is not one blob to back up. Git repositories, Postgres, release assets, Actions logs and artifacts, packages, LFS objects, avatars, and two build caches each live somewhere different and are protected by a different mechanism. This page maps each kind of data to where it lives and what protects it, then covers the two operational traps that matter most: running the storage-migration command in the wrong order, and the two caches that grow forever without garbage collection wired in separately.
+
+<Aside type="note" title="Updated 2026-11-12">
+  The shared buildx builder and its caches now run on a separate CI-only Docker daemon with bounded storage. The port of the runner's cache proxy, which jobs connect to, is now pinned instead of random. The maintenance-timer table and diagram below reflect this change; the full incident, design and rollout are covered on [A full disk took DHCP down](/reference/ci-docker-isolation-dhcp-outage/).
+</Aside>
+
+The forge's overall topology, hardening and restore-drill numbers are covered on [Forgejo as the primary forge](/reference/self-hosted-forgejo-router/); this page goes one level deeper on storage, backups and caches specifically.
 
 <Aside type="note" title="Provenance">
   One forge host running Forgejo, and one storage host holding an S3-compatible object store (named Silo, a fork of MinIO) plus the ZFS pool that backs everything up. Config rows are read from the forge's compose file and the two hosts' NixOS configuration, both clean working trees at the time of writing. Live rows are read-only `systemctl` probes against the forge host and `du` against the storage host, both run 2026-09-29. The 2026-09-23 restore drill is not re-run here; it is linked from the sibling topology page, where its full numbers already live.
@@ -40,6 +46,10 @@ digraph {
     pg [label="Postgres\nDocker volume", shape=cylinder];
     runnercache [label="runner Actions cache\nDocker volume", shape=cylinder];
   }
+  subgraph cluster_ci {
+    label="CI daemon (since 2026-11-12)\nbounded 250G loopback image"; style=rounded; fontsize=12; margin=12;
+    buildx [label="buildx ci-builder\nstate volume", shape=cylinder];
+  }
   subgraph cluster_storage {
     label="Storage host"; style=rounded; fontsize=12; margin=12;
     bucket [label="S3 bucket (Silo)\nrelease assets, Actions logs\n+ artifacts, packages, LFS, avatars", shape=cylinder];
@@ -49,6 +59,7 @@ digraph {
   repos -> backupds [label="nightly rsync"];
   pg -> backupds [label="nightly pg_dump"];
   runnercache -> runnercache [label="nightly prune\n(TTL + size cap)"];
+  buildx -> buildx [label="hourly prune +\nin-workflow GC policy"];
   bucket -> bucket [label="same-pool\nsnapshots only"];
 }
 ```
@@ -58,8 +69,8 @@ digraph {
 | Git repositories | Forge host volume | Nightly `rsync --delete` mirror to the storage host, plus that host's own snapshots |
 | Postgres | Forge host volume | Nightly `pg_dump -Fc` to the storage host, plus that host's own snapshots |
 | Release assets, Actions logs, Actions artifacts, packages, LFS objects, avatars | S3 bucket on the storage host | Same-pool snapshots on the storage host only - no off-pool copy |
-| Runner Actions cache (`actions/cache`) | Forge host volume, separate from Forgejo's own `[storage]` | Disposable by design; nightly TTL + size-cap prune |
-| CI builder's build-layer cache | Builder container's own state, on the forge host | Inline garbage-collection policy in every image-building workflow, not a timer |
+| Runner Actions cache (`actions/cache`) | Forge host volume, separate from Forgejo's own `[storage]` | Disposable by design; nightly TTL + size-cap prune. The cache proxy port jobs connect to is pinned since 2026-11-12 |
+| CI builder's build-layer cache | CI daemon state volume (since 2026-11-12, bounded 250G loopback image on the forge host) | Hourly prune on the CI daemon plus inline GC policy in every image-building workflow |
 
 Storage type is set with `STORAGE_TYPE=minio` plus `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY_ID`, `MINIO_SECRET_ACCESS_KEY`, `MINIO_BUCKET`, `MINIO_LOCATION` and `MINIO_USE_SSL=false` - each key duplicated under both the legacy and current environment-variable prefixes, for forward compatibility if the prefix ever changes again. Forgejo defines these eight subsystems as candidates for that storage backend: attachments, avatars, repository avatars, repository archives, packages, LFS, Actions logs, and Actions artifacts.[^fj-storage]
 
@@ -112,7 +123,9 @@ This prune fires nightly at 02:55, with no jitter, inside the same maintenance w
 
 ### Builder layer cache (buildkit GC)
 
-The CI builder's build-layer cache is a different thing entirely: it lives in the shared builder container's own state, not in Forgejo's `[storage]` or the runner's Actions-cache volume. It had no garbage collection configured at all, and grew to about 26 GB before anyone added one.
+Since 2026-11-12 the shared buildx builder and its state volume run on a separate CI-only Docker daemon whose data-root is a preallocated 250 GB loopback image. The builder's own inline GC policy (below) is the first line of defence; an hourly prune timer on the CI daemon adds a second.
+
+The CI builder's build-layer cache is a different thing entirely: it lives in the shared builder container's own state, not in Forgejo's `[storage]` or the runner's Actions-cache volume. Before this page was written, it had no garbage collection configured at all, and grew to about 26 GB before anyone added one.
 
 The fix is a garbage-collection policy passed inline to the build-driver setup step, in every workflow that builds an image:
 
@@ -133,24 +146,26 @@ The fix is a garbage-collection policy passed inline to the build-driver setup s
               maxUsedSpace = "15GB"
 ```
 
-Two GC policy tiers, not one: the first keeps entries under 10 GB as long as they're younger than 72 hours; the second, unconditional (`all = true`) tier caps total size at 15 GB regardless of age. The builder garbage-collects itself in the background as part of normal operation - nothing external has to trigger it.
+Two GC policy tiers, not one: the first keeps entries under 10 GB as long as they're younger than 72 hours; the second, unconditional (`all = true`) tier caps total size at 15 GB regardless of age. The builder garbage-collects itself in the background as part of normal operation. An external hourly prune timer on the CI daemon (see the maintenance table below) adds a second layer: it runs `builder prune` and `buildctl prune` against the same builder, and drops all age filters once the CI filesystem is 85% used.
 
 ---
 
 ## Supporting timers
 
-Beyond the backup and the two caches, four more timers keep the forge host's Actions surface from silently accumulating garbage:
+Beyond the backup and the two caches, these timers keep the forge host's Actions surface from silently accumulating garbage. Two are new since 2026-11-12, when CI moved to its own bounded Docker daemon:
 
 | Timer | Cadence | What it removes |
 |---|---|---|
-| Orphaned job-container reaper | Hourly | Job containers whose task is no longer waiting or running in Postgres, and which ended more than 10 minutes ago |
-| Buildx builder sweeper | Hourly | Leaked per-job builder containers and their dangling state volumes, older than 6 hours - skips the whole run if any job container is still active, and never touches the one shared, pinned builder used by CI |
+| CI daemon prune | Hourly | On the CI Docker daemon: images and containers older than 6 hours, build cache older than 72 hours, and a buildkit prune of the shared builder (keep 72 hours / 30,000 MB); drops the age filters once the CI filesystem is 85% used |
+| Main daemon image + builder prune | Daily, ~04:10 (+ up to 10 min) | Images and builder cache older than 168 hours on the main daemon |
+| Orphaned job-container reaper | Hourly | Job containers whose task is no longer waiting or running in Postgres, and which ended more than 10 minutes ago - now targets the CI daemon's socket |
+| Buildx builder sweeper | Hourly | Leaked per-job builder containers and their dangling state volumes, older than 6 hours - skips the whole run if any job container is still active, and never touches the one shared, pinned builder used by CI. Now targets the CI daemon's socket |
 | Runner liveness restart | Daily, 03:00 (+ up to 5 minutes) | Restarts the Actions runner, whose task-fetch loop stops permanently (and does not recover on its own) after it loses its connection to Forgejo |
 | Cache prune | Daily, 02:55 | Covered above |
 
 The orphan-reaper and the runner restart are a matched pair: the restart gives in-flight jobs 900 seconds (15 minutes) to finish before force-killing, up from Docker's 10-second default, which had been killing the runner mid-job and orphaning its job containers. The reaper is the safety net for whatever still leaks past that grace period.
 
-Live state checked 2026-09-29: the backup, cache-prune and runner-restart timers each had a recent successful run and a next-fire time consistent with their configured cadence; the two hourly timers had each fired within the hour.
+Live state checked 2026-09-29: the backup, cache-prune and runner-restart timers each had a recent successful run and a next-fire time consistent with their configured cadence; the two hourly timers had each fired within the hour. The two prune timers added on 2026-11-12 were scheduled at deploy time; their first runs were not checked for this page.
 
 ---
 

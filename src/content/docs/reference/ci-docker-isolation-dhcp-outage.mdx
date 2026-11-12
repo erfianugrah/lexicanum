@@ -1,0 +1,116 @@
+---
+title: "A full disk took DHCP down: isolating CI storage on a gateway"
+description: "A self-hosted gateway filled its root filesystem with CI images and its DHCP server NAKed every client. The chain of failure, the alert that would have fired 11 hours earlier, why a registry or NAS storage would not have fixed it, the second Docker daemon with bounded storage that did, and five Docker behaviours that broke the first attempts."
+author: Erfi Anugrah
+category: homelab
+featured: true
+blurb: "DHCP and CI shared one disk and one Docker daemon. What happened when the disk filled, and the isolation design that followed."
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+A self-hosted gateway runs routing, DHCP and DNS for a home network, and also a git forge with its CI runner. On 2026-11-12 its root filesystem ran out of space. The DHCP server could no longer write its lease file, refused every renewal, and the whole LAN lost its addresses within five minutes. This page covers why a full disk took DHCP with it, why the obvious fixes would not have prevented it, the design that shipped (CI on a second Docker daemon whose storage has a hard size limit), and five Docker behaviours that broke or nearly broke that design on the way in.
+
+<Aside type="note" title="Provenance">
+  Incident numbers come from the gateway's journal, the central Prometheus, and the forge's database, read on 2026-11-12. The design was rehearsed in a VM of the gateway's own NixOS configuration before each deploy; the rehearsal results quoted below are from those runs. Times are SGT (UTC+8).
+</Aside>
+
+## The incident
+
+| Time | Event |
+|---|---|
+| 2026-10-13 | Root filesystem (one 937 GB ext4 partition) has 584 GB available |
+| 2026-11-11 21:00 | 2.0% available |
+| 2026-11-12 09:55 | 21 GB available to non-root users |
+| 10:00:25 | A docs build job starts; it writes 25.3 GB inside its job container in 9 minutes |
+| 10:07:30 | 0 bytes available to non-root users |
+| 10:08:01 | Kea logs its first `ALLOC_ENGINE_V4_ALLOC_ERROR` ("failed to write CSV row") and starts answering renewals with DHCPNAK |
+| 10:09:12 | The gateway's own health check runs and reports zero failures |
+| 10:09:42 | Last NAK: 5,539 in total, to 19 clients on four VLANs |
+| 10:10:11 | Reboot; the build job had already failed on ENOSPC at 10:10:04 |
+
+Three details explain why a full disk became a DHCP outage rather than a CI failure.
+
+The disk was never full for root. ext4 keeps a share of blocks (about 51 GB on this partition) that only root may use. The Docker daemon and the CI jobs run as root and kept writing. Kea runs as its own unprivileged user, so it hit ENOSPC first, while root still had tens of gigabytes. Any alert on this filesystem has to watch the space available to non-root users (`node_filesystem_avail_bytes`), not the free space including the reserve.
+
+A NAK ends a lease immediately. RFC 2131 says a client that receives a DHCPNAK must restart configuration and cannot reuse its address.[^rfc2131] Longer leases would only have delayed each client's next renewal; once it renewed, it got the NAK anyway. The leases here are 300 seconds on purpose, so changes reach clients quickly, and they stayed that way.
+
+The health check passed because it asked whether the Kea service was running, which it was.
+
+Where the space went: 626 GB of the root filesystem was the Docker data directory, holding 285 images (480 GB of them unused by any container) and 109 GB of build cache. Nothing ever pruned that daemon. CI built images on it for 18 repositories and left every build behind; one repository alone added about 27 image tags per service per day. The docs build that finished the job copied a 25 GB cache volume into its container on every run.
+
+<Aside type="tip" title="Alert backtest">
+  The alerts added afterwards fire when the root filesystem drops below 15% available for 10 minutes, and below 5% for 2 minutes. Evaluated against the stored metrics, both would have been firing from 2026-11-11 21:00, about 11 hours before clients lost DHCP.
+</Aside>
+
+## Options considered
+
+The root cause is that CI shares a filesystem and a Docker daemon with the services that keep the network up. A fix has to stop CI from consuming the space those services need, including a single job that writes 25 GB in nine minutes.
+
+| Option | Why it was not chosen |
+|---|---|
+| Prune the existing daemon on a timer | Bounds steady-state growth, not one runaway job between two prunes. Kept as a second layer. |
+| A registry (self-hosted or the forge's) | Images land on whichever daemon builds them. A registry changes where they are pushed, not what accumulates locally. |
+| CI storage on the NAS, over the 10 Gbit link | The NAS pool is HDD raidz2, slow for the small random I/O of image layers. The NAS also unlocks its encrypted pools from a Tang server on this gateway, so the gateway's boot must not depend on NAS storage. |
+| CI on its own Docker daemon with a fixed-size disk | Chosen. CI can fill its own disk and nothing else. |
+
+## The design
+
+CI jobs run on a second `dockerd` with its own socket, data directory, runtime directory and pid file, declared in the gateway's NixOS configuration. The main daemon, which runs the forge, DNS and everything else, is not touched.
+
+The size limit comes from where that daemon keeps its data. The gateway has one ext4 root partition and no LVM or ZFS, so the hard limit is a preallocated image file mounted as its own filesystem:
+
+```bash
+fallocate -l 250G /var/lib/docker-ci.img
+mkfs.ext4 -q -E nodiscard,lazy_itable_init=0,lazy_journal_init=0 -m 0 -L docker-ci /var/lib/docker-ci.img
+```
+
+`fallocate` takes the full 250 GB from the root filesystem up front, so CI cannot later grow into space the other services need. The unit that creates the file refuses if it would leave less than 150 GB available on the root filesystem. The mount is `nofail` and not part of `local-fs.target`: a missing or broken CI disk fails CI and never blocks boot. After the deploy the root filesystem had 202 GB available and the CI filesystem 246 GB.
+
+The rest of the design:
+
+- The second daemon runs without its own iptables rules (`"iptables": false`); the main daemon already owns Docker's tables and two daemons writing them collide. The host firewall carries the CI daemon's NAT and forwarding rules.
+- CI's network on the new daemon has the same name as the network jobs used before, so no workflow file changed.
+- The firewall lets CI jobs reach exactly three things on the forge's network: the forge's HTTP port, the runner's cache proxy (its port is now pinned so a rule can name it), and SSH on a Windows build VM.
+- An hourly prune on the CI daemon removes images and containers older than 6 hours and build cache older than 72 hours, and drops the age filters once the CI filesystem is 85% used. A daily prune on the main daemon removes unused images and build cache older than a week. It runs `image prune` and `builder prune`, not `system prune`, which would also delete stopped containers and the networks of stopped stacks.
+- Alerts on the root filesystem: below 15% available (10 minutes), below 5% (2 minutes), and on track to fill within 24 hours from the last 6 hours' trend. A separate alert fires when the CI filesystem drops below 10%. All of them are evaluated off the gateway, because the gateway's own Prometheus also stops writing when its disk is full.
+
+Jobs still get a Docker socket and run privileged, so CI remains root-equivalent on the gateway. The change limits how much disk CI can use, not what CI is trusted to do.
+
+## Five Docker behaviours that broke the first attempts
+
+A VM built from the same NixOS configuration, booted on the gateway under KVM with user-mode networking, ran a check script at boot. It caught the first three problems before any deploy. The last two reached production and were fixed there.
+
+1. Docker 28 and later drop traffic to a container's IP that arrives from any other interface. The rules sit in the `raw` table, before any filter chain, so firewall accepts alone cannot let the CI network reach the forge's network. The fix is the network option `com.docker.network.bridge.trusted_host_interfaces` on the forge's network, naming the CI bridge.[^docker-portpub] In the VM, the three allowed endpoints failed without it and passed with it, and a port outside the three stayed blocked.
+
+2. The daemon's `ip` setting, which picks the address published ports bind to, applies only to the default bridge. On user-created networks, published ports bound to all addresses until each network got `com.docker.network.bridge.host_binding_ipv4`, also set as a default for networks jobs create.[^docker-portpub]
+
+3. A preallocated image file does not stay preallocated on its own. With default `mkfs.ext4` options, the kernel's background inode-table initialisation wrote zeroes through the loop device and turned part of the file back into holes: 98.4% of it was still allocated. A direct `fstrim` on the mounted CI filesystem was worse: an 8 GB test image went to 314 MB allocated, handing the space back to the root filesystem. The fix is the `mkfs` options above plus keeping the periodic fstrim to `/` and `/boot`.
+
+4. A daemon with `"bridge": "none"` deletes the host's `docker0`. Both daemons ran Docker 29.9.2, whose startup code removes the interface named `docker0` when the default bridge is disabled, and again on restart when address pools are configured and live-restore is off.[^moby-daemon] The CI daemon started at 13:06 and removed the main daemon's bridge. The main daemon still believed the bridge existed, so every new container on its default network failed with "adding interface ... to bridge docker0 failed: Device does not exist". The VM rehearsal had not covered this, because nothing in it started a default-bridge container on the main daemon after the CI daemon started. The fix gives the CI daemon its own default bridge under a different name, created before `dockerd` starts, and turns on live-restore. A rerun of the rehearsal with a check for this failed on the old configuration and passed on the new one, across two CI daemon restarts. In production, `docker0` was recreated by hand with its original address, which brought the main daemon's default network back without restarting it (a restart would have stopped DNS along with every other container).
+
+5. The runner's `docker_host: automount` handed each job the host path `/var/run/docker.sock`. The CI daemon resolves bind-mount paths on the host, where that path is the main daemon's socket, so job containers ran on the CI daemon while the `docker build` commands inside them went to the main daemon. The fix sets `docker_host` to the CI daemon's socket explicitly and mounts it into the runner at the same path it has on the host.
+
+## Cutover
+
+The gateway change deployed with nothing restarting except the firewall reload. The runner switch did not go as planned:
+
+- Pushing the forge's compose change triggered its push-to-deploy webhook before a builder container attached to the forge's network had been removed. The deploy stopped the forge, then failed to remove the network. Removing the builder and redeploying took the forge down for about 3 minutes; DNS and DHCP are on other networks and were not affected.
+- The Windows build VM was stopped at the time, and its container still pointed at the deleted network. Its next start would have failed with "network not found", so it was recreated against the new network and stopped again.
+
+One limit was carried over unchanged: a `RUN` step in an image build cannot reach the gateway's own public hostname. BuildKit gives build steps a public DNS resolver, the name resolves to the gateway's public address, and the firewall does not allow Docker networks to reach it. Builds that need the forge fetch from a workflow step instead.
+
+## Related
+
+- [Where Forgejo's data lives: storage, backups and caches](/reference/forgejo-storage-backups-cache/) - the forge's caches and the maintenance timers around them
+- [The Forgejo Actions runner](/reference/forgejo-actions-runner/) - how the runner starts job containers and the Docker access they get
+- [Forgejo as the primary forge](/reference/self-hosted-forgejo-router/) - the forge's topology on the gateway
+- [Forgejo recovery runbooks](/guides/forgejo-recovery-runbooks/) - recovery steps for the forge's past outages
+
+## References
+
+[^rfc2131]: R. Droms, "Dynamic Host Configuration Protocol," RFC 2131, IETF, Mar. 1997, secs. 3.1-3.2. https://www.rfc-editor.org/rfc/rfc2131
+
+[^docker-portpub]: Docker, "Port publishing and mapping," Docker Docs. https://docs.docker.com/engine/network/port-publishing/
+
+[^moby-daemon]: Moby project, `daemon/daemon_unix.go` (`configureNetworking`, `removeDefaultBridgeInterface`), tag docker-v29.9.2. https://github.com/moby/moby/blob/docker-v29.9.2/daemon/daemon_unix.go
