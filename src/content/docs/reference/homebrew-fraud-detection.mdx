@@ -1574,6 +1574,14 @@ With verdicts required, a signup posted straight to the Auth endpoint has none a
 is refused before any `auth.users` row exists. OAuth and SSO signups cannot carry
 `options.data` and are exempt.
 
+The kit's reference Worker can also post the signup itself, with the project's
+secret key and `Sb-Forwarded-For` set to the client's IP, so the verdict never
+reaches the browser and Auth's per-IP limits count the end user, not the
+Worker. Supabase honours that header only with a secret key and only once IP
+address forwarding is enabled for the project[^sb-rate-limits]. If Turnstile
+cannot be verified, the Worker refuses the signup rather than forwarding it
+unverified.
+
 ### Which piece runs where
 
 | Workers system | On Supabase | Notes |
@@ -1583,10 +1591,10 @@ is refused before any `auth.users` row exists. OAuth and SSO signups cannot carr
 | `scoring.ts` | `abuse.score()` in SQL | Same inputs and outputs, number for number (see evidence). |
 | `ip-rate-limiting.ts` | Velocity counts in the hook | Recorded, capped at 50 per lookup, never a block on their own. |
 | markov-mail RPC | pg_net call to its `/validate` | Retried on 5xx, 429 and timeout, per [pg_net under load](/reference/supabase-pg-net-under-load/). |
-| `footprint.ts` (unwired) | Footprint sweep every 5 minutes, retroactive on add, review queue | Full match raises the tier; a pivot or splash waits for an analyst. |
+| `footprint.ts` (unwired) | Footprint sweep every 5 minutes, retroactive on add, review queue | Full match raises the tier; a pivot or splash waits for an analyst. Confirming a pivot widens the changed indicator into a set of values, so the next signup from the new range is a full match. The sets are the kit's own extension: in `footprint.ts` every indicator must match exactly. |
 | Block, 429 | Tiers `allow < watch < quarantine < ban` | The custom-access-token hook[^sb-custom-access-token] adds a `risk_tier` claim; RLS reads the live tier because a claim changes only at token refresh. A ban also sets `auth.users.banned_until`. |
 | none | Password-verification hook[^sb-password-hook] | A valid password from an IP that failed for many other accounts is refused and the user watched; never logs the user out. Teams and Enterprise only. |
-| none | `abuse.send_guard` for send hooks | The send hooks replace Supabase's delivery[^sb-send-sms-hook], so the guard is called by the project's own hook: bans get nothing, quarantine gets no SMS, per-prefix SMS caps. |
+| none | `abuse.send_guard` for send hooks | The send hooks replace Supabase's delivery[^sb-send-sms-hook], so the guard is called by the project's own hook: bans get nothing, quarantine gets no SMS, per-prefix SMS caps. The kit ships reference send-SMS and send-email hooks as Edge Functions; a quarantined user still gets a recovery email. |
 
 Everything installs in monitor mode: every hit is recorded as "would deny" and
 nothing is refused until the operator switches to enforce.
@@ -1599,8 +1607,35 @@ redistribution cap of 2.0x keeps the highest score without a trigger at
 (14 + 7) x 2 = 42, under the block threshold of 70 (arithmetic from the weights,
 not a measurement). Only an email classifier `block` crosses it, through the
 email-fraud floor. That is forminator's rule held as written: IP-derived signals
-never block alone. Signup-only signals (prefix and domain bursts) would need
-their own weights, set from real traffic.
+never block alone.
+
+The kit adds a second score for what the hook can count. It looks at bursts of
+signups from one network (a /24 or /48), on one email domain outside the big
+free-mail providers, or from one address. Each burst scores from a threshold
+upwards. Bursts from one network count once and can reach watch on their own,
+never quarantine; two bursts that agree reach quarantine. The scorer decides on
+the higher of this score and forminator's.
+
+The thresholds were fitted on replayed traffic. Each sits one above the largest
+value a legit signup reached on three training seeds: carrier NAT reached 40
+signups per hour from one /24, and a team of up to 20 onboarding together
+reached 23 on its domain. The results below are from three other seeds: 600 bot
+signups an hour against about 1,200 legit ones (70% single users, 15% behind
+four carrier NAT ranges, and the rest households, offices and teams), 3% of
+them retrying once:
+
+| Campaign | Bots at watch or above % | Bots at quarantine % | Legit flagged % |
+| --- | --- | --- | --- |
+| Residential proxies, anonymous | 0.0 | 0.0 | 0.0 |
+| Three datacenter /24s, anonymous | 77.0 | 0.0 | 0.0 |
+| Two throwaway domains, residential IPs | 86.7 | 0.0 | 0.0 |
+| 40 reused addresses | 80.0 | 0.0 | 0.0 |
+| Three datacenter /24s and two throwaway domains | 86.7 | 77.5 | 0.0 |
+
+With twice as many users per carrier prefix, legit traffic alone reaches the
+hook's count cap of 50 per hour. The fit then turns the network score off and
+the datacenter pool goes uncaught. These thresholds fit a stated model, not real
+traffic; re-fit them in monitor mode on the project's own signups.
 
 ### Reading the numbers
 
@@ -1667,6 +1702,9 @@ abuse-kit is private; the author is the guarantor of the rows marked tested.
 | GoTrue copies signup `options.data` into `auth.users` and `auth.identities`; a BEFORE trigger on each removes the verdict | local e2e: after a signup with a verdict, neither row holds it and the hook still saw it | tested locally |
 | The signup's first access token is built before the stored row is read back, so it still carries `options.data`; the custom-access-token hook removes the verdict from it | local e2e: the decoded signup JWT had the verdict in `user_metadata` until the token hook dropped it | tested locally |
 | GoTrue's hook statement timeout does not bound the before-user-created hook, so a lock on the kit's table would stall signups without the hook's own `lock_timeout` | [`hookspgfunc.go` L89-L114](https://github.com/supabase/auth/blob/88725864802773ad4533e0cad28f7a2740c89a7e/internal/hooks/hookspgfunc/hookspgfunc.go#L89-L114) (`set local` on a connection outside a transaction); local e2e with `lock_timeout` removed: a signup under the lock ran past 5 s, with it the signup returned 200 | tested locally |
+| A send hook that answers 200 with an error body gives the client the guard's status and message; a planted 400 reply gave the client a 500 | local e2e through GoTrue: quarantined user's SMS refused with 429, nothing delivered | tested locally |
+| A banned user's password-recovery request still reaches the send-email hook | local e2e: GoTrue called the hook, the guard refused with 429 | tested locally |
+| A verdict minted by the reference Worker verifies in the hook | local e2e with Turnstile's response stubbed | tested locally |
 | Whether a client-supplied `X-Forwarded-For` reaches the hook's `ip_address` on hosted | not tested | open |
 
 <Aside type="caution" title="Gotchas">
@@ -1676,6 +1714,8 @@ abuse-kit is private; the author is the guarantor of the rows marked tested.
 - An HTTP hook must reject with a 200 and an error body. GoTrue turns a 400 reply into a 500 and drops the message ([`hookshttp.go` L186-L251](https://github.com/supabase/auth/blob/88725864802773ad4533e0cad28f7a2740c89a7e/internal/hooks/hookshttp/hookshttp.go#L186-L251)); the documented HTTP example returns 400. Not filed upstream.
 - The second signup from one device triggers at forminator's default threshold of 2, which catches households. Read `proposed_tier` in monitor mode before enforcing.
 - RLS covers the Data API, Storage and Realtime; Edge Functions and anything on the secret key bypass it and must check the tier themselves.
+- On the local stack (CLI 3.1.0), phone login stays off when no SMS provider is enabled, even with a send-SMS hook configured. A placeholder provider turns it on, and GoTrue still sends every SMS through the hook.
+- With postgres.js, `${JSON.stringify(event)}::jsonb` reaches Postgres as a JSON string, not an object, so every key lookup is null. Pass `sql.json(event)`.
 </Aside>
 
 ## Related docs
@@ -1692,3 +1732,4 @@ abuse-kit is private; the author is the guarantor of the rows marked tested.
 [^sb-custom-access-token]: Supabase, "Custom Access Token Hook," Supabase Docs. https://supabase.com/docs/guides/auth/auth-hooks/custom-access-token-hook
 [^sb-password-hook]: Supabase, "Password Verification Hook," Supabase Docs. https://supabase.com/docs/guides/auth/auth-hooks/password-verification-hook
 [^sb-send-sms-hook]: Supabase, "Send SMS Hook," Supabase Docs. https://supabase.com/docs/guides/auth/auth-hooks/send-sms-hook
+[^sb-rate-limits]: Supabase, "Rate limits," Supabase Docs. https://supabase.com/docs/guides/auth/rate-limits
