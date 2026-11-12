@@ -10,6 +10,7 @@ import {
   headlessTableRuns,
   markerLines,
   mathRiskLines,
+  mdxSyntaxError,
   parseMdx,
   REJECTED_MARKERS,
   smartPunctLines,
@@ -302,5 +303,47 @@ describe("body text", () => {
     expect(doc.bodyText).toContain("third");
     expect(doc.bodyText).not.toContain("not prose");
     expect(doc.bodyText).not.toContain("title: t");
+  });
+});
+
+describe("mdxSyntaxError", () => {
+  test("flags a bare <tag> in prose", () => {
+    // A line that passed bun test and then failed astro build with
+    // "Expected a closing tag for <room>".
+    const err = mdxSyntaxError(fm('The prompt reads "Rejoin <room>?" and waits.\n'));
+    expect(err).not.toBeNull();
+    expect(err).toContain("room");
+    expect(err).toMatch(/^6:/); // line 6 of the file: 4 frontmatter lines + blank
+  });
+
+  test("flags an arrow written as <->", () => {
+    expect(mdxSyntaxError(fm("Micro <-> Small resizes in place.\n"))).not.toBeNull();
+  });
+
+  test("accepts the same text in a code span or a fence", () => {
+    expect(mdxSyntaxError(fm('The prompt reads `Rejoin <room>?` and waits.\n'))).toBeNull();
+    expect(mdxSyntaxError(fm("```\nRejoin <room>?\n```\n"))).toBeNull();
+  });
+
+  test("accepts real components, imports and math with braces", () => {
+    const body = [
+      "import { Aside } from '@astrojs/starlight/components';",
+      "",
+      '<Aside type="caution" title="Note">',
+      "Held.",
+      "</Aside>",
+      "",
+      "{/* prose-dollar: math-intentional */}",
+      "",
+      // Without remark-math, {i\\pi} is an MDX expression acorn cannot parse,
+      // so this line fails if the parser drops the math extension.
+      "MSS is $1500 - 40 = 1460$ and $e^{i\\pi} = -1$.",
+      "",
+    ].join("\n");
+    expect(mdxSyntaxError(fm(body))).toBeNull();
+  });
+
+  test("ignores frontmatter, where <tag> is plain YAML", () => {
+    expect(mdxSyntaxError("---\ntitle: t\ndescription: replaces <room> prompts\n---\n\nprose\n")).toBeNull();
   });
 });
