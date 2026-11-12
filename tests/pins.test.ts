@@ -79,7 +79,7 @@ const pins: Pin[] = [
     doc: "reference/cloudflare-supabase-architecture",
     mustContain: [
       "Do not terminate `authenticator` backends to free slots",
-      "is a design choice built on that one run",
+      "is a design choice built on the two runs",
     ],
     mustNotContain: [
       "terminate the Hyperdrive roles' backends",
