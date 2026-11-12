@@ -81,7 +81,7 @@ the build/test gate only, no deploy.
   any SKIP as well as FAIL (house exits 0 on an unreachable URL). Same
   script locally after `bun run build`: about 50 s on the dev box
   (2026-11-10), against 205 s for one unsharded `house check --sitemap`.
-  Tools the image lacks (bun, jq, d2) come from GitHub releases via
+  Tools the image lacks (bun, jq) come from GitHub releases via
   `scripts/ci/playwright-tools.sh`; `bun install --ignore-scripts` there
   skips better-sqlite3's implicit node-gyp build (no make in the image;
   13.x loads its bundled prebuild). The rendered `type`
