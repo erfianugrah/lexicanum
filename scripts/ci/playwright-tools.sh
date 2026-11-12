@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # playwright-tools.sh - the tools the house-rendered job needs that the
-# Playwright image lacks (bun, jq, d2), into $HOME/.local/bin. No apt: the
+# Playwright image lacks (bun, jq), into $HOME/.local/bin. No apt: the
 # image has no unzip or jq, and archive.ubuntu.com is the download the job
 # avoids (unreachable from the runner for 20+ min on 2026-11-10). Everything
-# comes from GitHub releases, like the D2 step in build-and-deploy.
+# comes from GitHub releases.
 #
 # usage: playwright-tools.sh    (versions pinned below; bun matches deploy.yml)
 set -euo pipefail
 
 bun_v=1.3.13
 jq_v=1.7.1
-d2_v=0.7.1
 
 bin="$HOME/.local/bin"
 tmp="$(mktemp -d)"
@@ -34,13 +33,6 @@ get "$gh/sha256sum.txt" "$tmp/jq.sums"
 (cd "$tmp" && grep -E ' jq-linux-amd64$' jq.sums | sha256sum -c -)
 install -m 0755 "$tmp/jq-linux-amd64" "$bin/jq"
 
-# d2: same pinned tarball as build-and-deploy (the release publishes no
-# checksums).
-get "https://github.com/terrastruct/d2/releases/download/v$d2_v/d2-v$d2_v-linux-amd64.tar.gz" "$tmp/d2.tgz"
-tar --warning=no-unknown-keyword -xzf "$tmp/d2.tgz" -C "$tmp"  # macOS xattr headers
-install -m 0755 "$tmp/d2-v$d2_v/bin/d2" "$bin/d2"
-
 if [ -n "${GITHUB_PATH:-}" ]; then echo "$bin" >> "$GITHUB_PATH"; fi
 "$bin/bun" --version
 "$bin/jq" --version
-"$bin/d2" --version
