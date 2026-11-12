@@ -63,8 +63,9 @@ the build/test gate only, no deploy.
   Components under `src/components/house/` (Header, SiteTitle, ThemeSelect,
   Footer, PageTitle, Sidebar, DiagramExpand) use the generic kit
   conventions. DiagramExpand, loaded from `src/components/Head.astro`,
-  gives a Graphviz diagram rendered below its intrinsic size an EXPAND
-  DIAGRAM button that opens it in a lightbox over the page (house#21). Kit source
+  makes a Graphviz diagram rendered below its intrinsic size zoom in
+  place (click, ctrl+wheel or the ZOOM button; no overlay; house#21,
+  `docs/research/2026-11-12-diagram-expand.md`). Kit source
   and install steps: `house assets cat starlight/README.md`. Fonts: Overpass
   Mono for titles, nav and labels, Inconsolata for code, tables and data
   (@fontsource); no sans face, no social links, ea only as the footer
