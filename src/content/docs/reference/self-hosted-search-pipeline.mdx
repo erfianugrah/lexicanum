@@ -1,0 +1,142 @@
+---
+title: "Replacing a paid search API with a self-hosted pipeline"
+description: "Why the agent search tools moved from a third-party search API to a self-hosted pipeline of SearXNG candidates, concurrent page fetches, BM25 prefiltering, cross-encoder reranking, and context packing - and how recall, latency and relevance were measured."
+author: Erfi Anugrah
+category: homelab
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Coding agents spend much of their execution budget looking up documentation, API references, and library usage examples on the web. Until November 2026, the `websearch`, `codesearch` and `web_research` tools in this system routed every lookup through a third-party neural search API[^exa]. On 2026-11-10 the account ran out of credit, the API reported that as an in-band 402 error the client read as results, and its code-search tool had disappeared upstream. Topping up was possible, but the operator's rule is no paid search APIs in the agent hot path.
+
+Replacing it meant re-building a search pipeline from SearXNG upwards: candidate discovery, content extraction, document chunking, relevance ranking, and a context-packing step that fits the final string into the model's token budget. The pipeline now serves about 143 agent queries per day from the homelab NAS across the `websearch` and `web_research` tools, and a separate eval harness measures its output against the raw SearXNG baseline on a private query set.
+
+<Aside type="note" title="Provenance">
+  Based on the production deployment running on the homelab NAS (Ryzen 7 5800X, 62 GB RAM with about 28 GB available, no GPU role in the search pipeline). The Phase 3 and Phase 8 eval tables below each use a 48-query draft set; the Phase 1 engine-pool gate used 20 sample queries and the code-search eval used 12 queries. All latency tables come from the harness's per-query client wall clock (`run.py`); the stage-median breakdown comes from `/search`'s per-call `timings_ms` output. The reranker bench in "Why a cross-encoder" was run in a throwaway container on the NAS CPU.
+</Aside>
+
+## Why a third-party search API breaks
+
+The hosting stack includes SearXNG metasearch behind the crawler's `/extract` and several content-fetch tiers, all described in the [self-hosted research stack](/reference/self-hosted-research-stack/) doc. Before November 2026, the agent tools did not use any of it for search. They called a paid API that returned query-scored context strings. That API failed in three ways that a self-hosted pipeline can catch.
+
+**In-band errors that look like results.** An out-of-credit API answers HTTP 200 with a JSON body that carries the 402 error inside a response field rather than in the status line. The client only fell back to SearXNG on a non-2xx status or empty text, so its SSE parser handed the agent the literal error string (`web_search_exa error (402): You have exceeded your credits limit`) as if it were search results, and the fallback never ran.
+
+**Code search disappearing.** The API's code-context tool returned `-32602 Unknown tool` from the server's tool dispatcher. Before the stopgap built on 2026-11-11, `codesearch` had no fallback at all and failed outright. After the stopgap, it fell through to a SearXNG `it` fallback that ran on every call, but only after the dead Exa call consumed a network round trip. Phase 4 removed the dead call entirely, routing codesearch through `/search` directly.
+
+**No fallback that actually fired.** The outage on 2026-11-10 came before any self-hosted replacement existed. The first fix was a stopgap in the client (treat in-band errors as failures so the existing SearXNG fallback runs), shipped the next day alongside the pipeline below.
+
+## The pipeline from query to context string
+
+Every search call runs these steps:
+
+1. **SearXNG candidates.** The query goes to a local SearXNG instance backed by several search engines. The config merges results from each engine and de-duplicates by URL. The engine pool is described under "Recall: the engine pool" below.
+2. **Fetch with a deadline.** SearXNG returns up to 20 candidates. The top `fetch_top` (default 8, maximum 12) are fetched concurrently through the crawler's `/extract` service, within what is left of the 8-second request deadline after a 1.5-second reserve for ranking. Pages still fetching when the deadline expires, and candidates beyond `fetch_top`, contribute their SearXNG snippet instead. Every response carries a `timings_ms` breakdown of where the wait went.
+3. **Chunk and BM25 prefilter.** Each fetched page is split into paragraph-packed chunks of about 1,200 characters, carrying their nearest heading as context. The chunks are ranked against the query with a BM25 scorer that uses stdlib Python collections, with no external index library. The top 16 chunks form the shortlist for the cross-encoder.
+4. **Cross-encoder reranking.** The shortlist is scored by `cross-encoder/ms-marco-MiniLM-L6-v2` (22 M parameters) running under `sentence-transformers` in a dedicated CPU sidecar container. The model was chosen by a latency budget (bench below). The scores reorder the shortlist.
+5. **Context packing.** Scored chunks are packed greedily into the output budget (default 10,000 characters), with no more than 3 chunks from any one URL to keep the context diverse. The MCP formatter appends a provenance footer (`ranker`, candidate and fetch counts, elapsed time) to the packed string.
+
+The `/similar` endpoint (find pages related to a seed URL) follows a simpler path: extract the seed page's title and its 8 most common non-stopwords, issue up to 3 SearXNG queries from those terms, fetch the top 10 candidates, embed their first chunks and compare them by cosine similarity against the mean of the seed's first 2 chunks (`snowflake-arctic-embed-s`, 384 dimensions). If the embedding service is unavailable, the candidates keep SearXNG order.
+
+### Why a cross-encoder and not the GPU
+
+The reranker runs on the NAS CPU. The GPU on that host is shared with media transcoding and a local LLM service, so the rule was: no search-path dependency on the GPU.
+
+The model choice followed a measured budget: reranking 50 (query, passage) pairs should complete in under 500 ms on 4 CPU cores. Two candidates were benched on the NAS (Ryzen 7 5800X, Zen 3, AVX2, no VNNI). The bench was run in a throwaway container from the clip service image (`torch` CPU 2.13.0, `sentence-transformers` 5.7.0), with `--cpus 4` matching the sidecar's allocation, 50 pairs of about 1,200 characters each, `max_length` 512, `batch_size` 32, 10 runs after warm-up:
+
+| model | median (50 pairs) | verdict |
+|---|---|---|
+| `cross-encoder/ms-marco-MiniLM-L6-v2` | 2,250 ms | 4.5x over budget; chosen as the best available |
+| `gte-reranker-modernbert-base` (149 M) | 20,159 ms | 40x over budget |
+
+Neither model met the budget on PyTorch CPU; the ONNX backend could not be benched because the image lacks `optimum` and `onnxruntime`. The rule's fallback picked MiniLM-L6. Scaling the 2,250 ms for 50 pairs to the 16-chunk shortlist estimates about 720 ms per query, and production measured 0.7 seconds: the fastest of the three pipeline stages, about 9% of the 7.6-second p50.
+
+## Recall: the engine pool
+
+Ranking can only reorder what the candidate engines found. The SearXNG instance depends on upstream search engines, and the pool is the bottleneck that determines how much the pipeline can improve over raw snippets.
+
+### How one index became two
+
+On 2026-11-10, live queries returned results from a single engine (`mwmbl`). Four others reported as unresponsive: `brave` (too many requests), `duckduckgo` (CAPTCHA), `google cse` (too many requests), and `qwant` (access denied). The Google Custom Search JSON API is additionally "closed to new customers" and all customers must transition by 2027-01-01[^google-cse-shutdown].
+
+DuckDuckGo came back first. The upstream SearXNG image ships a `duckduckgo web` engine, disabled by default, that reads results through the `links.duckduckgo.com/d.js` preload path instead of the stock engine's POST to the HTML endpoint. From the host egress it answered 3 of 3 probes, while direct POSTs to the HTML endpoint returned one result page and then two CAPTCHAs. Both engines are enabled; they front the same DuckDuckGo index, so this is two access paths to one set of candidates, and the stock engine still answered the pool probe (50 hits) on 2026-11-11.
+
+Startpage followed, but it took fixing five faults in the SearXNG engine implementation[^startpage]:
+
+1. The upstream image marks the stock `startpage` engine `inactive: true` because it hits a proof-of-work captcha[^startpage], which also stops it loading. The anubis engine reuses the stock module's initialised state (traits, cache, base URL, request and response builders), so the stock engine has to load (`inactive: false`) without being queried (`disabled: true`). The image's stock module also exposes `setup()` rather than `init()`, and the wrapper called the old name.
+2. The `Cookie` header that `_with_cookies` constructed was dropped by `_raw_request`, so no cookie ever reached the server.
+3. The cookie the challenge page sets was discarded, so the pass-challenge step answered 500 "Cookies appear to be disabled"; and the success-cookie check only knew stock Anubis cookie names, while Startpage's build names it with an `spchal-` prefix.
+4. A non-reentrant `threading.Lock` deadlocked on the first cold-start proof-of-work solve, and every subsequent query waited 12 seconds for a lock that would never release.
+5. Direct egress gets proof-of-work difficulty 6 (about 14 seconds per solve) versus difficulty 4 (about 50 ms) through the VPN egress, so the engine routes through the host's VPN proxy.
+
+Startpage front-end proxies Google results. With DuckDuckGo (+ the `_web` frontend) and Google-via-Startpage answering, the median query across 20 sample queries got results from 2 independent indexes (the gate's passage threshold) and a median of 20 unique URLs, up from one index and 11 URLs earlier the same day. SearXNG query latency dropped from 12 seconds (every query waited out the deadlocked engine) to a p50 of 4.7 seconds. `mwmbl` and `wiby` answer occasionally (3 and 1 of the 20 queries); `brave` is kept as an opportunistic engine, proxied through the host's VPN, that recovers about 75 minutes after a burst of roughly 30 requests.
+
+### What DuckDuckGo over Tor taught
+
+Probes through a throwaway Tor daemon in the OSINT container against DuckDuckGo's HTML endpoint returned CAPTCHA on 5 of 5 attempts, worse than the direct egress. Tor was dropped as a route for the engine pool; the stack's Tor use stays limited to the OSINT service's own lookups through external `.onion` SearXNG instances.
+
+## Measuring the pipeline
+
+A search eval harness built alongside the pipeline measures every run against a private 48-query set across 6 categories (code, infra-docs, sg-local, product, fresh-news, general-fact). Each returned result is graded for relevance (0-3), and each packed context for answerability (could the query be answered from it alone), by an LLM judge that never sees which backend produced it; judgments are cached so re-runs only pay for new items. Ten judge grades re-graded by hand agreed on 8 and were one grade off on 2. The harness runs backends interleaved (order alternates per query) so a pool-health event during the run affects both sides equally. Two traps bit during the work: a draft query set that reused query ids per category silently pooled 8 queries into one nDCG ideal (the runner now rejects duplicate ids and the report pools by query text), and a re-run within 6 hours returned the crawler's cached answers (a `--max-chars` flag changes the cache key for every backend alike).
+
+The numbers below come from eval rounds across the project's phases. The Phase 3 and Phase 8 tables each show one interleaved 48-query run; the code-search table shows a separate 12-query run. The query texts are not public, but the canary queries used for pool health monitoring (such as `postgres logical replication slot`, `rust tokio select macro`, and `kubernetes pod disruption budget`) exercise the same categories.
+
+### Phase 3: /search vs raw SearXNG
+
+The first run had a 10.3-second p50 and failed the 8-second latency gate. Snippet passages for every unfetched candidate and an 8-second request deadline (down from 12) fixed that; the interleaved re-run:
+
+| backend | nDCG@5 | answerable | p50 (ms) | p95 (ms) |
+|---|---|---|---|---|
+| SearXNG snippets (baseline) | 0.723 | 0.46 | 4,648 | 8,972 |
+| /search | 0.674 | 0.55 | 7,552 | 13,323 |
+
+Answerability, the property an agent needs (whether the context string can answer the query), improved: 9 queries gained versus 2 that lost (sign test two-sided p ~ 0.07). Ranking did not measurably improve: the pipeline's results are mostly the same URLs as SearXNG's, fetched and reordered, so the reranker can only reshuffle what the candidate engines find. The p50 latency of 7.6 seconds passed the 8-second gate; the p95 of 13.3 seconds passed the 15-second gate.
+
+Stage medians from the timing breakdown (n=47 cached responses): SearXNG candidates 4.8 seconds, fetch 1.0 second, rank 0.7 second. SearXNG dominates the wait at about 63% of total time. The next latency lever is the engine pool speed, not the pipeline steps after it.
+
+### Code search: the `it` engine trap
+
+SearXNG groups its developer engines under an `it` category (on this instance GitHub, Stack Overflow, MDN and Docker Hub answered). A separate 12-query code-specific eval ran `/search` with `category=code` (which mapped at that point to SearXNG's `it` engines) against the raw snippets baseline:
+
+| backend | nDCG@5 | answerable |
+|---|---|---|
+| /search category=code (SearXNG it engines) | 0.004 | 0.00 |
+| SearXNG snippets (general pool) | 0.678 | 0.29 |
+| /search on general pool | 0.556 | 0.58 |
+
+The `it` pool returned mostly MDN pages (67 of 76 results), which answered none of the queries. `category=code` now maps to SearXNG's general pool, and the code-search tool sends no category at all. Raw snippets still ranked better than `/search` here, the same pattern as the main eval, and the general-pool run was not interleaved with the other two.
+
+### Own index (Phase 8): built, measured, kept off
+
+A focused embedding index was built from 29 documentation hosts (Python, Rust, PostgreSQL, Kubernetes, Arch Wiki, and others) as a supplementary recall source on top of SearXNG candidates. Retrieval is dense cosine similarity: the query is embedded into the same 384-dimensional space as the passages, and the top-scoring vectors are returned. An interleaved 48-query run comparing `/search` with the index merged versus the same pipeline without it (post-prune index: 1,615 pages, 14,751 passages):
+
+| backend | nDCG@5 | answerable | p50 (s) |
+|---|---|---|---|
+| /search (no index) | 0.744 | 0.54 | 7.8 |
+| /search with index | 0.767 | 0.54 | 7.8 |
+
+The first gate run, on the unpruned index (1,935 pages, 16,204 passages) and with no relevance floor, scored nDCG@5 0.757 with the index against 0.779 without, answerable 0.54 on both, p50 8.1 against 7.4 seconds. The nDCG@5 difference in the table above is 17 wins to 14 losses per query (sign test p 0.72), which is noise.
+
+The index added no measurable answer-quality gain on this query set, and its useful hits were GitHub pages ingested during earlier runs of the same eval queries (leakage rather than real recall). The index merge is off by default (`INDEX_MERGE=0`): ingest, seeding, and pruning keep running so the corpus grows, and it is re-evaluated on a fresh query set after a month of organic ingest.
+
+Two failures before this result taught the same lesson about index quality control: (1) without a relevance floor, the top-k index hits entered every query, so pages like `sqlite.org/about.html`, PostgreSQL event listings and ArchWiki `Special:` pages showed up in Singapore-food and shopping queries. On 20 test queries the best index hit scored 0.613-0.748 cosine for on-topic queries and 0.517-0.573 for off-topic ones, so a floor of 0.58 now drops them; the margin is small and needs re-checking as the corpus grows. (2) the seed BFS wandered into site navigation pages (about, blog, news, changelog) which a per-host path scope and a junk-path filter removed (337 URLs and about 1,600 passages from 21 hosts).
+
+## Trade-offs and what is still open
+
+**Latency budget.** SearXNG is about 63% of each query's wait. The engine pool's response time depends on the slowest-responding engine SearXNG queries in parallel (about 5 seconds at p50 for the general pool), and the 8-second fetch deadline is a trade-off: shorter deadlines save time but reduce the number of pages that contribute full text rather than snippets. The pool gate requires the median query to get results from at least 2 independent indexes across 20 sample queries; that is a floor. A third index would strengthen recall, and because SearXNG queries engines in parallel it costs latency only if it is slower than the engines already answering, up to the engine timeout.
+
+**Single-run evals.** Each table above comes from one run (48 queries, or 12 for code). Re-running the same queries days apart would show the real variance from pool health, engine response time, and the fetch pipeline. The harness supports interleaved runs with tags, so accumulating several runs is a process decision, not a tool gap.
+
+**Small query set.** Forty-eight queries across 6 categories covers the common shapes but cannot detect whether a path change helps long-tail hardware queries or harms general-reference ones. A random sample from the 4,400 past query archive, re-drawn per eval, would give a less familiar but more honest signal.
+
+**No Exa comparison.** By the time the harness was ready in November 2026, Exa's credits were exhausted[^exa-outage], so a paired Exa-versus-pipeline run was not possible. The baseline for every measurement is raw SearXNG snippets, not the paid API the pipeline replaced. The data says the pipeline improves over raw SearXNG on answerability; it cannot say whether it matches or exceeds the neural API's ranking.
+
+## Related docs
+
+- [A self-hosted web research stack for coding agents](/reference/self-hosted-research-stack/): the underlying container topology, extract tiers, and MCP tool layer this pipeline runs on.
+- [Hot vs bulk: placing app state on a two-tier ZFS homelab](/reference/appdata-tiering-zfs/): where the index store lives on the NAS QLC NVMe tier (no snapshots, regenerable) and why the tier choice matters.
+- [Self-hosted monitoring with Prometheus and Grafana](/reference/self-hosted-monitoring-topology/): the Prometheus scrape job and the `research-search` dashboard that alert on a thin engine pool.
+
+[^exa]: Exa, "Exa API Documentation," Exa. https://docs.exa.ai/
+[^google-cse-shutdown]: Google, "Custom Search JSON API: Overview," Google Developers. https://developers.google.com/custom-search/v1/overview
+[^startpage]: SearXNG, "[fix] engines: startpage anubis solver," pull request 6669, merged 2026-09-10. The upstream `settings.yml` cites it on the `inactive: true` line of the stock startpage engine ("uses a Proof Of Work captcha"). https://github.com/searxng/searxng/pull/6669
+[^exa-outage]: The 402 credit-exhaustion state was observed live on the production instance on 2026-11-10; the same day the error-text-in-response-body path was traced in the client's SSE parser. Phases 0-4 of the self-hosted pipeline shipped on 2026-11-11.
