@@ -61,7 +61,10 @@ the build/test gate only, no deploy.
   full article-body clarity rules), and `src/styles/custom.css`
   (lexicanum-only: layout widths, homepage, diagrams, print, references).
   Components under `src/components/house/` (Header, SiteTitle, ThemeSelect,
-  Footer, PageTitle, Sidebar) use the generic kit conventions. Kit source
+  Footer, PageTitle, Sidebar, DiagramExpand) use the generic kit
+  conventions. DiagramExpand, loaded from `src/components/Head.astro`,
+  gives a Graphviz diagram rendered below its intrinsic size an EXPAND
+  DIAGRAM button that opens it full screen (house#21). Kit source
   and install steps: `house assets cat starlight/README.md`. Fonts: Overpass
   Mono for titles, nav and labels, Inconsolata for code, tables and data
   (@fontsource); no sans face, no social links, ea only as the footer
