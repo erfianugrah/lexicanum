@@ -26,7 +26,7 @@
 | --- | --- | --- | --- |
 | Full-screen dialog | v0.1.34 | eliminated | tried and set aside |
 | Modal lightbox panel | v0.1.35, MkDocs Material glightbox, Starlight image zoom | eliminated | tried and set aside |
-| medium-zoom style animated zoom | Docusaurus, VitePress recipes, starlight-image-zoom | eliminated | works on `<img>` only; inline SVG needs serialising to a data URL, which drops `currentColor` theming (medium-zoom#190, its "generated SVG" guide) |
+| medium-zoom style animated zoom | Docusaurus, VitePress recipes, starlight-image-zoom | eliminated | works on `<img>` only; inline SVG needs serialising to a data URL, and "the image cannot inherit the page's CSS", which drops `currentColor` theming (medium-zoom "Generated SVGs" guide, https://medium-zoom.francoischalifour.com/docs/guides/generated-svg/; the worker's medium-zoom#190 is about extensionless SVG URLs, not inline SVG) |
 | Always-visible inline pan/zoom controls | GitHub mermaid, Mintlify | eliminated as specified | controls overlay the diagram; users asked GitHub to hide them ("get in the way of content, especially on mobile", community discussion #178929, 10 upvotes) |
 | Plain-wheel pan/zoom library (svg-pan-zoom, anvaka/panzoom) | many | eliminated | scroll-trap complaints across 14 issues (techniques.md, adversarial 1-14) |
 | Popover API overlay | none surveyed in docs | eliminated | still an overlay; the brief is to stay on the page |
