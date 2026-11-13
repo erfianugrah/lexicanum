@@ -42,7 +42,7 @@ the build/test gate only, no deploy.
   by `src/lib/og-card.mjs` (satori + sharp), called from the `ogCard`
   integration in `astro.config.mjs` on `astro:build:done`; doc counts on it
   are measured from `src/content/docs`, so adding docs needs no card edit.
-  `public/thumbnail.jpg` is not committed; there is nothing to regenerate by
+  `dist/thumbnail.jpg` is not committed (it is build output under `dist/`, which is gitignored); there is nothing to regenerate by
   hand. Not run in dev.
 - Favicon: `brand/icon.svg` (open book, red ribbon; house icon grammar) is
   the source; `house icon build` writes `public/brand/` (favicon.svg/.ico,
