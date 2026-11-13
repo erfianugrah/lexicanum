@@ -16,10 +16,9 @@ If you give each of your end-users a backend - an app builder, a per-customer
 workspace, a low-code tool - the obvious design is one Supabase project per tenant. It
 isolates cleanly and the Management API provisions one in a call. It also commits you
 to roughly \$10/month of compute for every tenant including the idle ones: on Pro and
-Team plans a project cannot be paused. The exception (the `platform` plan, where
-pausing is enforced and the create default is Nano - measured 2026-08-24) is gated
-behind the Supabase for Platforms programme; this architecture is the self-service
-alternative.
+Team plans a project cannot be paused. Supabase for Platforms offers
+scale-to-zero pricing, but only on Nano instances and only to select
+customers;[^sb-sfp] this architecture is the self-service alternative.
 
 The alternative is to put the free and trial majority in one always-warm project,
 separated by row-level security on an identity claim, and give a tenant its own
@@ -199,8 +198,11 @@ Both halves were measured. A tenant's own token doing
 `403 Updating app_metadata requires admin privileges`. The same token doing
 `{"data":{"tenant_id":"tenant-b"}}` SUCCEEDS - `user_metadata.tenant_id` becomes
 `tenant-b`, the next token carries it, and the read still returns only tenant A's
-rows, because the policy does not look there. Supabase's own docs state only the
-`user_metadata` half.
+rows, because the policy does not look there. Supabase's RLS guide states both
+halves: `raw_user_meta_data` "can be updated by the authenticated user" and "is
+not a good place to store authorization data", while `raw_app_meta_data`
+"cannot be updated by the user, so it's a good place to store authorization
+data".[^sb-rls]
 </Aside>
 
 <Aside type="caution">
@@ -227,13 +229,20 @@ create table public.items (
 alter table public.items enable row level security;
 
 create policy tenant_isolation on public.items
-  using      (tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id'))
-  with check (tenant_id = (auth.jwt() -> 'app_metadata' ->> 'tenant_id'));
+  to authenticated
+  using      (tenant_id = (select auth.jwt() -> 'app_metadata' ->> 'tenant_id'))
+  with check (tenant_id = (select auth.jwt() -> 'app_metadata' ->> 'tenant_id'));
 
 grant usage on schema public to authenticated;
 grant select, insert, update, delete on public.items to authenticated;
 grant usage, select on sequence public.items_id_seq to authenticated;
 ```
+
+`to authenticated` keeps the policy from running for `anon` at all, and the
+`(select ...)` wrap lets the planner evaluate `auth.jwt()` once per statement
+instead of once per row; Supabase's RLS guide recommends both.[^sb-rls] The
+runs measured in this guide used the policy without them, and were not
+repeated with them.
 
 `using` governs reads and `with check` governs writes, but on a `for all` policy the
 two are not independent: Postgres falls back to the `using` expression for new rows
@@ -289,7 +298,7 @@ nothing here measures.
 | Add `select c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r' and not c.relrowsecurity` to the pre-cutover checks. | One table without RLS is readable in full by every tenant; tenant B read 2 of 2 rows from one. | tenant-consolidation [C05](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/tenant-consolidation/tests/c05-rls-after-merge.ts) (2026-08-04) |
 | Poll `GET /v1/projects/{ref}/health?services=auth&services=rest&services=db`, then retry the first `POST /auth/v1/admin/users` with backoff. | 5 of 5 fresh projects refused it with `500 unexpected_failure` after `ACTIVE_HEALTHY` and accepted the second call one poll later (2026-08-04); 2 of 2 passed the per-service poll and still failed the first write (2026-08-03). | placement reference, Verified row 'Create -> healthy, and healthy is not writable' (2026-08-04, n=5, bash run not in the lab repo); supabase-lab `AGENTS.md`, provisioning note (2026-08-03) |
 | Select API keys by `name` or `type` when reading them from `GET /v1/projects/{ref}/api-keys?reveal=true`. | A new project carries both the legacy JWT keys and `sb_publishable_` / `sb_secret_`, and sending the wrong shape as a bearer returns `PGRST301 "Expected 3 parts in JWT; got 1"` - a fourth `PGRST301` cause beside the three in the gotchas. | supabase-lab `AGENTS.md`, provisioning note (2026-08-03); platform-facts [F02b](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/platform-facts/tests/f02-project-surface.ts) |
-| Keep `service_role` and `sb_secret_` off every tenant-reachable surface. | Those keys bypass RLS and read all tenants; a control-plane worker that needs a narrower one can mint it with `secret_jwt_template` on `POST /v1/projects/{ref}/api-keys`, whose templated `role` and custom claim reach `auth.jwt()` on the data plane on Pro and platform orgs. | [placement reference](/reference/supabase-multi-tenant-placement/), Proof 1 row 7 (2026-07-09); sfp-platforms [S14](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/sfp-platforms/tests/s14-secret-jwt-template.ts) (2026-08-25) |
+| Keep `service_role` and `sb_secret_` off every tenant-reachable surface. | Those keys bypass RLS and read all tenants; a control-plane worker that needs a narrower one can mint it with `secret_jwt_template` on `POST /v1/projects/{ref}/api-keys`, whose templated `role` and custom claim reach `auth.jwt()` on the data plane on a Pro org. | [placement reference](/reference/supabase-multi-tenant-placement/), Proof 1 row 7 (2026-07-09); sfp-platforms [S14](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/sfp-platforms/tests/s14-secret-jwt-template.ts) (2026-08-25, Pro org) |
 | Rotate the hub key with a PAT on `/v1/projects/{ref}/config/auth/signing-keys`, one standby at a time, and hold new sign-ins for the window. | Rotation is `GET`, `POST` and `PATCH` on the signing-keys path, with create body `{algorithm}`. The project's `/auth/v1/admin/signing-keys` is a 404 and a second standby answers `422 "already has a signing key in standby"`; the trusting project never re-resolved in 20 minutes over 116 probes, and a fresh integration created while the hub's JWKS was current still cached the old kid set. | key-rotation 2026-08-25 live run ([R01](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/key-rotation/tests/r01-rate-limit.ts) did not reproduce the rate limit, [R02](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/key-rotation/tests/r02-no-reresolve.ts) reproduced no re-resolve, [R03](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/key-rotation/tests/r03-revoked-key.ts) observed the revoked key incidentally) |
 | To use the second scoping dimension, enable the OAuth server with `PATCH /v1/projects/{ref}/config/auth`, then register clients with `POST /auth/v1/admin/oauth/clients`. | Enabling the OAuth server takes the body `{oauth_server_enabled: true, oauth_server_authorization_path: ...}`, and client registration needs both the `apikey` and `Authorization` headers; PKCE is required even for confidential clients. The full authorization-code flow runs headless and the issued token carries `client_id`. | byo-oauth [O03](https://github.com/erfianugrah/supabase-lab/blob/6d42c55/experiments/byo-oauth/tests/o03-auth-idp-client-id-rls.ts) (2026-08-18) |
 
@@ -394,7 +403,7 @@ checking anything.
 | An untrusted issuer's token is refused | Same tenant token against the target with no integration configured | Measured - `401 PGRST301` |
 | Deleting the integration stops the token | `DELETE`, then re-read with the same token, polling | Measured - `PGRST301` after 587-654ms across three repeats |
 | Trust changes are synchronous with the API call | Probed immediately after create and after delete | Measured - no; the immediate probe sees the old state both ways. Accept landed in 1038-1169ms |
-| Scale-to-zero on Nano removes the premise for this architecture | Ran the SfP-prescribed create (no `desired_instance_size`) plus a pause/restore cycle on a `platform`-plan organization, 2026-08-24 | Measured - create provisions `nano` by default (224MB shared_buffers) and pause is enforced (`200` -> `INACTIVE`); nano is the platform plan's create default, not a catalogue variant |
+| Scale-to-zero pricing is Nano-only and limited to select customers | Read the [Supabase for Platforms guide](https://supabase.com/docs/guides/integrations/supabase-for-platforms) on 2026-11-13 | Documented, not tested |
 | OAuth tokens carry a `client_id` claim usable in RLS | Headless authorization-code flow with PKCE, then a policy on `auth.jwt() ->> 'client_id'` read as two different clients | Measured 2026-08-18 - claim present (`aud=authenticated`, `scope=email`); matching client sees the row, other client sees nothing |
 | `custom_jwks` never resolves | Created it, polled the Data API with a valid ES256 token | Measured - `PGRST301` for 7m32s over 31 polls; `jwks_url` worked first try |
 | RLS on an external claim isolates tenants | Read `items` as two different tenants | Measured - each saw only its own rows |
@@ -433,3 +442,6 @@ checking anything.
   - the runbook for moving a tenant off this tier once it converts, including the
   identity-migration option and the hub key-rotation risk this tier's trust wiring
   carries.
+
+[^sb-sfp]: Supabase, "Supabase for Platforms," Supabase Docs. https://supabase.com/docs/guides/integrations/supabase-for-platforms
+[^sb-rls]: Supabase, "Row Level Security," Supabase Docs. https://supabase.com/docs/guides/database/postgres/row-level-security

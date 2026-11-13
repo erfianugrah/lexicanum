@@ -361,12 +361,11 @@ const pins: Pin[] = [
   },
   {
     doc: PLATFORM_MGMT,
-    // The 2026-08-24 platform-plan correction: nano is the plan's create
-    // default, not a gated catalogue variant. The pre-correction framing
-    // ("Nano-only and gated") is forbidden so it cannot drift back in. This
-    // doc had no pins at all until 2026-08-25 - the only one of the tenancy
-    // four without them, and the one that missed the correction because of it.
-    mustContain: ["the platform plan's create default"],
+    // Scale-to-zero pricing as the Supabase for Platforms guide states it:
+    // Nano only, and access for select customers. The older framing ("Nano-only
+    // and gated") is forbidden so it cannot drift back in. This doc had no pins
+    // at all until 2026-08-25 - the only one of the tenancy four without them.
+    mustContain: ["select customers have access"],
     mustNotContain: ["Scale-to-zero pricing is Nano-only and gated"],
     linksTo: [MULTITENANT],
   },
@@ -378,11 +377,10 @@ const pins: Pin[] = [
     // adjacent, but both being visible and both opening on "Consolidating" was
     // enough to confuse the two moves.
     mustContain: [
-      // The 2026-08-24 platform-plan measurements, carried in the prose
-      // rather than only in evidence rows - the 2026-08-25 review found the
-      // table and the paragraphs asserting opposites.
-      "provisions Nano by default",
-      "accepted and echoed",
+      // The secret_jwt_template measurement, carried in the prose rather than
+      // only in the evidence row - the 2026-08-25 review found the table and
+      // the paragraphs asserting opposites.
+      "the template is accepted (`201`)",
     ],
     mustNotContain: [
       "Consolidating Supabase accounts into one organization",
@@ -407,19 +405,18 @@ const pins: Pin[] = [
       "custom_jwks",
       "PGRST301",
       "app_metadata",
-      // The lede's cost premise, qualified 2026-08-25: pausing exists on the
-      // platform plan (measured 2026-08-24) and the premise holds because
-      // that plan is gated, not because pausing is impossible.
-      "The exception (the `platform` plan",
+      // The lede's cost premise names its exception from the public SfP
+      // guide: scale-to-zero pricing exists, Nano-only and for select
+      // customers, which is why the shared tier is the self-service route.
+      "only on Nano instances and only to select",
     ],
     mustNotContain: [
       // True when written, measured false since. Inert here but kept as a
       // regression guard on both halves.
       "Neither approach was built or tested in this run",
       "Neither discovery endpoint nor gateway was built",
-      // The unqualified form of the premise. Measured false on a platform
-      // org 2026-08-24 (this doc's own evidence row L371 said so while the
-      // lede asserted it) - the qualified form scopes it to Pro/Team.
+      // The unqualified form of the premise. The lede scopes it to Pro and
+      // Team and names the SfP scale-to-zero exception right after.
       "a project on a paid plan cannot be paused",
     ],
     sections: [/^#{2,3} .*Verification/m, /^#{2,3} .*Gotchas/m],
@@ -509,9 +506,9 @@ const pins: Pin[] = [
       // sections regex below cannot see it - pin the literal.
       "**TL;DR:**",
       "Where should a tenant live?",
-      // The provenance paragraph must own the 2026-08-24 platform-plan
-      // measurements; "five dates" silently excluded the newest and most
-      // load-bearing rows.
+      // The provenance paragraph must count every dated group it lists,
+      // through the 2026-08-24 Pro migrations read; "five dates" once
+      // silently excluded the newest group.
       "six dates",
     ],
     mustNotContain: [
@@ -1080,10 +1077,13 @@ const pins: Pin[] = [
       // S17: FORCE binds only a non-BYPASSRLS owner, with the platform's own
       // refusal text for the obvious workaround.
       'is a reserved role, only superusers can modify it',
-      // S16: the hosted edge appends and passes cf-connecting-ip; the
-      // pre-request hook survived neither reload nor restart.
+      // S16: the hosted edge appends and passes cf-connecting-ip. The
+      // pre-request hook survived neither reload nor restart in the
+      // 2026-08-28 and 2026-09-03 runs, while Securing your API now documents
+      // the same steps as working; the page keeps the two unreconciled until
+      // a re-run rather than asserting either side (lexicanum#91).
       "cf-connecting-ip",
-      "by reload or by restart",
+      "have not been reconciled by a re-run",
       // S18: the trail is the logs endpoint, not the admin audit table.
       "returned 200 with 0 entries",
       // A01d plus A03b/A03c (2026-09-08): the default statement class is
@@ -1687,14 +1687,12 @@ const pins: Pin[] = [
   {
     doc: PLATFORM_MGMT,
     mustContain: [
-      // Z01 (2026-09-09): the parked-project sweep answers empty `200`s on
-      // three project-scoped reads, so a status-code sweep reports parked
-      // tenants healthy. The count is three, not the four the first pass
-      // listed - `/advisors/security` is empty on a fresh project too.
+      // Z01 (2026-10-13): the parked-project sweep answers empty `200`s on
+      // four project-scoped reads, so a status-code sweep reports parked
+      // tenants healthy. `/advisors/security` counts only because the run
+      // seeds a finding; on an unseeded fresh project it is empty awake too.
       "scores every parked tenant clean",
-      "and is not one - a fresh project's lint list is empty awake as well",
-      "/advisors/security` looks like a",
-      "never exercised auto-pause",
+      "so the security advisor has a finding to lose",
       // The hibernation arm returned a null, not a pending result.
       "Hibernation was not reachable on any account available here",
     ],
