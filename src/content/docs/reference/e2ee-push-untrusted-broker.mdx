@@ -1,0 +1,274 @@
+---
+title: "End-to-end encrypted push notifications through an untrusted broker"
+description: Design reference for a self-hosted push notification broker that stores and forwards only ciphertext - per-topic keys with epochs, device-to-device key wrapping, QR onboarding with fingerprint approval, a recovery phrase, Web Push delivery that stays end-to-end encrypted, and the metadata the broker still sees. Compared with server-readable designs such as ntfy, with the tested-versus-design-only split of one implementation.
+author: Erfi Anugrah
+category: homelab
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+How to build a publish/subscribe notification service whose server never holds a key that decrypts a message: scripts publish with one HTTP request, phones and browsers receive the push, and for encrypted topics a full copy of the server's database reveals routing metadata and nothing else. It is for anyone choosing or building a self-hosted alternative to ntfy, Gotify or a hosted push service.
+
+The design below has one implementation: a Go server with embedded SQLite, a CLI, and a browser PWA with Web Push, in use but not published. Every number in this page is the value that implementation uses, read from its source on 2026-11-13; the [Evidence](#evidence) table splits what its tests exercise from what is design only.
+
+**TL;DR:**
+
+- The broker stores and forwards ciphertext. Topic keys are random 256-bit keys made on a device; the server holds them only wrapped to a device's X25519 public key or sealed under the recovery phrase.
+- A new device joins by scanning a QR code and being approved by a device that already has the keys. The approver wraps each topic key to the newcomer; the server stores the wrapped bundles and performs no cryptographic operation.
+- The server still sees topic names, priority, timestamps, sizes, device IPs and delivery state. Title and tags are sealed inside the payload, so a publisher that sends them as plain headers can only use unencrypted topics.
+- Web Push works without breaking this: the push service sees an RFC 8291 envelope around ciphertext it could not read anyway, and the browser's service worker decrypts with a key kept in IndexedDB.
+- The guarantee covers a server that is breached or copied. A server that is actively malicious can still wrap a key it chose to a device, because bundles are not authenticated to the device that wrapped them.
+- Pick this over a server-readable broker when the server or its backups sit somewhere you do not fully trust. Pick ntfy when ntfy-compatible tooling and native apps matter more than the server being blind: as of 2026-11-13 ntfy's end-to-end encryption issue has been open since 2021-12-29.[^ntfy-69]
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  publisher [label="Publisher\n(script, monitor,\npublisher device)"];
+  broker    [label="Broker\nciphertext, wrapped keys,\nrouting metadata"];
+  db        [label="SQLite", shape=cylinder];
+  pushsvc   [label="Browser push service\n(RFC 8030)"];
+  phone     [label="Device A\n(PWA, service worker)"];
+  laptop    [label="Device B\n(CLI or PWA)"];
+
+  publisher -> broker  [label="POST /<topic>\nJWE body"];
+  broker    -> db;
+  broker    -> laptop  [label="WebSocket / SSE\nlive"];
+  broker    -> pushsvc [label="Web Push\nwhen no live WebSocket"];
+  pushsvc   -> phone   [label="RFC 8291 envelope"];
+  laptop    -> broker  [label="approve: wrapped\ntopic keys"];
+  broker    -> phone   [label="key bundles"];
+}
+```
+
+Every arrow carries ciphertext the broker cannot open. The one plaintext path is a topic created without encryption, which exists so tools that only speak ntfy headers keep working.
+
+---
+
+## Which do I pick
+
+| You need | Use | Why |
+|---|---|---|
+| Existing tooling (Uptime Kuma, Grafana, Alertmanager) posting ntfy headers, today | ntfy, or this design's plaintext topics | both accept the ntfy publish headers; the content is readable on the server either way |
+| A server, VPS or backup that could be breached or copied | this design, encrypted topics | a database dump yields wrapped keys and JWE bodies |
+| Native Android or iOS apps | ntfy | ntfy ships both;[^ntfy-phone] the implementation here ships a browser PWA and a CLI; native apps are design only |
+| Notifications that must survive every device being lost | this design, with the recovery phrase | the server keeps a backup blob it cannot decrypt; the 12-word phrase restores it |
+| Hiding which topics exist and when they fire | neither | topic names and timing stay visible to the broker in both |
+
+---
+
+## What the broker sees
+
+The threat model protects message content and topic keys against a fully compromised server, network observers, push services, and other users of the same server. It does not protect metadata, device endpoints, or availability: a malicious server can drop or delay messages.
+
+| Field | Broker sees it | Why |
+|---|---|---|
+| Message body | no | JWE compact serialisation, `alg=dir`, `enc=A256GCM`[^rfc7516] |
+| Title and tags | no | when present, sealed with the body as JSON `{"title","tags","body"}` inside the JWE; otherwise the body is sealed alone |
+| Topic name | yes | routing, wildcard subscription, access checks |
+| Key id `kid` (topic and epoch) | yes | in the JWE protected header so a device knows which key to use |
+| Priority | yes | the server sets the Web Push urgency from it; the service worker's quiet-hours check reads it from the push payload |
+| Supersedes, collapse key, TTL | yes | the server replaces, collapses and expires copies it cannot read |
+| Timestamps, sizes, device IPs | yes | inherent to a store-and-forward server |
+| Delivery receipts (`received`, `displayed`, `actioned`, `dismissed`) | yes | escalation fires on missing acknowledgement, not on content |
+
+Two features follow from the table. A heartbeat topic (alert when a topic goes silent for its interval) works on encrypted topics because it watches arrival times only; its alert is plaintext, since the server has no key to encrypt it with. Escalation to email or a webhook carries topic, message id, priority and age, never content.
+
+<Aside type="caution" title="Plain headers on an encrypted topic">
+ntfy-style `Title` and `Tags` headers are plaintext by definition. On an encrypted topic the broker rejects a plaintext publish rather than storing the headers, so a tool that can only send headers needs its own unencrypted topic. Treat that topic's content as public to whoever runs the server.
+</Aside>
+
+---
+
+## Keys and epochs
+
+| Key | Made by | Stored where | Primitive |
+|---|---|---|---|
+| Topic key | first device on the topic, CSPRNG | devices; server only wrapped | 256-bit symmetric, used with AES-256-GCM in the JWE |
+| Device key pair | each device at provisioning | private key on the device only | X25519[^rfc7748] |
+| Wrapped topic key (bundle) | an approving device | server | ephemeral X25519, HKDF-SHA256, XChaCha20-Poly1305 with a 192-bit nonce |
+| Recovery key | derived from the phrase | nowhere | 128-bit BIP-39 entropy[^bip39] through Argon2id[^rfc9106] |
+
+A bundle is the ephemeral public key, the nonce, the sealed topic key, and the topic, epoch, recipient device, wrapping device and timestamp. Those five fields are bound into the AEAD's associated data, so the server cannot move a bundle to another topic, epoch or device without the unwrap failing.
+
+Each topic key has an epoch. Messages name it in `kid` (`<topic>.<epoch>`), so a device holding several epochs decrypts old history with old keys and new messages with the current one. Rotation is lazy: a device that wants a new key asks the server to reserve `epoch + 1`, which the server grants to one device at a time for 10 minutes. That device generates the key, wraps it to every active device of the user and uploads the bundles; the first publish at the new epoch makes it current. Without the reservation, two devices revoking at once would each mint a different key for the same epoch and split the topic's devices into two groups that cannot read each other.
+
+The broker accepts an encrypted publish only at the current epoch or the next one; a stale epoch or a jump of more than one returns 409.
+
+Revoking a device deletes its bundles and push registrations at once. On a topic with rotate-on-revoke set (the clients set it for every encrypted topic they create), the server also marks the current epoch as revoked: any publish at that epoch or below now returns 409, so the next message has to go out under a newer key. That key is only new to the revoked device if it was generated after the revoke: a rotation already reserved and distributed before it, still waiting for its first publish, stays acceptable at `epoch + 1` and was wrapped to the revoked device too. Rotate once more after revoking. The revoked device keeps every key it already had, so it can still read the history it was given.
+
+---
+
+## History policy
+
+A newly approved device gets the history the topic's policy says, which is a decision made per topic rather than a property of a shared static key:
+
+| Policy | Keys the new device receives | Stored messages the server replays |
+|---|---|---|
+| `all` | every epoch the approving device holds | all retained |
+| `since-join` | the approver's latest epoch, then every later rotation | from when the device was first given a key for the topic |
+| `none` | the same as `since-join` | none; live delivery only |
+
+The server enforces the replay cut on stored messages. The key set is chosen by the approving client, not enforced by the server, and it protects only older epochs: a message published in the current epoch before the device joined is withheld by the server alone.
+
+---
+
+## Onboarding a device
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.6;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  minted   [label="minted\nprovisioning token"];
+  prov     [label="provisioned\nkey pair made"];
+  pending  [label="pending approval"];
+  active   [label="active\nbundles downloaded"];
+
+  minted -> prov    [label="scan QR"];
+  prov   -> pending [label="POST /v1/provision"];
+  pending -> active [label="approver compares\nfingerprint, wraps keys"];
+}
+```
+
+1. An admin mints a one-time provisioning token (15-minute lifetime) and shows it as a QR code: a URI carrying the server URL and the token.
+2. The new device scans it, generates its X25519 key pair, and redeems the token with its public key and a name. It gets a device id and a 256-bit bearer token; the server stores only the token's SHA-256.
+3. Existing devices are told a device is waiting. Each side shows an 80-bit fingerprint of the new device's public key, as four groups of four base32 characters, on the pending device and in the approver's prompt.
+4. The user compares the two and approves. The approver wraps every topic key the new device should have and uploads the bundles.
+5. The new device downloads and unwraps them. A full device provisioned while the user has no other active full device is activated by the server directly and creates keys locally.
+
+The fingerprint comparison defends against one attack the broker can mount on its own: serving the approver a substituted public key so the topic keys get wrapped to the server's key instead. It does not defend against a second. Every device's public key is on the server, and a bundle names its wrapping device in the associated data without proving it, so a malicious server can wrap a key it chose to a device and serve it as a new epoch; the device will then encrypt under a key the server knows. Closing that needs bundles authenticated to the wrapping device, through a per-user cross-signing key or a static-key wrap, and both are design only. Until then, the guarantee holds against a server that is breached or copied, not against one that is actively malicious.
+
+A headless box (a monitoring host) joins as a publisher device: its provisioning token binds the role, and its device token can publish but cannot subscribe or rotate keys. A compromised monitoring host can then forge alerts but cannot fetch anyone's messages.
+
+---
+
+## Recovery
+
+The backup is the device list and every topic key, as JSON, sealed with XChaCha20-Poly1305 under a key derived from the recovery phrase with Argon2id, uploaded as an opaque blob with its KDF parameters and a version byte. Defaults are 3 passes, 64 MiB and 4 lanes; the clients accept 1 to 10 passes and 8 MiB to 1 GiB of memory when they seal or open a blob, so a tampered blob cannot request an absurd derivation.
+
+The phrase is 12 BIP-39 words, 128 bits of entropy, shown once. Brute-force resistance rests on those 128 bits; Argon2id is the second layer. The server limits backup reads to 10 per minute per user regardless.
+
+Restoring needs no surviving device, provided the lost devices are revoked first (an admin token can revoke any device): with no active full device left, the server activates the fresh device directly. Provision it by QR, enter the phrase, download and unseal. The restored device then wraps every recovered key to its own public key and uploads the bundles, because there is no other device to do it.
+
+---
+
+## Delivery
+
+| Path | Used when | What travels |
+|---|---|---|
+| WebSocket or SSE | the device is connected | the stored JWE |
+| `GET /<topic>/json?since=<seq>` | catching up after being offline | stored JWEs after a monotonic sequence number |
+| Web Push[^rfc8030] | the device has no live WebSocket on the topic | the JWE inside an RFC 8291 envelope[^rfc8291], or a fetch hint |
+
+The broker sends no push to a device that has a live WebSocket on the topic; an SSE subscriber still gets the push. Proxies drop idle connections, so the server sends an SSE comment or a WebSocket ping every 30 seconds and closes a WebSocket peer that leaves a ping unanswered for two intervals.
+
+Web Push keeps the property because RFC 8291 encrypts the payload to a key the browser generated, authenticated with VAPID,[^rfc8292] and the payload inside is already the JWE. The push service sees timing and approximate size. The browser's service worker unseals the JWE with the topic key from IndexedDB and builds the notification itself.
+
+Size is the constraint. A push service may refuse anything over 4096 octets,[^rfc8030-413] which RFC 8291 says leaves at most 3993 octets of plaintext.[^rfc8291-size] The implementation sends the message in the push only when the JSON payload is 3072 bytes or less; above that it sends the routing fields with `fetch: true`, and the service worker fetches the message through the replay endpoint. The broker itself caps an inline message at 4096 bytes.
+
+The browser subscription endpoint is a URL the client supplies, so it is a server-side request forgery vector. The broker accepts only https on port 443, refuses any host that resolves to a private, loopback, link-local or CGNAT address, re-resolves on every send, never follows redirects, keeps at most 5 registrations per device, and deletes a registration when the push service answers 404 or 410, or after 10 consecutive failures.
+
+---
+
+## Abuse limits
+
+The server is reachable from the internet for phones to use it, and onboarding and backup are the two endpoints an attacker would hammer. The first two limits are per client IP, token buckets in process; backup reads are counted per user:
+
+| Endpoint | Limit | After the limit |
+|---|---|---|
+| `POST /v1/provision` | 10 per minute | 429 with `Retry-After` |
+| Any authenticated route, failed authentication | 30 per minute | every credentialed request from that IP gets 429 before the token is checked |
+| `GET /v1/backup` | 10 per minute per user | 429 |
+
+Blocking before the token check means a guessed-right token after the limit still fails, so guessing gets no oracle. Behind a reverse proxy the client IP must come from a header the server trusts only from the proxy's address; otherwise every request shares the proxy's bucket and one attacker locks out everyone.
+
+---
+
+## Gotchas and lessons learned
+
+- A browser is not a key store you can recover from: clearing site data deletes the IndexedDB that holds the device key and the topic keys. Make the backup and its phrase part of onboarding, not a later setting.
+- A push about an unknown topic still has to go somewhere. In this implementation Web Push for a message to a topic that has never been configured goes to the publisher's own devices, which makes a `curl -d hello` with a publish token to a new topic name a working first test with no setup. The message itself is plaintext and readable by any subscribe-scoped token on the server, so this is for testing, not for anything private.
+- The fingerprint is only useful if the approver can see the same string the new device shows, so the pending device displays its own fingerprint, computed locally, beside the approver's prompt.
+- Account changes are pushed as data-free hints over one WebSocket per device, and each client re-fetches: device-list changes (provisioned, approved, revoked) go to every connected device of the user, key uploads and the approval itself only to the device concerned. A pending device may hold that socket so it notices its approval without polling; in exchange it observes the timing of account changes while it waits.
+
+---
+
+## Evidence
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| Server stores no title or tags for a sealed message | tested | client integration test publishes with both and asserts the stored row's metadata is empty |
+| Go client and browser TypeScript agree on JWE, key wrap, fingerprint and backup formats | tested | shared test vectors in both directions: Go-generated vectors checked by the browser unit tests, TypeScript-generated vectors checked by a Go test |
+| Onboarding, approval, encrypted publish and live delivery between two browsers | tested | Playwright end-to-end test driving two browser contexts against a fresh server |
+| A pending device cannot sync keys; a revoked device's token is refused | tested | client integration test |
+| Concurrent rotations converge on one next-epoch key | tested | client test with two rotating devices |
+| Server replay cut per history policy | tested | API test per policy; the key set per policy is client logic and untested |
+| Web Push skips devices with a live WebSocket, falls back to a fetch hint above 3072 bytes, prunes a gone registration | tested | API tests against a fake push sender |
+| Push endpoints resolving to private addresses are refused | tested | API test with a stub resolver |
+| Rate limits and the block-before-token-check rule | tested | API tests, including a valid token from a blocked IP |
+| Real Web Push delivery through browser push services, camera QR scanning | checked by hand, not automated | the end-to-end suite stops at the service worker and decodes QR from a fixture; delivery and the camera were checked on a phone |
+| Revoked-epoch 409, and the rotation-reserved-before-revoke case above | code read, untested | no test exercises the revoked-epoch path |
+| Bundles authenticated to the wrapping device | not built | see Onboarding a device |
+| Native Android and iOS apps, cross-signing, federation | design only | not built |
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="Is the server, its host or its\nbackups outside your trust?"];
+  q2 [label="Do you need native\nmobile apps now?"];
+  q3 [label="Must notifications survive\nlosing every device?"];
+  ntfy [label="Server-readable broker\n(ntfy)"];
+  e2ee [label="Untrusted-broker design,\nencrypted topics"];
+  e2eeb [label="Untrusted-broker design\nplus recovery phrase"];
+
+  q1 -> q2 [label="no"];
+  q2 -> ntfy [label="yes"];
+  q2 -> e2ee [label="no, a PWA is enough"];
+  q1 -> q3 [label="yes"];
+  q3 -> e2eeb [label="yes"];
+  q3 -> e2ee [label="no"];
+}
+```
+
+1. If the server, its host and its backups are all yours and trusted, and you want native apps today, a server-readable broker such as ntfy is the smaller system.
+2. If they are yours but a PWA is enough, the untrusted-broker design costs little extra and makes a leaked backup harmless.
+3. If the server sits somewhere you do not trust, use encrypted topics, and set up the recovery phrase when losing every device would lose the keys. Against an operator who would actively tamper with key bundles, this design is not enough yet (see [Onboarding a device](#onboarding-a-device)).
+
+---
+
+## Related docs
+
+- [Client-keyed objects on Supabase](/reference/supabase-client-keyed-objects/) -
+  the same wrapped-key pattern applied to storage: a data key per object, wrapped by a key service, with ciphertext the platform cannot read.
+- [Choosing a secrets backend](/reference/choosing-a-secrets-backend/) -
+  where the admin token and the push service's VAPID private key live.
+
+[^ntfy-69]: binwiederhier, "End-to-end encryption (E2E) between clients (Android app, CLI, web app)," ntfy issue #69, GitHub. https://github.com/binwiederhier/ntfy/issues/69
+[^ntfy-phone]: ntfy, "Subscribe from your phone," ntfy docs. https://docs.ntfy.sh/subscribe/phone/
+[^rfc7516]: M. Jones and J. Hildebrand, "JSON Web Encryption (JWE)," RFC 7516, IETF. https://www.rfc-editor.org/rfc/rfc7516
+[^rfc7748]: A. Langley, M. Hamburg and S. Turner, "Elliptic Curves for Security," RFC 7748, IETF. https://www.rfc-editor.org/rfc/rfc7748
+[^bip39]: M. Palatinus, P. Rusnak, A. Voisine and S. Bowe, "Mnemonic code for generating deterministic keys," BIP-39, GitHub. https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki
+[^rfc9106]: A. Biryukov, D. Dinu, D. Khovratovich and S. Josefsson, "Argon2 Memory-Hard Function for Password Hashing and Proof-of-Work Applications," RFC 9106, IETF. https://www.rfc-editor.org/rfc/rfc9106
+[^rfc8030]: M. Thomson, E. Damaggio and B. Raymor, "Generic Event Delivery Using HTTP Push," RFC 8030, IETF. https://www.rfc-editor.org/rfc/rfc8030
+[^rfc8291]: M. Thomson, "Message Encryption for Web Push," RFC 8291, IETF. https://www.rfc-editor.org/rfc/rfc8291
+[^rfc8292]: M. Thomson and P. Beverloo, "Voluntary Application Server Identification (VAPID) for Web Push," RFC 8292, IETF. https://www.rfc-editor.org/rfc/rfc8292
+[^rfc8030-413]: M. Thomson, E. Damaggio and B. Raymor, "Generic Event Delivery Using HTTP Push," RFC 8030, section 7.2, IETF. https://www.rfc-editor.org/rfc/rfc8030#section-7.2
+[^rfc8291-size]: M. Thomson, "Message Encryption for Web Push," RFC 8291, section 4, IETF. https://www.rfc-editor.org/rfc/rfc8291#section-4
