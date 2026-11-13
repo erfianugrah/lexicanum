@@ -51,7 +51,7 @@ cell now `LV01e, run1 and run2`).
 name `edge_logs`, so the same event reads two ways on one page.** `LV01j` shows
 `0.97 (1.12)` and `1014 (1144)`, and its prose immediately says 100 cache HIT-reads
 "produced 99 (`run1`) and 90 (`run2`) `edge_logs` rows". Settled from the published
-artifacts (`out/2026-10-15`, ref `f7e86f3`): `run2` LV01j `edge_logs_rows_raw` 90,
+artifacts (`out/2026-10-15`, ref `463e88e`): `run2` LV01j `edge_logs_rows_raw` 90,
 `edge_logs_rows_per_action` 0.90, `all_sources_rows_per_action` 0.97,
 `all_sources_bytes_per_action` 1014; `run1` 99 / 0.99 / 1.12 / 1144. Same pattern for
 `LV01b`: run2 `edge_logs` 0.92 / 1662 bytes against `all_sources` 0.91 / 1659, and run1
@@ -93,7 +93,7 @@ but not to that limit:
 The two runs are internally consistent, so no single cell is a typo, and both totals sit
 10.8-16.6 MB above the stated 536.9 MB. The published facts file for the run
 (`experiments/pipelines/out/2026-10-10/run-2026-10-10T07-27-52-201Z.facts.md`, ref
-`ddd41b2`) carries the same pair in the same cells - `max_slot_wal_keep_size_mb` 536.9
+`efc7203`) carries the same pair in the same cells - `max_slot_wal_keep_size_mb` 536.9
 beside `safe_wal_size_mb` 552.5 with `retained_mb` 1 - so the doc is faithful to its
 artifact and the mismatch is upstream (API semantics or the probe's unit conversion).
 No number changed; either the limit the platform applied was not 536.9 MB, or
