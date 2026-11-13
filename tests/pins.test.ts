@@ -865,7 +865,7 @@ const pins: Pin[] = [
       // prose, so pin the constants-table phrasing instead).
       "never `>=500` alone",
       // File reference links out to the public repo.
-      "github.com/erfianugrah/supabase-lab/blob/e8a852b/experiments/edge-resilience/worker/worker.ts",
+      "github.com/erfianugrah/supabase-lab/blob/304a472/experiments/edge-resilience/worker/worker.ts",
     ],
     linksTo: ["reference/supabase-incident-resilience"],
   },
@@ -1731,7 +1731,7 @@ const pins: Pin[] = [
     sections: [/^## Checklist$/m, /^## What was checked here$/m],
     linksTo: ["reference/openaq-pm25-home-assistant"],
   },
-  // 2026-10-26 lab runs (supabase-lab aca5612). Each pin is a correction of a
+  // 2026-10-26 lab runs (supabase-lab 4afd0b7). Each pin is a correction of a
   // claim the page carried before: the resending layer was "unidentified",
   // a function's statement_timeout "wins for every key", the same-region
   // split was "not measured", and the Realtime pool was compared against the
