@@ -1,0 +1,274 @@
+---
+title: Nuvoton M483 flash locks and the glitch-oracle trap
+description: Why reading protected flash off a locked Nuvoton M480/M483 microcontroller requires an address-sensitive positive control, how SBLOCK, ALOCK, and ISPFF behave across CPU and ICE paths, and how evidence promotion turns a repeatable failure signature into a blind 8,651-attempt sweep.
+author: Erfi Anugrah
+category: workstations
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Non-destructive readout of a locked microcontroller by voltage-fault injection is an instrumentation problem before it is a timing problem. This reference documents the Flash Memory Controller (`FMC`) protection model on the Nuvoton `M480`/`M483` family (`M483SIDAE`)[^m480trm][^m480ds] and the methodological post-mortem of an `8,651`-attempt `trigger=none` (`10,157` total attempts including `1,506` reset-rising trials) fault-injection investigation on my own Endgame Gear OP1 8k v2 mouse - where the lock held, no key or plaintext `APROM` was extracted over SWD, and a post-run review of the journals showed that the sweep had been firing against a repeatable failure signature rather than a qualified memory-read oracle.
+
+For the physical wiring, single-rail-owner power sequencing that prevents Faultier RP2040 back-powering (`Windows error code 10`), and the patched OpenOCD driver used during these tests, see the companion guide [Read-only SWD and voltage-glitch harness on a locked Nuvoton M483](/guides/swd-and-voltage-glitch-harness-m483/). For the broader workflow combining static binary decompilation with black-box protocol captures prior to hardware probing, see [Agent-assisted reverse engineering](/reference/agent-assisted-reverse-engineering/).
+
+<Aside type="note" title="Provenance: measured versus documented">
+Hardware measurements were recorded between 2026-11-01 and 2026-11-15 across three retail OP1 8k v2 boards (`Nuvoton M483SIDAE`, `LQFP-64`), a Nu-Link Pro debug adapter (`0416:511c`, FW `8062`) driven by a patched xPack OpenOCD build (`7bb05570f40dae2c742e6e581db4129468fed689`)[^xpack] at `200 kHz`, a Faultier RP2040 MOSFET crowbar (`ADC_CROWBAR` at `2.604 MS/s`), and an `fx2lafw` logic analyzer sampling `nRESET` and `VDD` at `1 MHz` and `2 MHz`. Register definitions, lock-effect tables, and reset reload rules come from the Nuvoton M480 Series Technical Reference Manual Rev. 3.07[^m480trm] and Datasheet Rev. 3.09[^m480ds]. No chip erase, mass erase, or `OTP` write was executed; the flash lock was not bypassed.
+</Aside>
+
+## TL;DR
+
+- **`0xFF` in `CONFIG2` means locked, not unlocked.** On the `M480`/`M483` family, `CONFIG2[15:8]` (`SBLOCK`) and `CONFIG2[7:0]` (`ALOCK`) use `0x5A` as their explicit unlock token[^m480trm]. Any other byte value - including an erased or default `0xFF` - activates the lock.
+- **`M483SIDAE` has no hardware AES accelerator or `XOM`, but `SBLOCK` still blocks ICE reads.** The `M483xIDAE` sub-family omits the cryptographic accelerator and Execute-Only Memory present on `GCAE`/`E8AE` parts[^m480ds]. When `SBLOCK != 0x5A`, Note 6 of the TRM ICE Lock Effect Table (`Table 6.5-7`) marks every ICE-initiated `FMC` operation except `MassErase` invalid and sets the ISP Fail Flag (`ISPFF`)[^m480trm][^fmcreg].
+- **A repeated `DPIDR` word (`0x2ba01477`) at memory addresses is a failure signature, not a memory read.** Reading `CPUID` (`0xe000ed00`), `CONFIG0`..`CONFIG3` (`0x00300000`), `APROM` (`0x00000000`), and peripheral registers (`0x50080100`, `0x50080110`) over raw Nu-Link HLA commands returned `0x2ba01477` at every word. Treating that repeatable response as a working readback oracle left the sweep unable to distinguish chip-level lock enforcement from adapter-level stale buffer echoes.
+- **Three other evidence promotions compounded the blind oracle.** Running `8,651` `trigger=none` pulses with no synchronization to a target reset or boot event (and multi-second OpenOCD startup latency after a `35`-`37 us` reset response), treating an update-mode application ciphertext backup (`65` pages, `66,560` bytes) as proof of full-chip recoverability, and treating a microsecond ADC rail dip (`0.388 -> 0.0235`) as proof that nanosecond (`4`-`128 ns`) pulses reached the core latch all masked missing prerequisites.
+
+## FMC protection topology and access paths
+
+The `M480`/`M483` Flash Memory Controller evaluates protection differently depending on whether the bus master is the internal Cortex-M4 CPU (`Table 6.5-6`) or an external SWD/ICE debug probe (`Table 6.5-7`)[^m480trm].
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  cfg [label="Flash Initialization Controller\nReloads User Configuration\nat POR or active reset\nCONFIG0 (LOCK, ICELOCK, MBS, CBS)\nCONFIG2 (SBLOCK[15:8], ALOCK[7:0])"];
+  gate [label="Comparator gate\nUnlocked only when:\nLOCK == 1 AND\nALOCK == 0x5A AND\nSBLOCK == 0x5A"];
+  cpu [label="CPU master path\n(TRM Table 6.5-6)\nAPROM: R/W allowed\nBoot Loader (0x00800000): R allowed\nOTP/SBK (0x00300500): masked 0xA5"];
+  ice [label="SWD / ICE master path\n(TRM Table 6.5-7 Note 6)\nWhen SBLOCK != 0x5A:\nall ops except MassErase invalid\nFMC sets ISPFF = 1"];
+  obs [label="Observed SWD readback\nAll-0xFF or repeated DPIDR\n(0x2ba01477 at every address)\nNo address sensitivity"];
+
+  cfg -> gate [label="latched state"];
+  gate -> cpu [label="internal bus"];
+  gate -> ice [label="AHB-AP / HLA debug"];
+  ice -> obs [label="blocked read"];
+}
+```
+
+## Early diagnostic table: what each observation actually proves
+
+When probing a locked microcontroller, most early milestones prove less than they appear to. Use this table to separate what a measurement confirms from the stronger claim it is often promoted to support.
+
+| Bench observation | What it genuinely proves | What it does **not** prove | Minimum gate to advance |
+|---|---|---|---|
+| SWD returns `DPIDR = 0x2ba01477` | Physical SWD clock/data continuity to the Cortex-M4 Debug Port (`DP`) | That `AHB-AP` memory reads work, or which `M483` sub-variant is fitted | Read an address-dependent register (`CPUID`, `SYS_PDID`) and verify distinct values |
+| Raw SWD read returns `0xFFFFFFFF` or `0x2ba01477` at `0x00300000` (`CONFIG0`) | The read path did not return valid plaintext configuration words | That `CONFIG0` or `CONFIG2` actually contains `0xFFFFFFFF` in flash | Qualify the read path against an unlocked `M480`/`M483` control board |
+| `10 us` crowbar pulse drops Faultier ADC min from `0.388` to `0.0235` | The MOSFET pulls the probed rail down at `10 us` (`~26` ADC samples at `2.604 MS/s`) | That `4`-`128 ns` pulses cross the core `LDO` or `FMC` sense threshold | Measure nanosecond waveforms on an oscilloscope (`>= 100 MHz`) |
+| `40 us` `VDD` pulse drives `nRESET` low `35`-`37 us` after `VDD` fall | External reset assertion occurs above `35`-`40 us` of `VDD` droop on this harness | Whether shorter pulses trigger internal `POR`/`BOD`/`LVR`, or when `CONFIG` latches | Synchronise readback to `nRESET` release with sub-millisecond latency |
+| USB update-mode backup saves `65` pages (`66,560` B app + `1,024` B configuration) | The bootloader exports encrypted application pages and configuration data | That the file matches the currently wired PCB, or restores `LDROM`/`OTP` | Bind backup manifest to a hardware `board_id` and verify round-trip restore |
+
+## The Nuvoton M480/M483 flash-lock model
+
+### What `M483SIDAE` includes and omits
+
+The Nuvoton `M480` family spans parts with full cryptographic secure boot (`M487`, `M483GCAE`, `M483E8AE`) and general-purpose high-speed USB parts (`M483SIDAE` in the `M483xIDAE` selection group)[^m480ds]. According to the Datasheet Rev. 3.09 selection table, `M483SIDAE` has:
+
+- **No hardware cryptography peripheral** (no AES, DES, SHA, or ECC engine, and no `KEYPRT` hardware key-protection registers).
+- **No `XOM` (Execute-Only Memory) region support.**
+- **Standard `FMC` readout-protection and boot locks** stored in the User Configuration block starting at `0x00300000` (`CONFIG0` through `CONFIG3`, with extended configuration words up to `CONFIG10`).
+
+Eliminating hardware AES and `XOM` narrows the problem: any protection on `M483SIDAE` comes from the standard `FMC` configuration gates and mask-ROM / `LDROM` boot flow rather than a dedicated cryptographic coprocessor.
+
+### `CONFIG0` and `CONFIG2`: why `0xFF` means locked
+
+A common trap when reading Nuvoton documentation quickly is assuming that erased flash (`0xFF`) leaves every protection field open. While single-bit flags in `CONFIG0` use `1` for their inactive/default state, the byte-wide lock tokens in `CONFIG2` invert that intuition by requiring an explicit `0x5A` magic byte to unlock[^m480trm]:
+
+| Register bits | Field name | Erased / default value | Unlocked value | Documented behaviour in M480 TRM Rev. 3.07 |
+|---|---|---|---|---|
+| `CONFIG0[1]` | `LOCK` | `1` | `1` (`0` = locked) | Flash content is unlocked **only if** `LOCK == 1`, `ALOCK == 0x5A`, and `SBLOCK == 0x5A`[^m480trm] |
+| `CONFIG0[5]` | `MBS` | `1` | `1` (`APROM`/`LDROM`) | Master Boot Selection; `0` or `SBLOCK != 0x5A` routes boot through the mask-ROM Boot Loader[^m480trm] |
+| `CONFIG0[7:6]` | `CBS` | `11` | Application-defined | Chip Boot Selection between `APROM` and `LDROM` when `MBS == 1` |
+| `CONFIG0[11]` | `ICELOCK` | `1` | `1` (`0` = ICE disabled) | Controls whether the Cortex-M4 debug interface (`ICE`) is enabled |
+| `CONFIG2[15:8]` | `SBLOCK` | `0xFF` | `0x5A` | Secure Boot Lock; any value other than `0x5A` locks flash and restricts `ICE` to `Chip Erase`[^m480trm] |
+| `CONFIG2[7:0]` | `ALOCK` | `0xFF` | `0x5A` | Advance Security Lock; any value other than `0x5A` enables security lock even when `LOCK == 1`[^m480trm] |
+
+Two structural consequences follow from this layout:
+
+1. **Both `SBLOCK` and `ALOCK` live in the same 32-bit word (`CONFIG2` at `0x00300008`).** For the `FMC` to treat flash as unlocked over SWD, both comparators must evaluate to `0x5A` (`CONFIG2[15:0] == 0x5A5A`) while `CONFIG0[1]` (`LOCK`) is `1` and `CONFIG0[11]` (`ICELOCK`) is `1`. Flipping a single bit in `CONFIG0` cannot unlock a chip whose `SBLOCK` or `ALOCK` byte is `0xFF`.
+2. **An `all-0xFF` SWD read of `0x00300000` is not a reading of `CONFIG0`..`CONFIG3`.** Early in the investigation (2026-11-01), an `all-0xFF` SWD read of the `CONFIG` block was interpreted literally as "the chip's `CONFIG` words are `0xFFFFFFFF`, so `SBLOCK = 0xFF` and `ALOCK = 0xFF`". While `SBLOCK != 0x5A` is consistent with the official NuMicro ICP tool reporting `Target flash is in security lock mode`, a locked chip returning `0xFFFFFFFF` (or `0x2ba01477`) at every address is returning a bus-level lock mask, not the stored flash bytes. You cannot know the exact programmed `CONFIG` bits of a locked board from a blocked SWD read.
+
+## CPU versus ICE access asymmetry and the `ISPFF` gate
+
+The M480 TRM splits flash access permissions into two separate tables: **Table 6.5-6** (operations initiated by the CPU via `FMC` In-System Programming registers) and **Table 6.5-7** (operations initiated by an external `ICE`/`ICP`/Writer tool)[^m480trm].
+
+| Memory region / operation | Address window | CPU master (`Table 6.5-6`, `SBLOCK` active) | ICE / SWD master (`Table 6.5-7` + Note 6, `SBLOCK != 0x5A`) |
+|---|---|---|---|
+| `APROM` (512 KB application flash) | `0x00000000`-`0x0007FFFF` | `R W` (CPU can read and write `APROM`) | **Blocked** (Note 6 overrides column; sets `ISPFF = 1`) |
+| `LDROM` (4 KB loader flash) | `0x00100000`-`0x00100FFF` | Blocked or restricted by `LOCK`/`SBLOCK` | **Blocked** (Note 6: only `MassErase` valid) |
+| User Configuration (`CONFIG0`..`3`) | `0x00300000`-`0x0030000F` | Readable by CPU / boot path | Table column says `R W`, but Note 6 + live SWD block reads |
+| `OTP` / Secure Boot Key (`SBK`) | `0x00300500`-`0x003005FF` | Direct reads return masked `0xA5` (`0xA5A5A5A5`) | **Blocked** (no read/compare oracle before unlock) |
+| Mask-ROM Boot Loader (32 KB) | `0x00800000`-`0x00807FFF` | `R -` (readable in all protection columns) | **Blocked** by ICE lock gate |
+
+### Why ICE-initiated `FMC` register writes fail (`Note 6` and `ISPFF`)
+
+At first glance, `Table 6.5-6` suggests an easy workaround: since the CPU is allowed to read `APROM` under `SBLOCK`, why not use SWD to write an ISP read command (`FMC_ISPCMD = 0x00`, target address in `FMC_ISPADR`, trigger `ISPGO` in `FMC_ISPTRG`, poll `FMC_ISPSTS` for `ISPBUSY == 0`, and read `FMC_ISPDAT` at `0x4000C008`), or halt the CPU and inject a small SRAM stub?
+
+**Note 6 of Table 6.5-7** closes all three routes: *"All operations (except for MassErase) are invalid for ICE when SBLOCK is not 0x5A."*[^m480trm] When `SBLOCK != 0x5A`:
+
+- Any `ICE`-initiated `FMC` operation sets the ISP Fail Flag (`ISPFF`, bit 6 / `0x40` in `FMC_ISPSTS` and `FMC_ISPCTL`)[^fmcreg]. The TRM's `ISPFF` condition list explicitly includes *"Invalid operations with ICE connection if SBLOCK is not 0x5A"* (TRM Rev. 3.07, pages 711 and 721)[^m480trm].
+- OpenNuvoton's own `numicro.c` flash driver in OpenOCD[^numicro] does not attempt ISP reads on a locked chip; its unlock path writes the `CHEAT` register and triggers a whole-chip mass erase.
+- As for the Secure Boot Key (`SBK`) region in `OTP` (`0x00300500`-`0x003005FF`) and the adjacent configuration page around `0x00300800`, static analysis of the vendor boot path showed that direct reads return a constant `0xA5` (`0xA5A5A5A5`) mask unless preceded by a matching unlock write. There is no partial-match or timing oracle on that region from outside the chip.
+
+## The oracle problem: how a failure signature masquerades as a memory read
+
+In fault-injection testing, an **oracle** is the measurement that tells the runner whether a single glitch pulse changed the target's security state. To be valid for a flash-readout sweep, a readback oracle must satisfy three properties:
+
+1. **Address sensitivity.** Querying two different addresses that contain different values must return two different words.
+2. **Failure-mode separation.** The classifier must distinguish a transport error or adapter buffer echo from a valid bus read.
+3. **Positive-control verification.** Before attacking the locked target, the exact readback command must be proven to return expected, address-dependent words on an unlocked control target (or an unlocked address range on the same bus).
+
+### What actually happened on the locked `M483SIDAE`
+
+Once the physical `SWCLK` contact fault on pin 34 was repaired on 2026-11-14 and the safe-connect OpenOCD driver connected at `200 kHz` (`2980 mV` sense voltage, `supply=0`), the probe returned the exact Cortex-M4 `DPIDR` (`0x2ba01477`) across three consecutive runs. The next step was reading memory:
+
+1. **Standard OpenOCD `mdw` failed at target examination.** Before running `mdw 0x00300000 1`, OpenOCD's Cortex-M target layer reads the architectural `CPUID` register at `0xe000ed00`. The trace log showed that reading `0xe000ed00` returned `0x2ba01477` - the exact `DPIDR` value. OpenOCD extracted bits `[15:4]` as `PARTNO = 0x147` (unrecognised Cortex-M part), left the target unexamined, and rejected `mdw` with `Target not examined yet`.
+2. **Bypassing `CPUID` examination via `raw_mdw` returned `0x2ba01477` everywhere.** Adding a custom HLA command (`raw_mdw <address>`) that called the Nu-Link memory-read API directly bypassed OpenOCD's `CPUID` gate. Querying the locked chip then produced:
+   - `CONFIG0`..`CONFIG3` (`0x00300000`..`0x0030000C`): `0x2ba01477` at every word.
+   - First 16 words of `APROM` (`0x00000000`..`0x0000003C`): `0x2ba01477` at every word.
+   - Peripheral register addresses (`0x50080100`, `0x50080110`): `0x2ba01477` at every word.
+
+### Why `locked-response` was not a qualified oracle
+
+The runner code classified any 16-word `APROM` read consisting entirely of `0xFFFFFFFF` as `all-ff` and any read consisting of repeated `0x2ba01477` as `locked-response`. For a sample to be promoted to `plaintext`, the classifier required a plausible Cortex-M SRAM initial stack pointer (`0x2000xxxx`) in word 0 and a Thumb reset vector in `APROM`/`LDROM` in word 1, confirmed by a second identical read.
+
+That classifier properly rejected `0x2ba01477` as plaintext, **but the preflight gate accepted `locked-response` as proof that the readback oracle worked.** That was a category error:
+
+- Returning `0x2ba01477` at `0xe000ed00`, `0x00300000`, `0x00000000`, and `0x50080100` has **zero address sensitivity**.
+- Because two similarly locked OP1 boards both returned `0x2ba01477` (and earlier `0xFFFFFFFF`), the bench had no unlocked `M483` positive control showing that `raw_mdw` over the Nu-Link HLA transport would return real flash words *even if a glitch briefly cleared the `FMC` lock latch*.
+- Worse, a repeated `DPIDR` value on an HLA adapter is indistinguishable from the adapter's USB firmware returning its last valid SWD buffer word when an `AHB-AP` read stalls or faults (just as disconnected `IDCODE` reads echoed the `0x0b9f` ADC voltage word twice as `0x0b9f0b9f`).
+
+## Three more ways evidence promotion derailed the sweep
+
+A post-run review of the session history and run journals on 2026-11-15 identified three additional places where a scoped observation was promoted into a stronger assumption that the data did not support.
+
+### 1. Timing sweeps without a qualified target event (`trigger=none` and readback latency)
+
+Where in the boot cycle does the `M483` sample `CONFIG0`/`CONFIG2`? The M480 TRM (printed page 652, *Flash Initialization Controller*) states: *"When chip is powered on or active from reset, Flash Initialization Controller checks the flash stability first, and then reloads User Configuration to flash control registers"* (with reset-source exceptions for `BL`/`BS` documented on pages 711-712)[^m480trm].
+
+After an initial `1,506`-attempt reset-rising sweep (`0`-`250 us` delay, `4`-`128 ns` width on `LDO_CAP` with the decoupling capacitor installed) returned no change, a working note hypothesised that `SBLOCK` is latched **only at cold Power-On Reset (`POR`)** and never on `nRESET`. Later summaries repeated that `POR`-only hypothesis as an established fact, even though the TRM explicitly lists *"powered on or active from reset"* and the actual latch window had never been measured.
+
+Acting on that unverified premise, two larger sweeps were launched on 2026-11-15 with `trigger=none` and power-cycling disabled (`OUT_NONE`):
+
+| Run identifier | Trigger mode | Requested attempts | Completed rows | Recorded outcome classes | Final state |
+|---|---|---:|---:|---|---|
+| Initial `LDO_CAP` grid (2026-11-14) | `nRESET` rising edge | `1,506` | `1,506` | `1,506` `all-ff` / `locked-response` | Exhausted, `disarmed=true` |
+| Baseline `VDD` grid (2026-11-15) | `trigger=none` (`OUT_NONE`) | `1,506` | `1,506` | `1,506` `locked-response` | Exhausted, `disarmed=true` |
+| Wide `VDD` grid (2026-11-15) | `trigger=none` (`OUT_NONE`) | `10,000` | `7,145` | `7,142` `locked-response`, `3` `readback_error` | Stopped on 3rd error, `disarmed=true` |
+
+Look at what the two `trigger=none` runs (`8,651` attempts combined) actually did in hardware:
+
+- **No synchronisation to any target event.** With `trigger=none` and `OUT_NONE`, the target MCU was already booted and idling in USB application/update mode. Varying Faultier's `delay` parameter only changed how many microseconds the RP2040 waited *after receiving the host USB command* before pulsing the MOSFET. Every delay value was firing into the same steady-state idle loop, never intersecting a `POR` or reset-release `CONFIG`-reload window.
+- **Five-order-of-magnitude readback latency mismatch.** As the logic-analyzer pulse ladder in the [companion harness guide](/guides/swd-and-voltage-glitch-harness-m483/) showed, a `VDD` crowbar pulse of `40 us` or longer causes `nRESET` to assert `35`-`37 us` after the `VDD` falling edge. Even if a pulse triggered a reset and transiently corrupted a volatile configuration latch, the runner checked the result by spawning a fresh `openocd` OS process after the pulse - a step that takes **seconds** on Windows, missing a microsecond boot window by five orders of magnitude.
+
+### 2. Intact update-mode backups promoted to full-chip recovery proof
+
+Before running hardware fault trials on a live device, a sound safety rule is to capture a verified backup so any corrupted flash page can be restored. Using the mouse's USB update-mode HID protocol (`3367:1977`), a read-only backup tool dumped all `65` application pages (`66,560` bytes total, starting with the expected `96` bytes of header padding across page ranges `0x00`-`0x33`, `0x34`-`0x74` application ciphertext, and `0x75`-`0x7F`) alongside a `1,024`-byte configuration block.
+
+When hashed across three physical OP1 8k v2 boards, the captures showed:
+
+| Capture source | Application image size | App SHA-256 prefix | Configuration image size | Configuration SHA-256 prefix |
+|---|---:|---|---:|---|
+| Board A pre-update backup | `66,560 B` (`65` pages) | `33b06cf0` | `1,024 B` | `71809669` |
+| Board B in-boot backup (2026-11-14) | `66,560 B` (`65` pages) | `5194d938` | `1,024 B` | `71809669` |
+| Board C bring-up backup (2026-11-15) | `66,560 B` (`65` pages) | `33b06cf0` | `1,024 B` | `c1917858` |
+
+The runner checked that the recovery files existed on disk and matched their recorded SHA-256 hashes before arming the crowbar. Promoting that hash check into "full recovery is proven" hid three gaps:
+
+1. **Application ciphertext is not a full-chip dump.** The update-mode reader exports the encrypted application partition and its configuration block. It does not back up the `4 KB` `LDROM` bootloader (`0x00100000`), the `FMC` `CONFIG0`..`CONFIG3` words (`0x00300000`), or `OTP` (`0x00300500`). If a voltage glitch during flash initialisation corrupts `LDROM` or `CONFIG`, an application-partition backup cannot unbrick the board.
+2. **Equal hashes do not prove board identity or fresh capture.** Board A and Board C shared the exact same `33b06cf0` application hash, while Board B differed (`5194d938`), and Board A and Board B shared the `71809669` configuration hash. A hash proves file integrity on disk, not which physical PCB is currently under the needles.
+3. **Readback is not write-restoration.** Proving that `65` pages can be read in update mode does not prove that a standalone script can write them back and exit update mode without the vendor's official updater binary.
+
+### 3. Undersampled ADC dips promoted to sweep qualification
+
+Faultier's onboard `ADC_CROWBAR` (`250 MHz / 96 = 2.604 MS/s`, `~384 ns` per sample) recorded a normalised baseline of `~0.388` on `LDO_CAP` (pin 50, `1.26 V`) and `~0.919`-`0.933` on `VDD` (pin 51, `3.3 V`). When a `10 us` test pulse dropped the `LDO_CAP` minimum to `0.0235` and the `VDD` minimum to `0.0627`, that confirmed DC continuity and microsecond MOSFET conduction.
+
+Promoted into "the crowbar path is qualified for a nanosecond sweep", it masked the sampling physics:
+
+- At `384 ns` per sample, any pulse between `4 ns` and `128 ns` falls inside a single ADC conversion window.
+- With the factory `2.2 uF` decoupling capacitor still soldered to `LDO_CAP` (pin 50), nanosecond crowbar pulses are absorbed by the capacitor's charge reservoir; with the crowbar on `VDD` (pin 51), the onboard `LDO` regulator and bulk decoupling sit between the crowbar drain and the `1.26 V` internal core domain (`LDO_CAP`) where the `FMC` sense amplifiers run[^stm32glitch].
+- Without an oscilloscope trace on the core rail, there is no evidence that a sub-microsecond pulse on `VDD` reaches the internal `FMC` comparators before triggering a whole-chip brown-out reset.
+
+## Decision guide: qualifying a read-only fault-injection experiment
+
+Before launching any automated glitch sweep on a locked MCU, walk through the qualification gates in order. Every gate is a hard stop if it fails.
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  g1 [label="1. Non-glitch CPU/ISP path exhausted?\nCheck TRM CPU vs ICE table (Table 6.5-6 vs 6.5-7).\nProbe read-only mask-ROM / UART / USB ISP first."];
+  g2 [label="2. Positive readback oracle qualified?\nDoes the exact readback command return distinct,\naddress-sensitive words on an unlocked control target?"];
+  g3 [label="3. Target event and readback latency matched?\nIs the trigger tied to a measured POR or nRESET edge,\nand can readback run before the transient state clears?"];
+  g4 [label="4. Pulse waveform verified at the core rail?\nDoes an oscilloscope or time-resolved capture show\ndroop at the actual pulse width under test?"];
+  g5 [label="5. Board-bound recovery scope accepted?\nIs the backup bound to this board_id, and is the\nunbacked risk (LDROM / CONFIG) explicitly accepted?"];
+  run [label="Run bounded, logged calibration ladder\n(stop on first anomaly; verify address sensitivity\nbefore calling any changed word plaintext)"];
+  stop [label="STOP: do not launch a timing grid.\nMore attempts cannot fix an unqualified oracle\nor an unsynchronised trigger."];
+
+  g1 -> g2 [label="ISP absent / locked"];
+  g1 -> stop [label="Untested ISP route exists"];
+  g2 -> g3 [label="Yes (address-sensitive)"];
+  g2 -> stop [label="No (all-0xFF or repeated DPIDR)"];
+  g3 -> g4 [label="Yes (edge-coupled)"];
+  g3 -> stop [label="No (trigger=none / slow spawn)"];
+  g4 -> g5 [label="Yes"];
+  g4 -> stop [label="No (sub-sample ADC only)"];
+  g5 -> run [label="Yes"];
+  g5 -> stop [label="No"];
+}
+```
+
+1. **Exhaust non-glitch CPU/ISP routes first.** Because `Table 6.5-6` allows the CPU to read `APROM` even when `SBLOCK != 0x5A`[^m480trm], check whether the mask-ROM Boot Loader (`0x00800000`) or `LDROM` exposes a read-only command over USB (`0416:a316` / `0416:3f00`) or `UART1` (`PF.0`/`PF.1`, pins 33/34)[^an0039] before pulsing power rails. (On the OP1 8k v2, USB HID ISP was absent on power-up; `UART1` remains a separate read-only check.)
+2. **Qualify an address-sensitive positive control.** Never start a sweep whose preflight accepts `locked-response` (`0x2ba01477`) or `all-ff` as proof that memory reads work. Verify the readback transport (such as persistent vendor-interface SWD over Faultier interface 1 or OpenOCD `raw_mdw`) against an unlocked `M480`/`M483` board first.
+3. **Couple the trigger and readback to a measured target event.** Never run a delay grid with `trigger=none`. Tie the glitch timer to a physical `POR` ramp or `nRESET` edge, and use an in-process SWD readback rather than spawning a multi-second OS process per trial.
+4. **Measure pulse shape at the timescale under test.** Treat Faultier's `2.604 MS/s` ADC and a `1`-`2 MHz` logic analyzer as tools for microsecond (`>= 1 us`) delivery and reset-threshold checks; require an oscilloscope before sweeping nanosecond (`4`-`128 ns`) widths.
+5. **Bind recovery artifacts to the physical board and scope.** Record the target's `board_id` in the backup manifest, verify round-trip restoration, and treat `LDROM`/`CONFIG` corruption as an explicit unbacked risk.
+
+## Evidence table
+
+| Claim or observation | Status | How it was checked |
+|---|---|---|
+| `M483SIDAE` (`M483xIDAE`) has no hardware AES/crypto engine and no `XOM` | Documented | Nuvoton M480 Series Datasheet Rev. 3.09 selection table[^m480ds] |
+| `CONFIG2` `SBLOCK[15:8]` and `ALOCK[7:0]` require `0x5A` to unlock; `0xFF` is locked | Documented | Nuvoton M480 TRM Rev. 3.07 section 6.5 (`CONFIG0`/`CONFIG2` descriptions, p. 659)[^m480trm] |
+| When `SBLOCK != 0x5A`, all `ICE` operations except `MassErase` are invalid and set `ISPFF` | Documented | Nuvoton M480 TRM Rev. 3.07 Table 6.5-7 Note 6 and `ISPFF` conditions (pp. 711, 721)[^m480trm]; `fmc_reg.h`[^fmcreg] |
+| Flash Initialization Controller reloads `CONFIG` at power-on **or** active from reset | Documented | Nuvoton M480 TRM Rev. 3.07 printed page 652 (with `BL`/`BS` reset rules on pp. 711-712)[^m480trm] |
+| `OTP` Secure Boot Key (`SBK`, `0x00300500`-`0x003005FF`) reads return masked `0xA5` values | Measured (static) | Static decompilation and `M480` boot-path review (2026-11-14) |
+| Locked `M483SIDAE` returns `DPIDR` `0x2ba01477` on `CPUID` (`0xe000ed00`), `CONFIG0` (`0x00300000`), and `APROM` (`0x00000000`) via `raw_mdw` | Measured (live) | Safe-connect OpenOCD logs and manifests on OP1 8k v2 boards (2026-11-14) |
+| `1,506` reset-rising + `8,651` `trigger=none` (`1,506` baseline + `7,145` wide `VDD`) attempts produced `0` plaintext reads | Measured (live) | Recomputed complete `journal.jsonl` attempt records (2026-11-14 to 2026-11-15) |
+| `VDD` crowbar pulses of `40 us` to `1 ms` assert `nRESET` `35`-`37 us` after `VDD` fall; `1`-`35 us` pulses leave `nRESET` high | Measured (live) | `fx2lafw` logic analyzer captures at `1 MHz` and `2 MHz` paired with Faultier ADC counts (2026-11-15) |
+| Update-mode `65`-page (`66,560 B`) application hashes differ across boards (`33b06cf0` vs `5194d938`) while `1,024 B` configuration hashes can match (`71809669`) | Measured (live) | SHA-256 verification across three OP1 8k v2 boards (2026-11-14 to 2026-11-15) |
+
+## What to do about it
+
+| Practice | Evidence |
+|---|---|
+| Require an address-sensitive positive control before any glitch sweep | `raw_mdw` returned `0x2ba01477` at `0xe000ed00`, `0x00300000`, `0x00000000`, and `0x50080100`; accepting `locked-response` in preflight hid a zero-sensitivity oracle across `8,651` `trigger=none` rows. |
+| Reject `trigger=none` in automated timing-grid configurations | Without a hardware `POR` or `nRESET` trigger edge, varying `delay` only shifts when the MOSFET fires relative to the host USB command, testing `0` points of the boot-time `CONFIG` latch window. |
+| Couple readback to the trigger over a persistent SWD session | `nRESET` asserts `35`-`37 us` after a `>= 40 us` `VDD` droop, whereas spawning a fresh `openocd` process per trial takes seconds and misses any transient unlock state. |
+| Treat changed words on a locked target as an anomaly first, never plaintext | A single non-`0xFF`, non-`DPIDR` read can come from SWD framing corruption; require a repeatable re-read and an address-dependent match across multiple offsets before claiming an unlock. |
+| Bind backup manifests to a hardware `board_id` and state unbacked regions | Two boards shared a `1,024 B` configuration SHA-256 (`71809669`) with different `66,560 B` app images (`33b06cf0` vs `5194d938`), and update-mode backups omit `LDROM` (`0x00100000`) and `CONFIG` (`0x00300000`). |
+
+## Related docs
+
+- [Read-only SWD and voltage-glitch harness on a locked Nuvoton M483](/guides/swd-and-voltage-glitch-harness-m483/) - the companion step-by-step hardware guide covering continuity isolation, single-rail-owner sequencing against RP2040 ESD diode back-powering (`Windows error code 10`), the safe-connect OpenOCD patch, and the `1 us` to `1 ms` `VDD` pulse ladder.
+- [Agent-assisted reverse engineering](/reference/agent-assisted-reverse-engineering/) - how static binary decompilation and protocol capture narrow the hardware questions before touching a PCB.
+- [8 kHz mouse polling on Windows: merged HID reports](/guides/8khz-mouse-merged-reports-windows/) - USB high-speed HID report analysis on the OP1 8k v2 and its peers.
+- [PCB-as-code verification](/reference/pcb-as-code-verification/) - automated geometry and netlist gates for custom hardware.
+- [GRIDDLE LX Hall-effect keyboard](/reference/griddle-lx-hall-effect-keyboard/) - bringing up custom analog-sensing peripheral hardware and firmware.
+
+[^m480trm]: Nuvoton Technology Corp., "NuMicro Family M480 Series Technical Reference Manual," Rev. 3.07, Dec. 2023, Flash Memory Controller (`FMC`) section 6.5 (pp. 652, 659, Tables 6.5-6 and 6.5-7, Note 6, and `ISPFF` conditions on pp. 711, 721). https://www.nuvoton.com/export/resource-files/en-us--TRM_M480_Series_EN_Rev3.07.pdf
+
+[^m480ds]: Nuvoton Technology Corp., "NuMicro Family M480 Series Datasheet," Rev. 3.09, product selection tables (`M483xIDAE` vs `M483GCAE`/`E8AE`) and electrical characteristics. https://www.nuvoton.com/export/resource-files/en-us--DS_M480_Series_EN_Rev3.09.pdf
+
+[^fmcreg]: OpenNuvoton contributors, "fmc_reg.h," M480BSP CMSIS device header (`FMC_ISPSTS_ISPFF_Msk` and `FMC_ISPCTL` definitions). https://github.com/OpenNuvoton/M480BSP/blob/master/Library/Device/Nuvoton/M480/Include/fmc_reg.h
+
+[^numicro]: OpenNuvoton contributors, "numicro.c," OpenOCD-Nuvoton NOR flash driver. https://github.com/OpenNuvoton/OpenOCD-Nuvoton/blob/master/src/flash/nor/numicro.c
+
+[^xpack]: xPack Dev Tools, "xPack OpenOCD," commit `7bb05570f40dae2c742e6e581db4129468fed689`. https://github.com/xpack-dev-tools/openocd
+
+[^stm32glitch]: 0xrafasec, "Voltage glitching the STM32F1 read-out protection: a step-by-step crowbar attack," 0xrafasec Blog. https://0xrafasec.com/en/posts/voltage-glitching-the-stm32f1-read-out-protection-a-step-by-step-crowbar-attack
+
+[^an0039]: Nuvoton Technology Corp., "NuMicro M480 Series Secure Boot Application Note (AN0039)," mask-ROM bootloader `SBLOCK` and `HSUSBD`/`UART1` command-mode behaviour. https://www.nuvoton.com/export/resource-files/en-us--TRM_M480_Series_EN_Rev3.07.pdf

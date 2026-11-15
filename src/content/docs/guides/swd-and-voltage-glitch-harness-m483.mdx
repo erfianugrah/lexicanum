@@ -1,0 +1,234 @@
+---
+title: Read-only SWD and voltage-glitch harness on a locked Nuvoton M483
+description: Bringing up a read-only Nu-Link Pro SWD probe and Faultier crowbar harness on an OP1 8k v2 mouse's Nuvoton M483SIDAE without erasing flash, shorting adjacent LQFP-64 pins, or back-powering the glitcher into Windows error code 10.
+author: Erfi Anugrah
+category: workstations
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Bringing up SWD and a MOSFET crowbar glitcher on a live consumer peripheral has a narrower safety margin than bench work on a bare development board. While probing my own Endgame Gear OP1 8k v2 mouse (covered from the USB host side in [8 kHz mouse polling on Windows](/guides/8khz-mouse-merged-reports-windows/)) to study its locked Nuvoton `M483SIDAE` microcontroller, three hardware traps surfaced before a single valid fault trial could run: stock OpenOCD adapter initialisation asserted resets and enabled target power, failed SWD transactions echoed ADC voltage words back as fake chip IDs, and connecting a powered target rail to a Faultier crowbar line back-fed the glitcher's RP2040 through its GPIO ESD diodes until Windows refused to start the USB device with error code 10.
+
+This guide covers the physical bring-up, rail-ownership rules, patched safe-connect OpenOCD driver, and logic-analyzer pulse verification for a read-only SWD and crowbar harness. The companion reference, [Nuvoton M483 flash locks and the glitch-oracle trap](/reference/m483-flash-locks-and-glitch-oracles/), covers the Flash Memory Controller (`FMC`) lock architecture and why a fault-injection sweep on this target fails without an address-sensitive readback oracle.
+
+## Constants
+
+Every check in this procedure depends on the target identity, pin map, and sampling constants below.
+
+### Target and adapter identifiers
+
+| Component | Identifier / value | Role in preflight |
+|---|---|---|
+| Target MCU | Nuvoton `M483SIDAE` (`LQFP-64`, Cortex-M4)[^m480ds] | 512 KB `APROM`, 4 KB `LDROM`, no hardware AES or `XOM` |
+| Expected SWD `DPIDR` | `0x2ba01477` | Only accepted target identity check |
+| OP1 8k v2 USB (application mode) | `3367:1978` | Normal HID enumeration when powered over USB |
+| OP1 8k v2 USB (update mode) | `3367:1977` | Bootloader HID enumeration |
+| Nuvoton USB HID ISP IDs | `0416:a316`, `0416:3f00` | Mask-ROM / CPU ISP HID signatures (absent on normal boot) |
+| Nu-Link Pro USB ID | `0416:511c` (product `0x40012009`, FW `8062`) | SWD debug probe (`ICE_DAT`, `ICE_CLK`, `/RESET`, `VCC` sense) |
+| NuMicro ICP Programming Tool | `3.24.8062r`[^icptool] | Used once to set Nu-Link Pro I/O voltage to `3.3 V` |
+| Faultier glitcher ADC clock | `250 MHz / 96 = 2.604 MS/s` (`~384 ns/sample`) | Onboard `ADC_CROWBAR` 3,000-sample buffer at clock division 1 |
+
+### LQFP-64 pin and bottom debug-header map
+
+The `M483SIDAE` can be probed either on the `LQFP-64` legs with spring-loaded `SP10` microprobes or on the unpopulated five-hole debug row (`H1` through `H5`, numbered left to right looking at the bottom PCB with the optical sensor lens below the row).
+
+| LQFP-64 pin | Signal | Bottom row hole | Nominal DC voltage | Harness connection |
+|---|---|---|---|---|
+| Pin 32 | `nRESET` | `H1` | `3.3 V` (active-low) | Nu-Link `/RESET`, Faultier `EXT0` trigger, LA `D0` (`CH0`) |
+| Pin 33 | `PF.0` / `SWDIO` | `H3` | `3.3 V` I/O | Nu-Link `ICE_DAT` (or Faultier `Program IO`, never both) |
+| Pin 34 | `PF.1` / `SWCLK` | `H2` | `3.3 V` I/O | Nu-Link `ICE_CLK` (or Faultier `Program CLK`, never both) |
+| Pin 49 | `VSS` (`GND`) | `H5` | `0 V` | Common return for Nu-Link `VSS`, Faultier `Crowbar G`, and LA `GND` |
+| Pin 50 | `LDO_CAP` | None | `~1.26 V` | Internal core LDO capacitor node (`2.2 uF`); leave capacitor installed on `VDD` route |
+| Pin 51 | `VDD` | `H4` | `3.3 V` | Target `3.3 V` rail; Nu-Link `VCC` (sense only), Faultier `Crowbar D`, LA `D1` (`CH1`) |
+
+## Architecture overview
+
+The harness separates power delivery, SWD readback, crowbar fault injection, and digital timing verification so that no two tools drive the same net simultaneously.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  usb [label="Host USB 5V\n(sole rail owner)"];
+  ldo [label="Board 3.3V regulator\n-> Pin 51 VDD (3.3V)"];
+  mcu [label="Nuvoton M483SIDAE\nPin 32 nRESET\nPin 33 SWDIO\nPin 34 SWCLK\nPin 50 LDO_CAP (1.26V)"];
+  probe [label="Nu-Link Pro\n(safe HLA layout, supply=0)\n200 kHz SWD master"];
+  faultier [label="Faultier RP2040\nProgram VCC open\nCrowbar D -> Pin 51 VDD\nADC 2.604 MS/s"];
+  la [label="fx2lafw logic analyzer\n1-2 MHz digital capture\nD0=nRESET, D1=VDD"];
+
+  usb -> ldo [label="VBUS 4.92V"];
+  ldo -> mcu [label="VDD 3.3V"];
+  ldo -> probe [label="VCC sense only"];
+  faultier -> ldo [label="Crowbar D pull-down"];
+  probe -> mcu [label="ICE_DAT / ICE_CLK"];
+  mcu -> la [label="nRESET + VDD taps"];
+}
+```
+
+### Component versions
+
+- Patched xPack OpenOCD built from commit `7bb05570f40dae2c742e6e581db4129468fed689`[^xpack] with a safe-connect HLA layout patch applied over the OpenOCD-Nuvoton JTAG/SWD driver[^openocdnuvoton].
+- Nuvoton NuMicro ICP Programming Tool `3.24.8062r` (digitally signed by Nuvoton Technology Corporation)[^icptool].
+- Faultier RP2040 crowbar hardware using `ADC_CROWBAR` (`3,000` samples per trigger) and SMA-to-pigtail drain/ground leads.
+- `fx2lafw`-compatible logic analyzer running under `sigrok-cli` at `1 MHz` and `2 MHz` sample rates.
+
+## Step 1: Unpowered continuity and short isolation
+
+Adjacent pins on a `0.5 mm`-pitch `LQFP-64` package bridge easily under angled microprobe needles, and semiconductor junctions inside the MCU can trigger a multimeter continuity buzzer even when no metallic short exists.
+
+1. Disconnect every USB cable (target mouse, Nu-Link Pro, Faultier, and logic analyzer) before switching the multimeter to resistance or continuity mode. Never probe a powered board in resistance or continuity mode: touching pin 51 (`VDD`) to ground with a continuity source injects current into the rail and causes an immediate USB reset.
+2. Measure end-to-end resistance along each intended wire path from the tool header to the target pad:
+   - Nu-Link pin 2 (`VCC`) to pin 51 (`VDD` / `H4`): under `2 ohm`.
+   - Nu-Link pin 4 (`ICE_DAT`) to pin 33 (`SWDIO` / `H3`): under `2 ohm`.
+   - Nu-Link pin 6 (`ICE_CLK`) to pin 34 (`SWCLK` / `H2`): under `2 ohm`.
+   - Nu-Link pin 8 (`/RESET`) to pin 32 (`nRESET` / `H1`): under `2 ohm` when attached.
+   - Nu-Link pin 10 (`VSS`) to pin 49 (`GND` / `H5` / USB shield): under `2 ohm`.
+3. Measure resistance between adjacent signal nets in both probe polarities:
+   - Pin 33 (`SWDIO`) to pin 34 (`SWCLK`) must not read near `0`-`2 ohm`.
+   - Pin 32 (`nRESET`) to pin 33 and pin 34 must not read near `0`-`2 ohm`.
+   - Pin 51 (`VDD` / `H4`) to pin 49 (`GND` / `H5`) must not read near `0`-`2 ohm`.
+4. If pin 33 and pin 34 read `0 ohm` (observed during initial bring-up on 2026-11-13), lift both microprobe needles and measure the board pads and the free probe leads separately. If both are open when separated, the seated needles were bridging the adjacent legs.
+5. Check `SP10` header jumpers: each `SP10` probe body exposes two header pins tied to the **same needle**. Use one jumper lead per probe unless intentionally splitting that signal to a passive observer such as a logic analyzer channel.
+
+## Step 2: Rail ownership and power-up ordering (avoiding back-powering)
+
+<Aside type="caution" title="Back-powering locks up Faultier with Windows error code 10">
+Never allow a debug probe or an already-powered target rail to feed `3.3 V` into an unpowered Faultier crowbar or program header, and never allow the Nu-Link Pro to source target power while a Faultier crowbar lead is attached to `VDD`.
+</Aside>
+
+When a debug probe drives `3.3 V` onto the target `VDD` rail (`supply=1`) or the target is powered before Faultier USB enumerates, that `3.3 V` sits directly on Faultier's crowbar drain (`Crowbar D`) and any connected GPIO/sense lines. Current flows from the target `VDD` net backward through the RP2040 GPIO ESD protection diodes into the glitcher's internal `3V3` rail. Because the RP2040 core is partially energised through its I/O clamping diodes before its own USB regulator and power-on reset sequence run, the microcontroller enters a wedged state: Windows detects the USB device descriptors (`VID:PID` appears in Device Manager) but marks the composite device failed with **error code 10 (`This device cannot start`)**, and `usbipd` attachment produces no persistent device node.
+
+Enforce three electrical rules across every session:
+
+1. **Pick one rail owner.** Power the target board from its own USB cable (`VBUS` `4.92 V` feeding the onboard `3.3 V` regulator). Keep the Nu-Link Pro target-power output disabled (`supply=0`), and leave Faultier's `Program` header `3.3V/VCC` pin physically disconnected (`front view left-to-right: VCC, CLK, GND, IO, RST`).
+2. **Keep one SWD master on `SWDIO`/`SWCLK`.** Attach either the Nu-Link Pro (`ICE_DAT`/`ICE_CLK`) or Faultier's `Program` header (`IO`/`CLK`), never both at once.
+3. **Follow strict connect and teardown ordering.**
+   - **Connect sequence.** (1) Plug Faultier into host USB first and confirm clean USB enumeration with all target leads disconnected; (2) plug in the Nu-Link Pro (with `supply=0`) and logic analyzer over USB; (3) wire the ground, SWD, sense, and crowbar leads to the unpowered target; (4) plug in the target mouse USB cable last to energise `VDD`.
+   - **Teardown sequence.** (1) Unplug the target mouse USB cable first so `VDD` drops to `0 V`; (2) disconnect the harness leads from the target; (3) unplug the Nu-Link Pro and Faultier USB cables last.
+
+With the target powered over USB and all tools idle, verify DC voltages with the multimeter in DC volts mode:
+
+- Pin 51 (`VDD`) to ground: `~3.3 V` (Nu-Link pin 2 to pin 10 must match within a few millivolts).
+- Pin 50 (`LDO_CAP`) to ground: `~1.26 V`. Never attach `VDD_SENSE` to pin 50; a `~1.26 V` or `~1.8 V` reading on the probe's voltage channel means the sense wire is on `LDO_CAP` or floating.
+
+## Step 3: Nu-Link 3.3 V configuration and the safe-connect OpenOCD driver
+
+OpenOCD can drive a Nu-Link Pro over USB HID, but it cannot configure the probe's programmable SWD I/O voltage translator, which defaults to `5 V` (`~4910`-`4930 mV` measured before configuration).
+
+### Set 3.3 V I/O once in the official ICP tool
+
+1. Open the Nuvoton NuMicro ICP Programming Tool (`3.24.8062r`)[^icptool] with the Nu-Link Pro connected over USB and the target disconnected.
+2. Select **M480 Series**, click **Option** next to **Start**, set **Nu-Link Pro IO Voltage = 3.3 V**, and click **OK**.
+3. Do **not** click **Start**, and do **not** accept any popup offering to unlock or mass-erase the chip (`Target flash is in security lock mode` -> cancel immediately).
+4. Click **Stop check** if the tool is polling for a target, then **close the ICP tool completely** so it releases the USB HID handle before OpenOCD starts.
+
+### Why the stock Nu-Link OpenOCD configuration is unsafe on a locked target
+
+Inspecting OpenNuvoton's USB JTAG/SWD driver source (`src/jtag/drivers/`)[^openocdnuvoton] showed that stock adapter initialization performs `RESET_HW` and `RESET_SYSRESETREQ` and sends `CMD_SET_CONFIG` with `supply=1` during adapter open. On a target that is already USB-powered and wired to a crowbar harness, `supply=1` violates single-rail ownership, and unsolicited reset assertions disturb target state during a read-only check.
+
+To prevent both hazards, apply a dedicated safe-connect HLA layout patch to xPack OpenOCD (`7bb05570f40dae2c742e6e581db4129468fed689`)[^xpack]:
+
+1. Register a separate safe HLA layout so an unpatched OpenOCD binary fails closed before opening the USB device.
+2. In the safe connect path, force `if_target_power_supplied(0)` (`supply=0`), skip hardware reset on open, and reject explicit `SRST` assertions.
+3. Expose a read-only `hla_command "raw_mdw <address>"` backed by the Nu-Link memory-read API so single 32-bit words can be queried without Cortex-M `CPUID` target examination.
+
+```tcl
+# Inline safe OpenOCD configuration
+adapter driver hla
+hla_vid_pid 0x0416 0x511c 0x0416 0x511d 0x0416 0x5200
+transport select hla_swd
+adapter speed 200
+```
+
+### Fail-closed DPIDR check and the voltage-channel echo trap
+
+Do not treat an OpenOCD exit code of `0` as target detection. When the SWD physical layer fails to get a response from the target, the Nu-Link USB driver buffer can retain the preceding voltage-sense response words and print them as the `IDCODE`:
+
+| Recorded run state | Reported probe voltage | Returned `IDCODE` / `DPIDR` | Diagnosis |
+|---|---|---|---|
+| Target disconnected (FW `7246`) | `3 mV` | `0x00030001` | Invalid: open sense line echo |
+| Prior to ICP `3.3 V` setup | `4910 mV` / `4930 mV` | `0x0e381022` / `0x0e620ff7` | Invalid: `5 V` I/O mismatch |
+| ICP set to `3.3 V`, open `SWCLK` | `3315 mV` | `0x0a4b0bde` | Invalid: broken `SWCLK` contact |
+| Voltage-buffer echo (`06a9`, `06a4`) | `~1700 mV` (floating sense) | `0x06a406a9` | Invalid: raw voltage words echoed as `IDCODE` |
+| Safe layout with open contact | `2963 mV` | `0x0b9f0b9f` | Invalid: `2963 mV` (`0x0b9f`) echoed twice |
+| Safe layout after `SWCLK` repair | `2980 mV` (`200 kHz`) | `0x2ba01477` | **Pass**: valid Cortex-M4 `DPIDR` across 3 consecutive runs |
+
+Notice `0x0b9f0b9f` in the fifth row: `0x0b9f` in decimal is `2975`, matching the `2963 mV` ADC sense reading. Always require an exact match on `0x2ba01477` before running any memory read or glitch pulse.
+
+## Step 4: Qualifying crowbar delivery with logic-analyzer and ADC baselines
+
+Once SWD returns `0x2ba01477` and the crowbar is wired to `VDD` (pin 51) and `GND` (pin 49), verify that crowbar pulses actually reach the rail before running any timing sweep.
+
+### Why onboard ADC misses nanosecond pulses
+
+The glitcher calls `configure_adc(ADC_CROWBAR, 3000)` before firing `glitch()`. At the default clock divider of `1`, the RP2040 ADC samples at `250 MHz / 96 = 2.604 MS/s`, or one sample every `~384 ns`. A `4 ns` or `16 ns` crowbar pulse is `24x` to `96x` shorter than a single sample period: an unchanged ADC trace at `4 ns` proves that the ADC is undersampled, not that the MOSFET failed to fire. Time-resolving nanosecond pulses requires an oscilloscope; without one, use microsecond calibration pulses (`1 us` to `1 ms`) cross-checked by a `1`-`2 MHz` logic analyzer on `VDD` (`D1`) and `nRESET` (`D0`) to verify physical delivery and reset latency.
+
+### LDO_CAP (pin 50) versus VDD (pin 51) calibration
+
+On `LDO_CAP` (pin 50, `~1.26 V` DC with the factory `2.2 uF` decoupling capacitor installed), the normalised Faultier ADC baseline sits at `0.388`-`0.3917` (above `FaultierTool selfcheck`'s generic `0.15`-`0.30` open threshold, which assumes an unpowered pin). Pulses of `4 ns`, `16 ns`, `128 ns` (ADC min/max `0.3686`/`0.4392`), and `1 us` produced no resolved droop; a `10 us` pulse pulled the normalised ADC minimum down to `0.0235`.
+
+Moving the crowbar drain to `VDD` (pin 51, `3.3 V` DC, normalised ADC baseline `0.919`-`0.933`) while leaving the `LDO_CAP` capacitor intact produced clean, repeatable rail pull-downs confirmed simultaneously by the onboard ADC and an `fx2lafw` logic analyzer:
+
+| Programmed `VDD` pulse | Faultier ADC samples below `0.5` | Logic-analyzer `VDD` (`D1`) low width | Logic-analyzer `nRESET` (`D0`) response | USB PnP / SWD readback state |
+|---|---|---|---|---|
+| `1 us` (`250` cycles) | Min `0.0392` (`3` low samples) | `~1 us` (`2` low samples at `2 MHz`) | High (`60,000,000` samples, `0` edges) | Unchanged / `locked-response` |
+| `10 us` (`2,500` cycles) | `33` samples (span `488`-`521`) | `27` low samples (at `2 MHz`) | High (`60,000,000` samples, `0` edges) | Unchanged / `locked-response` |
+| `25 us` | `79` samples | `32`-`33 us` (at `1 MHz`) | High | Unchanged / `locked-response` |
+| `30 us` | `95` samples | Measured low (`1 MHz`) | High | Unchanged / `locked-response` |
+| `35 us` | `111` samples | Measured low (`1 MHz`) | High | Unchanged / `locked-response` |
+| `40 us` | `127` samples | Measured low (`1 MHz`) | **Low pulse** (`~35`-`37 us` after `VDD` fall) | Unchanged / `locked-response` |
+| `45 us` | `143` samples | Measured low (`1 MHz`) | **Low pulse** (`~35`-`37 us` after `VDD` fall) | Unchanged / `locked-response` |
+| `50 us` | `158` samples | `62 us` (at `1 MHz`) | **Low pulse** (`~35`-`37 us` after `VDD` fall) | Unchanged / `locked-response` |
+| `100 us` | `306`-`307` samples | `119 us` (at `1 MHz`) | **Low pulse** | Unchanged / `locked-response` |
+| `200 us` / `500 us` / `1 ms` | `637` / `1,741` / `2,983` samples | `247/670/1149 us` (at `1 MHz`) | **Low pulse** across all three rungs | Unchanged / `locked-response` |
+
+Two hardware facts stand out from the ladder:
+
+1. **External `nRESET` assertion starts between `35 us` and `40 us` of `VDD` pull-down**, with `nRESET` falling `35`-`37 us` after the `VDD` falling edge. Shorter pulses (`1 us` to `35 us`) droop the rail without triggering an externally visible pin reset.
+2. **Every rung disarmed cleanly without dropping USB enumeration**, proving that the crowbar path delivers repeatable energy to pin 51 while keeping the peripheral alive.
+
+## Verification
+
+Before declaring the harness ready for any readback or fault experiment, confirm every row in this checklist:
+
+| Gate | How to check | Expected pass state | Stop condition |
+|---|---|---|---|
+| Unpowered isolation | DMM resistance across `SWDIO`/`SWCLK`, `nRESET`, and `VDD`/`GND` with all USB unplugged | End-to-end leads under `2 ohm`; adjacent nets open | Any adjacent pair near `0`-`2 ohm` |
+| Glitcher USB enumeration | Plug Faultier USB in before target power; check Windows Device Manager | Composite device starts cleanly; no warning icon | Windows error code 10 (`This device cannot start`) -> unplug target power and probe |
+| Rail voltage and ownership | DMM DC volts on pin 51 (`VDD`) and pin 50 (`LDO_CAP`); OpenOCD safe-layout log | `VDD` `~3.3 V`, `LDO_CAP` `~1.26 V`, `if_target_power_supplied(0)` | Probe voltage near `5 V` or `supply=1` |
+| Target SWD identity | Run safe-layout ID check at `200 kHz` | Exact `DPIDR` `0x2ba01477` on 3 consecutive runs | Process exits `0` with `0x0b9f0b9f` or other voltage-echo word |
+| Crowbar delivery | Single `1 us` and `40 us` `VDD` calibration pulses with `1`-`2 MHz` LA on `D0`=`nRESET`, `D1`=`VDD` | `1 us` shows `VDD` dip with `nRESET` high; `40 us` shows `nRESET` low `~35`-`37 us` after `VDD` fall | No `VDD` transition on LA, or board warms up while idle |
+
+## Gotchas and lessons learned
+
+- **Back-powering through GPIO ESD diodes mimics a dead glitcher.** When Windows reported code 10 on Faultier's composite USB device, the hardware was undamaged: `3.3 V` on the crowbar drain was back-feeding the RP2040 `3V3` rail before USB enumeration. Enforcing a single rail owner (`supply=0` on Nu-Link, `Program VCC` disconnected on Faultier) and plugging Faultier USB in before target power eliminated the fault immediately.
+- **OpenOCD exit status `0` is not target detection.** Stock scripts that only check whether `openocd` exited cleanly will pass when the target is completely disconnected, because the Nu-Link driver prints voltage-channel words (`0x06230625`, `0x0b9f0b9f`) as the `IDCODE`. Always parse the output log and assert `DPIDR == 0x2ba01477`.
+- **Repeated `0x2ba01477` on memory reads is a lock signature, not memory content.** Once `SWCLK` contact was repaired, reading Cortex-M `CPUID` (`0xe000ed00`), `CONFIG0`..`CONFIG3` (`0x00300000`), `APROM` (`0x00000000`), and peripheral registers via `raw_mdw` returned `0x2ba01477` at every address. Because `CPUID` returned `0x2ba01477`, OpenOCD decoded `PARTNO` as `0x147` and refused normal `mdw` commands with `Target not examined yet`. Why that happens - and why you cannot run a fault-injection sweep until you have a positive control that beats it - is the subject of [Nuvoton M483 flash locks and the glitch-oracle trap](/reference/m483-flash-locks-and-glitch-oracles/).
+- **Never move `VDD_SENSE` to `LDO_CAP` (pin 50).** Pin 50 sits right next to pin 51 (`VDD`), but it carries the `1.26 V` internal core regulator output. Connecting a probe's `VCC` sense pin to pin 50 produces a `~1.26`-`1.8 V` target-voltage reading and breaks `3.3 V` level translation.
+
+## File reference
+
+| Artifact or setting | Purpose |
+|---|---|
+| `src/jtag/drivers/` (patched xPack OpenOCD `7bb0557`) | Adds the safe-connect HLA layout (`if_target_power_supplied(0)`, suppressed connect resets, rejected `SRST`, and read-only `raw_mdw`) |
+| NuMicro ICP Programming Tool (`3.24.8062r`) option setting | Stores `Nu-Link Pro IO Voltage = 3.3 V` in the probe before closing the ICP GUI |
+| `openocd.log` and `manifest.json` per SWD check | Records adapter firmware (`8062`), sense voltage (`~2980`-`3315 mV`), clock (`200 kHz`), and verified `DPIDR` (`0x2ba01477`) |
+| `sigrok-cli` `fx2lafw` capture (`1 MHz` / `2 MHz`) | Digital trace of `D0` (`nRESET`) and `D1` (`VDD`) confirming pulse delivery and the `35`-`37 us` reset assertion delay |
+
+## Related docs
+
+- [Nuvoton M483 flash locks and the glitch-oracle trap](/reference/m483-flash-locks-and-glitch-oracles/) - the companion reference on `SBLOCK`/`ALOCK`/`ISPFF` lock mechanics, the access-path split between CPU and ICE, and why a repeatable failure signature is not a campaign oracle.
+- [8 kHz mouse polling on Windows: merged HID reports](/guides/8khz-mouse-merged-reports-windows/) - host-side USB HID report batching and sensor delta analysis on the same 8 kHz mouse class.
+- [Agent-assisted reverse engineering](/reference/agent-assisted-reverse-engineering/) - structuring static decompilation and black-box protocol capture before touching hardware pads.
+- [PCB-as-code verification](/reference/pcb-as-code-verification/) - programmatic netlist and pad-coordinate verification used before building physical test harnesses.
+
+[^m480ds]: Nuvoton Technology Corp., "NuMicro Family M480 Series Datasheet," Rev. 3.09, sections 4.2.3 and 8.5.1. https://www.nuvoton.com/export/resource-files/en-us--DS_M480_Series_EN_Rev3.09.pdf
+
+[^icptool]: Nuvoton Technology Corp., "NuMicro ICP Programming Tool," version 3.24.8062r. https://www.nuvoton.com/tool-and-software/software-tool/programmer-tool/
+
+[^openocdnuvoton]: OpenNuvoton contributors, "OpenOCD-Nuvoton JTAG/SWD drivers," `src/jtag/drivers/`. https://github.com/OpenNuvoton/OpenOCD-Nuvoton/tree/master/src/jtag/drivers
+
+[^xpack]: xPack Dev Tools, "xPack OpenOCD," commit `7bb05570f40dae2c742e6e581db4129468fed689`. https://github.com/xpack-dev-tools/openocd
