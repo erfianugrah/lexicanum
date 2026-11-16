@@ -12,6 +12,7 @@ import rehypeKatex from "rehype-katex";
 import rehypeGraphviz from "@beoe/rehype-graphviz";
 // house Starlight kit: lay Graphviz out for a monospace face.
 import rehypeGraphvizMonoLayout from "./src/lib/graphviz-mono-layout.mjs";
+import rehypeCodeGlue from "./src/lib/code-glue.mjs";
 import { getCache } from "@beoe/cache";
 
 // Build-cache for rendered diagrams so unchanged dot blocks are not re-rendered
@@ -342,6 +343,8 @@ export default defineConfig({
         // Rename the GFM "Footnotes" section heading to "References".
         rehypeFootnoteLabelToReferences,
         rehypeTableScroll,
+        // Keep inline code on one line with the "(", ")" or ".." it touches.
+        rehypeCodeGlue,
       ],
     }),
     syntaxHighlight: {

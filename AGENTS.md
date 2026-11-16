@@ -65,7 +65,11 @@ the build/test gate only, no deploy.
   conventions. DiagramExpand, loaded from `src/components/Head.astro`,
   makes a Graphviz diagram rendered below its intrinsic size zoom in
   place (click, ctrl+wheel or the ZOOM button; no overlay; a card,
-  `docs/research/2026-11-12-diagram-expand.md`). Kit source
+  `docs/research/2026-11-12-diagram-expand.md`). `src/lib/code-glue.mjs`
+  (kit rehype plugin, last in `rehypePlugins`) wraps inline code and the
+  characters touching it in `span.house-glue` (nowrap), because inline
+  code is an inline block and a browser may break a line on either side
+  of one, leaving a ")" alone on the next line. Kit source
   and install steps: `house assets cat starlight/README.md`. Fonts: Overpass
   Mono for titles, nav and labels, Inconsolata for code, tables and data
   (@fontsource); no sans face, no social links, ea only as the footer
