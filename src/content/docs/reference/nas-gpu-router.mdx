@@ -1,0 +1,132 @@
+---
+title: "Sharing one NAS GPU between chat, embeddings, a writer model and photo ML"
+description: How servarr-gpu-router hands one 12 GB RTX 3080 Ti on the NAS to four workloads - a chat LLM, an embedding server, a LoRA writer model and immich's photo ML - with one resident container at a time, drain-before-switch, measured-VRAM gates, a writer hold, and the reconcile pass that keeps a compose deploy from running three models on a card that fits one. Includes the incidents that shaped each rule.
+author: Erfi Anugrah
+category: homelab
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+This page describes the GPU arbiter on the home NAS: a small Go reverse proxy that owns which model container holds the card and switches between them on demand. It is the NAS sibling of [the workstation scheduler](/reference/llmc-single-gpu-stack/), from which its event loop was ported, and it serves the LLM behind [the personal knowledge graph](/reference/personal-knowledge-graph-local-llm/).
+
+Provenance: the behaviour below is read from the router's source and its repository notes, and the incident timings come from the router's own logs on the NAS. The router repository is private, so paths are named but not linked. The hardware is an RTX 3080 Ti with 12 GB, shared with Jellyfin and other media services that the router does not schedule. Measured timings are labelled with their date; everything else is design-read.
+
+## TL;DR
+
+- One resident model container at a time: chat LLM, embedding server or writer model. Immich's photo ML is the resting mode and owns no container, so it runs whenever nothing else holds the card.
+- Chat and photo-ML requests switch the mode; batch embedding requests switch it too but never preempt chat. Passive probes (`/v1/models`, `/health`) never switch anything.
+- A switch drains in-flight requests (30 s grace), stops the outgoing container, waits until `nvidia-smi` reports enough free memory, starts the incoming one and waits for its Docker health check. The whole switch is capped at 180 s.
+- A compose deploy starts every model container at once. The router stops any container its mode does not own, and since 0.4.6 it drops to the resting mode when its own container dies, so the next request restarts it.
+- Most of the rules on this page exist because of a dated failure; [Incidents](#incidents) lists them.
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  clients [label="clients\nchat, knowledge-graph drain,\nimmich server"];
+  router [label="gpu-router\nreverse proxy + scheduler loop"];
+  llama [label="llama-server\nGemma 12B Q4_K_M"];
+  writer [label="writer llama-server\nsame base + LoRA"];
+  tei [label="TEI\nmultilingual-e5-large"];
+  ml [label="immich machine learning\n(always running)"];
+  docker [label="Docker Engine\nstop / start / events"];
+
+  clients -> router;
+  router -> llama [label="/v1/chat/completions"];
+  router -> writer [label="chat, model = writer"];
+  router -> tei [label="/embed"];
+  router -> ml [label="/predict"];
+  router -> docker [label="lifecycle", style=dashed];
+}
+```
+
+The router is the only path to the three model servers. It classifies each request by path (and, for chat, by the `model` field in the JSON body), asks the scheduler for the mode that request needs, and forwards it once granted. The scheduler is a single goroutine that owns the mode, the in-flight counters and any pending switch; container work runs on a separate goroutine that reports back to it. Immich's ML container stays up permanently; with llama loaded it held 746 MiB beside it (2026-10-30), so it fits next to any one model.
+
+## Modes
+
+| Mode | Container | VRAM gate | Entered by | Left by |
+|---|---|---|---|---|
+| `immich` | none (resting) | 6,144 MiB free after the stop | idle timeout, `/predict` | chat, `/embed` |
+| `llm` | llama-server | 8,192 MiB free before the start | interactive chat | idle, `/embed`, `/predict` |
+| `embed` | TEI | 1,536 MiB free before the start | `/embed` | idle, chat, `/predict` |
+| `writer` | llama-server with the LoRA | 8,192 MiB free before the start | chat whose `model` is the writer | idle, `/predict`, chat or embed after the writer hold |
+
+Interactive means real user traffic: `/v1/chat/completions`, `/v1/embeddings`, `/v1/tokenize` and `/predict`. A non-interactive LLM request in another mode gets a 503 instead of a switch, so a health probe cannot wake the 8 GB model. `/embed` is batch on purpose: it is the knowledge-graph backfill, and marking it interactive would let it preempt chat the way chat preempts it.
+
+The writer has its own container because a LoRA cannot share the chat server. Loaded at scale 0 with per-request activation, the adapter leaked into base requests through llama-server's prompt cache: on 2026-11-14 the top-20 log-probabilities of base requests shifted by 6 to 8.5 after an adapter-on request, and `cache_prompt: false` on the writer request did not prevent it.
+
+## What a switch does
+
+| Step | Bound | Notes |
+|---|---|---|
+| Drain the outgoing mode | 30 s (`--drain-grace`) | in-flight requests finish; past the grace the switch proceeds anyway |
+| Stop the outgoing container | inside the switch budget | `docker stop -t 10`; llama-server and TEI exit 137 when killed |
+| Wait for free VRAM | 20 s (`--vram-wait`) | polls `nvidia-smi` inside the router container; on timeout waiters get a 503 naming the measured and needed MiB |
+| Start the incoming container | inside the switch budget | skipped gate if it is already running: its memory is the VRAM the gate would wait for |
+| Wait for Docker health | rest of 180 s (`--switch-timeout`) | the container's own health check decides when the model is ready |
+
+The VRAM thresholds are not budgets. With llama-server loaded, `nvidia-smi` showed it at 8,014 MiB with 3,886 MiB free (2026-10-30), so the immich threshold of 6,144 MiB sits above what is free while llama still holds the card: reaching it proves the memory was released. TEI held 1,430 MiB in its bake-off, which the 1,536 MiB gate covers.
+
+After 300 s without interactive traffic (`--idle-timeout`) the router returns `llm`, `embed` or `writer` to `immich`. Every `/embed` request resets the timer in embed mode, so a long backfill is not cut every five minutes. For 180 s after a writer request (`--writer-hold`) chat and embed requests get a 503 instead of swapping the writer out, so a few rewrites in a row cost one switch instead of one each; the knowledge-graph drain retries its 503s. Photo ML is never held.
+
+<Aside type="caution" title="Health-check interval is part of the switch time">
+The router waits on Docker's health status, and Docker only re-evaluates it once per `interval`. With a 30 s interval a warm writer switch took 57 s, most of it waiting for the next probe, although the model loaded in about 4 s. Compose's `start_interval: 2s` probes every 2 s until the first healthy result; the same switch then took 5 s (2026-11-16). Any router that polls Docker health inherits this lag.
+</Aside>
+
+## Deploys and reconcile
+
+The model containers live in the same Compose project as the router, and `compose up` starts every service in it. On a 12 GB card three models cannot load at once: the 0.4.1 and 0.4.2 deploys each lost one container to an out-of-memory crash. The router reconciles in two places.
+
+| Trigger | What the router does | Since |
+|---|---|---|
+| Router start | picks the mode from what is running (llama, then writer, then TEI, else immich) and stops the other resident containers, each with its own stop budget | per-stray budget 0.4.3 |
+| `docker events` start | stops a resident container that neither the mode nor an in-flight switch owns | 0.4.4 |
+| Failed switch, no retry | leaves the target up for one switch timeout so a retry can reuse the load, then stops it | 0.4.5 |
+| `docker events` die, or a stopped mode container in the post-start pass | if the current mode's own container exited outside a switch, the mode drops to `immich` | 0.4.6 |
+
+The last row closes the case the first one cannot. The start-time check reads the container states once, and on 2026-11-16 llama was still running at that instant but losing the VRAM race to the writer that compose had started beside it. Llama exited with a CUDA out-of-memory error a second later, after the router had chosen `llm`, and chat requests were proxied to a dead backend until llama was started by hand. With 0.4.6 the same race on its own deploy logged `reconcile: gumshoe-llama exited while mode=llm; mode -> immich`, and the next chat request switched to `llm` and was answered about 5 s later. The race itself still happens on a deploy that recreates the router; the router now recovers from it instead of preventing it.
+
+## Incidents
+
+| Date | What happened | Rule it produced |
+|---|---|---|
+| 2026-10-30 | A switch to `llm` timed out on the health wait and left llama running in `immich` mode. Every retry then waited on the VRAM gate for llama's own 8 GB, and the knowledge-graph drain stalled for 2.5 h. | 0.2.1: skip the gate when the target is already running; the health wait gets the rest of the switch budget |
+| 2026-11-14 | A writer LoRA loaded into the chat server changed base-model output through the prompt cache. | the writer gets its own container |
+| 2026-11-14 | Deploys started all three models; one crashed with an out-of-memory error each time. A shared 10 s stop context ran out on the first stop, so the second stray kept loading. | 0.4.3: one stop budget per stray; 0.4.4: reconcile on start events |
+| 2026-11-16 | A cold writer load read the 12B model from the NAS's hard-disk pool and took 97 s; the 60 s switch timeout failed it. | switch timeout 180 s; 2 s `start_interval` health probes |
+| 2026-11-16 | That failed switch left the writer running in `immich` mode for 21 minutes, next to the photo ML, until the next writer request claimed it. | 0.4.5: stop an unclaimed failed-switch target after one switch timeout |
+| 2026-11-16 | The 0.4.5 deploy: llama lost the VRAM race to the writer and died after the router had chosen `llm`. | 0.4.6: follow die events; the mode's own exit drops to `immich` |
+
+## Which rule for which symptom
+
+| Symptom | Likely cause | Where to look |
+|---|---|---|
+| Chat returns 503 naming free and needed MiB | something outside the router holds the card (a transcode, a stray container) | `nvidia-smi` on the host |
+| Chat returns 503 within a few minutes of a writer request | the writer hold | wait out `--writer-hold` or send to the writer |
+| First chat after a quiet period takes seconds | idle return to `immich`, then a switch back | expected; 5 s warm, 97 s for a cold writer load off the hard disks (2026-11-16) |
+| Mode says a container the host shows as exited | a router older than 0.4.6, or a die event missed while the events stream restarts | the router log's `reconcile:` lines |
+
+## Reproducing
+
+| Surface | Where in the source |
+|---|---|
+| Mode state machine, drain, idle timer, writer hold, failed-switch grace, die handling | `internal/scheduler/scheduler.go` |
+| Path and body classification, streaming proxy | `internal/proxy/proxy.go` |
+| Docker stop, start, health and the events stream | `internal/docker/docker.go` |
+| `nvidia-smi` free-memory probe | `internal/gpu/` |
+| Start-time mode pick, stray stops, events loop | `cmd/router/main.go` |
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| One resident container; modes, gates and entry rules | design-read | scheduler and proxy source, deployed router flags |
+| 8,014 MiB for llama, 3,886 MiB free beside it | measured | `nvidia-smi` on the NAS, 2026-10-30 |
+| LoRA leaking through the prompt cache | measured | log-probability comparison, 2026-11-14 |
+| 97 s cold writer load against a 60 s timeout | measured | router and writer container logs, 2026-11-16 |
+| Warm writer switch 57 s with a 30 s health interval, 5 s with `start_interval` | measured | router switch log lines before and after, 2026-11-16 |
+| Failed-switch target stopped after the grace | unit-tested | scheduler tests; not yet seen live |
+| Recovery from a dead mode container | measured | the 0.4.6 deploy's own race, router log, 2026-11-16 |
