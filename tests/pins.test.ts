@@ -1798,6 +1798,13 @@ const pins: Pin[] = [
     // (about 30002 ms each), so "all 5001 ms" was a figure not in the artifact.
     mustNotContain: ["put all 5001 ms under"],
   },
+  {
+    doc: "reference/griddle-lx-hall-effect-keyboard",
+    // 2026-11-16: the griddle repo is private (personal boards, nothing
+    // published), so the series must not call the project open source.
+    mustContain: ["The repo is private, though, so this is not an open-source project"],
+    mustNotContain: ["an open-source 5x12", "an open 5x12", "on open firmware"],
+  },
 ];
 
 describe.each(pins.map((p) => [p.doc, p] as const))("%s", (_name, pin) => {
