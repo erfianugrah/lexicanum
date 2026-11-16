@@ -163,7 +163,37 @@ Do not treat an OpenOCD exit code of `0` as target detection. When the SWD physi
 | Safe layout after `SWCLK` repair | `2980 mV` (`200 kHz`) | `0x2ba01477` | **Pass**: valid Cortex-M4 `DPIDR` across 3 consecutive runs |
 
 Notice `0x0b9f0b9f` in the fifth row: `0x0b9f` in decimal is `2975`, matching the `2963 mV` ADC sense reading. Always require an exact match on `0x2ba01477` before running any memory read or glitch pulse.
+### Driving OpenOCD over Tcl RPC: run-control and memory read discipline
 
+Once the safe-connect driver is loaded, every run-control and memory operation must go through OpenOCD's adapter-driven commands. Three rules that hold for Nu-Link HLA targets on the M480/M483 family:
+
+Run-control goes through the adapter commands, never a raw DHCSR write. The Nu-Link firmware caches whether the core is halted or running and gates the `CMD_MCU_STOP_RUN` / `CMD_MCU_START_RUN` USB commands (which `halt` and `resume` proxy) against that cached state. Writing `C_HALT` or `C_DEBUGEN` directly to `DHCSR` (`0xE000EDF0`) through the memory-write path updates the real `DHCSR` but does not update the firmware's cached state. The firmware may then refuse to resume a core it believes is already running, or skip halting one it believes is already halted. The next memory transaction hangs OpenOCD's event loop indefinitely. The fix: use only `halt`, `resume`, `poll`, and `get_reg` through the Tcl RPC. These route through the firmware's native run-control commands and keep firmware state coherent with the core.
+
+Drive OpenOCD over its Tcl RPC port, not stdin, and wrap reads in `capture { ... }`. OpenOCD ignores Tcl on stdin except in `gdb_port pipe` mode. When scripting OpenOCD programmatically, connect to the Tcl RPC port (configured with `tcl_port` in the config) over TCP, send Tcl commands terminated with `0x1A` framing, and read the framed response. Memory reads must be wrapped in `capture { ... }` so the result line is returned as the RPC result rather than emitted to the log stream. For a single word read:
+
+```tcl
+capture { mdw 0x40000000 1 }
+```
+
+Without `capture`, the `mdw` command returns empty through the RPC.
+
+Call `poll` before `resume` after an HLA examine. After the HLA layer examines the target, OpenOCD leaves the target state `TARGET_UNKNOWN`. The `adapter_resume` command checks `target->state`, not the real `DHCSR` - so it refuses to resume from `TARGET_UNKNOWN` even when the core is visibly halted (`DHCSR.S_HALT` set). The sequence for a clean startup is:
+
+```tcl
+# After connect + examine:
+poll      # Reads real DHCSR, updates target->state to TARGET_HALTED
+resume    # Now works
+```
+
+All three rules are latent in any Tcl script that examines an HLA target and then attempts run-control. Upstream scripts avoid them by connecting, examining, and handing off to GDB without resuming.
+
+### The connect-lockup: why a running locked core faults on debug attach
+
+The companion reference, [Nuvoton M483 flash locks and the glitch-oracle trap](/reference/m483-flash-locks-and-glitch-oracles/#the-connect-lockup-attaching-to-a-running-locked-m480m483-core), covers the lockup mechanism in full. In summary: the safe-connect driver sends `CMD_MCU_RESET` with `CONNECT_NORMAL`, which tells the Nu-Link firmware to halt the running core as part of debug-connect. On a locked M483, that halt triggers a fault. The fault-handler vector reads from locked flash as `0xFFFFFFFF`, the core branches to `0xFFFFFFFE`, and the fault escalates to permanent LOCKUP (`PC=0xFFFFFFFE`, `xPSR` exception number `3`). Read the fault-status registers after the lockup to confirm: `HFSR` (`0xE000ED2C`) shows the `VECTTBL` bit (`0x40000000`), and `DFSR` (`0xE000ED30`) shows the `HALTED` bit (`0x00000001`).
+
+The upstream Nuvoton OpenOCD source never hits this because it always resets the target before connecting - the core is stopped when `CONNECT_NORMAL` runs. With safe-connect (`RESET_NONE`, no reset), the core is still running, creating the untested code path.
+
+A gentler connect mode exists in the Nu-Link protocol: `CONNECT_DISCONNECT` (enum value `4`). The upstream driver uses it in its close handler for clean disconnection, explicitly paired with `RESET_NONE`. Tested on the locked target, it does NOT power the `AHB-AP`: reads returned a garbage `IDCODE` (`0x0bbc0bc7`, not `0x2ba01477`) and `SRST` was rejected, so memory reads die. The Nu-Link bundles AP power-up with the halt in `CONNECT_NORMAL` and offers no power-without-halt path. There is therefore no non-perturbing debug attach on a running locked target through the Nu-Link; a raw-SWD probe (CMSIS-DAP) that powers the AP without the bundled halt is the remaining alternative.
 ## Step 4: Qualifying crowbar delivery with logic-analyzer and ADC baselines
 
 Once SWD returns `0x2ba01477` and the crowbar is wired to `VDD` (pin 51) and `GND` (pin 49), verify that crowbar pulses actually reach the rail before running any timing sweep.

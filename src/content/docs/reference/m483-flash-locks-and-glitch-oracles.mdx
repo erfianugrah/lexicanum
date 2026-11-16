@@ -276,6 +276,69 @@ digraph {
 | Skipping `CMD_MCU_RESET` omitted `CONNECT_NORMAL`, causing all HLA reads to echo `DPIDR` `0x2ba01477`; connect-only `reset type 5` restored `AHB-AP` reads (`SYS_PDID` `0x40000000` = `0x00d48310`, `SRAM` stack pointer `0x20001c60`, `Cortex-M4 r0p1` examined) while `APROM` (`0x00000000`), `LDROM` (`0x00100000`), and `SPROM` (`0x00200000`) read `0xffffffff` | Measured (live) | Patched OpenOCD connect-only verification on the 8 kHz mouse board (2026-11-15) |
 | On the locked `M483SIDAE`, debugger writes to `PPB` debug registers (`0xe0002010`, `0xe000102c`) land while `CMD_WRITE_RAM` writes to `SRAM` (`0x20000400`) silently no-op and read back `0x00000000` | Measured (live) | Instrumented Nu-Link `CMD_WRITE_RAM` (`0xb9`) comparison on the 8 kHz mouse board (2026-11-16) |
 
+## Driving OpenOCD against a locked M483: Tcl RPC and adapter-state discipline
+
+Three operational rules for scripting OpenOCD against an M480/M483 target over the Nu-Link HLA transport. Each was discovered when a Tcl-based OpenOCD wrapper hit an undocumented interaction between the Nu-Link firmware's cached state and the Cortex-M4 core's real debug state.
+
+**Run-control through adapter commands, not raw DHCSR writes.** The Nu-Link firmware gate-keeps its `CMD_MCU_STOP_RUN` / `CMD_MCU_START_RUN` USB commands (which `halt` and `resume` proxy) against an internal cached copy of the core's run state. Writing `C_HALT` or `C_DEBUGEN` to `DHCSR` (`0xE000EDF0`) through the memory-write path changes the real `DHCSR` but leaves the firmware's cache stale. The firmware may refuse to resume a core it believes is already running, or skip halting one it believes is already halted. The next memory transaction hangs OpenOCD's event loop indefinitely. The fix: use only `halt`, `resume`, `poll`, and `get_reg` through the Tcl RPC - these route through the firmware's native run-control commands.
+
+**Drive OpenOCD over its Tcl RPC port, not stdin, and wrap reads in `capture { ... }`.** OpenOCD ignores Tcl on stdin except in `gdb_port pipe` mode. Connect to the Tcl RPC port (configured with `tcl_port`) over TCP, send commands terminated with `0x1A` framing, and wrap memory reads in `capture { mdw <addr> 1 }` so the result line is returned as the RPC result rather than emitted to the log stream. Without `capture`, a `mdw` command returns empty.
+
+**Call `poll` before `resume` after the HLA examine.** After the HLA adapter initialises and examines the target, OpenOCD leaves `target->state` at `TARGET_UNKNOWN`. The `adapter_resume` command checks `target->state`, not the real `DHCSR`, and refuses to resume from `TARGET_UNKNOWN` even when `DHCSR.S_HALT` is set. The `poll` command reads the real `DHCSR` through the adapter and updates `target->state` to `TARGET_HALTED`; `resume` then works.
+
+## The connect-lockup: attaching to a running locked M480/M483 core
+
+The safe-connect OpenOCD layout described in the [companion harness guide](/guides/swd-and-voltage-glitch-harness-m483/) sends the Nu-Link firmware a `CMD_MCU_RESET` command with `RESET_NONE` (no hardware or system reset) and `CONNECT_NORMAL`. `CONNECT_NORMAL` tells the closed-source Nu-Link firmware to halt the running core as part of establishing debug connectivity - it is the same connect mode the upstream driver pairs with hardware resets. On a flash-locked M480/M483 whose core is actively executing from the locked `APROM` region, that debug-halt triggers a fault chain that escalates to permanent LOCKUP.
+
+### Fault register evidence
+
+After the connect-lockup, reading the Cortex-M4 fault-status registers over the `AHB-AP` (which remains functional - the debug connection itself is not lost) reveals the exact fault chain:
+
+| Register | Address | Observed value | Meaning |
+|---|---|---|---|
+| `PC` | (via `get_reg pc`) | `0xFFFFFFFE` | LOCKUP state address |
+| `xPSR` exception number | (via `get_reg xPSR`) | `3` | Exception escalated to HardFault |
+| `HFSR` | `0xE000ED2C` | `0x40000000` | `VECTTBL` bit set: vector table read fault occurred |
+| `DFSR` | `0xE000ED30` | `0x00000001` | `HALTED` bit set: a halt request was received |
+| `VTOR` | `0xE000ED08` | application value | Vector table offset register was configured (not at default `0x00000000`) |
+| FMC `VECMAP` | `0x4000C02C` | `0x00000000` | `APROM` mapped at `0x00000000` |
+| `SP` | (via `get_reg sp`) | valid | Stack pointer was valid at time of fault |
+| `LR` | (via `get_reg lr`) | `EXC_RETURN` | Core was in exception context when halted (bootloader interrupt handler active) |
+
+The `HFSR.VECTTBL` bit (`0x40000000`) is the load-bearing finding. It confirms that the core attempted to vector to the HardFault handler at `0x0000000C`, the vector-table read fetched from locked `APROM` and returned `0xFFFFFFFF` (consistent with all debug-AP reads of locked flash returning `0xFFFFFFFF`), and the core branched to `0xFFFFFFFE` (the `0xFFFFFFFF` value with the Thumb bit cleared). ARMv7-M then escalated the HardFault to LOCKUP because the branch target is an invalid address.
+
+The `DFSR.HALTED` bit confirms the trigger: a debug halt request was received. The `LR = EXC_RETURN` value shows the core was running in an exception context (an interrupt handler) when the halt arrived, which is consistent with the bootloader's normal execution loop.
+
+### Mechanism
+
+The exact sequence inside the closed Nu-Link firmware is not observable, but the ARM architecture and the fault-register evidence support this chain:
+
+1. As part of `CONNECT_NORMAL`, the Nu-Link firmware writes `DHCSR` to set `C_DEBUGEN` and `C_HALT`. This is the standard ARM debug halt sequence.
+
+2. On the M483 with `SBLOCK` active and the core running from locked `APROM`, the debug-enable transition triggers a fault. The mechanism could be a debug-related bus fault when the `AHB-AP` is powered while the core is mid-instruction, a silicon-specific interaction between the flash controller's security state and debug enable, or the Nu-Link firmware writing additional debug registers as part of its connect sequence that trigger a fault on a locked part.
+
+3. The core vectors to the fault handler at `0x0000000C`. At this point, with the debugger connected and the core transitioning to exception state, the vector table read through the I-bus returns `0xFFFFFFFF` - the locked-flash read value observed through the debug AP. This sets `HFSR.VECTTBL`.
+
+4. The core attempts to fetch from `0xFFFFFFFE` (`0xFFFFFFFF` with Thumb bit cleared). This is an invalid address.
+
+5. ARMv7-M escalates this to LOCKUP: `PC` permanently set to `0xFFFFFFFE`, no further instructions executed. Only a reset (pin reset, `SYSRESETREQ`, or power cycle) can escape LOCKUP.
+
+The upstream Nuvoton OpenOCD driver never hits this code path because `nulink_usb_open()` always runs `RESET_HW` before `CONNECT_NORMAL` - the core is in reset, stopped, when the connect runs. The safe-connect layout deliberately suppresses the reset (`RESET_NONE`) but still sends `CONNECT_NORMAL` to power the `AHB-AP`, creating the untested combination: connect-with-halt on a running core.
+
+The `cortex_m_poll()` function in OpenOCD's Cortex-M target layer can recover debug access to a locked-up core by writing `C_HALT` to `DHCSR` (clearing the LOCKUP state), which restores register reads through the debug AP. The core remains dead until a physical reset.
+
+### A gentler connect mode: CONNECT_DISCONNECT investigation
+
+The Nu-Link protocol defines `CONNECT_DISCONNECT` (enum value `4`) as a non-perturbing connect mode. It is used by the upstream Nuvoton OpenOCD driver in its close handler for clean disconnection, explicitly paired with `RESET_NONE`, and documented as supporting the no-reset case. The hypothesis: replacing `CONNECT_NORMAL` with `CONNECT_DISCONNECT` in the safe-connect path would tell the Nu-Link firmware to power the `AHB-AP` without halting the core.
+
+Three outcomes are possible:
+
+1. **`AHB-AP` powered, core running.** Memory reads work, the core keeps executing, and the USB peripheral remains alive. This is the non-perturbing observe mode needed for DWT-based CPU-bus observation without voltage glitching.
+2. **`AHB-AP` not powered, reads echo `DPIDR`.** The `CONNECT_DISCONNECT` mode releases the debug connection without powering the `AHB-AP`. Every memory read echoes the stale `DPIDR` value `0x2ba01477` - the same failure mode as the early safe-connect patch that skipped `CMD_MCU_RESET` entirely. A separate AP power-up command would be needed.
+3. **Same lockup.** `CONNECT_DISCONNECT` also halts the core, or the M483 silicon always faults on debug connection regardless of connect mode.
+
+Resolved on the bench (2026-11-16): `CONNECT_DISCONNECT` does NOT power the `AHB-AP`. Reads returned a garbage `IDCODE` (`0x0bbc0bc7`, not `0x2ba01477`) and `SRST` was rejected - the same dead-transport failure mode as the early safe-connect patch that skipped `CMD_MCU_RESET` entirely. So outcome 2 is the measured one: the Nu-Link powers the AP only inside `CONNECT_NORMAL`, bundled with the halt, and offers no power-without-halt path. No debug-attach sequence against a locked M480/M483 through the Nu-Link is side-effect-free; a raw-SWD probe that powers the AP directly (no bundled halt) is the remaining alternative. Reads through the raw memory-access path still work on the locked-up core, which is what the fault-injection read-back relies on.
+
 ## What to do about it
 
 | Practice | Evidence |
