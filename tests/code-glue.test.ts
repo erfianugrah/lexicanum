@@ -54,6 +54,26 @@ describe("rehypeCodeGlue", () => {
       .toBe("<p>see [(<a>`foo` docs</a>),] then</p>");
   });
 
+  test("a lone code carries its glued character count; several codes do not", () => {
+    const lone = code("ISPFF");
+    rehypeCodeGlue()(el("p", lone, t(").")));
+    expect(lone.properties?.style).toBe("--glue:2");
+    const a = code("CONFIG0");
+    rehypeCodeGlue()(el("td", t("("), a, t(".."), code("3"), t(")")));
+    expect(a.properties?.style).toBeUndefined();
+  });
+
+  test("glues several codes only while the word fits a phone line", () => {
+    expect(run(el("p", t("("), code("0x00300500"), t("-"), code("0x003005FF"), t(")"))))
+      .toBe("<p>[(`0x00300500`-`0x003005FF`)]</p>");
+    expect(run(el("p", code("MIGRATIONS_PASSED"), t("/"), code("FUNCTIONS_DEPLOYED"))))
+      .toBe("<p>`MIGRATIONS_PASSED`/`FUNCTIONS_DEPLOYED`</p>");
+  });
+
+  test("leaves a word alone when too much text would be glued", () => {
+    expect(run(el("p", code("x"), t("-and-a-very-long-suffix")))).toBe("<p>`x`-and-a-very-long-suffix</p>");
+  });
+
   test("block siblings end a word", () => {
     expect(run(el("tr", el("td", code("a")), el("td", t("b"))))).toBe("<tr><td>`a`</td><td>b</td></tr>");
   });
