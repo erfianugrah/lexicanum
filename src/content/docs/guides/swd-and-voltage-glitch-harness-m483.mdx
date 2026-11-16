@@ -132,7 +132,7 @@ Inspecting OpenNuvoton's USB JTAG/SWD driver source (`src/jtag/drivers/`)[^openo
 To prevent both hazards, apply a dedicated safe-connect HLA layout patch to xPack OpenOCD (`7bb05570f40dae2c742e6e581db4129468fed689`)[^xpack]:
 
 1. Register a separate safe HLA layout so an unpatched OpenOCD binary fails closed before opening the USB device.
-2. In the safe connect path, force `if_target_power_supplied(0)` (`supply=0`), skip hardware reset on open, and reject explicit `SRST` assertions.
+2. In the safe connect path, force `if_target_power_supplied(0)` (`supply=0`), send `CMD_MCU_RESET` in connect-only mode (`reset type 5` with `CONNECT_NORMAL`, powering the debug `AHB-AP` with zero pin or software reset), and reject explicit `SRST` assertions.
 3. Expose a read-only `hla_command "raw_mdw <address>"` backed by the Nu-Link memory-read API so single 32-bit words can be queried without Cortex-M `CPUID` target examination.
 
 ```tcl
@@ -142,6 +142,12 @@ hla_vid_pid 0x0416 0x511c 0x0416 0x511d 0x0416 0x5200
 transport select hla_swd
 adapter speed 200
 ```
+
+### The connect-only AP power-up trap: why skipping reset broke HLA memory reads
+
+In the OpenNuvoton USB JTAG/SWD driver (`src/jtag/drivers/`)[^openocdnuvoton], adapter open calls the reset helper, which sends `CMD_MCU_RESET` bundling a hardware or system reset (`RESET_HW` or `RESET_SYSRESETREQ`) with `CONNECT_NORMAL`. When the initial version of the safe-connect patch skipped that `CMD_MCU_RESET` call altogether to avoid resetting the live mouse, it also skipped `CONNECT_NORMAL` - the command that tells the Nu-Link firmware to power up and initialise the target's Cortex-M Debug Access Port (`AHB-AP`). With the Debug Port (`DP`) awake (`DPIDR = 0x2ba01477`) but the `AHB-AP` never connected to the internal bus, every subsequent HLA memory read echoed the stale `DPIDR` word `0x2ba01477` from the adapter buffer.
+
+Replacing the skipped call with a connect-only handshake (`CMD_MCU_RESET` using connect-only `reset type 5` and `CONNECT_NORMAL`, while keeping `supply=0` and suppressing all resets) powered the `AHB-AP` without resetting the chip. On the same locked board, OpenOCD then examined `Cortex-M4 r0p1`, read the real part ID from `SYS_PDID` (`0x40000000` = `0x00d48310`), and read live `SRAM` (`0x20000000`, initial stack pointer `0x20001c60`), while `APROM` (`0x00000000`), `LDROM` (`0x00100000`), and `SPROM` (`0x00200000`) returned `0xffffffff` under the flash lock. Note that `CONNECT_NORMAL` halts the running core on attach; resume or power-cycle the target after the read check completes.
 
 ### Fail-closed DPIDR check and the voltage-channel echo trap
 
@@ -200,13 +206,14 @@ Before declaring the harness ready for any readback or fault experiment, confirm
 | Glitcher USB enumeration | Plug Faultier USB in before target power; check Windows Device Manager | Composite device starts cleanly; no warning icon | Windows error code 10 (`This device cannot start`) -> unplug target power and probe |
 | Rail voltage and ownership | DMM DC volts on pin 51 (`VDD`) and pin 50 (`LDO_CAP`); OpenOCD safe-layout log | `VDD` `~3.3 V`, `LDO_CAP` `~1.26 V`, `if_target_power_supplied(0)` | Probe voltage near `5 V` or `supply=1` |
 | Target SWD identity | Run safe-layout ID check at `200 kHz` | Exact `DPIDR` `0x2ba01477` on 3 consecutive runs | Process exits `0` with `0x0b9f0b9f` or other voltage-echo word |
+| Address-sensitive `AHB-AP` read | With connect-only `CONNECT_NORMAL` (`reset type 5`), read `SYS_PDID` (`0x40000000`), `SRAM` (`0x20000000`), and `APROM` (`0x00000000`) | `SYS_PDID` reads `0x00d48310`, `SRAM` returns live words (`0x20001c60`), `Cortex-M4 r0p1` examines cleanly, `APROM` reads `0xffffffff` | Every address echoes `DPIDR` (`0x2ba01477`) -> `AHB-AP` not connected |
 | Crowbar delivery | Single `1 us` and `40 us` `VDD` calibration pulses with `1`-`2 MHz` LA on `D0`=`nRESET`, `D1`=`VDD` | `1 us` shows `VDD` dip with `nRESET` high; `40 us` shows `nRESET` low `~35`-`37 us` after `VDD` fall | No `VDD` transition on LA, or board warms up while idle |
 
 ## Gotchas and lessons learned
 
 - **Back-powering through GPIO ESD diodes mimics a dead glitcher.** When Windows reported code 10 on Faultier's composite USB device, the hardware was undamaged: `3.3 V` on the crowbar drain was back-feeding the RP2040 `3V3` rail before USB enumeration. Enforcing a single rail owner (`supply=0` on Nu-Link, `Program VCC` disconnected on Faultier) and plugging Faultier USB in before target power eliminated the fault immediately.
 - **OpenOCD exit status `0` is not target detection.** Stock scripts that only check whether `openocd` exited cleanly will pass when the target is completely disconnected, because the Nu-Link driver prints voltage-channel words (`0x06230625`, `0x0b9f0b9f`) as the `IDCODE`. Always parse the output log and assert `DPIDR == 0x2ba01477`.
-- **Repeated `0x2ba01477` on memory reads is a lock signature, not memory content.** Once `SWCLK` contact was repaired, reading Cortex-M `CPUID` (`0xe000ed00`), `CONFIG0`..`CONFIG3` (`0x00300000`), `APROM` (`0x00000000`), and peripheral registers via `raw_mdw` returned `0x2ba01477` at every address. Because `CPUID` returned `0x2ba01477`, OpenOCD decoded `PARTNO` as `0x147` and refused normal `mdw` commands with `Target not examined yet`. Why that happens - and why you cannot run a fault-injection sweep until you have a positive control that beats it - is the subject of [Nuvoton M483 flash locks and the glitch-oracle trap](/reference/m483-flash-locks-and-glitch-oracles/).
+- **Repeated `0x2ba01477` on memory reads is a dead-transport echo, not memory content or a lock signature.** Once `SWCLK` contact was repaired, reading Cortex-M `CPUID` (`0xe000ed00`), `CONFIG0`..`CONFIG3` (`0x00300000`), `APROM` (`0x00000000`), and peripheral registers via `raw_mdw` returned `0x2ba01477` at every address. Because `CPUID` returned `0x2ba01477`, OpenOCD decoded `PARTNO` as `0x147` and refused normal `mdw` commands with `Target not examined yet`. That happened because skipping `CMD_MCU_RESET` altogether on open also skipped `CONNECT_NORMAL`, leaving the `AHB-AP` unpowered so every HLA read echoed the `DPIDR` word. Switching the safe-connect driver to connect-only mode (`CMD_MCU_RESET` with `reset type 5` and `CONNECT_NORMAL`) powered the `AHB-AP` without resetting the chip: `SYS_PDID` (`0x40000000`) then read `0x00d48310`, `SRAM` (`0x20000000`) read live data (`0x20001c60`), and `APROM` still returned `0xffffffff`. Why that happens - and why you cannot run a fault-injection sweep until you have a positive control that beats it - is the subject of [Nuvoton M483 flash locks and the glitch-oracle trap](/reference/m483-flash-locks-and-glitch-oracles/).
 - **Never move `VDD_SENSE` to `LDO_CAP` (pin 50).** Pin 50 sits right next to pin 51 (`VDD`), but it carries the `1.26 V` internal core regulator output. Connecting a probe's `VCC` sense pin to pin 50 produces a `~1.26`-`1.8 V` target-voltage reading and breaks `3.3 V` level translation.
 
 ## File reference
