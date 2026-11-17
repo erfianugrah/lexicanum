@@ -12,6 +12,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import satori from "satori";
 import sharp from "sharp";
+import { TAXONOMY } from "./taxonomy.mjs";
 
 // Dark palette from src/styles/house.css (:root[data-theme="dark"] block).
 const P = {
@@ -44,11 +45,9 @@ const FONT_FILES = {
   inconsolata400: `${WF}/inconsolata/files/inconsolata-latin-400-normal.woff`,
 };
 
-// Taxonomy ids in order (from src/lib/taxonomy.mjs).
-const TAX_ORDER = [
-  "supabase", "cloudflare", "kubernetes", "networking", "homelab",
-  "forge", "secrets", "hardware", "workstations",
-];
+// Taxonomy ids in order, from the one table (a hardcoded copy here went stale
+// when categories were added). Hues wrap at 9, as in the sidebar.
+const TAX_ORDER = TAXONOMY.map((c) => c.id);
 
 /** Count .mdx files in src/content/docs/<sub>/ */
 const countDocs = async (root, sub) =>
@@ -141,7 +140,7 @@ export async function writeOgCard(root, outDir, opts = {}) {
               style: {
                 width: 10,
                 height: 10,
-                background: HUES[i],
+                background: HUES[i % HUES.length],
               },
             },
           },
