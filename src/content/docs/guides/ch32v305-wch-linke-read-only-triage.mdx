@@ -1,0 +1,129 @@
+---
+title: CH32V305 WCH-LinkE read-only debug triage
+description: Attach triage, FX2 logic-analyzer capture workflow, and the corrected WCH-LinkE JP1 pinout for a CH32V305GBU6 target returning wlink protocol error 0x55 - no attach, no erase, no debug enable without an independently protected backup.
+author: Erfi Anugrah
+category: reverse-engineering
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This is a separate CH32V305 RISC-V target. The WCH-LinkE probe (`1a86:8010`, RV mode, firmware `v3.6(v42)`) can see the chip's 2-wire SDI at the electrical level - logic-analyzer activity confirms both SWCLK and SWDIO transition during attach - but `wlink v0.1.3`'s `AttachChip` command fails with protocol error `0x55` (`[0x81, 0x55, 0x01, 0x01]`). This error occurs before `ChipID` and `RDPR` status are available; it does not confirm that the chip's option bytes lock the debug interface.
+
+This page covers: the corrected WCH-LinkE JP1 pinout, the exact wire-level meaning of the `0x55` error and why it happens before any protection status query, the FX2 logic-analyzer capture workflow and the re-enumeration gotcha, an activity-not-decode caveat, and read-only next steps. No erase, unprotect, or debug-enable instructions are included.
+
+For the related Nuvoton M483 lock model, see [Nuvoton M483 flash locks and the glitch-oracle trap](/reference/m483-flash-locks-and-glitch-oracles/). For the SWD harness on that target, see [Read-only SWD and voltage-glitch harness on a locked Nuvoton M483](/guides/swd-and-voltage-glitch-harness-m483/).
+
+<Aside type="note" title="2026-11-17 status">
+One live session with a WCH-LinkE (`1a86:8010`, RV mode, firmware `v3.6(v42)`), `wlink v0.1.3`, and an `fx2lafw` logic analyzer on the CH32V305 SDI lines. Continuity-tested, target-powered (`3.3 V` at the probe pads), four wire runs, both high and low speed, all returning the same `0x55` attach error. No `ChipID`, no `RDPR` status, no flash read, no erase or debug-enable command issued.
+</Aside>
+
+## Constants
+
+| Component | Identifier / value |
+|---|---|
+| Target MCU | WCH `CH32V305GBU6` (`QFN28`)[^ch32v305ds] |
+| SDI data | `PA13` / `SWDIO`, pin 19 |
+| SDI clock | `PA14` / `SWCLK`, pin 22 |
+| Ground | `VSS`, pin 20 |
+| Supply | `VDD`, pin 21 (`3.3 V`) |
+| Debug probe | WCH-LinkE-R0-1v3, USB `1a86:8010` in RV mode, firmware `v3.6(v42)` |
+| `wlink` version | `v0.1.3` (`ch32-rs/wlink`) |
+| Target USB VID:PID | `3710:5406` (normal boot enumeration) |
+| Logic analyzer | `fx2lafw`-compatible via `sigrok-cli`, `usbipd`-attached |
+
+## WCH-LinkE JP1 pinout (corrected)
+
+The official WCH-LinkE-R0-1v3 schematic (page 1)[^wchlinke] confirms:
+
+| JP1 pin | Signal |
+|---|---|
+| 1 | RX |
+| 2 | SWCLK/TCK |
+| 3 | TX |
+| 4 | SWDIO/TMS |
+| 5 | TDO |
+| 6 | GND |
+| 7 | TDI |
+| 8 | 3V3 |
+| 9 | RST |
+| 10 | 5V |
+
+A raw worker note that proposed a different order was wrong. Use the pinout above. For 2-wire SDI: JP1 pin 2 (SWCLK) to target PA14 (pin 22), JP1 pin 4 (SWDIO) to target PA13 (pin 19), JP1 pin 6 (GND) to target VSS (pin 20).
+
+## SDI vs SWD naming
+
+WCH reuses the ARM pin names `SWDIO`/`SWCLK`, but the protocol is WCH-proprietary SDI (Serial Debug Interface). A standard ARM SWD debugger (CMSIS-DAP, J-Link in SWD mode) cannot talk to a CH32V305. The WCH-LinkE must be in RV mode (not ARM-DAP mode), and `wlink` implements the SDI protocol. The WCH-LinkRV bulk USB protocol uses OUT endpoint `0x01` and IN endpoint `0x81`; normal responses begin with `0x82`, error responses with `0x81`.
+
+## What the 0x55 error means at the wire level
+
+In `wlink v0.1.3`, a session starts by opening the USB bulk interface and sending:
+
+1. `GetProbeInfo` (`[0x81, 0x0d, 0x01, 0x01]`) - succeeds, probes the WCH-LinkE itself.
+2. Up to 4 attempts (initial + 3 retries, 100 ms apart) of:
+   - `SetSpeed` (`[0x81, 0x0c, 0x02, <riscvchip>, <speed>]`) - succeeds.
+   - `AttachChip` (`[0x81, 0x0d, 0x01, 0x02]`) - **fails with `0x55`**.
+
+`AttachChip` instructs the WCH-LinkE MCU to initiate the 2-wire SDI handshake with the target RISC-V Debug Module and read its `ChipID`. When the probe cannot complete this handshake, it replies:
+
+- `[0x81, 0x55, 0x01, 0x01]`
+  - `0x81`: error response marker
+  - `0x55`: error reason "failed to connect with riscvchip"[^wlinkproto]
+  - `0x01`: payload length 1
+  - `0x01`: failure subcode
+
+The attach error happens during **Stage 1** (`AttachChip`). Stage 2 (`CheckReadProtect`, `[0x81, 0x06, 0x01, 0x01]`) runs only AFTER `AttachChip` succeeds and returns chip family + `ChipID`. Because `0x55` occurs in Stage 1, `ChipID` and `RDPR` status are unqueried. The error proves the SDI handshake did not complete. It does not confirm that option-byte locks are active.
+
+### Possible causes of `0x55`
+
+From the WCH official OpenOCD driver[^wlinkec] and `ch32-rs/wlink` issue reports[^wlink94]:
+
+1. **Physical SDI connection or target power issue**: open/swapped `SWDIO` (PA13, pin 19) or `SWCLK` (PA14, pin 22), missing common GND, or unpowered target VDD. The live session eliminated these: all four wire runs were continuity-tested, and the target pad measured `3.3 V`.
+2. **Debug interface disabled or locked in option bytes / bootloader config (`RDPR != 0xA5`)**: on CH32V30x, the option-byte register `RDPR_USER` has reset/unprotected value `0x00FF5AA5` (`RDPR = 0xA5`). A chip whose 2-wire SDI is closed at boot or by ISP config can refuse `AttachChip`. Debug-enable/configuration transitions may mass-erase code flash; do not attempt them without an independently protected backup.
+3. **Application firmware reconfiguring PA13/PA14 or entering a tight loop after boot**: firmware can disable SDI on PA13/PA14 microseconds after reset release. `AttachChip` does not assert the hardware `nRST` pin; if the firmware disables SDI immediately, a USB-paced attach cannot catch the boot window.
+
+## Logic-analyzer workflow and FX2 re-enumeration gotcha
+
+The generic FX2 analyzer is attached through `usbipd` and driven by `sigrok-cli`. The capture workflow has a USB re-enumeration gotcha: when `sigrok` uploads firmware to the FX2, the USB device briefly disappears and re-appears. If the device is attached through `usbipd` when this happens, the attachment is dropped and must be re-attached. The workflow is now automated by `tools/capture/fx2-capture.py` and documented in the `fx2-logic-analyzer` skill.
+
+With CH0/D0 on target SWCLK (PA14, pin 22) and CH1/D1 on target SWDIO (PA13, pin 19):
+
+| Capture | CH0 transitions | CH1 transitions | Attach result |
+|---|---:|---:|---|
+| First | 0 | 12,118 | `0x55` |
+| Tool self-test | 49,782 | 11,838 | `0x55` |
+| Repeat | 163,482 | 12,248 | `0x55` |
+
+In the repeat capture both channels began transitioning at the same sample. The initial flat SWCLK is therefore not reliable evidence of a missing clock. The reproducible result is probe activity on both SDI lines while target attach still fails.
+
+### Activity is not decode
+
+The logic-analyzer capture counts digital transitions. It does not decode the SDI protocol or verify that the target ever responds. The recorded activity is probe-driven (the WCH-LinkE sending the attach sequence). A silent target would still show probe-driven transitions on both lines. A full protocol decode or an `NRST`-controlled attach is required to separate the cases.
+
+<Aside type="caution" title="No erase or unprotect without an independent backup">
+Do not run `wchisp config enable-debug`, WCH-LinkE special erase commands, or any `EraseCodeFlash` variant without an independently protected backup covering application image, option bytes, and bootloader region. The live session ran read-only; flash was not read or erased.
+</Aside>
+
+## Read-only next steps
+
+1. **Protocol-decode the existing captures.** Run a WCH SDI protocol decoder against the `sigrok` captures to determine whether the target ever sends a response or remains silent throughout the handshake. A silent target points at debug disable or firmware pin reconfiguration; a partial response points at a timing or electrical issue.
+2. **`NRST`-controlled attach.** Target pad `P7` has now been continuity-confirmed to CH32 pin 3 `NRST`; JP1 pin 9 is the reset candidate. Verify that the selected driver actually asserts that pin before relying on the method - the recorded `wlink status` operation did not toggle it. A qualified held-reset attach prevents application firmware from reconfiguring PA13/PA14 during the attempt. Persistent `0x55` would still need the known-unprotected control before attribution.
+3. **ISP backup over USB/UART.** The CH32V305 has a bootloader ISP that operates over USB or UART before the application firmware runs. Check whether a read-only ISP backup path exists via `wchisp` or a similar tool. Do not issue any write, erase, or config-change command without a verified backup.
+4. **Qualified `NRST`-controlled attach with a known-unprotected CH32V305.** The positive control: attach to a development board or unlocked sample with known-unprotected option bytes. Without it, a persistent `0x55` cannot be attributed to the target.
+
+## Related docs
+
+- [Nuvoton M483 flash locks and the glitch-oracle trap](/reference/m483-flash-locks-and-glitch-oracles/) - the lock model, evidence timeline, and methodological lessons from a related investigation.
+- [Read-only SWD and voltage-glitch harness on a locked Nuvoton M483](/guides/swd-and-voltage-glitch-harness-m483/) - single-rail-owner SWD harness and safe-connect OpenOCD for a different target and debug transport.
+- [Agent-assisted reverse engineering](/reference/agent-assisted-reverse-engineering/) - static decompilation and protocol capture as the step before hardware probing.
+
+## References
+
+[^ch32v305ds]: WCH, "CH32V20x_30x Datasheet," QFN28 pinout (PA13=pin 19, PA14=pin 22), distributor-hosted copy. https://www.lcsc.com/datasheet/C19100608.pdf
+
+[^wchlinke]: WCH, "WCH-LinkE-R0-1v3 Schematic," page 1 JP1 header pinout. https://file.wch.cn/download/file?id=421
+
+[^wlinkproto]: ch32-rs/wlink contributors, "protocol.md" (v0.1.3), WCH-LinkRV bulk USB protocol. https://raw.githubusercontent.com/ch32-rs/wlink/v0.1.3/protocol.md
+
+[^wlinkec]: WCH/treideme, "wlinke.c," WCH Official OpenOCD driver. https://raw.githubusercontent.com/treideme/openocd-hacks/wch-riscv-2026/src/jtag/drivers/wlinke.c
+
+[^wlink94]: ch32-rs/wlink, Issue #94, "0x55 protocol error." https://github.com/ch32-rs/wlink/issues/94
