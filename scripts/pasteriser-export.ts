@@ -7,14 +7,13 @@
 // What changes and why (contrast scripts/rentry-export.ts, which flattens):
 // - frontmatter -> `# title`, the description as an italic lede, a canonical erfi.dev link
 // - footnotes kept: pasteriser renders GFM footnotes (marked-footnote, pasteriser#33)
-// - ```dot fences -> PNG via the local graphviz `dot` (white background, so it reads in
-//   both themes), referenced as fig/<slug>-<n>.png; publish uploads them same-origin
+// - ```dot fences kept: pasteriser draws them in the browser (Graphviz WASM) as
+//   theme-coloured SVG, like the site's build-time rehype-graphviz
 // - <Aside> and :::note blocks -> blockquotes with a bold label
 // - links to a doc in the set -> `<slug>.md#anchor` (pasteriser switches pages);
 //   other site links -> absolute https://erfi.dev URLs; in-page `#anchor` links kept
 // - `\$` -> `$` outside code (pasteriser has no math parser)
 // Anything left that pasteriser would render wrongly is listed on stderr.
-import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
@@ -33,7 +32,7 @@ const sitePath = (src: string) => {
 };
 const slugOf = new Map(srcs.map((s) => [sitePath(s), basename(s).replace(/\.mdx?$/, "")]));
 
-mkdirSync(join(outdir, "fig"), { recursive: true });
+mkdirSync(outdir, { recursive: true });
 const LABEL: Record<string, string> = { note: "Note", tip: "Tip", caution: "Caution", danger: "Danger" };
 const quote = (type: string, heading: string | undefined, text: string) =>
   `> **${heading ?? LABEL[type] ?? "Note"}:** ` + text.trim().replace(/\n/g, "\n> ");
@@ -53,14 +52,7 @@ for (const src of srcs) {
   if (!title) throw new Error(`${src}: no title`);
   let body = raw.slice(fm[0].length);
 
-  let fig = 0;
-  body = body.replace(/```dot\n([\s\S]*?)```/g, (_, dot: string) => {
-    const name = `fig/${slug}-${++fig}.png`;
-    const png = execFileSync("dot", ["-Tpng", "-Gdpi=144", "-Gbgcolor=white", "-Gpad=0.2"], { input: dot });
-    writeFileSync(join(outdir, name), png);
-    return `![Diagram ${fig}](${name})`;
-  });
-
+  const fig = (body.match(/^[ \t]*```(dot|graphviz)\b/gm) ?? []).length;
   body = body
     .replace(/^import .* from ["']@astrojs\/[^"']+["'];?\n/gm, "")
     .replace(/\{\/\*[\s\S]*?\*\/\}\n?/g, "")
