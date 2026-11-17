@@ -353,8 +353,14 @@ const pins: Pin[] = [
       "re-plans the schema",
       "## Every task, three ways",
     ],
-    // Removed because the two failure modes ARE distinguishable in the listing.
-    mustNotContain: ["the dashboard listing looks complete either way"],
+    mustNotContain: [
+      // Removed because the two failure modes ARE distinguishable in the listing.
+      "the dashboard listing looks complete either way",
+      // 2026-11-17: contradicted the page's own session-carry paragraph
+      // (2026-09-25: a copied refresh token refreshes at the target, 200).
+      // Access tokens stop verifying; sessions die only without the row copy.
+      "every user session dies at cutover",
+    ],
     sections: [/^#{2,3} .*Verification/m, /^#{2,3} .*Gotchas/m],
     anchors: ["measured-run-2026-07-30"],
     linksTo: [UPGRADE],
@@ -1096,7 +1102,16 @@ const pins: Pin[] = [
       // S19 drove HIBP at signup; the old hedge must not return.
       "signup was not driven in the lab",
       "was not driven in the lab",
+      // S23 (2026-10-23) measured pg_cron, webhooks and pg_net under
+      // restrict-all; the practices row kept the older hedge until 2026-11-17.
+      "Whether pg_cron jobs or database webhooks are affected was not measured",
     ],
+  },
+  {
+    doc: "reference/supabase-compute-disk",
+    // 2026-11-17: the TL;DR kept "1-2 minute window (measured)" after D09's
+    // re-run (2026-10-23) measured 144.528 to 254.886 s per resize in the body.
+    mustNotContain: ["1-2 minute window (measured)"],
   },
   {
     doc: "guides/supabase-own-postgrest",
