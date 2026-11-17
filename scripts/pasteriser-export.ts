@@ -5,19 +5,20 @@
 //
 // The first doc becomes the first page. Each doc is written as <outdir>/<slug>.md.
 // What changes and why (contrast scripts/rentry-export.ts, which flattens):
-// - frontmatter -> `# title`, the description as an italic lede, a canonical erfi.dev link
+// - frontmatter -> `# title` and the description as an italic lede (no author line)
 // - footnotes kept: pasteriser renders GFM footnotes (marked-footnote, pasteriser#33)
 // - ```dot fences kept: pasteriser draws them in the browser (Graphviz WASM) as
 //   theme-coloured SVG, like the site's build-time rehype-graphviz
 // - <Aside> and :::note blocks -> blockquotes with a bold label
-// - links to a doc in the set -> `<slug>.md#anchor` (pasteriser switches pages);
-//   other site links -> absolute https://erfi.dev URLs; in-page `#anchor` links kept
+// - self-contained, no trail back to the site: no canonical line, links to a doc in
+//   the set -> `<slug>.md#anchor` (pasteriser switches pages), links to any other
+//   site doc -> their link text only (a list item that opens with one is dropped);
+//   in-page `#anchor` and external links kept
 // - `\$` -> `$` outside code (pasteriser has no math parser)
 // Anything left that pasteriser would render wrongly is listed on stderr.
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
-const SITE = "https://erfi.dev";
 const [outdir, ...srcs] = process.argv.slice(2);
 if (!outdir || srcs.length === 0) {
   console.error("usage: bun scripts/pasteriser-export.ts <outdir> <doc.mdx>...");
@@ -63,12 +64,18 @@ for (const src of srcs) {
       quote(t, h, x),
     );
 
+  // A list item that opens with a link to a doc outside the set ("Related docs")
+  // points nowhere once the paste is self-contained: drop the item.
+  body = body.replace(/^[ \t]*[-*] \[[^\]]*\]\((\/[a-z0-9-]+\/[a-z0-9-]+)\/?(#[^)\s]*)?\).*\n?/gm, (line, path: string) =>
+    slugOf.has(`${path}/`) ? line : "",
+  );
+
   body = outside(body, /(^[ \t]*```[\s\S]*?^[ \t]*```)/m, (prose) =>
     outside(
-      // Site links: (/reference/x/#a) or (/reference/x#a) -> page in the set, else erfi.dev.
-      prose.replace(/\]\((\/[a-z0-9-]+\/[a-z0-9-]+)\/?(#[^)\s]*)?\)/g, (m, path: string, hash = "") => {
+      // Site links: [t](/reference/x/#a) -> page in the set, else plain text t.
+      prose.replace(/\[([^\]]*)\]\((\/[a-z0-9-]+\/[a-z0-9-]+)\/?(#[^)\s]*)?\)/g, (m, text: string, path: string, hash = "") => {
         const s = slugOf.get(`${path}/`);
-        return s ? `](${s}.md${hash})` : `](${SITE}${path}/${hash})`;
+        return s ? `[${text}](${s}.md${hash})` : text;
       }),
       /(`[^`\n]*`)/,
       (p) => p.replaceAll("\\$", "$"),
@@ -76,7 +83,7 @@ for (const src of srcs) {
   );
 
   const description = field("description");
-  const head = `# ${title}\n\n${description ? `*${description}*\n\n` : ""}Canonical: ${SITE}${sitePath(src)}\n\n`;
+  const head = `# ${title}\n\n${description ? `*${description}*\n\n` : ""}`;
   const text = head + body.replace(/\n{3,}/g, "\n\n").trim() + "\n";
 
   const problems: string[] = [];
@@ -85,7 +92,7 @@ for (const src of srcs) {
     if (/^\s*```/.test(line)) inFence = !inFence;
     if (inFence) return;
     const prose = line.replace(/`[^`]*`/g, "");
-    for (const re of [/\]\(\//, /:::/, /<[A-Z]/, /\{\/\*/, /\\\$/]) {
+    for (const re of [/\]\(\//, /:::/, /<[A-Z]/, /\{\/\*/, /\\\$/, /erfi\.dev/i]) {
       if (re.test(prose)) problems.push(`${slug}.md:${n + 1}: ${re} ${line.slice(0, 90)}`);
     }
   });
