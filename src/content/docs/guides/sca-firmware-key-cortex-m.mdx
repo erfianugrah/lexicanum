@@ -1,89 +1,115 @@
 ---
-title: Recover a firmware key with power side-channel analysis on Cortex-M
-description: Using correlation power analysis (CPA) of a core-rail power tap to recover the decryption key of a locked Nuvoton M483SIDAE peripheral whose firmware reads back encrypted but executes from flash - no glitch, no unlock, no flash mutation.
+title: Test a firmware cipher with power side-channel analysis on Cortex-M
+description: Use simple power analysis (SPA) of a core-rail tap to test firmware encryption architecture and cipher models, then apply correlation power analysis (CPA) only when the algorithm, input variance, trigger, and leakage evidence support it.
 author: Erfi Anugrah
 category: reverse-engineering
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-When a locked Cortex-M peripheral returns its firmware only as ciphertext, the cheapest way to the plaintext is usually not the debug port at all. The Nuvoton `M483SIDAE` has no hardware cryptography engine, so the cipher that protects the firmware runs in software on the Cortex-M4 - and a software cipher's power draw varies with the key bits it processes. That variation is a side channel: measure the core rail during the operation that uses the key, and correlation power analysis (CPA) recovers the key without glitching, unlocking, or writing a byte.
+When a locked Cortex-M peripheral returns firmware only as ciphertext, power analysis provides a passive way to test where encryption happens and whether a candidate key-recovery model applies. The Nuvoton `M483SIDAE` has no hardware cryptography engine, so a firmware cipher would execute as ordinary Thumb code. That does not identify the cipher family or guarantee usable power leakage.
 
-This guide covers when that applies, the execution model that decides what to measure, the core-rail measurement front-end, and a working CPA script. It is the passive companion to [read-only SWD and voltage-glitch harness on a locked Nuvoton M483](/guides/swd-and-voltage-glitch-harness-m483/), which attacks the same target with fault injection instead. The lock architecture that makes the debug path unrewarding is in [Nuvoton M483 flash locks and the glitch-oracle trap](/reference/m483-flash-locks-and-glitch-oracles/); the USB host side of the same peripheral is in [8 kHz mouse polling on Windows](/guides/8khz-mouse-merged-reports-windows/).
+This guide covers the architecture question, an SPA-first measurement ladder, the core-rail front-end, and a CPA script whose self-test validates synthetic AES only. SPA requires repeated captures and reference operations; one trace cannot separate cipher rounds from copying, checksums, USB, or flash activity. It is the passive companion to [read-only SWD and voltage-glitch harness on a locked Nuvoton M483](/guides/swd-and-voltage-glitch-harness-m483/), which attacks the same target with fault injection instead. The lock architecture that makes the debug path unrewarding is in [Nuvoton M483 flash locks and the glitch-oracle trap](/reference/m483-flash-locks-and-glitch-oracles/).
 
 ## When power analysis applies
 
-Power analysis is worth trying when three conditions hold:
+Power analysis is worth trying when four conditions hold:
 
-- The chip has **no hardware crypto engine**, so the cipher is software. On the `M483SIDAE` the datasheet's cryptography row is empty[^m480ds], so AES (or a custom block cipher) runs as ordinary Thumb code whose power consumption is data-dependent.
-- The device performs an operation that **uses the key where you can observe it** - a firmware read, a boot, or an update.
-- You have a **known input** for the statistical attack: the ciphertext (for a decryption or an encryption) is enough for a last-round CPA. You do not need the plaintext.
+- The device performs a candidate key-using operation where you can observe it: a firmware read, boot, or update. An empty cryptography row in the `M483SIDAE` datasheet supports a software-cipher model.[^m480ds]
+- SPA shows repeatable operation-dependent activity after accounting for reference commands, triggering, and front-end noise.
+- A cipher family and intermediate state provide a plausible leakage model. A same-block permutation with an offset-dependent tweak does not by itself identify AES.
+- CPA inputs vary at the analysed offset across traces and are known for every trace. Constant ciphertext provides zero input variance.
 
-The payoff is the key itself, which then decrypts the ciphertext you already hold offline. It does not depend on any debug-read primitive, which on this target the lock closes comprehensively.
+Key recovery is conditional on those measurements and on model validation. A quiet trace or null correlation is inconclusive until the observer and model have been qualified.
 
-## The execution model decides what to measure
+## The execution model and architecture question
 
-The measured facts on this peripheral: the application image read back over HID is ciphertext; the debug AHB-AP reads of flash return `0xFF`; and the chip has no execute-only memory (`XOM`) and no plaintext code in the sampled SRAM. Since the application demonstrably runs (the device works), and it cannot run from XOM or from a RAM copy that is not there, it must execute directly from flash. Therefore flash holds **plaintext**, and the HID read path **encrypts on egress** to produce the ciphertext you see.
+The measured facts on this peripheral: the application image read back over HID is ciphertext; debug AHB-AP flash reads return `0xFF`; and the chip has no execute-only memory (`XOM`). No plaintext application code or identified key/decrypt buffer appeared in the sampled SRAM snapshots. These facts favour **arch B**: plaintext executes from flash and the HID path encrypts on egress.
 
-That model - call it arch B - means **every firmware read runs the key**, so a read is the thing to measure. The alternative (arch A: ciphertext in flash, returned verbatim, decrypted somewhere executable) would mean the key is used at boot or during an update instead. The two are distinguished by the same capture: cipher activity during a read confirms arch B, its absence points to arch A and a boot/update target. Either way the capture yields both the architecture and the key.
+Arch B is a strong prior, not a forced deduction. Arch A (ciphertext at rest, decrypted somewhere executable) remains possible through transient or unobserved paths. Differential SPA is the planned architecture test; no physical capture has run.
 
 <Aside type="note" title="Model, not yet a direct measurement">
-The arch B deduction rests on (no XOM) + (no plaintext in sampled SRAM) + (a working application). It is the model that fits the evidence, not a proven fact. The read capture is also the experiment that confirms it - treat the first trace as the test of the model, not just a key-recovery run.
+The arch B deduction rests on (no XOM) + (no plaintext in sampled SRAM) + (a working application). It is a strong prior, not a forced conclusion. The first SPA trace is also the test of the model - treat it as the architecture discriminator, not just a key-recovery prelude.
+</Aside>
+
+## Experiment ladder: SPA first, CPA conditional
+
+### E1 - differential SPA-on-read (read-only, do first)
+
+Capture repeated power traces on `LDO_CAP` (pin 50) during plain `page read` and non-crypto reference commands (no update or flash mutation). Use fresh triggers and compare reads against `command completion`, filler-page reads, or invalid commands.
+
+- **Repeatable cipher-like activity specific to reads** supports arch B and identifies ordinary reads as a candidate CPA operation.
+- **No read-specific activity after the observer controls pass** redirects attention to boot/update decryption under arch A.
+
+Copying, checksums, USB, and flash activity can all resemble computation in one trace. Differential, repeatable evidence is required; one trace is exploratory.
+
+### E2 - boot/update SPA when more evidence is needed
+
+If read captures do not expose a useful pattern, capture the boot or update path and look for repeated macro-cycles over known 1,024-byte pages. Round-like structure can support an AES hypothesis; it does not prove AES or its key size. A different structure requires a different model or template/SPA analysis.
+
+The on-target evidence shows a same-block permutation with a per-offset tweak. That is consistent with several block-cipher constructions and leaves the family unknown.
+
+**Note**: this experiment writes one page via the normal update path. Use the fresh backup image so the official-updater recovery path stays valid, and satisfy the usual recovery manifest. No LDROM/CONFIG/OTP mutation.
+
+### E3 - CPA key recovery (conditional on an AES model and input variance)
+
+Attempt CPA only after SPA identifies a candidate operation and the AES-128 model is defensible:
+
+1. **Collect N traces** during operations with known, varying 16-byte ciphertext inputs. Group by block offset and keep the ciphertext associated with every trace.
+2. **Use the candidate leakage model** `HW(InvSBox(C[b] ^ K10[b]))`. For AES-128 this targets the final-round inverse S-box and can recover `K10`, which the key schedule inverts to the master key. A post-decrypt tweak may be irrelevant; a pre-decrypt tweak can fold into a per-offset result only when the model and offset alignment actually hold. Otherwise the model is invalid.
+3. **Evaluate the result adversarially.** Check correlation separation, stability across trace subsets, and a known-answer control. The published AES-bootloader work demonstrates the general CPA method on a different target and algorithm profile.[^oflynn]
+
+The `cpa_aes.py` script at the tooling path implements this model plus the key-schedule inversion and per-offset grouping. Its self-test recovers a known round-10 and master key from synthetic AES traces. **It validates the analysis against synthetic AES only.** If E2 shows the primitive is not AES, `cpa_aes.py`'s self-test proves nothing about the custom cipher and the output is meaningless. A null CPA result on real data can be from the capture (SNR, alignment, the model), or from the primitive not being AES - the SPA ladder is how you tell.
+
+<Aside type="caution" title="No constant-single-block CPA as a key-recovery recipe">
+A CPA that correlates the same single 16-byte block against every trace has zero input variance. The model's predictions are constant, the real leakage is constant, and the correlation collapses to noise. The ciphertext MUST vary at the same block offset across traces. Use two firmware versions or different code pages, and group traces by block offset so the per-offset tweak can be recovered as a constant offset rather than defeating the attack.
 </Aside>
 
 ## The core-rail measurement front-end
 
-The measurement point is the internal core regulator's capacitor node (`LDO_CAP`, `~1.26 V` on this part), which carries the core's instantaneous current draw. A 10x passive probe attenuates too much for the microvolt-level leakage, so the front-end is a 50-ohm, DC-blocked feed into the oscilloscope's sensitive 50-ohm range. The decoupling capacitor stays installed - it keeps the regulator stable; removing it would turn ripple into artifact.
+The measurement point is the internal core regulator's capacitor node (`LDO_CAP`, `~1.26 V` on this part), which carries the core's instantaneous current draw. A 10x passive probe attenuates too much for the microvolt-level leakage, so the front-end is a 50-ohm, DC-blocked feed into the oscilloscope's sensitive 50-ohm range.
 
 | Part | Role |
 |---|---|
 | Mini-Circuits `BLK-222+` (BNC-F/BNC-M DC block) | Blocks the rail's DC level into the scope |
 | Pomona `5187-C-24` (BNC-to-grab-hook lead) | Clips the `LDO_CAP` pad and the nearest ground |
-| Oscilloscope (`MHO954`, 12-bit, 4 GSa/s) | Captures the rail during the key-using operation |
-| Optional: a 20 dB low-noise amplifier (LNA) | Only if the unamplified rail is too quiet - measure first |
+| Oscilloscope (Rigol MHO954, 12-bit, 4 GSa/s) | Captures the rail during the key-using operation |
+| Optional: a 20 dB low-noise amplifier (LNA) | Only if the unamplified rail SNR is too low - measure first |
 
-Connect the DC block directly into the scope input, and the grab-hook lead into the DC block's female end. Set the channel to 50-ohm, 200 uV/div with a 250 MHz bandwidth limit. The internal-LDO / VCAP measurement technique is documented in a public advanced-usage guide for power side-channel work[^cwreg]. If a crowbar or glitcher shares the rail, disconnect it first so its MOSFET capacitance does not filter the signal.
+<Aside type="caution" title="LDO_CAP capacitor state">
+Source notes on whether the `LDO_CAP` decoupling capacitor is currently installed are conflicting. Verify the physical state of the board before connecting the probe. If in doubt, default to keeping the stability capacitor installed - it keeps the regulator stable, and removing it turns ripple into artifact. Do not remove it without confirming the board's current state first.
+</Aside>
+
+Connect the DC block directly into the scope input, and the grab-hook lead into the DC block's female end. Set the channel to 50-ohm, 200 uV/div with a 250 MHz bandwidth limit. If a crowbar or glitcher shares the rail, disconnect it first so its MOSFET capacitance does not filter the signal.
+
+<Aside type="note" title="LNA is a measurement, not a default">
+Do not buy the amplifier until the unamplified SNR is measured and proves to be noise-limited. An unamplified rail with adequate SNR is the cleaner signal - every amplifier adds its own noise floor. Measure first, buy only if needed.
+</Aside>
 
 ## Procedure
 
 1. **Qualify the observer before trusting a negative.** Confirm the rail shows real, repeatable activity for a known event (a read, a GPIO toggle) before concluding anything from a quiet trace. On this target several earlier "locked" results were broken probes, not the chip - a negative only counts when a known-positive and a known-negative control pass through the same setup in the same run.
-2. **Drive the key-using operation and capture on a fresh trigger.** For arch B, issue repeated firmware reads and capture the rail during each. For a boot target (arch A), power-cycle and capture from reset. Keep the trigger identical across captures so the traces align.
-3. **Collect traces with the known ciphertext.** A few hundred to a few thousand reads. Each trace pairs with the 16-byte ciphertext block of the page that was read. A per-offset tweak does not defeat the attack: a post-decrypt tweak has no effect on the model, and a constant pre-decrypt tweak just folds into the recovered value at that offset, so group traces by block offset.
-4. **Run CPA.** For each key byte and each of the 256 guesses, compute the predicted leakage and correlate it against the measured traces; the correct guess stands out. Then invert the AES key schedule to the master key.
-
-## The CPA model and script
-
-The leakage model that works for both architectures is the Hamming weight of the inverse S-box applied to the ciphertext XOR the round-10 key byte:
-
-```
-HW( InvSBox( C[b] ^ K10[b] ) )
-```
-
-For a decryption (arch A) this targets the first `InvSubBytes`; for an encryption (arch B) it targets the state before the last `SubBytes`. Both recover the round-10 key `K10`, which the AES-128 key schedule inverts to the master key. The method is the same one published work used to recover a firmware-update bootloader's AES key from known ciphertext[^oflynn].
-
-The script at `tools/sca/cpa_aes.py` implements exactly this, plus the key-schedule inversion and per-offset grouping:
-
-```bash
-python3 tools/sca/cpa_aes.py --traces reads.npy --ciphertexts block.bin --offset 0 --out result.json
-```
-
-`reads.npy` is a `(n_traces, n_samples)` array of rail samples aligned on the read trigger; `block.bin` is the 16-byte ciphertext block (or a per-trace array). Its self-test recovers a known round-10 and master key from synthetic traces, so a null result on real data points at the capture (SNR, alignment, the model), not at the analysis.
+2. **Run the SPA ladder first (E1 -> E2).** Use repeated read/reference traces to test arch A versus B, then boot/update traces if the read result is inconclusive. Collect a large CPA set only after the operation, cipher model, and input variance are defensible.
+3. **Drive the key-using operation and capture on a fresh trigger.** For arch B, issue repeated firmware reads and capture the rail during each. For a boot target (arch A), power-cycle and capture from reset. Keep the trigger identical across captures so the traces align.
+4. **Collect traces with the known ciphertext.** A few hundred to a few thousand reads. Each trace pairs with the 16-byte ciphertext block of the page that was read. Offset-dependent tweaks must be modelled explicitly: some constant pre-decrypt tweaks fold into a per-offset result, while other placements invalidate the AES intermediate-state assumption. Grouping by offset is necessary but does not prove the model.
+5. **Run CPA.** For each key byte and each of the 256 guesses, compute the predicted leakage and correlate it against the measured traces; the correct guess stands out. Then invert the AES key schedule to the master key.
 
 ## Gotchas
 
 - **A quiet trace is not a null result.** It can mean bad triggering, an idle rail, or the wrong architecture - re-qualify the observer before concluding the cipher is not there.
-- **One trace never decides the architecture.** Checksums, copying, USB and flash activity all draw current. Use a non-crypto reference (a filler-page read, an invalid command) to subtract the baseline before claiming cipher structure.
-- **Input variance matters.** Re-reading one page gives no CPA variance; use pages whose ciphertext differs at the same block offset (two firmware versions, or different code pages).
+- **One trace never decides the architecture alone.** Checksums, copying, USB and flash activity all draw current. Use a non-crypto reference (a filler-page read, an invalid command) to subtract the baseline before claiming cipher structure.
+- **Input variance matters.** Re-reading one page gives no CPA variance; use pages whose ciphertext differs at the same block offset (two firmware versions, or different code pages). Group traces by block offset so the per-offset tweak is recovered as a constant, not a noise source.
 - **The LNA is a measurement, not a default.** Buy the amplifier only after the unamplified rail proves to be noise-limited.
+- **CPA only works if the primitive is AES.** The `cpa_aes.py` self-test validates synthetic AES; if E2 shows a non-AES primitive, CPA with an AES model produces garbage. Template/SPA fingerprinting replaces it.
 
 ## Related docs
 
+- [Nuvoton M483 flash locks and the glitch-oracle trap](/reference/m483-flash-locks-and-glitch-oracles/) - the lock architecture, evidence timeline, and open-avenue ledger for the same target.
 - [Read-only SWD and voltage-glitch harness on a locked Nuvoton M483](/guides/swd-and-voltage-glitch-harness-m483/) - the active, fault-injection companion to this passive method.
-- [Nuvoton M483 flash locks and the glitch-oracle trap](/reference/m483-flash-locks-and-glitch-oracles/) - why the debug path is closed and why a readback oracle matters.
+- [CH32V305 WCH-LinkE read-only debug triage](/guides/ch32v305-wch-linke-read-only-triage/) - SDI attach triage for a separate RISC-V target.
 - [8 kHz mouse polling on Windows](/guides/8khz-mouse-merged-reports-windows/) - the USB host side of the same peripheral.
 
 ## References
 
 [^m480ds]: Nuvoton Technology Corp., "NuMicro Family M480 Series Datasheet," Rev. 3.09. https://www.nuvoton.com/export/resource-files/en-us--DS_M480_Series_EN_Rev3.09.pdf
-[^cwreg]: "Internal Regulators and VCAP," an advanced-usage guide to measuring a chip's internal core regulator for power side-channel analysis.
-[^oflynn]: C. O'Flynn and Z. Chen, "Power Analysis of a Firmware Update Bootloader," IACR ePrint 2014/899.
+[^oflynn]: C. O'Flynn and Z. Chen, "Side Channel Power Analysis of an AES-256 Bootloader," Cryptology ePrint Archive, Paper 2014/899. https://eprint.iacr.org/2014/899
