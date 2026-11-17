@@ -422,7 +422,10 @@ Run `bun run build` and confirm:
 - `bun test` is green. ALL doc checks live in `tests/` and run inside `bun run build`,
   so a defect fails the build instead of appearing on the page. `scripts/` holds
   tooling only (`new-doc.ts`, the scaffolder; `rentry-export.ts`, which turns a
-  doc into rentry.co markdown for an off-site copy) - checks live here in `tests/`,
+  doc into rentry.co markdown for an off-site copy; `pasteriser-export.ts`, which
+  turns a set of docs into a multi-page pasteriser.io paste with footnotes, page
+  links and dot diagrams as PNGs, published with `pasteriser publish <outdir>`) -
+  checks live here in `tests/`,
   after the old verify scripts were either absorbed or found to be vacuous.
   - `tests/docs.test.ts` - corpus-wide structure: split tables, footnote balance,
     smart punctuation, math-risk dollars, internal links, draft links, dot-fence
