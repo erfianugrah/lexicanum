@@ -78,9 +78,24 @@ export const TAXONOMY = [
     blurb: "Designing, ordering and bringing up hardware: the GRIDDLE LX Hall-effect keyboard series.",
   },
   {
+    id: "reverse-engineering",
+    label: "Reverse engineering",
+    blurb: "Locked microcontrollers, fault injection, side channels and decompilers: getting at what a device or binary will not show.",
+  },
+  {
+    id: "coding-agents",
+    label: "Coding agents and LLMs",
+    blurb: "The agent harness, the models behind it, and the working methods that keep them honest.",
+    groups: [
+      { id: "harness", label: "Harness and tooling" },
+      { id: "models", label: "Models and local inference" },
+      { id: "workflow", label: "Methods and review" },
+    ],
+  },
+  {
     id: "workstations",
     label: "Workstations and tooling",
-    blurb: "Hardware tuning and the tooling around the machines.",
+    blurb: "Machine tuning, audio and input latency, Windows and WSL2, and the desktop tooling around them.",
   },
 ];
 
