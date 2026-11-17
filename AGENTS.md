@@ -386,8 +386,13 @@ importance-announcing, colon-headline stamps, negative parallelism) from the
 post-contract docs and normalised their prose spelling to British -ise; the
 regex-able subset of those tells gates the build via `LLM_MARKERS` in
 `tests/lib/mdx.ts`, and `REJECTED_MARKERS` there records the candidates
-rejected because the author's own pre-contract writing uses them. New docs
-must conform fully. When
+rejected because the author's own pre-contract writing uses them. Tells the
+regex cannot see (participle tails, rhythm triplets, mystery teases, mixed
+metaphors, "not X" framings) get an advisory pass before each prose commit:
+`erfi-review --changed` (local model on the author's own hardware, flags
+only as `file:line: kind: "quote"`, exit 0). Fix the real tells by hand and
+ignore wrong flags; it never rewrites, and it does not gate CI (the runner
+has no model). New docs must conform fully. When
 making a substantial edit to an older doc, bring the touched sections into
 conformance (heading case, ASCII punctuation, section skeleton); a wholesale
 rewrite just for style is not required.
