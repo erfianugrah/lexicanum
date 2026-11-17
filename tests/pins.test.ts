@@ -1204,8 +1204,10 @@ const pins: Pin[] = [
     mustContain: [
       "269 repositories",
       "206 push mirrors",
-      "16.0.5",
-      "PostgreSQL | `postgres:18-alpine`",
+      // Current versions since the 2026-11-17 server upgrade (16.0.7 -> 17.0.1)
+      // and the postgres pin to 18.7.
+      "17.0.1-rootless",
+      "PostgreSQL | `postgres:18.7-alpine`",
       "capacity 4",
       "Silo",
       "effectively root on the router",
@@ -1218,8 +1220,9 @@ const pins: Pin[] = [
       "248 GitHub pull mirrors",
       // The pre-upgrade database version.
       "PostgreSQL 17",
-      // The pre-upgrade Forgejo image tag.
+      // The pre-upgrade Forgejo image tags.
       "16.0.3",
+      "16.0.5-rootless",
       // The runner's old concurrency before the capacity 1 -> 4 change.
       "capacity: 2",
       "Capacity 2 means",
