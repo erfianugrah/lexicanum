@@ -29,21 +29,25 @@ import { parse } from "yaml";
 export const TAXONOMY = [
   {
     id: "supabase",
-    label: "Supabase",
-    blurb: "Where tenants live, what they cost, and how to move them - the largest cluster here.",
+    label: "Supabase and Postgres",
+    blurb: "Tenancy, migrations, auth, network access, the database and the platform services, mostly measured on throwaway projects.",
     groups: [
       { id: "tenancy", label: "Tenancy and placement" },
       { id: "migrations", label: "Migrations and upgrades" },
-      { id: "operations", label: "Operations and access" },
-      { id: "architecture", label: "Architecture and data" },
+      { id: "auth", label: "Auth and RLS" },
+      { id: "security", label: "Network access and audit" },
+      { id: "database", label: "Database and Postgres" },
+      { id: "services", label: "Storage, Edge Functions and Realtime" },
+      { id: "operations", label: "Platform operations" },
+      { id: "architecture", label: "Architecture and comparisons" },
     ],
   },
   {
     id: "cloudflare",
     label: "Cloudflare",
-    blurb: "Workers, caching, tunnels, and the WAN - the edge provider half of the estate.",
+    blurb: "Workers, caching, tunnels, Access and Magic WAN.",
     groups: [
-      { id: "edge", label: "Edge and Workers" },
+      { id: "edge", label: "Workers, caching and API" },
       { id: "connectivity", label: "Connectivity and access" },
     ],
   },
@@ -55,12 +59,18 @@ export const TAXONOMY = [
   {
     id: "networking",
     label: "Networking and DNS",
-    blurb: "The self-hosted edge and the resolvers behind it.",
+    blurb: "The NixOS edge router, the switch, Caddy, and the resolvers and authoritative DNS behind them.",
   },
   {
     id: "homelab",
     label: "Homelab and self-hosting",
-    blurb: "The services that run on the home network, and the network they run on.",
+    blurb: "Storage and backups, the hosts and how they are deployed, the services they run, and the home sensors.",
+    groups: [
+      { id: "storage", label: "Storage and backups" },
+      { id: "hosts", label: "Hosts, deploys and monitoring" },
+      { id: "services", label: "Services and media" },
+      { id: "home", label: "Home network and sensors" },
+    ],
   },
   {
     id: "forge",
@@ -75,17 +85,17 @@ export const TAXONOMY = [
   {
     id: "hardware",
     label: "Hardware design",
-    blurb: "Designing, ordering and bringing up hardware: the GRIDDLE LX Hall-effect keyboard series.",
+    blurb: "The GRIDDLE LX Hall-effect keyboard: PCB, case, firmware and ordering, plus QMK keymaps.",
   },
   {
     id: "reverse-engineering",
     label: "Reverse engineering",
-    blurb: "Locked microcontrollers, fault injection, side channels and decompilers: getting at what a device or binary will not show.",
+    blurb: "Locked microcontrollers, fault injection, side channels and decompilers.",
   },
   {
     id: "coding-agents",
     label: "Coding agents and LLMs",
-    blurb: "The agent harness, the models behind it, and the working methods that keep them honest.",
+    blurb: "The agent harness, the models behind it, and how agent work is reviewed.",
     groups: [
       { id: "harness", label: "Harness and tooling" },
       { id: "models", label: "Models and local inference" },
@@ -95,7 +105,12 @@ export const TAXONOMY = [
   {
     id: "workstations",
     label: "Workstations and tooling",
-    blurb: "Machine tuning, audio and input latency, Windows and WSL2, and the desktop tooling around them.",
+    blurb: "Windows, WSL2 and Steam Deck setup, latency measurements, and graphics, film and site design.",
+    groups: [
+      { id: "windows", label: "Windows, WSL2 and Steam Deck" },
+      { id: "performance", label: "Latency and performance" },
+      { id: "design", label: "Graphics, film and design" },
+    ],
   },
 ];
 

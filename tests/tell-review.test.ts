@@ -6,7 +6,7 @@
  * the CI gate block a deploy for nothing.
  */
 import { describe, expect, test } from "bun:test";
-import { accept, allowedQuotes, batches, changedLines, paragraphs, touched } from "../scripts/tell-review";
+import { accept, allowedQuotes, batches, changedLines, paragraphs, titles, touched } from "../scripts/tell-review";
 import { factTokens, guard, layout, pinnedFor, splitMarker } from "../scripts/tell-fix";
 import { parseMdx } from "./lib/mdx";
 
@@ -197,5 +197,27 @@ describe("tell-fix guards", () => {
     expect(wrapped.every((l) => l.length <= 60)).toBe(true);
     expect(wrapped[0]?.startsWith("- ")).toBe(true);
     expect(wrapped.slice(1).every((l) => l.startsWith("  "))).toBe(true);
+  });
+});
+
+test("titles: a homepage blurb is reviewed as an ordinary sentence", () => {
+  expect(titles(parseMdx("x.mdx", '---\ntitle: T\nblurb: "Two managers, one mountpoint."\n---\n'))).toEqual([
+    { line: 2, lines: [2], text: "Title: T" },
+    { line: 3, lines: [3], text: "Two managers, one mountpoint." },
+  ]);
+});
+
+describe("titles", () => {
+  test("the frontmatter title and each heading are one paragraph each, marked as titles", () => {
+    expect(titles(parseMdx("x.mdx", DOC))).toEqual([
+      { line: 2, lines: [2], text: "Title: A title: with a colon" },
+      { line: 7, lines: [7], text: "Title: A heading that is not running text" },
+    ]);
+  });
+
+  test("a heading inside a fence is not a title", () => {
+    expect(titles(parseMdx("x.mdx", "---\ntitle: T\n---\n\n```md\n## not a heading\n```\n"))).toEqual([
+      { line: 2, lines: [2], text: "Title: T" },
+    ]);
   });
 });
