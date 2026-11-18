@@ -402,7 +402,16 @@ Reword a real flag; clear a wrong one for that doc with
 dropped, and an unreachable model fails the job (exit 2). The model only
 sees touched paragraphs, so an old doc's existing tells block nothing until
 someone edits that paragraph; the 2026-11-18 corpus sweep is in
-`docs/research/raw/2026-11-18-tell-sweep/`. `erfi-review --changed` (local
+`docs/research/raw/2026-11-18-tell-sweep/`. To clear flags in bulk, use
+`sx OPENROUTER_API_KEY=OPENROUTER_API_KEY -- bun scripts/tell-fix.ts <docs>`:
+it rewrites only flagged paragraphs (kimi-k3.1-pro) and refuses any rewrite
+that changes a number, code span, URL, link or footnote, drops over 40% of
+the words, removes a string pinned in `tests/lib/pins.ts`, or still draws a
+flag. It cannot see meaning: on 2026-11-18 a reviewer model reading the
+word diff sent back 31 of 211 and 14 of 77 rewrites (merged lists, lost
+qualifiers and provenance), so always read the diff, or have another model
+read it, before committing. Agent workers editing freely did worse (facts
+lost in 5 of 74 docs, real tells cleared with tells-ok). `erfi-review --changed` (local
 model, exit 0) is still there as a free pre-check, but it missed most of the
 tells the gate catches. New docs must conform fully. When
 making a substantial edit to an older doc, bring the touched sections into
