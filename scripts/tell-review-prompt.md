@@ -22,6 +22,7 @@ Do not flag:
 - a list of any length whose items are concrete and true;
 - dates, numbers, commands, file paths, product names;
 - the house's fixed labels: a paragraph starting "Provenance." and a "TL;DR:" label;
+- the one-line introduction to a diagram's text fallback, which the house requires under every decision diagram ("The same thing in list form:", "The same decision as text:");
 - ordinary technical sentences that are merely dense or long;
 - something you are not confident a careful human editor would cut. Precision matters more than recall: every flag you raise blocks a deploy until a person reads it.
 

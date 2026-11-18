@@ -146,3 +146,57 @@ describe("batches", () => {
     expect(b.flat().map((p) => p.line)).toEqual([1, 2, 3, 4, 5]);
   });
 });
+
+describe("tell-fix guards", () => {
+  const { guard, factTokens, layout, splitMarker } = require("../scripts/tell-fix") as typeof import("../scripts/tell-fix");
+  const before = "Three things matter here. The ring holds `512` entries at 9.4 Gbps, see [the guide](/guides/x/)[^ring].";
+
+  test("passes a rewrite that keeps every fact and most words", () => {
+    expect(guard(before, "The ring holds `512` entries at 9.4 Gbps, see [the guide](/guides/x/)[^ring].")).toBeNull();
+  });
+
+  test("refuses a lost or invented number, code span, link or footnote", () => {
+    expect(guard(before, "The ring holds entries at 9.4 Gbps, see [the guide](/guides/x/)[^ring].")).toBe("facts changed");
+    expect(guard(before, "The ring holds `512` entries at 9.4 Gbps and 10 more, see [the guide](/guides/x/)[^ring].")).toBe("facts changed");
+    expect(guard(before, "The ring holds `512` entries at 9.4 Gbps, see the guide[^ring].")).toBe("facts changed");
+  });
+
+  test("refuses a rewrite that drops most of the words", () => {
+    expect(guard("one two three four five six seven eight nine ten 5", "one two 5")).toBe("kept under 60% of words");
+  });
+
+  test("refuses smart punctuation, double hyphens and a bare <", () => {
+    expect(guard("a b c 1", "a b \u2014 c 1")).toBe("smart punctuation");
+    expect(guard("a b c 1", "a b -- c 1")).toBe("double hyphen");
+    expect(guard("a b c 1", "a <b> c 1")).toBe("bare <");
+    expect(guard("a `<b>` c 1", "a `<b>` c 1")).toBeNull();
+  });
+
+  test("an announcer with no facts may be deleted; a paragraph with facts may not", () => {
+    expect(guard("Three details carry the weight:", "")).toBeNull();
+    expect(guard("Three details carry the weight at 9.4 Gbps:", "")).toBe("empty rewrite");
+  });
+
+  test("refuses a rewrite that removes a pinned string, and finds pins by doc path", () => {
+    expect(guard("Coverage is a property of vantage points, not of rule count. More 1", "More 1 here", ["Coverage is a property"])).toBe(
+      "removes a pinned string",
+    );
+    const { pinnedFor } = require("../scripts/tell-fix") as typeof import("../scripts/tell-fix");
+    expect(pinnedFor("src/content/docs/guides/supabase-grafana-monitoring.mdx")).toContain(
+      "Coverage is a property of vantage points, not of rule count",
+    );
+  });
+
+  test("factTokens counts repeats", () => {
+    expect(factTokens("1 and 1 and `x`")).toEqual(["1", "1", "`x`"]);
+  });
+
+  test("splitMarker and layout keep list markers and wrapping", () => {
+    expect(splitMarker("1. Do the thing")).toEqual(["1. ", "Do the thing"]);
+    expect(layout(["one line"], "", "a b c")).toEqual(["a b c"]);
+    const wrapped = layout(["- " + "x".repeat(58), "  y"], "- ", "aaaa ".repeat(20).trim());
+    expect(wrapped.every((l) => l.length <= 60)).toBe(true);
+    expect(wrapped[0]?.startsWith("- ")).toBe(true);
+    expect(wrapped.slice(1).every((l) => l.startsWith("  "))).toBe(true);
+  });
+});
