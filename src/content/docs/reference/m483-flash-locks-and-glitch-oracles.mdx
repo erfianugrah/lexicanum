@@ -163,6 +163,53 @@ The `M483xIDAE` sub-family has no hardware cryptography peripheral (no AES, DES,
 
 The TRM states: *"When chip is powered on or active from reset, Flash Initialization Controller checks the flash stability first, and then reloads User Configuration to flash control registers"*[^m480trm] (with reset-source exceptions for `BL`/`BS`). This means `CONFIG` is reloaded at `POR` and on certain resets - the `POR`-only hypothesis that motivated the `trigger=none` grids was wrong.
 
+## Live write-gate map, halted SRAM state, and step-ram-diff
+
+### Debugger AHB-AP and halted-CPU write-gate matrix
+
+The 2026-11-18 control matrix paired every write and single-step probe against a same-session, same-primitive positive control on `CLK_AHBCLK` (`0x40000204`, baseline `0x0000C404`), toggling bit 14 (`SPIMCKEN`) to `0x00008404` and restoring `0x0000C404` with `close_error=null`. That separates what the `M483SIDAE` lock blocks on the debugger's `AHB-AP` bus from what it blocks when the halted Cortex-M4 CPU executes Thumb instructions already resident in `SRAM`.
+
+| Initiator and primitive | Target address | Same-session control (`CLK_AHBCLK` `0x40000204`) | Target observation | Status |
+|---|---|---|---|---|
+| `AHB-AP` 32-bit write | `SRAM` `0x20001000`, `FMC_ISPCTL` `0x4000C000`, `PDMA` `0x40008000` | `0x0000C404` write and readback landed; `DCRSR`/`DCRDR` `r0` write landed and restored | `SRAM` unchanged; `ISPCTL` and `PDMA` read back 0 with `ISPCKEN` and `PDMACKEN` set | Blocked (live-qualified) |
+| `AHB-AP` 8-bit write (`width-matrix`) | `SRAM` `0x20000400` (mask `0x000000A5`) | `0x40000205` mask `0x00000040` changed word to `0x00008404` and restored `0x0000C404` | `0x00000000` stayed `0x00000000`, restored | Blocked (live-qualified) |
+| `AHB-AP` 16-bit write (`width-matrix`) | `SRAM` `0x20004000` (mask `0x0000BEEF`) | `0x40000204` mask `0x00004000` changed word to `0x00008404` and restored `0x0000C404` | `0xBC1F936F` stayed `0xBC1F936F`, restored | Blocked (live-qualified) |
+| `AHB-AP` bit-band alias (`bit-band`) | `SRAM` `0x20001000` bit 0 via `0x22020000` | `0x420040B8` (`CLK_AHBCLK` bit 14) changed word to `0x00008404` and restored `0x0000C404` | `0x00000000` stayed `0x00000000` (`sram-blocked`) | Blocked (live-qualified) |
+| Halted CPU `ldr r2, [r1, #0]` (`0x680A` at `0x20002277`) | `SRAM` `0x20001C60` (`ldr-sram`) | `PC` advanced `0x20002277` -> `0x20002278` (`DHCSR=0x01030007`) | `r2` changed from 0 to `0x00028000`; `PC`, `xPSR`, `r1`, and `r2` restored | Landed (live-qualified) |
+| Halted CPU `ldr r2, [r1, #0]` (`0x680A` at `0x20002277`) | `APROM` `0x00000000` (`ldr-aprom0`) | Same `0x20002277` -> `0x20002278` step and opcode check in session | `r2` loaded `0xFFFFFFFF` (`all-ff`); core registers restored | Blocked (live-qualified) |
+| Halted CPU `str r2, [r3, #0]` (`0x601A` at `0x20004787`) | `SRAM` `0x20001000` (`str-sram-current`) | `str-clk-current` stepped `0x20004787` -> `0x20004788`, changed `0x40000204` to `0x00008404`, and restored `0x0000C404` | Store of 1 read back 0 (`no-land`); core and target restored | Blocked (live-qualified) |
+| Halted CPU `FMC` ISP `CID` (`0x0B` at `0x00000000`) | `FMC` `0x4000C000` (`cpu-fmc-aprom0-rw1c`) | CPU `str` gadget landed on `0x40000204` and set `ISPCTL.ISPEN` (`ispen_ok=true`) | `ISPTRG` (`0x4000C010`) fired; `ISPSTS=0x0000005E` (`fmc-fail`, `ISPFF` set), `MPDAT0=0xFFFFFFFF`; `APROM` `READ` not issued; RW1C and `CLK` restored | Blocked (live-qualified) |
+
+In-SRAM gadget offsets move between sessions and must be re-verified before stepping. The first 2026-11-18 store test (`str-sram`) targeted `0x2001732B` from a 2026-11-17 dump and aborted before mutation (`probe_unqualified`) because the halfword at `0x2001732A` read back `0x0AA0` instead of `0x600A`. A fresh 128 KB dump (`ram-128k-current`) located `0x601A` (`str r2, [r3, #0]`) at `0x20004786`, which passed the in-session opcode gate before `str-clk-current` and `str-sram-current` ran.
+
+### Observed halt and SRAM state
+
+Following a qualified 32-byte reset-held `SRAM` read (`clean-reset`, `DPIDR=0x2BA01477`), attaching and halting the running target (`halt-context`) records a forced `HardFault` context rather than an instruction in `APROM` or `LDROM`:
+
+| Register or region | Observed value | Interpretation |
+|---|---|---|
+| `PC`, `LR`, `xPSR` | `PC=0xFFFFFFFE`, `LR=0xFFFFFFF9`, `xPSR=0x01000003` | Halted in exception 3 (`HardFault`) with `EXC_RETURN` in `LR` and an unexecutable `PC` |
+| `CFSR`, `HFSR`, `DFSR` | `CFSR=0x00010001`, `HFSR=0x40000000`, `DFSR=0x00000009` | `UNDEFINSTR` and `IACCVIOL` escalated to a forced `HardFault` (`FORCED=1`) |
+| `MSP`, `PSP` | `MSP=0x20001C60`, `PSP=0x00000000` | Main stack pointer lies in bank-0 `SRAM`; process stack pointer is unused |
+| 8-word frame at `MSP` (`0x20001C60`) | `0x00028000`, `0xE000E000`, `0x00000000`, `0x40004844`, `0x00000C00`, `0x000006D5`, `0x200002C8`, `0x2000002C` | Does not form a valid exception return frame with an executable stacked `PC` and Thumb `xPSR`; an 8 KB stack scan around `MSP` found none |
+| `dwt-probe-read` (`COMP0=0x4000C008`, `COMP1=0x0000D000`) | `DHCSR=0x00030003`, `DFSR=0x00000008`, `DEMCR=0x010007F0`, `PC=0xFFFFFFFE`, `CFSR=0x00001001`, `MSP=0xFFFFFFD8` | Resume leaves the core halted at `PC=0xFFFFFFFE` (`transport-error`) |
+| Bank-0 `SRAM` (`0x20000000`-`0x2001FFFF`, 128 KB) and bank-2 `SRAM` (`0x20020000`-`0x20027FFF`, 32 KB, `CCMEN=0`) | Isolated halfwords such as `0x680A` (`0x20002276`) and `0x601A` (`0x20004786`) inside data buffers | Individual Thumb opcodes can be single-stepped in place, but neither bank contains a plaintext firmware stream or key schedule |
+
+### What step-ram-diff adds and why per-instruction stepping is unproven
+
+The read-only campaign sampled static 128 KB bank-0 and 32 KB bank-2 `SRAM` dumps plus free-running HID overread windows. Those snapshots cannot exclude transient plaintext written to `SRAM` and overwritten between reads. `tamarin_swd.py step-ram-diff` (`tools/faultier/step_ram_diff.py`) adds a bounded `halt -> dump -> step -> diff` harness over the direct `TamarinSWD` transport: while the CPU stays halted after each single-step, the `AHB-AP` reads bank 0 (`0x20000000`, default 128 KB) and optional bank 2 (`--cache`, 32 KB at `0x20020000`) and computes contiguous changed byte ranges against the preceding frame.
+
+To prevent `LOCKUP` or a no-op step from being recorded as instruction progress, `step-ram-diff` enforces four gates before any collection step (`--steps`, 0 to 256) executes:
+
+1. **Backup provenance and approval.** `--yes` and `--recovery-manifest` are required before opening the probe. The harness verifies `board_id`, `app_sha256`, `cfg_sha256`, `capture_scope` (`app+config`), and `recovery_scope` (`updater-app-config`) against disk files.
+2. **Executable initial `PC`.** After `init(hold_reset=False)` and `halt_running()`, `executable_pc(initial_pc)` rejects `0x00000000`, `0xFFFFFFFE`, `0xFFFFFFFF`, and any address outside `APROM` (below `0x00080000`), `LDROM` (`0x00100000`-`0x00100FFF`), or `SRAM` (`0x20000000`-`0x20027FFF`), and requires `initial_pc` to match `--expect-pc` before frame 0 is dumped.
+3. **Mandatory store-to-RAM control.** Frame 0 must hold `--control-before` at the word-aligned `--control-addr`. One masked single-step (`step_instruction()`) must advance `PC` from `--expect-pc` to `--control-next-pc`, and frame 1 must read `--control-after` at `--control-addr` before `control.qualified` becomes `true`.
+4. **Crash-preserving output.** Every frame (`frames/NNNNNN.bin`), byte-range diff (`diffs/NNNNNN.json`), fault register snapshot (`DHCSR`, `CFSR`, `HFSR`, `DFSR`), and `journal.jsonl` event is written with `os.fsync` before the next step, and `close()` powers down the debug port and resets the target.
+
+**Per-instruction stepping is unproven.** The capture state machine is tested offline against a fake target (14 unit tests), and the underlying `TamarinSWD` read and single-step primitives are live-qualified, but no physical `halt -> dump -> step -> diff` series has run. Both live control-only runs (`--steps 0` on 2026-11-17 and `step-ram-diff-control` on 2026-11-18) exited at `initial-state-failed` (`initial PC is not executable: 0xFFFFFFFE`, `frames=[]`, `steps_completed=0`, `control.qualified=false`). Because `halt_running()` lands in `HardFault` at `PC=0xFFFFFFFE` and halted-CPU `STR` to `SRAM` does not land (`no-land`), neither prerequisite for `step-ram-diff` - an executable firmware `PC` and a passing store-to-RAM control - is met on the locked target.
+
+Where an updater accepts modified application images, recovery scope and static patch verification also gate any attempt to plant a software stub. On a separate Nordic `nRF52840` peripheral (application base `0x1c000`), a hand-assembled `SPIM` patch placed at `0x1d046`-`0x1d06b` overwrote the live IRQ 22 (`SWI2_EGU2`, vector slot `0x1c098` -> `0x1d051`) handler and branched into the middle of 4-byte instructions (`0x1d07a`, `0x1d06a`), hanging the device before USB initialisation even though byte-presence unit tests passed.
+
 ## Architecture: where the plaintext lives
 
 With the `M483SIDAE` confirmed to have no `XOM`, no hardware crypto engine, and no plaintext firmware in the sampled SRAM snapshots, **arch B** is the favoured model: the CPU executes plaintext directly from flash and `cmdRead` encrypts on egress. The working application and absent executable decode paths support that model.
@@ -188,6 +235,10 @@ The lowest-cost planned discriminator is differential SPA of the core rail (`LDO
 | `SRAM` via bit-band alias blocked | Proven | Same-alias `CLK_AHBCLK[14]` control landed and restored; SRAM alias unchanged |
 | `FMC` `ISPCTL.ISPEN` and `PDMA` registers blocked from the debugger | Proven for direct writes | Reads back 0 even with clock enables set; peripheral bit-band aliases remain unqualified |
 | Core debug registers, `CLK_AHBCLK` and `SPIM` accept debugger writes | Proven | DCRSR/DCRDR, `0x40000204`, `0x40007004` - same session positive controls |
+| Halted CPU in-SRAM `ldr` executes and reads `SRAM`; `APROM` `0x00000000` returns `0xFFFFFFFF` | Live-qualified | In-session verified Thumb `ldr r2, [r1, #0]` (`0x680A` at `0x20002277` -> `0x20002278`) loaded `0x00028000` from `0x20001C60` and `0xFFFFFFFF` from `0x00000000` with full core restore |
+| Halted CPU in-SRAM `str` lands on `CLK_AHBCLK` but is blocked on `SRAM` | Live-qualified | In-session verified Thumb `str r2, [r3, #0]` (`0x601A` at `0x20004787` -> `0x20004788`) changed `0x40000204` from `0x0000C404` to `0x00008404` and restored, while `0x20001000` stayed 0 (`no-land`) |
+| Halted CPU `FMC` ISP `CID` command sets `ISPFF` and returns `0xFFFFFFFF` | Live-qualified | CPU `str` gadget set `ISPCTL.ISPEN` and triggered `CID` (`0x0B`); `ISPSTS` read `0x0000005E` (`fmc-fail`) with `MPDAT0=0xFFFFFFFF`, RW1C and `CLK` restored |
+| `step-ram-diff` initial-`PC` gate rejects `HardFault` attach before frame 0 | Live-qualified | Control-only live run (`--steps 0`) with verified recovery manifest exited `initial-state-failed` on `PC=0xFFFFFFFE` (`frames=[]`, `steps_completed=0`) |
 | Native 65-page app restore + vendor updater return to app mode | Proven | Per-page SHA-256 verification; the vendor updater completed |
 | `DEMCR.VC_CORERESET` avoids connect-lockup | Verified | Clean halt with `DHCSR=0x02030003` |
 | DP power-down + reset restores normal USB | Verified | Device enumerated normally after debug session close |
@@ -199,6 +250,7 @@ The lowest-cost planned discriminator is differential SPA of the core rail (`LDO
 | Claim | Status | What is missing |
 |---|---|---|
 | Halted-CPU flash reads are globally gated | Overclaimed | `PC=0xFFFFFFFE` is a reproducible fault, not proven lock behaviour; MSP varied between sessions, inconsistent with a uniform `0xFF` lock signature |
+| Per-instruction `step-ram-diff` capture on the locked `M483SIDAE` | Unproven | Engine is offline-tested, but live attach halts at `PC=0xFFFFFFFE` and halted-CPU `str` to `SRAM` returns `no-land`; no physical `halt -> dump -> step -> diff` series has run |
 | Universal live-SWD impossibility | Retracted | The 2026-11-18 claim was superseded by the evidence audit; no live series was demonstrated, but a universal limit was not established |
 | Resume from reset-catch is blocked | Current state | The reset-caught `PC` is invalid; resume fails; this is the current state, not a proven permanent gate |
 | `CONFIG0`..`CONFIG3` contents are `0xFFFFFFFF` | Cannot confirm | No unlocked positive control; blocked SWD reads return bus-level masks |

@@ -1,0 +1,245 @@
+---
+title: Building a USB Audio 2.0 ACX driver without the WDK
+description: "Building Microsoft's open-source USB Audio Class 2.0 driver for Windows without the full Windows Driver Kit, using WDK NuGet packages, a VS Build Tools toolset shim and a PowerShell build script that runs in CI on a Windows VM. Covers the five source edits for a Topping D70 Pro Sabre, test-signing and loading from a second boot entry, and the measured outcome: the custom driver loaded at 7 ms and 10 ms shared-mode periods but lost to the inbox usbaudio2 driver by 7 ms at the minimum period and 3.5 ms at the default, and crackled."
+author: Erfi Anugrah
+category: workstations
+group: performance
+---
+
+Microsoft's USB Audio Class 2.0 driver, built on its Audio Class Extensions (ACX) framework[^ms-lla], is the open-source replacement for the inbox `usbaudio2` class driver. Building it normally requires the full Windows Driver Kit - a multi-gigabyte install that ties the build to the machine that installed it. This guide builds it without the WDK, using only the WDK NuGet packages and VS Build Tools, so the build is self-contained in a single PowerShell script and runs in CI on a fresh Windows VM with no toolchain installed.
+
+Prerequisites: a Windows 10 22H2 (build 19045) machine with Secure Boot off and HVCI off, a second boot entry for test signing, and a DAC whose hardware ID you know. The build needs a Windows VM with VS 2022 Build Tools (the C++ workload) and no WDK. Everything here was measured on a Topping D70 Pro Sabre in November 2026.
+
+The motivation, the larger latency picture and the measured numbers that drove the fork are in [GPU HDMI audio vs a USB DAC](/guides/gpu-hdmi-audio-vs-usb-dac-latency-windows/) (Part 9). The loopback measurement method is in [Measuring USB audio output latency on Windows with a loopback cable](/guides/usb-audio-loopback-latency-windows/).
+
+## Constants
+
+### Hardware and device
+
+| Piece | Detail |
+|---|---|
+| DAC | Topping D70 Pro Sabre, `USB\VID_152A&PID_8750&MI_00`, REV 0109 |
+| OS | Windows 10 Pro 22H2 (build 19045) |
+| Secure Boot / HVCI | both OFF (required for test signing) |
+| Test certificate | CN `erfi D70 driver test (low-latency-audio)`, RSA 3072, code signing, expires 2031-11-06, SHA1 `10237B4EF3497CA884116ABFEDB5F64219A6D05A` |
+
+### Framework versions on the target (19045)
+
+| Component | File | Version |
+|---|---|---|
+| KMDF runtime | `Wdf01000.sys` | 1.31.19041.1 |
+| ACX runtime | `Acx01000.sys` | 10.0.19041.7725 |
+
+`Wdf01000.sys` 1.31 is the Windows 10 2004+ framework[^ms-kmdf-ver]. KMDF 1.33 needs Windows 11 21H2+, so the driver must bind to 1.31. `Acx01000.sys` on this build registers ACX 1.0.0 with 210 functions (read from its `g_WdfClassLibraryInfo` public PDB), not the 1.1 the upstream project targets. A 1.1 driver with 221 functions fails the class bind before `DriverEntry`. Microsoft's ACX version table[^ms-acx-ver] lists 1.1 as shipped with Windows 10 version 2004; this build of Windows 10 has 1.0.
+
+### The five source edits
+
+Every edit is in the fork. Listed here so you know what to change; the rest of the guide assumes these are applied.
+
+| Edit | File | Change |
+|---|---|---|
+| 1. KMDF 1.31 | `src/uac2-driver/USBAudioAcxDriver.vcxproj` | `KMDF_VERSION_MINOR` 33 -> 31 |
+| 2. D70 hardware ID | `src/uac2-driver/USBAudio2-ACX.inf` | Add `USB\VID_152A&PID_8750&MI_00` under `[Standard.NT$ARCH$.10.0...16299]` |
+| 3. BSOD fix (upstream issue 33) | `src/uac2-driver/RtPacketObject.h` / `.cpp` | `WDFWAITLOCK m_rtPacketLock` makes Set/UnsetRtPackets and the copy loops mutually exclusive |
+| 4. Configurable minimum period | `src/uac2-driver/CircuitHelper.h`, `Device.h`, `Device.cpp`, `RenderCircuit.cpp`, `CaptureCircuit.cpp` | `MinimumPeriodHns` (REG_DWORD, 100 ns units) read from the driver's `Parameters` key, default 70000 (upstream behaviour), clamped to [10000, 100000] |
+| 5. ACX 1.1 downgrade to 1.0 | `src/uac2-driver/USBAudioAcxDriver.vcxproj` + source files | Build against `acx\km\1.0` + its `acxstub.lib`; replace three 1.1-only calls: `AcxCircuitGetPinsCount` (walk pin groups until `AcxCircuitGetPinById` returns NULL, bounded 64), `AcxCircuitGetSymbolicLinkName` (use `IoGetDeviceInterfaces` on the PDO instead) |
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  src [label="source\n(vcxproj, INF, .cpp)"];
+  nuget [label="WDK + SDK\nNuGet pkgs"];
+  shim [label="toolset shim\n+ build.props"];
+  msbuild [label="MSBuild\n(VS Build Tools)"];
+  stamp [label="stampinf +\ninfverif /w"];
+  cat [label="Inf2Cat\n/os:10_x64"];
+  sign [label="signtool\n(test cert)"];
+
+  src -> msbuild;
+  nuget -> msbuild;
+  shim -> msbuild;
+  msbuild -> stamp;
+  stamp -> cat;
+  cat -> sign;
+}
+```
+
+1. Source (the driver vcxproj, INF and C++ files with the five edits applied) enters MSBuild.
+2. The WDK and SDK NuGet packages provide headers, libraries and tools without a WDK install.
+3. A toolset shim (two tiny XML files) bridges the project's `WindowsKernelModeDriver10.0` toolset to the NuGet WDK's `WindowsDriver` props and targets.
+4. A `Directory.Build.props` sets `WDKContentRoot`, `KMDFVERSION 1.31`, and disables the NuGet WDK's non-functional ApiValidator and InfVerif (both are post-build hard gates instead).
+5. MSBuild with VS 2022 Build Tools compiles the driver.
+6. `stampinf` sets a UTC DriverVer date, then `infverif.exe /w` (x64) validates the INF as a hard gate.
+7. `Inf2Cat /os:10_x64` generates the catalog, `signtool` test-signs the .cat and .sys, and the test certificate's public half is kept.
+
+## Component versions
+
+| Component | Version |
+|---|---|
+| Upstream source | `microsoft/low-latency-audio`, commit `24dbed7` (main as of 2026-11-07) |
+| WDK NuGet | `Microsoft.Windows.WDK.x64` 10.0.26100.6584 |
+| SDK NuGet | `Microsoft.Windows.SDK.CPP` and `.x64`, 10.0.26100.6584 |
+| VS Build Tools | 2022 (17.x), C++ workload |
+| `WindowsTargetPlatformVersion` | 10.0.26100.0 (the vcxproj value; the NuGet package 6584 is compatible) |
+| WIL (Windows Implementation Library) | 1.0.250325.1, restored from the project's `packages.config` |
+| KMDF | 1.31, stamped into the INF and binary |
+| ACX | 1.0 (downgraded from upstream's 1.1) |
+
+## Part 1: source edits
+
+Apply the five edits from the constants table to a clone of `microsoft/low-latency-audio`. Each block is marked `// d70:` in the fork for traceability. The edits are small by design: the upstream driver compiles on Windows 10 with only the KMDF version and ACX version changed, and the D70 entry is one line in the INF. The BSOD fix applies a lock around the real-time packet buffer; without it, `UnsetRtPackets` can zero `RtPacketsCount` between a copy loop's entry check and its modulo, which divides by zero.
+
+The configurable period replaces the hardcoded `s_PacketSizeConstraints` 7 ms constant. The three constraint fields are filled from `MinimumPeriodHns` in each circuit's power-up, before `AddPropertyToCircuitInterface`. The value is logged with the existing WPP trace mechanism.
+
+The ACX 1.0 downgrade is the single largest edit, and the one most likely to need reversal on a newer Windows build. The three 1.1-only calls and their replacements:
+
+- `AcxCircuitGetPinsCount`: the connector-change loop now walks pin groups until `AcxCircuitGetPinById` returns NULL, bounded at 64.
+- `AcxCircuitGetSymbolicLinkName`: `AddPropertyToCircuitInterface` takes the circuit name directly and finds the `KSCATEGORY_AUDIO` interface via `IoGetDeviceInterfaces` on the PDO, matching the reference string.
+
+## Part 2: build with WDK NuGet packages
+
+The build script (`build-driver.ps1`) self-contains the toolchain. It runs on a machine with VS 2022 Build Tools and no WDK. The script does four things, in order:
+
+### 2a. Restore the NuGet WDK and SDK
+
+Three packages, restored once into a cache directory:
+
+```
+Microsoft.Windows.WDK.x64      10.0.26100.6584
+Microsoft.Windows.SDK.CPP      10.0.26100.6584
+Microsoft.Windows.SDK.CPP.x64  10.0.26100.6584
+```
+
+The packages provide headers (`acx\km\1.0\`), libraries (`acxstub.lib`, `usbdex.lib`, `usbd.lib`), and tools (`stampinf.exe`, `infverif.exe`, `Inf2Cat.exe`, `signtool.exe`). The restore is `nuget install` from `https://api.nuget.org/v3/index.json`. These packages are cached - they download once, and subsequent builds skip the restore.
+
+### 2b. Register the toolset shim
+
+The driver vcxproj uses `PlatformToolset=WindowsKernelModeDriver10.0`. The NuGet packages install no toolset, and VS Build Tools do not ship this one. The script writes two files into the VS Build Tools `PlatformToolsets` directory:
+
+- `Toolset.props` imports the MSVC toolset x64 props, then the NuGet WDK's `WindowsDriver.Default.props`, `WindowsDriver.Common.props`, and the platform common props.
+- `Toolset.targets` imports the standard C++ targets, the Windows SDK targets, and the NuGet WDK's `WindowsDriver.Common.targets`.
+
+Created once per VM (the script skips when present).
+
+### 2c. Write Directory.Build.props
+
+A `Directory.Build.props` at the source root sets MSBuild properties the vcxproj expects from a WDK install:
+
+- `WDKContentRoot` with a trailing backslash. The NuGet package's props set the root without one, and the WDK's `UsingTask` declarations append `build\...` without a separator, producing a broken path. The trailing backslash fixes it.
+- `KMDFVERSION` = 1.31. The project's property group says 33 (for Windows 11), and the INF stamps `$KMDFVERSION$` from the property. Override to 1.31 for Windows 10.
+- `ApiValidator_Enable` = false. The NuGet WDK ships no working x86 tooling for it.
+- `SkipPackageVerification` = true. MSBuild's InfVerif task cannot load `x86\InfVerif.dll` from the NuGet package. The INF is checked post-build with the x64 `infverif.exe` as a hard gate instead.
+
+### 2d. Build, stamp, verify and sign
+
+`msbuild -t:restore` (for the WIL NuGet package), then `msbuild -p:Platform=x64 -p:Configuration=Release`. After a successful build:
+
+1. `stampinf.exe` sets the DriverVer date in UTC. A local SGT date ahead of UTC is postdated from Inf2Cat's perspective and fails with error 22.9.7.
+2. `infverif.exe /w` (x64) validates the INF. The `/w` flag treats warnings as errors. The check expects `INF is VALID`.
+3. `Inf2Cat.exe /os:10_x64` generates the catalog file from the stamped INF.
+4. `signtool.exe sign` with the test certificate's PFX signs the .cat and .sys with SHA-256. The PFX password is passed by file, never on the command line. The private key directory is deleted after signing and on any failure after the PFX was decoded.
+
+Artifacts: `USBAudio2-ACX.inf`, `USBAudio2-ACX.sys`, `USBAudio2-ACX.cat`, `lla-test.cer`, `SHA256SUMS`.
+
+## Part 3: test-sign and load
+
+The test certificate is self-signed. Windows will not trust it without test signing enabled, which needs Secure Boot off, HVCI off, and a reboot with `bcdedit /set testsigning on`. The standard approach is a second boot entry so anti-cheat works on the normal one:
+
+1. Create a "Windows 10 (driver test)" boot entry that copies `{current}` and turns `testsigning` on only for that entry. The normal entry stays clean.
+2. Reboot into the test entry.
+3. Import `lla-test.cer` into `LocalMachine\Root` and `LocalMachine\TrustedPublisher`.
+4. `pnputil /add-driver USBAudio2-ACX.inf /install`. The D70 switches from `usbaudio2.inf` to the published `oemNN.inf`.
+5. Verify: the D70's `DEVPKEY_Device_DriverInfPath` points to the custom driver. A new endpoint appears under Sound control panel (named "Analogue 1/2 (USBAudio2-ACX)" at 44.1 kHz for the D70).
+
+To roll back: remove the package with `pnputil /delete-driver`, re-scan, and the D70 returns to `usbaudio2.inf`. Then remove the certificate from both stores, delete the boot entry, and reboot.
+
+## Part 4: CI on a Windows VM
+
+The build runs in Forgejo Actions on a dedicated Windows VM. The workflow is one `windows` job:
+
+- Start the VM container through the Docker API, wait for SSH.
+- Copy the source (git archive of the pushed commit) and the signing secrets (base64 PFX + password) to the VM.
+- Run `build-driver.ps1`.
+- Pull the artifacts back, upload them as workflow artifacts.
+- Wipe the secrets on the VM and stop the container in `always()` steps.
+
+A tag push `v*` additionally publishes a Forgejo release with the artifacts attached.
+
+For an interactive build loop without CI (compile, fix, compile), start the VM, `scp` the working tree, run `build-driver.ps1 -NoSign` (skips signing - the key is only in CI), and stop the VM afterwards.
+
+## Verification
+
+| Check | How | Expected |
+|---|---|---|
+| Build exit 0 | `msbuild` then `infverif /w` | `INF is VALID`, artifacts present |
+| `KmdfLibraryVersion` | `rg KmdfLibraryVersion USBAudio2-ACX.inf` | 1.31 |
+| D70 hardware ID present | `rg 'VID_152A&PID_8750' USBAudio2-ACX.inf` | one match |
+| Signed | `signtool verify /v /pa USBAudio2-ACX.cat` | fails on untrusted root (expected: self-signed cert); signer name matches |
+| Driver loads (G1) | `Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-Kernel-PnP'; Id=219}` after install | no event with status 0xC0000365 |
+| Endpoint appears | `Get-AudioDevice -List` | "Analogue 1/2 (USBAudio2-ACX)" |
+| Latency (G2) | loopback measurement per the [USB audio guide](/guides/usb-audio-loopback-latency-windows/) | measured against usbaudio2 in the same session |
+
+## Gotchas and lessons learned
+
+### G1: ACX class bind failure on Windows 10 19045
+
+The first build never reached `DriverEntry`. The kernel debug output showed the framework stub's class bind for ACX returning `STATUS_INVALID_PARAMETER` (0xC000000D), and the device failed with code 37 (status 0xC0000365, "The driver was not loaded because it failed its initialization call").
+
+The public symbols for `Acx01000.sys` 10.0.19041.7725 show its class library registering version 1.0.0 with 210 functions. The driver, built against the WDK 26100's ACX 1.1 headers, emitted a bind info block with version 1.1.0 and 221 functions. The framework stub's `VersionBindClass` compared the version and function count and rejected the bind.
+
+Building against the WDK's `acx\km\1.0` headers and its `acxstub.lib`, and replacing the three ACX 1.1-only DDIs the driver calls, got past the bind. This is the single most likely change to need reversal on a build of Windows that ships ACX 1.1.
+
+No WPP trace was produced during the failure - the driver's tracing session started (8 KB header-only ETL), but `DriverEntry` never ran, so the failure was entirely in the framework before the driver's code.
+
+### G2: driver loads, but slower than the inbox driver
+
+After the three fixes (ACX 1.0 bind, clock-selector stall tolerance, pending reboot from the previous image), the driver started and presented an endpoint at 44.1 kHz with a 10 ms default shared-mode period and 7.01 ms minimum. Same loopback method as the GPU HDMI guide, 30 clicks per run, all clicks found:
+
+| Driver and settings | Minimum period | Default period |
+|---|---|---|
+| Inbox `usbaudio2`, 48 kHz (runs shortly before) | 34.95 ms | 48.03 ms |
+| Fork, upstream defaults (4 ms per transfer, 4 transfers queued, 7 ms period) | 41.87 / 42.08 ms | 51.58 / 51.32 ms |
+| Fork, 1 ms per transfer, 2 queued, period set to 7 / 3 / 2 / 1 ms | 41.32-41.99 ms | 51.24-51.90 ms |
+
+- The custom driver was 7 ms slower at the minimum period and 3.5 ms slower at the default than the inbox driver in the same session. The 44.1 kHz format explains 1-2 ms at most.
+- The period value (`MinimumPeriodHns`) never reached the audio engine. The driver's trace shows the write to the endpoint's interface property succeeding (`STATUS_SUCCESS`), and the engine kept offering 7.01 ms at every setting from 70,000 to 10,000 (in 100 ns units).
+- The transfer settings (`ClassicFramesPerIrp2`, `MaxIrpNumber`) moved latency by under 1 ms.
+- It crackled on music and clicks at the upstream defaults, and short sounds came out with their start cut off.
+- After this driver restarted the D70, the DAC stalled class requests (the clock selector read, then the sample-rate range on its clock source) until it was replugged. The inbox driver restarts the same DAC without this. Because of the wedge, 48 kHz and the smaller-period tests could not be run past the first restart.
+
+The negative result matters for the earlier latency pages: the inbox `usbaudio2` driver's numbers from the [USB audio guide](/guides/usb-audio-loopback-latency-windows/) and the [GPU HDMI guide](/guides/gpu-hdmi-audio-vs-usb-dac-latency-windows/) are the best this DAC gets on Windows 10. A custom USB Audio Class 2 driver did not improve them, and the hold trick from the GPU HDMI guide (keeping a minimum-period stream open so default-period apps run at 7 ms) remains the only measured latency improvement for everyday use.
+
+## File reference
+
+| Path | Purpose |
+|---|---|
+| `src/uac2-driver/USBAudioAcxDriver.vcxproj` | driver project: KMDF version, ACX version, platform, includes, signing |
+| `src/uac2-driver/USBAudio2-ACX.inf` | INF: hardware IDs, services, endpoint properties |
+| `src/uac2-driver/CircuitHelper.h` | `s_PacketSizeConstraints`: the three 7 ms constants; the configurable minimum reads from the Parameters key |
+| `src/uac2-driver/Device.cpp` | driver start/stop, `Parameters` key read/write, `IsValidInternalParameters`, offset encoding |
+| `src/uac2-driver/RtPacketObject.h` / `.cpp` | real-time packet buffer; the BSOD fix lock |
+| `src/uac2-driver/RenderCircuit.cpp` / `CaptureCircuit.cpp` | render/capture circuits: connector-change loop (ACX 1.0 pins walk), property writes, circuit power-up where the period value is applied |
+| `.forgejo/scripts/build-driver.ps1` | the build script: NuGet restore, toolset shim, `Directory.Build.props`, MSBuild, stampinf, infverif, Inf2Cat, signing |
+| `.forgejo/workflows/build.yml` | Forgejo Actions CI: VM lifecycle, secrets transfer, build, artifact upload, cleanup |
+| `scripts/use-test-driver.ps1` | on the PC (admin): verify SHA256SUMS, `pnputil /add-driver`, confirm the D70 bound to `oemNN.inf` |
+| `scripts/use-inbox-driver.ps1` | rollback: remove the package, re-scan, D70 returns to `usbaudio2.inf` |
+| `scripts/test-boot-entry.ps1` | create/remove the testsigning boot entry |
+| `scripts/trust-test-cert.ps1` | import/remove the test certificate |
+| `scripts/set-period.ps1` | write `MinimumPeriodHns` and restart the device |
+
+## Related docs
+
+- [GPU HDMI audio vs a USB DAC](/guides/gpu-hdmi-audio-vs-usb-dac-latency-windows/) (Part 9): the motivation, the ceiling analysis and the measured numbers that drove the fork
+- [Measuring USB audio output latency on Windows with a loopback cable](/guides/usb-audio-loopback-latency-windows/): the loopback method, the `audio-loopback.ps1` script and the baseline usbaudio2 numbers
+
+[^ms-lla]: Microsoft, "Low Latency Audio," GitHub. Accessed 2026-11-07. https://github.com/microsoft/low-latency-audio
+
+[^ms-kmdf-ver]: Microsoft, "KMDF Version History," Windows Driver Docs. https://learn.microsoft.com/en-us/windows-hardware/drivers/wdf/kmdf-version-history
+
+[^ms-acx-ver]: Microsoft, "ACX version overview," Windows Driver Docs. https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/acx-version-overview

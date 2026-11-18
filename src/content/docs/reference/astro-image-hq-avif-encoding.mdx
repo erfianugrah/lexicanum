@@ -1,0 +1,214 @@
+---
+title: "Content-aware AVIF encoding for Astro images"
+description: "How astro-image-hq routes AVIF encoding across avifenc, NVENC and sharp per image, with shadow detection that fixes banding in dark photographs without slowing the rest of the build"
+author: Erfi Anugrah
+category: workstations
+group: design
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+`@erfianugrah/astro-image-hq` is an Astro image service that replaces sharp's built-in AVIF encoder with per-image routing across three encoders and content-aware quality boosts at build time. It fixes banding in dark photographs, skips NVENC for images with alpha transparency, and costs nothing on images that need no special treatment.
+
+**TL;DR:**
+
+- Sharp's prebuilt binaries lack 10-bit AVIF support, so dark gradients show visible banding even at high quality. This service routes to `avifenc` (libavif CLI) for 10-bit 4:4:4 output or NVENC for fast 10-bit 4:2:0, with sharp as the 8-bit fallback.
+- Shadow detection runs per image via `sharp.stats()` on a 256px thumbnail, taking about 5-20 ms. Images with mean luma below 64 and standard deviation above 12 are promoted to 10-bit 4:4:4 aom at quality 95 regardless of the project-wide quality setting.
+- Alpha transparency, odd-dimension 4:2:0 outputs, NVENC chroma limits, and missing codec backends are all detected and routed around at build time without configuration.
+- Four built-in profiles (`fast`, `balanced`, `hq`, `photo`) cover dev iteration through production; the `photo` profile with shadow boost caught about 7% of images on a photography blog and added negligible total build time.
+
+---
+
+## Encoder routing pipeline
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  detect [label="Detect capabilities\n(avifenc version, NVENC GPU,\navifenc codec backends)", shape=box, style=rounded];
+
+  analyze [label="Analyze image\n(sharp.stats() on 256px thumbnail:\nluma mean, stdev, alpha)", shape=box, style=rounded];
+
+  content [label="Content-aware rules\n(shadow boost if dark + gradient)" shape=diamond];
+
+  route_box [label="Walk encoder preference\n(pick first available + capable)" shape=box];
+
+  skip_nvenc [label="Skip NVENC if alpha /\n4:4:4 requested /\nsmaller than 128px", shape=diamond];
+  skip_codecs [label="Drop codec flags if\nmissing in avifenc build /\nodd 4:2:0 dims /\nalpha on non-aom", shape=diamond];
+
+  fallback [label="Fallback to sharp\n(fail / warn / silent\nper profile policy)", shape=box, style=dashed];
+
+  encode [label="Encode and return", shape=box, style=rounded];
+
+  detect -> analyze;
+  analyze -> content;
+  content -> route_box;
+  route_box -> skip_nvenc;
+  skip_nvenc -> skip_codecs;
+  skip_codecs -> encode;
+
+  route_box -> fallback [label="no encoder\navailable"];
+  fallback -> encode;
+}
+```
+
+1. **Capability detection** probes the build environment once: `avifenc --version` for the libavif CLI version and compiled codec backends (aom, svt, rav1e), `nvidia-smi` for GPU name, compute capability and memory utilisation, and sharp's `package.json` for its version. Detection is memoised at module level and runs once per Astro build.
+2. **Image analysis** downsamples the input to 256px and calls `sharp.stats()` for per-channel mean and standard deviation. Luma is computed via Rec. 709 coefficients (0.2126 R + 0.7152 G + 0.0722 B). Alpha is flagged only when a non-uniformly-opaque channel exists (alpha channel present and `alpha.min < 255`).
+3. **Content-aware rules** match on image characteristics. The shadow-boost rule triggers when mean luma is below 64 and standard deviation is above 12, upgrading the image to 10-bit 4:4:4 aom at quality 95.
+4. **Encoder walk** steps through the profile's ordered preference list and picks the first encoder that is installed and capable of the requested format, chroma subsampling and bit depth. NVENC is skipped for alpha images, 4:4:4/4:2:2 chroma (NVENC is 4:2:0 only) and images smaller than 128px on the short side (NVENC AV1 minimum frame dimension). Codec flags on avifenc are dropped if the codec backend is not compiled in, the image is below that codec's minimum dimension (64px for svt, 32px for rav1e), an odd-dimension 4:2:0 output would error, or the image has alpha on a non-aom codec (SVT-AV1 and av1_nvenc drop the alpha plane).
+5. **Fallback policy** is set by profile: `fail` aborts the build (for `hq`), `warn` logs and falls back to sharp (for `balanced` and `photo`), and `silent` falls back with no message (for `fast`).
+
+## Which encoder for which image
+
+| Encoder | Bit depth | Chroma | Alpha | Speed | When |
+|---|---|---|---|---|---|
+| `nvenc` (av1_nvenc) | 8, 10 | 4:2:0 only | No | Fastest | Balanced/photo default on NVIDIA GPU |
+| `avifenc` (libavif aom) | 8, 10, 12 | All | Yes | Slow (3-5 s at speed 4) | Shadow-boosted images, alpha transparency, 4:4:4 output |
+| `avifenc` (libavif svt) | 8, 10 | All | No | Medium | Balanced default when NVENC unavailable |
+| `sharp` (libvips) | 8 only | 4:4:4 | Yes | Fast | Fallback when no system encoder installed |
+
+NVENC is the fastest path and produces 4:2:0 10-bit AVIF. It is skipped when chroma 4:4:4 or 4:2:2 is requested because `av1_nvenc` does not expose those through ffmpeg or NVIDIA's consumer-tier driver SDK even though the GPU silicon supports it[^nvenc-av1]. On this rig, NVENC on an NVIDIA GeForce RTX 5090 handles the balanced profile default.
+
+avifenc with the aom codec is the highest-quality path and the only one that reliably carries the alpha auxiliary plane. It is the fallback for alpha images regardless of the profile's encoder preference and is force-used by the `hq` profile and the shadow boost rule.
+
+Sharp is the universal fallback. Its prebuilt binaries reject 10-bit output with `Expected 8 for bitdepth when using prebuilt binaries`, so it is 8-bit only.
+
+<Aside type="caution" title="avifenc codec backends are build-time, not runtime">
+  The codec flags `-c svt`, `-c rav1e` and `-c aom` require libavif compiled with those backends. If the installed `avifenc` lacks the requested codec, the service drops the codec flag and lets avifenc use its default (aom). This is logged in the routing reason string so a missing codec is visible in build output, not silent.
+</Aside>
+
+## Shadow detection
+
+The banding problem: dark photographs with smooth gradients (night skies, shadow walls, studio backdrops) encode poorly at 8-bit 4:2:0 because the quantisation steps in luma and chroma are too coarse for the value range. The result is visible contour bands in what should be smooth transitions.
+
+The detection runs on every image at build time via `analyzeImage()` and costs about 5-20 ms. Two thresholds gate the boost:
+
+| Condition | Threshold | When true |
+|---|---|---|
+| Mean luma | Below 64 | Image is predominantly dark |
+| Luma standard deviation | Above 12 | Significant gradient or detail present |
+
+Both must hold. A dark solid colour (low mean, low stdev) does not trigger; a bright gradient (high mean, high stdev) does not trigger. On a photography blog (revista-3), about 7% of source images matched both criteria.
+
+When triggered, the boost overrides the component-level `quality` prop (e.g. `<Image quality={85} />`) so the banding fix applies regardless of the project-wide quality cap. The encoder preference is set to `["avifenc", "sharp"]`, skipping NVENC entirely, because NVENC does not output 4:4:4 and the aom codec is required for alpha safety.
+
+The shadow boost applies to the AVIF format only; WebP, JPEG and PNG outputs are unchanged.
+
+## Astro image service integration
+
+The service implements Astro's `LocalImageService` interface[^astro-image-service]. It wraps the built-in sharp service and overrides only `transform()`, delegating URL parsing and HTML attribute generation to the underlying service:
+
+```js
+// astro.config.mjs
+import { defineConfig } from "astro/config";
+import hqService from "@erfianugrah/astro-image-hq";
+
+export default defineConfig({
+  image: {
+    service: hqService({ profile: "photo" }),
+  },
+});
+```
+
+At build time, `propertiesToHash` extends Astro's defaults with `_profile`, `_encoder`, `_depth`, `_chroma` and the package version, so changing profile or upgrading the package invalidates the output cache.
+
+The transform pipeline hands off to sharp for unsupported formats (anything not avif/webp/jpeg/png) and for builds where no profile is configured (misconfiguration fallback).
+
+Component-level `quality` overrides are folded into the profile's base config before content-aware rules run. This way the shadow boost acts as a quality floor: bright images take the component value, dark gradients get promoted regardless.
+
+## Build-time detection and logging
+
+Capability detection runs once at build start, in parallel across three probes:
+
+```sh
+avifenc --version    # → "Version: 1.4.1 (dav1d [dec]:1.5.3, aom [enc/dec]:v3.13.3, svt [enc]:v4.1.0)"
+nvidia-smi --query-gpu=name,compute_cap,memory.used,memory.total --format=csv,noheader,nounits
+# sharp version read from sharp/package.json
+```
+
+If an `avifenc` probe fails (binary not installed, non-zero exit), detection omits that capability and routing skips the avifenc preference. The same fault-tolerant pattern applies to the NVENC probe. If both are absent, the service falls back to sharp.
+
+Build summary output at log level `summary` (the default) reports:
+
+```
+[astro-image-hq] profile=photo; AVIF route: nvenc > avifenc > sharp
+[astro-image-hq] available: sharp 0.34.5, avifenc 1.4.1, av1_nvenc on NVIDIA GeForce RTX 5090
+```
+
+At the end of the build, the tally prints encoder hit counts and the number of shadow-boosted images. Log level `verbose` prints a routing reason for every image; `off` suppresses all output.
+
+<Aside type="caution" title="GPU memory utilisation gate">
+  When the GPU is shared with ComfyUI or llama.cpp, the `gpu.maxMemoryUtilization` option (default 0.5) skips NVENC if GPU memory utilisation exceeds that fraction. The nvidia-smi probe reads `memory.used` and `memory.total` per build; the gate is local to this service and does not coordinate with other GPU consumers.
+</Aside>
+
+## Profiles
+
+| Profile | Encoder preference (AVIF) | Chroma / depth | Quality | Missing-encoder | Use case |
+|---|---|---|---|---|---|
+| `fast` | sharp | 4:2:0 8-bit | 80 | silent fallback | Dev iteration, CI smoke |
+| `balanced` | nvenc > avifenc-svt > sharp | 4:2:0 10-bit | 88 | warn + fallback | General purpose |
+| `hq` | avifenc-aom only | 4:4:4 10-bit | 92 | fail build | Production, max quality |
+| `photo` | nvenc > avifenc-svt > sharp + shadow boost | 4:2:0 10-bit (4:4:4 boosted) | 90 (95 boosted) | warn + fallback | Photography blogs (default) |
+
+The `photo` profile is the most common choice. It uses the fast 4:2:0 path for typical content and automatically promotes dark gradient images to 4:4:4 10-bit aom.
+
+Custom profiles can tweak a built-in via `mergeProfile()` or define a full `Profile` object with custom `ContentAwareRule` arrays.
+
+## Known limitations
+
+**Alpha transparency routing.** SVT-AV1 and av1_nvenc drop the alpha plane (transparent logos render as solid black). The service detects meaningful alpha via `analyzeImage()` and routes those images to aom (via avifenc or sharp), which carries the alpha auxiliary plane correctly. The alpha guard forces aom-only and skips NVENC for all alpha-bearing images.
+
+**Even-dimension clamp for 4:2:0 AVIF.** Firefox rejects AVIFs with odd dimensions encoded 4:2:0 ("Image corrupt or truncated"). aom pads odd dimensions and crops in-bitstream; Chrome honours this, Firefox does not without a container `clap` box. All three encoders clamp resize output dimensions to even (floor) when the output is AVIF with 4:2:0 chroma. 4:4:4 and 4:2:2 outputs are not clamped.
+
+**NVENC chroma.** `av1_nvenc` outputs 4:2:0 only. Routing automatically skips NVENC when 4:4:4 or 4:2:2 is requested and falls through to avifenc.
+
+**libavif version sensitivity.** The `-c svt`/`-c rav1e` codec flags require libavif compiled with those backends. If the installed `avifenc` lacks the requested codec, the service drops the codec flag and lets avifenc use its default (aom)[^avifenc-codecs].
+
+**Sharp 10-bit.** Prebuilt sharp binaries fail with `bitdepth: 10` (`Expected 8 for bitdepth when using prebuilt binaries`). Use avifenc for 10-bit output; sharp is 8-bit only.
+
+**Astro Image API surface.** Only `quality` is overridable via the component. Other format settings (depth, chroma, codec) come from the profile or content-aware rules.
+
+**NVENC minimum frame dimension.** Images smaller than 128px on the short side (favicons, small thumbnails) fail NVENC with "Frame dimensions are less than the minimum supported value". Routing skips NVENC for these inputs and falls through to avifenc or sharp.
+
+## Evidence
+
+| Claim | Source | How it was checked |
+|---|---|---|
+| Encoder routing walks preference list, skipping unavailable and incapable encoders | `src/route.ts:65-131` | Unit-tested via `bun run test` (55 tests) |
+| Shadow detection thresholds: mean luma < 64, stdev luma > 12 | `src/analyze.ts:16-17` | Code review of `DARK_THRESHOLD` and `GRADIENT_STDEV_THRESHOLD` constants |
+| Rec. 709 luma coefficients used for analysis | `src/analyze.ts:13` | Code review of `REC709` constant |
+| Shadow boost caught ~7% of images on revista-3 | `README.md:88-90` | Observed on a live photography blog build; not independently reproduced |
+| NVENC skipped for 4:4:4/4:2:2 chroma, alpha, and sub-128px images | `src/route.ts:88-107,207-221` | Unit-tested; codec-level constraints in `CODEC_CONSTRAINTS` |
+| Alpha guard routes alpha images to aom-only and skips NVENC | `src/route.ts:88-92,152-155` | Unit-tested |
+| Build-time detection probes avifenc, nvidia-smi and sharp in parallel; fault-tolerant | `src/detect.ts:49-56` | Unit-tested |
+| Component-quality override folded before shadow boost so boost acts as quality floor | `src/service.ts:144-149` | Design review of `applyTransformOverrides` and `withFormatOverride` |
+| Four built-in profiles with encoder preferences, chroma, bit depth, quality and fallback policy | `src/profiles.ts:85-152` | Code review of `BUILTIN_PROFILES` |
+| Even-dimension clamp for 4:2:0 AVIF output | `src/even-dims.ts` (separate module) | Unit-tested; Firefox rejection behaviour documented in README |
+| NVENC minimum frame dimension is 128px | `src/route.ts:67` | NVENC AV1 encoder constraint; tested with small images |
+| SVT-AV1 minimum dimension is 64px; rav1e 32px | `src/route.ts:50-52` | Codec documentation; encoded in `CODEC_CONSTRAINTS` |
+| Missing codec backend: flags dropped, logged in reason string | `src/route.ts:49-55,147-165` | Unit-tested |
+
+Rows marked "code review" or "observed" cite the source file and line but were not independently re-measured for this doc. The service's test suite (`bun run test`, 55 tests) covers the routing, detection, analysis and encoding modules.
+
+## Which profile to pick
+
+| Situation | Profile |
+|---|---|
+| Dev iteration or CI smoke, speed over quality | `fast` |
+| General-purpose site, want 10-bit AVIF with GPU acceleration | `balanced` |
+| Photography blog with dark images, want automatic banding fix | `photo` |
+| Maximum quality, every AVIF at 4:4:4 10-bit, no fallback | `hq` |
+| Custom rules (e.g. different thresholds, different formats) | Custom profile via `mergeProfile()` or inline `Profile` object |
+
+## Related docs
+
+- [Print-ready graphics: what a printer needs from your logo](/reference/print-ready-graphics/) - image format and quality decisions for print output, with command-line svg-to-pdf and cmyk conversion
+- [Linear Film Negative Inversion & Develop Pipeline](/reference/linear-film-negative-inversion-pipeline/) - DCP profile math and per-channel spline curves for colour-accurate film scan inversion
+- [Typography and layout for this docs site](/reference/docs-reading-column-and-wide-tables/) - the two-width layout that accommodates the wide tables and diagrams on pages like this one
+
+[^nvenc-av1]: NVIDIA, "Video Encode and Decode GPU Support Matrix." https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new
+[^astro-image-service]: Astro, "Image Service API," Astro Docs. https://docs.astro.build/en/reference/image-service-reference/
+[^avifenc-codecs]: AOMedia, "libavif," GitHub. https://github.com/AOMediaCodec/libavif
