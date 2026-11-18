@@ -356,8 +356,9 @@ Cite the source path when answering from docs.erfi.io in chat, too.
   A count, duration, size or rate in running text stays plain (8,651
   trials, 13.70 s, 128 KB, 200 kHz). Every backticked span renders as a
   boxed chip, and a paragraph of chips is hard to read (the M483 page had
-  70 boxed numbers; the corpus has about 1,100). Tables follow the same
-  rule.
+  70 boxed numbers). Tables follow the same rule. An HTTP status, SQLSTATE,
+  IP, version or hash is a literal value and stays boxed.
+  `bun scripts/unbox-numbers.ts <docs>` strips the safe cases.
 - **ASCII punctuation only** in prose/headings/commits. No em/en dashes (use `-`),
   no smart quotes, no ellipsis char. The `ascii-punctuation-guard` enforces this.
 - Arrows in prose: `->` (renders literally; SmartyPants leaves it alone).

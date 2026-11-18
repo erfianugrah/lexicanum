@@ -727,7 +727,7 @@ export const pins: Pin[] = [
     sections: [
       /^## Topology$/m,
       /^## The segment design$/m,
-      /^## The adoption path that works$/m,
+      /^## Adopting devices$/m,
       /^## Reading the numbers$/m,
       /^## What generalises$/m,
     ],
