@@ -42,6 +42,15 @@ How to fix each kind:
 - metaphor: say the literal thing.
 - self-narration, mystery-tease: state the content directly.
 
+Never delete a sentence or clause that carries meaning; rephrase it in place instead. In a first run, 31 of 211 rewrites had to be undone for exactly this:
+- a sentence that introduces a list or table ("What each field does, all measured:") - deleting it merges two lists or leaves a list with no subject; keep a plain intro that says what the items are;
+- provenance ("measured", "confirmed", "each measured", "read from source") - keep it;
+- a reason or consequence ("which is why", "because", "is the whole argument for") - keep the causal link, drop only the grading word;
+- a qualifier ("only", "the interesting", "on this box", "not yet") - keep it;
+- a ranking the doc means ("the biggest lever") - state the comparison it makes instead of deleting it;
+- a TL;DR bullet's or a section's main lesson - restate it plainly, do not drop it;
+- the first item of a pair ("The first is...") when a later sentence refers to "the second".
+
 Hard rules:
 - Keep every number, date, version, backticked span, URL, markdown link and footnote reference (like [^slug]) exactly as written, the same number of times. Do not add any new ones.
 - Keep markdown formatting (bold, italics, links, inline code) on the words that keep it.

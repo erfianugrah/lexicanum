@@ -7,6 +7,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { accept, allowedQuotes, batches, changedLines, paragraphs, touched } from "../scripts/tell-review";
+import { factTokens, guard, layout, pinnedFor, splitMarker } from "../scripts/tell-fix";
 import { parseMdx } from "./lib/mdx";
 
 const DOC = [
@@ -148,7 +149,6 @@ describe("batches", () => {
 });
 
 describe("tell-fix guards", () => {
-  const { guard, factTokens, layout, splitMarker } = require("../scripts/tell-fix") as typeof import("../scripts/tell-fix");
   const before = "Three things matter here. The ring holds `512` entries at 9.4 Gbps, see [the guide](/guides/x/)[^ring].";
 
   test("passes a rewrite that keeps every fact and most words", () => {
@@ -181,7 +181,6 @@ describe("tell-fix guards", () => {
     expect(guard("Coverage is a property of vantage points, not of rule count. More 1", "More 1 here", ["Coverage is a property"])).toBe(
       "removes a pinned string",
     );
-    const { pinnedFor } = require("../scripts/tell-fix") as typeof import("../scripts/tell-fix");
     expect(pinnedFor("src/content/docs/guides/supabase-grafana-monitoring.mdx")).toContain(
       "Coverage is a property of vantage points, not of rule count",
     );
