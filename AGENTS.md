@@ -11,11 +11,13 @@ minutes (observed 2026-08-17). The purge needs CLOUDFLARE_API_TOKEN, or
 CLOUDFLARE_API_KEY + CLOUDFLARE_EMAIL, in env; it warns and skips without them.
 
 PUSHING TO MAIN ALSO DEPLOYS: `.forgejo/workflows/deploy.yml` (Forgejo Actions) runs on every
-push to main - build + test gate, then `wrangler-action` deploy and a
-cache-purge job (`if: refs/heads/main`). A docs commit is live within ~2 min
+push to main - the house and prose-tells gates, the build + test gate, then
+`wrangler-action` deploy, a zone purge step (`scripts/purge-cache.ts`) and a
+separate host-scoped `purge-cloudflare-cache` job (both `if: refs/heads/main`
+or manual dispatch). A docs commit is live within ~2 min
 of `git push`; there is no separate release step. `bun run deploy` is the
 manual path for when CI is bypassed or broken, not the normal one. PRs get
-the build/test gate only, no deploy.
+the gates only, no deploy.
 
 ## Pipeline facts (load-bearing)
 
@@ -147,7 +149,7 @@ the build/test gate only, no deploy.
   fences and MDX comments, with or without a `#fragment`. A new doc must be
   linked from at least one other doc: `tests/docs.test.ts` fails otherwise,
   except for the docs frozen in `tests/no-inbound-baseline.json` (4 at
-  2026-10-21). Link one of those and remove it from the baseline in the same
+  2026-10-21, 3 at 2026-11-18). Link one of those and remove it from the baseline in the same
   commit - a stale entry fails too.
 
 ## Two traps in this repo
@@ -434,9 +436,14 @@ Run `bun run build` and confirm:
   tooling only (`new-doc.ts`, the scaffolder; `rentry-export.ts`, which turns a
   doc into rentry.co markdown for an off-site copy; `pasteriser-export.ts`, which
   turns a set of docs into a multi-page pasteriser.io paste with footnotes, page
-  links and dot fences kept for pasteriser to draw, published with `pasteriser publish <outdir>`) -
+  links and dot fences kept for pasteriser to draw, published with `pasteriser publish <outdir>`;
+  `set-lab-pin.sh <sha>`, which replaces the `PINHASH` placeholder in docs and pins
+  with a real supabase-lab commit and checks each URL returns 200) -
   checks live here in `tests/`,
-  after the old verify scripts were either absorbed or found to be vacuous.
+  after the old verify scripts were either absorbed or found to be vacuous. The one
+  exception is `scripts/tell-review.ts`, the prose-tells CI gate: it calls a model
+  over the network, so it cannot run inside the build; its pure logic is
+  unit-tested in `tests/tell-review.test.ts`.
   - `tests/docs.test.ts` - corpus-wide structure: split tables, footnote balance,
     smart punctuation, math-risk dollars, internal links, draft links, dot-fence
     style, built-page assertions, and the taxonomy checks (every doc in the
@@ -444,7 +451,8 @@ Run `bun run build` and confirm:
     the inbound-link ratchet, built-page checks that each "Linked from" list
     and link graph match the links the test parser derives from source, and
     that neither reaches the search index. `tests/site-links.test.ts` unit-
-    tests `src/lib/links.mjs`, including a real Graphviz render.
+    tests `src/lib/links.mjs`, including a real Graphviz render, and
+    `tests/code-glue.test.ts` unit-tests the kit's `src/lib/code-glue.mjs`.
   - `tests/pins.test.ts` - per-doc pins: corrections that must not regress, claims
     that must not creep back, required sections, and the anchors other docs link to.
     Adding a pin is a row in the table.
