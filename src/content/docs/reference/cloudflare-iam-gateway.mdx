@@ -1,0 +1,270 @@
+---
+title: Gatekeeper IAM Gateway
+description: How Gatekeeper evaluates deny-first IAM policies, collapses purge requests, verifies SigV4, and gates Cloudflare DNS and Supabase management APIs.
+category: cloudflare
+group: edge
+sidebar:
+  label: IAM Gateway
+  order: 3
+---
+
+A key scoped to one hostname must not purge another hostname's cache. Gatekeeper enforces that boundary by evaluating each request context against a deny-first policy before any upstream credential is used.
+
+```json
+{
+  "version": "2025-01-01",
+  "statements": [
+    {
+      "effect": "allow",
+      "actions": ["purge:host"],
+      "resources": ["zone:1234567890abcdef1234567890abcdef"],
+      "conditions": [
+        { "field": "host", "operator": "eq", "value": "app.example.com" }
+      ]
+    },
+    {
+      "effect": "deny",
+      "actions": ["purge:host"],
+      "resources": ["zone:1234567890abcdef1234567890abcdef"],
+      "conditions": [
+        { "field": "host", "operator": "ne", "value": "app.example.com" }
+      ]
+    }
+  ]
+}
+```
+
+For a request whose host is `app.example.com`, the allow statement matches and the deny statement does not. For another host, the allow statement does not match but the deny statement does, so the purge is denied. Evaluation is deny-first: a matching deny anywhere in the policy overrides every matching allow.
+
+| Claim | Linked mechanism |
+|---|---|
+| A matching deny overrides matching allows | [Deny-first evaluation](#deny-first-evaluation) |
+| Missing fields affect allow and deny statements differently | [Effect-aware missing fields](#effect-aware-missing-fields) |
+| Seven D1 tables hold proxy and audit events | [External event storage](#external-event-storage) |
+| Scheduled retention and expiry cleanup have separate jobs | [Scheduled cleanup](#scheduled-cleanup) |
+| Policy validation bounds nesting and regular expressions | [Inbound policy validation](#inbound-policy-validation) |
+| Per-key bucket storage is bounded | [Bucket eviction](#bucket-eviction) |
+| Explicit upstream registrations win over wildcard resolution | [Upstream token resolution](#upstream-token-resolution) |
+| S3 authorization covers each object in a batch delete | [Operation-to-action mapping](#operation-to-action-mapping) |
+| Supabase actions come from the HTTP method and path | [Method-and-path classification](#method-and-path-classification) |
+| DNS conditions use request-derived fields only | [Request fields](#request-fields) |
+| Signed S3 headers and payload hashes are verified | [Request verification](#request-verification) |
+| Per-key debit is not refunded after global rejection | [Two-tier debit](#two-tier-debit) |
+| Collapse identity uses the zone and exact raw body | [Request collapse](#request-collapse) |
+
+## Policy model
+
+### Deny-first evaluation
+
+Each key carries a policy document with a version and a statement list. A statement contains an effect, actions, resources, and an optional array of conditions. Evaluation checks every statement: the first matching deny returns false immediately, while matching allows are remembered. If no deny matches, at least one allow must match. Otherwise the request is denied.
+
+Statement order therefore does not let an earlier allow override a later deny. For multiple contexts, such as the keys in an S3 batch delete, every context must independently pass this evaluation.
+
+`test/policy-engine.test.ts` covers deny-first behavior, default deny, and multi-context evaluation.
+
+### Effect-aware missing fields
+
+A leaf condition names a field, an operator, and usually a comparison value. Evaluation reads that field from the request context's field map. For a file purge with custom cache-key headers, each header in the file's request-body object becomes a `header.<name>` field using the supplied name.
+
+A missing field does not automatically make a statement fail:
+
+- In an allow statement, conditions whose fields are missing are skipped. The remaining applicable conditions must still match.
+- In a deny statement, those conditions make the statement inapplicable, so they cannot trigger the deny.
+
+A missing host can therefore make an otherwise matching allow statement match. A policy that must fail closed for that case needs an explicit guard, such as a deny statement with `not_exists` on the required field. `test/policy-engine.test.ts` exercises both effects.
+
+### Condition operators
+
+The leaf operator union contains:
+
+- Comparisons: `eq`, `ne`, `lt`, `lte`, `gt`, `gte`.
+- Membership and string matching: `in`, `not_in`, `contains`, `not_contains`, `starts_with`, `ends_with`, `matches`, `not_matches`, `wildcard`.
+- Presence: `exists`, `not_exists`.
+
+Conditions can also be nested with `any`, `all`, and `not`. The `any` and `all` compounds contain condition arrays; `not` contains one condition. `wildcard` performs case-insensitive glob matching, while `matches` and `not_matches` compile regular expressions.
+
+### Inbound policy validation
+
+Key creation validates statement structure, actions, resources, and condition values. Nested conditions are limited to 20 levels. Patterns used by `matches` and `not_matches` are limited to 256 characters by `MAX_REGEX_LENGTH`; invalid expressions and constructs associated with catastrophic backtracking are rejected, along with patterns that fail a runtime backtracking probe.
+
+Purge request limits come from configuration rather than policy validation. `single_max_ops` defaults to 500 files, and `bulk_max_ops` defaults to 100 hosts, tags, or prefixes.
+
+`test/policy-engine-validation.test.ts` covers malformed statements, compound conditions, and unsafe regular expressions. The depth check is in `src/policy-engine.ts`.
+
+## Purge proxy
+
+### Durable Object isolation
+
+All routes resolve the same Durable Object instance with the name `account`. Its SQLite storage holds purge keys, upstream credentials, configuration, and sessions; token buckets hold rate-limit state in memory. External D1 tables hold event history. This separates persistent authorization state from analytical queries without creating a separate Durable Object per key or zone.
+
+### Two-tier rate limiting
+
+Purge requests use two token-bucket tiers. A key without custom limits goes straight to the account-level bucket. A key with custom limits first consumes from its own bucket and then from the account bucket.
+
+| Setting | Default |
+|---|---|
+| `single_rate` | 3,000 tokens per second |
+| `single_bucket_size` | 6,000 tokens |
+| `bulk_rate` | 50 tokens per second |
+| `bulk_bucket_size` | 500 tokens |
+
+File purges use the single class and consume one token per file. Host, tag, prefix, and full-zone purges use the bulk class and consume one token per request.
+
+If the account bucket rejects a request after the per-key bucket accepted it, the per-key tokens remain consumed. There is no refund path. An upstream 429 drains the account bucket for that rate class and returns a retry delay.
+
+### Rate-limit headers
+
+Responses that reached upstream without an upstream 429 carry `RateLimit` and `RateLimit-Policy`. The policy header identifies the bucket, quota, and window; the other reports remaining tokens and time until refill. A gateway-generated 429 carries both of those headers plus `Retry-After`; an upstream 429 carries `Retry-After`. These header names and parameters follow the current IETF draft.[^rfc-ratelimit]
+
+### Request collapse
+
+Authorization completes before collapse is considered. The collapse key is the zone ID, a NUL separator, and the exact raw request body text. There is no canonical JSON transformation or body hash: two semantically equivalent bodies with different formatting form different flights.
+
+The first request becomes the leader and performs the upstream purge. Concurrent followers wait for its result, and requests arriving within a 50-millisecond grace window can share the settled result. After that window, the next request starts a new flight.
+
+Debit depends on which collapse layer catches the follower. An isolate-level follower never calls the Durable Object, so it consumes neither per-key nor account tokens. Inside the Durable Object, the per-key check runs before collapse, so followers with custom key limits still consume their own tokens. Only the leader enters the account-bucket path, meaning Durable Object followers do not consume account tokens.
+
+The shared flight ID and collapse state are recorded in purge analytics. `test/request-collapse.test.ts` covers result sharing, grace expiry, and failed-leader recovery; the zone-and-body key and bucket ordering are in `src/routes/purge.ts` and `src/durable-object.ts`.
+
+### Caches
+
+The resolved gateway configuration is cached for 30 seconds by `CONFIG_CACHE_TTL_MS`; admin configuration changes invalidate that cache. Credential and upstream-token lookups use the configured `key_cache_ttl_ms`, whose default is 60 seconds, matching `DEFAULT_CACHE_TTL_MS`.
+
+### Bucket eviction
+
+Custom per-key buckets are stored in a map capped at 1,024 entries. Adding a bucket at capacity evicts the least-recently-used entry. Updating a key's custom rate limits clears its existing bucket state; changing or revoking a key without custom limits leaves the shared account buckets intact.
+
+`test/config-cache.test.ts` covers configuration expiry and invalidation. `test/purge.test.ts` covers custom key limits and bucket eviction; `src/durable-object.ts` defines the debit and collapse order.
+
+## Storage and retention
+
+### External event storage
+
+`src/schema.ts` defines seven D1 tables:
+
+| Table | Contents |
+|---|---|
+| `purge_events` | Purge type, target, token cost, result, collapse state, timing, and flight ID |
+| `s3_events` | S3 operation, bucket, key, result, timing, and response detail |
+| `dns_events` | DNS action, record name and type, result, timing, and response detail |
+| `cf_proxy_events` | Cloudflare account, service, action, resource ID, result, and timing |
+| `supabase_proxy_events` | Supabase project, category, action, result, and timing |
+| `supabase_membership_events` | Membership action, organization, role transition, outcome, and reconciliation detail |
+| `audit_events` | Administrative action, actor, entity type, entity ID, and detail |
+
+Event writes are scheduled with the Worker lifecycle API rather than awaited in the proxy response path. Purge, DNS, Cloudflare proxy, and Supabase proxy events record upstream status separately from gateway status. Purge targets and stored purge response details are truncated to 4,096 characters by the shared log-value limit.
+
+### Scheduled cleanup
+
+The scheduled handler reads the single `retention_days` setting and deletes rows older than that cutoff from all seven event tables. Its default is 30 days, and the same value applies to purge, S3, DNS, Cloudflare proxy, Supabase, membership, and audit events.
+
+The second phase calls `cleanupExpired`. It revokes expired purge keys and S3 credentials, deletes expired upstream tokens and R2 registrations, and removes expired sessions and admin tokens. Key expiry comes from the key's own expiration timestamp, assigned when a key is created or rotated with an expiry; it is not derived from event retention.
+
+`test/scheduled.test.ts` covers retention configuration and the cleanup call. `test/iam.test.ts` covers creation and rejection of expired keys.
+
+## Upstream credentials
+
+### Upstream token resolution
+
+A purge key pinned to an upstream token ID uses that registration. Legacy unbound keys use zone resolution: the newest active zone-scoped registration containing the exact zone wins; otherwise the newest active wildcard registration is used. Account-scoped registrations are excluded from zone resolution, and expired registrations are skipped.
+
+The same distinction applies to R2. A credential pinned to an R2 registration uses that registration. Otherwise the resolver prefers an exact bucket registration over a wildcard, with the newest active registration winning within each class. `test/upstream-tokens.test.ts` and `test/upstream-r2.test.ts` cover these resolution paths.
+
+### Secret handling
+
+Purge bearer keys are looked up by a deterministic SHA-256 hash rather than stored in raw form. S3 client secrets are stored as hashes and compared through an HMAC-based timing-safe check.
+
+Registered upstream credentials are different: the Durable Object must retain their secret values to sign or authorize upstream requests. Its SQLite storage holds those upstream secrets, while API responses return previews rather than the stored secret.
+
+Administrative routes authenticate with Cloudflare Access JWTs, administrative tokens or keys, or built-in session cookies. TLS transport is provided by the deployment platform rather than implemented in the policy engine.
+
+## S3 proxy
+
+### Request verification
+
+The gateway verifies the client's SigV4 signature before replacing it with a different signature for the registered upstream R2 credential.
+
+| Check | Implementation |
+|---|---|
+| Request time | Header or presigned date must be within 15 minutes, bounded by `MAX_CLOCK_SKEW_MS` |
+| Signed headers | Sorted, lowercase signed-header names are resolved from the request; a missing value rejects the request |
+| Canonical request | Method, canonical path, query, signed headers, and payload hash are rebuilt from the received request |
+| Payload hash | Exact hashes, unsigned payloads, and the supported streaming-unsigned-payload-trailer marker are handled according to their type |
+| Signature | Derived signing key and expected signature are compared with the timing-safe HMAC helper |
+
+The gateway does not keep a replay nonce cache. A captured signed request can therefore be replayed within the signature acceptance window unless another layer prevents it. `test/s3-sigv4.test.ts` covers verification and presigned requests.
+
+### Operation-to-action mapping
+
+Authorization uses the parsed operation, not the upstream response:
+
+| Operation | Authorization behavior |
+|---|---|
+| ListBuckets | Requires the account-level resource; the upstream bucket list is returned without gateway filtering |
+| ListBucket | Requires the bucket resource and exposes the requested prefix as `list_prefix`; returned object entries are not filtered per key |
+| Object reads and writes | Require the corresponding action on the object resource |
+| DeleteObjects | `parseDeleteObjectKeys` extracts every key and each object must pass authorization |
+| CopyObject | Requires read permission on the source object and write permission on the destination object |
+
+DeleteObjects has a 1 MiB request-body limit. The gateway does not add a separate 1,000-key check; upstream S3 limits still apply. For ListBucket, a prefix condition constrains the requested operation, not the contents of the returned XML. Callers can see entries returned by the upstream credential within an authorized list response.
+
+`test/s3-e2e-iam.test.ts` covers account and object authorization. `test/s3-e2e-objects.test.ts` covers batch deletes and copies. `test/s3-xml.test.ts` covers batch-delete key extraction.
+
+## Supabase proxy
+
+### Method-and-path classification
+
+`classifySupabaseRequest` receives only the HTTP method and path. It maps path prefixes to categories and constructs actions such as `supabase:database:read` and `supabase:database:write`. It does not read the SQL body, strip comments, split statements, or infer safety from query text.
+
+| Request shape | Classification |
+|---|---|
+| GET or HEAD on a mapped path | Read action for the matched category |
+| POST to the database read-only query path | `supabase:database:read` through an explicit read override |
+| POST to the general database query path | `supabase:database:write` |
+| Other methods on a mapped path | Write action unless an explicit read override matches |
+| Unmapped path | No classification; the proxy returns 404 |
+
+Project-scoped requests produce a project resource when a project reference is present. Account, organization, and branch routes produce their corresponding resource types. Policy fields include the category, HTTP method, write flag, and project reference when available.
+
+`test/supabase-classify.test.ts` covers path categories, read overrides, and unmapped paths. `test/supabase-mgmt.test.ts` covers read-only keys, write denial, and bound upstream credentials.
+
+## Cloudflare DNS proxy
+
+### Request fields
+
+The DNS router classifies operations before proxying them and builds policy fields from the route and inbound body.
+
+| Operation | Required action | Operation-specific policy fields |
+|---|---|---|
+| List or get records | `dns:read` | None |
+| Create | `dns:create` | Name, type, content, TTL, proxied flag, comment, and tags when supplied |
+| Delete | `dns:delete` | None |
+| PATCH or PUT | `dns:update` | Name, type, content, TTL, proxied flag, comment, and tags when supplied |
+| Batch | `dns:batch` plus each sub-operation's action | Fields from each create, patch, put, or delete entry |
+
+Batch deletes require `dns:delete`, batch patches and puts require `dns:update`, and batch creates require `dns:create`; the batch context itself must also be allowed. Every generated context must pass the policy.
+
+The gateway does not pre-fetch the existing record before authorizing DELETE, PATCH, PUT, or batch operations. Name, type, and content conditions therefore see only values supplied in the inbound request. Those fields are absent for DELETE, and omitted PATCH or PUT fields remain absent; the effect-aware missing-field rules apply. Route record IDs select the upstream path but are not added to the policy fields.
+
+Export uses `dns:export` and import uses `dns:import`. Zone scans use `dns:scan`, scan triggers use `dns:trigger_scan`, and scan review uses `dns:get_scan_review` for GET or `dns:review_scan` for POST.
+
+`test/dns.test.ts` covers action mapping, request-derived fields, and proxying without a pre-flight record read.
+
+## Claim evidence
+
+| Claim | Evidence |
+|---|---|
+| Deny-first evaluation, default deny, and missing-field behavior | `test/policy-engine.test.ts` |
+| Validation structure and regular-expression limits | `src/policy-engine.ts`, `test/policy-engine-validation.test.ts` |
+| Key lifecycle and zone authorization | `test/iam.test.ts` |
+| Header extraction, purge authorization, and effect-aware conditions | `test/purge.test.ts` |
+| Configuration caching | `test/config-cache.test.ts` |
+| Two-tier debit and bounded per-key buckets | `src/durable-object.ts`, `test/purge.test.ts`, `test/token-bucket.test.ts` |
+| Raw-body collapse and follower accounting | `src/routes/purge.ts`, `src/durable-object.ts`, `test/request-collapse.test.ts` |
+| Event retention and expiry cleanup | `test/scheduled.test.ts` |
+| Upstream token and R2 resolution | `test/upstream-tokens.test.ts`, `test/upstream-r2.test.ts` |
+| S3 signatures, per-object authorization, and batch XML | `test/s3-sigv4.test.ts`, `test/s3-e2e-iam.test.ts`, `test/s3-e2e-objects.test.ts`, `test/s3-xml.test.ts` |
+| Supabase method-and-path classification | `test/supabase-classify.test.ts`, `test/supabase-mgmt.test.ts` |
+| DNS actions, request fields, and no pre-fetch | `src/cf/dns/routes.ts`, `src/cf/dns/operations.ts`, `test/dns.test.ts` |
+
+[^rfc-ratelimit]: IETF HTTPAPI Working Group, "RateLimit header fields for HTTP", draft-ietf-httpapi-ratelimit-headers-11. https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers-11/
