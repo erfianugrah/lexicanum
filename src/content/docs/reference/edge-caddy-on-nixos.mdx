@@ -350,6 +350,126 @@ Instead of maintaining separate web server and security audit logs, Caddy writes
 
 `edgectl`'s `AccessLogStore` tails `/var/log/caddy/combined-access.log` using byte offset tracking saved to `/var/lib/edgectl/.access-log-offset`. When log rotation occurs, the file size drops below the saved offset; `edgectl` detects the truncation, resets the offset to zero, and resumes streaming without missing events or re-parsing rolled logs.
 
+## DDoS mitigator plugin internals
+
+The DDoS mitigator (`http.handlers.ddos_mitigator`) runs before the policy engine in Caddy's handler chain. The Caddyfile snippet in the traffic tiers section places `ddos_mitigator` outside `policy_engine` so blocked traffic never reaches downstream WAF processing, saving CPU under load. The plugin header comment states the ordering explicitly: "log_append runs first (outermost), then ddos_mitigator, then policy_engine."[^ddos-handler-order]
+
+### Three-layer detection architecture
+
+The plugin scores every request through three independent layers, then jails IPs whose score crosses a configurable threshold (default 0.75):
+
+**Layer 1 - Global rate gate:** Per-IP sustained requests per second across all services, measured over a 60-second sliding window using a 64-slot ring buffer of request timestamps.[^ddos-l1-ring] When `global_rate_threshold` is set (default 0, disabled) and the rate exceeds it, the IP is jailed immediately regardless of path diversity. This catches server-saturating floods that spread across many paths.
+
+**Layer 2 - Per-service behavioral profiling:** An `ipTracker` keyed on `(IP, host)` gives each service its own behavioral profile. Path diversity - unique paths divided by total requests - detects targeted low-rate attacks: a normal user browsing 16 pages scores 1.00, while a flood hitting one path repeatedly scores below 0.01. Volume confidence dampens low-request-count profiles, and rate amplification raises the score when a 60-second window rate is high with low diversity.[^ddos-l2-tracker]
+
+**Layer 3 - Host diversity exculpation:** A global per-IP host count from `hostTracker` reduces the effective score at jail-decision time: `effectiveScore = rawScore / log2(uniqueHosts + 1)`.[^ddos-l3-hosts] A real user hitting 8 services gets a roughly 3.17x score reduction; a DDoS targeting one service gets none. The `min_host_exculpation` setting (default 2) sets a floor below which dampening does not activate, so first-time visitors to a single host are not prematurely excused.
+
+### Request hot path
+
+The `ServeHTTP` method runs six guarded steps on every request before reaching the backend:
+
+1. Whitelist check - private subnet addresses pass immediately.
+2. Jail and promoted-CIDR check - 64-shard concurrent map, O(1) per request via `IsJailed`. If jailed and the adaptive stats engine is in spike mode, only 1 in 64 blocked requests is logged to avoid the synchronous JSON log pipeline becoming the bottleneck.[^ddos-spike-sampling]
+3. Host recording and L1 rate check - global per-IP ring buffer rate compared to threshold.
+4. L2 and L3 behavioral scoring - `RecordAndScore` on the `(IP, host)` profile, then divide by host diversity factor.
+5. Jail decision - if score exceeds threshold, the IP is added to the jail with exponential backoff (`base_penalty * 2^infractions`) and up to 25% jitter to prevent synchronised retry storms.[^ddos-ttl-jitter] The CIDR aggregator checks whether enough IPs from the same /24 (IPv4) or /64 (IPv6) have been jailed to promote the entire prefix.
+6. Pass through - `next.ServeHTTP` for clean requests.
+
+The hot path benchmarks at approximately 90 ns per request with zero heap allocation.[^ddos-perf]
+
+### State and lifecycle
+
+The plugin is provisioned once per Caddy process and holds all state in memory:
+
+- **ipJail:** 64-shard concurrent map (`sync.RWMutex` per shard) with TTL-based lazy expiry. A package-level registry maps jail file paths to shared jail instances, so the L4 TCP RST handler (`mitigator_l4.go`) accesses the same jail as the L7 handler without any IPC.[^ddos-jail-registry]
+- **Infraction history:** 24-hour TTL keyed by IP. Counts persist across jail terms so repeat offenders escalate penalties even after expiry or manual unjail.[^ddos-infraction-history]
+- **hostTracker:** Per-IP host diversity tracked globally across all services. The host count and ring buffer rate are updated atomically on each request.
+- **ipTracker:** Per-`(IP, host)` behavioral profiles with LRU eviction. Each profile stores a ring buffer for the 60-second rate, a bounded set of up to 256 unique paths, and HTTP method counts.
+- **Count-Min Sketch:** Fingerprint frequency tracking across the whole traffic corpus. Counters are halved every `decay_interval` (default 30 s) so the sketch responds to traffic shifts.
+- **adaptiveStats:** Welford algorithm plus dual exponential weighted moving averages for spike detection. Below `warmup_requests` (default 1000), the stats engine suppresses scoring to prevent false positives during cold start.[^ddos-warmup]
+- **CIDR aggregator:** Tracks jailed IPs per /24 and /64 prefix. When `cidr_threshold_v4` (default 5) IPs are jailed from one prefix, the entire prefix is promoted and any subsequent connection from that range is blocked instantly without per-IP lookup.
+
+### Enforcement layers
+
+Four enforcement mechanisms share the same jail, deployed from fastest (kernel) to slowest (userspace):
+
+| Layer | Mechanism | Config flag | Capability required |
+|---|---|---|---|
+| eBPF/XDP | `XDP_DROP` at NIC driver, approximately 10M packets per second | `xdp_drop`, `xdp_iface` | `BPF`, `NET_ADMIN` |
+| nftables | Kernel ipset drop, approximately 1.5M packets per second | `kernel_drop` | `NET_ADMIN` |
+| L4 TCP | `SetLinger(0)` sends RST before TLS handshake | Via `caddy-l4` app | `NET_BIND_SERVICE` |
+| L7 HTTP | 403 Forbidden, approximately 50K requests per second | Default, always active | None |
+
+nftables uses the `google/nftables` library with auto-reconnection on netlink failure and tear-down of all rules, chains and tables on Caddy shutdown.[^ddos-nft-setup] XDP loads a BPF program via `cilium/ebpf`; the sync uses diff-based updates (only changed entries) rather than full reloads. Both kernel layers log a warning and fall back gracefully if the required capability is missing at Provision time.[^ddos-nft-fallback]
+
+### Config reload behaviour
+
+Configuration is set at Provision time via Caddyfile or JSON and does not hot-reload. The jail file is the dynamic surface: the `runFileSync` goroutine reads and writes `jail.json` every `sync_interval` (default 2 s) under flock.[^ddos-sync-interval] On read, new entries from `edgectl` are merged in without removing existing ones. When an entry present in memory is absent from the file and predates the file's `updated_at` timestamp, the plugin treats it as a manual unjail: the IP is removed from the jail, the CIDR counter is decremented, and a 60-second grace period prevents immediate re-jail from stale profile data accumulated before the unjail.[^ddos-grace]
+
+Infraction history is written to the jail on `jail.Add` and persisted in memory separately from the jail map. It survives expiry and manual unjail so a repeat offender escalates from its last known infraction count rather than starting over.
+
+## Policy engine plugin internals
+
+The policy engine (`http.handlers.policy_engine`) evaluates user-defined rules through a 7-pass priority pipeline. The order of passes is determined by numeric priority bands: rules within each band are sorted by priority then by rule ID for deterministic tie-breaking.[^pe-pipeline-order]
+
+The engine implements six Caddy interfaces: `Module`, `Provisioner`, `Validator`, `CleanerUpper`, `MiddlewareHandler` (`ServeHTTP`), and `Unmarshaler` for Caddyfile parsing.[^pe-interfaces] A JA4 TLS fingerprinting listener wrapper (`caddy.listeners.ja4`) computes fingerprints at connection-accept time for use in rule conditions.
+
+### 7-pass evaluation pipeline
+
+| Pass | Priority band | Rule type | Behaviour |
+|---|---|---|---|
+| 1 | 50-99 | `allow` | Short-circuit: skip all remaining passes, pass to next handler immediately. |
+| 2 | 100-149 | `block`, `honeypot` | Return 403 Forbidden. In `detection_only` mode, log but do not reject. |
+| 3 | 150-199 | `challenge` | Verify PoW cookie or serve interstitial HTML. |
+| 4 | 200-299 | `skip` | Accumulate skip flags for downstream passes (detect, rate_limit, block, challenge). Non-terminating. |
+| 5 | 300-399 | `rate_limit` | Sliding window counter per rule-defined key. Returns 429 on exceed, or logs only in `log_only` action. |
+| 6 | 400-499 | `detect` | Anomaly scoring (inbound and outbound). If accumulated score exceeds configured threshold at end of loop, return 403. |
+| 7 | 500-599 | `response_header` | Set, add, remove, or default-set response headers after upstream processing. |
+
+The inbound loop (passes 1 through 6) runs before `next.ServeHTTP`. Pass 7 and outbound detect rules run after the upstream response. The `ServeHTTP` implementation wraps the response writer to capture status code and body for outbound matching.[^pe-outbound]
+
+An `allow` rule that matches still lets `rate_limit` rules evaluate for allowed traffic, so rate limits are enforced regardless of allow status.[^pe-allow-rl] A `skip` rule can suppress specific rule IDs, entire passes, or all remaining evaluation altogether via `skip_targets.all_remaining`.
+
+### Rule compilation and hot-reload
+
+Rules are loaded from `policy-rules.json` as a JSON file generated by `edgectl`. At load time, every rule is compiled into a `compiledRule` struct: regular expressions are pre-compiled, operator names are resolved to enums, byte-range validation sets are pre-built as 256-bool arrays, challenge difficulty is bounded, and an `needsBody` flag is set for rules that reference request body fields.[^pe-compile]
+
+Hot-reload runs via mtime polling at the configured `reload_interval` (default 5 s). The `checkReload` function stats the user rules file, the optional default rules file, and the JTI denylist file. On any mtime change, it opens the file under a single `os.Open` descriptor, stats the same descriptor to avoid TOCTOU races, and reads and parses the JSON content.[^pe-reload-atomic] If compilation fails, the old rules remain in place. If the file is deleted, rules are cleared and rate limit zones are emptied.[^pe-reload-deleted]
+
+Rate limit counter state is preserved across reloads for zones whose configuration (`events` and `window`) has not changed. Zones whose parameters change get fresh counters; removed zones are evicted.[^pe-rl-preserve]
+
+### State and lifecycle
+
+- **Compiled rules:** Stored behind a `sync.RWMutex` (read-locked during `ServeHTTP`, write-locked during reload). Rule count, enabled count, and rate-limit zone count are logged at Provision.
+- **Rate limit state:** 16-shard concurrent maps using fixed-window interpolation (`prevCount * (1 - elapsed/window) + currCount`), matching the algorithm used by nginx and envoy.[^pe-rl-algo] A background sweep goroutine evicts expired counters every 30 s. Max keys per zone defaults to 100000 to bound memory growth.
+- **JA4 registry:** A package-level `sync.Map` keyed by remote address. The listener wrapper writes fingerprints at `Accept()` time; `ServeHTTP` reads them. The wrapper uses a 2-second peek deadline because upstream wrappers such as `caddy-l4` clear the connection deadline after route matching - without it, a silent or drip-feeding client parked the serial accept loop during the 2026-08-08 edge outage.[^pe-ja4-deadline]
+- **Challenge state:** A 32-byte HMAC-SHA256 key for cookie signing, a flag indicating whether any challenge rules exist in the loaded config, and an mtime-polled JTI denylist file for retrospective cookie invalidation.[^pe-jti]
+- **WAF config:** Per-service anomaly scoring thresholds, protocol enforcement limits, and disabled detect-category lists, resolved by host at request time.
+
+### Challenge system
+
+The challenge system serves an embedded HTML interstitial page when a `challenge` rule matches and no valid cookie is present. Client-side JavaScript spawns a Web Worker that performs SHA-256 hashcash proof-of-work, collects 13 browser-probe signals (webdriver, CDC markers, WebGL renderer, audio context, speech voices, permissions timing, languages, `chrome.runtime`, platform, memory, touch, screen), and sends the solution to `/.well-known/policy-challenge/verify`.[^pe-challenge-probes] The server validates the HMAC, PoW hash, and timing, then runs a 6-layer bot scoring pass. A score below 70 issues an HMAC-signed cookie with configurable TTL that lets the client bypass subsequent challenge rules.
+
+Adaptive difficulty maps a pre-solve signal score linearly to a difficulty range configured per rule (`min_difficulty` to `max_difficulty`).[^pe-adaptive-diff] A session tracking service worker and page-level collector inject beacons for cross-navigation correlation. The JTI denylist enables invalidation of specific cookies without rotating the global HMAC key.
+
+### CRS protocol enforcement
+
+Before the main rule loop, `enforceProtocolLimits()` checks request-level properties against configurable limits: HTTP method allowlist, HTTP version allowlist, maximum argument count, argument name and value lengths, total query string length, and upload size limits.[^pe-crs-enforce] Violations produce synthetic detect matches with CRITICAL severity (+5 anomaly score) using their original CRS rule IDs for event correlation. All limits support per-service overrides via `WafServiceConfig`; a zero value means not enforced.
+
+### Config reload behaviour
+
+Unlike the DDoS mitigator which syncs a jail file bidirectionally, the policy engine reads its rules file unidirectionally: `edgectl` writes, Caddy polls. A failed hot-reload logs the error and keeps the previous rule set. A removed rules file clears all rules and rate limit zones. The JTI denylist file is polled independently on the same ticker so cookie invalidation updates propagate without waiting for a rules change.
+
+The `rlState` (rate limit state) pointer is set once at Provision and never set to nil, even during `Cleanup`, because `ServeHTTP` reads it without holding the rules mutex. Nil-ing it would race with in-flight requests.[^pe-rlstate-cleanup]
+
+### Operational gotchas
+
+If the JA4 listener wrapper's `Accept()` blocks without its 2-second `clientHelloPeekTimeout` deadline, the serial accept loop stalls and no new TLS connections are accepted. The deadline is cleared after the peek so slow-but-legitimate TLS clients are not affected.
+
+Challenge rules that bind cookies to the JA4 fingerprint (`bind_ja4: true`) fail when the client's TLS fingerprint changes between the interstitial solve and the verification POST - for instance, a browser that rotates its cipher suite order. The cookie is rejected and the client is served a fresh interstitial.
+
+Detection-only mode for block rules (`detection_only` in WAF config) turns 403s into logged events. The rate limiter has its own independent `log_only` action per zone. The two settings do not interact, so a block rule in detection-only mode still triggers a `block_logged` action variable while a rate limit rule with `action: log_only` produces a different variable path.
+
 ## Decision guide: native service vs containerised stack
 <a id="decision-guide-native-service-vs-containerized-stack"></a>
 
@@ -404,3 +524,34 @@ The decision flow follows three criteria:
 [^grpc-release]: gRPC Project, "gRPC-Go Releases," GitHub. https://github.com/grpc/grpc-go/releases
 [^ipsum-feed]: Stamparm, "IPsum: Threat Intelligence Feed," GitHub. https://github.com/stamparm/ipsum
 [^rfc2136]: P. Vixie et al., "Dynamic Updates in the Domain Name System (DNS UPDATE)," RFC 2136, IETF. https://www.rfc-editor.org/rfc/rfc2136
+
+[^ddos-handler-order]: caddy-ddos-mitigator, `mitigator.go` lines 1-10 (package doc comment: handler ordering log_append, ddos_mitigator, then policy_engine).
+[^ddos-l1-ring]: caddy-ddos-mitigator, `profile.go` lines 1-26 (package doc describing three-layer architecture) and lines 62-73 (rateWindowSize, rateWindowNs, ring buffer constants).
+[^ddos-l2-tracker]: caddy-ddos-mitigator, `profile.go` lines 139-147 (record method updating per-profile request counts, unique paths, and ring buffer on each request).
+[^ddos-l3-hosts]: caddy-ddos-mitigator, `mitigator.go` lines 478-488 (hostsForScore logic dividing by log2(uniqueHosts + 1) when host count meets MinHostExculpation).
+[^ddos-spike-sampling]: caddy-ddos-mitigator, `mitigator.go` lines 417-426 (spike-mode deterministic sampling: 1-in-64 blocked requests logged via FNV-32a hash).
+[^ddos-ttl-jitter]: caddy-ddos-mitigator, `mitigator.go` lines 544-557 (calcTTLForInfractions with exponential backoff and up to 25% jitter).
+[^ddos-perf]: caddy-ddos-mitigator, `README.md` lines 271-277 (benchmark on AMD Ryzen 7 7800X3D, single-threaded: Jail IsJailed 9 ns/op, CMS Increment 8 ns/op, total hot path approximately 90 ns per request with zero allocation).
+[^ddos-jail-registry]: caddy-ddos-mitigator, `jail.go` lines 270-284 (package-level jailRegistry map keyed by jail file path, getOrCreateJail function).
+[^ddos-infraction-history]: caddy-ddos-mitigator, `jail.go` lines 190-200 (infraction history with 24-hour TTL, persists across jail terms).
+[^ddos-warmup]: caddy-ddos-mitigator, `mitigator.go` lines 204-207 (WarmupRequests defaults to 1000, prevents false positives during startup and low-traffic periods).
+[^ddos-nft-setup]: caddy-ddos-mitigator, `nftables.go` lines 1-26 (package doc: nftables ipset management, cleanup on shutdown, auto-reconnection on failure).
+[^ddos-nft-fallback]: caddy-ddos-mitigator, `mitigator.go` lines 245-255 (nftables setup: on NET_ADMIN unavailable, fall back to nftNoop).
+[^ddos-sync-interval]: caddy-ddos-mitigator, `mitigator.go` lines 182-184 (SyncInterval default 2 s) and lines 667-760 (runFileSync with flock, bidirectional merge, and unjail detection).
+[^ddos-grace]: caddy-ddos-mitigator, `mitigator.go` lines 717-730 (60-second grace period on manual unjail).
+
+[^pe-pipeline-order]: caddy-policy-engine, `AGENTS.md` lines 61-75 (7 rule types evaluated in priority-band order, sorted by priority then rule ID).
+[^pe-interfaces]: caddy-policy-engine, `AGENTS.md` lines 267-280 (six Caddy interfaces: Module, Provisioner, Validator, CleanerUpper, MiddlewareHandler, Unmarshaler).
+[^pe-outbound]: caddy-policy-engine, `policyengine.go` lines 1385-1493 (outbound response wrapping: responseRecorder, ServeHTTP, then evaluateOutbound).
+[^pe-allow-rl]: caddy-policy-engine, `policyengine.go` lines 896-899 (allow-matched guard skips everything except rate_limit rules).
+[^pe-compile]: caddy-policy-engine, `AGENTS.md` lines 159-161 (compiled counterparts pre-processed at load time for O(1) runtime lookups).
+[^pe-reload-atomic]: caddy-policy-engine, `policyengine.go` lines 4771-4785 (loadFromFile: open and stat same file descriptor to avoid TOCTOU).
+[^pe-reload-deleted]: caddy-policy-engine, `policyengine.go` lines 4708-4720 (checkReload: file removed clears rules and rate limit zones).
+[^pe-rl-preserve]: caddy-policy-engine, `ratelimit.go` lines 1-14 (package doc: counter state preserved across hot-reloads, only zones whose config changes get fresh counters).
+[^pe-rl-algo]: caddy-policy-engine, `ratelimit.go` lines 7-11 (package doc: fixed-window interpolation matching nginx/envoy/cloudflare).
+[^pe-ja4-deadline]: caddy-policy-engine, `ja4_listener.go` lines 1-5 and 60-63 (package doc: 2-second peek deadline; unbounded peek parked serial accept loop during 2026-08-08 outage).
+[^pe-jti]: caddy-policy-engine, `AGENTS.md` lines 220-223 (JTI denylist written by edgectl, polled by plugin for retrospective cookie invalidation).
+[^pe-challenge-probes]: caddy-policy-engine, `AGENTS.md` lines 321-327 (6-layer bot scoring with 13 browser probes at L3).
+[^pe-adaptive-diff]: caddy-policy-engine, `challenge.go` lines 37-47 (ChallengeConfig fields: MinDifficulty, MaxDifficulty for adaptive range).
+[^pe-crs-enforce]: caddy-policy-engine, `AGENTS.md` lines 82-103 (CRS protocol enforcement settings and their CRS rule IDs).
+[^pe-rlstate-cleanup]: caddy-policy-engine, `policyengine.go` lines 772-777 (Cleanup comment: rlState intentionally not nilled to avoid data race with in-flight ServeHTTP).

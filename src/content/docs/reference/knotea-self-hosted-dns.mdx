@@ -122,11 +122,65 @@ A second instance of the same image runs on the edge router as the LAN resolver,
 
 The serving authority moved once more on 2026-09-18, in a blue-green cutover. The original app kept serving while a second Fly app stood up on a dedicated anycast address with a fresh volume and the repo-managed seed; once every zone was verified serving from the new app, the TLD glue and the DS records flipped to it in the registrar config, and the original app was retired the same day - machine destroyed, its dedicated anycast released. The released address cannot be re-allocated, so a rollback is the cutover re-run in reverse (new machine, new address, glue and DS repointed), rather than a pointer flip. Keeping the registrar side as code is what makes that tolerable: the serving address is a single local in the OpenTofu config, so the next cutover changes that one local in the same commit that moves the NS. Daily backups of the non-regeneratable state (KASP signing keys, timers, confdb export) land on R2 with 14-day retention, and the rebuild runbook is drill-tested against a scratch app.
 
-## The registrar side: glue and DS as infrastructure
+## The registrar layer: domain registration, authoritative DNS, and the edge
 
-The authority on Fly is one half of the deployment. The other half is at the registrar: who the TLD points to, what address the in-bailiwick NS resolves to, and which DS record pins the zone's DNSSEC key. On 2026-09-05 that half failed silently. The registrar's glue push to the TLD registry never landed, so the registry held no A records for the in-bailiwick NS. The failure mode is a loop: a recursive resolver following the referral must resolve the NS itself, and resolving the NS requires querying the NS it is trying to resolve. The glue A record in the referral is what breaks the cycle. The registrar's UI showed the glue records the whole time; the registry showed the delegation with no A records behind it.
+A self-hosted DNS setup spans three independently-operated layers, each in a different repo and run by a different tool:
 
-The registrar side of the domain portfolio is now declarative OpenTofu. Per-domain NS, the glue address (centralised in one local), and the DS records for the in-zone delegations are state in git, imported from the live registrar account, with a drift check and SOPS-encrypted state behind a pre-commit gate. OpenTofu cannot force the registry to serve glue - the registry still has to put the A record in the referral. What the repo adds is a checked-in verification: a query of the TLD registry itself for the NS A records, checking the ADDITIONAL section rather than the `+short` output that hides it. The registrar-side state can report the glue as pushed while the registry never received it - the 2026-09-05 failure was exactly that gap - so the registry-side check is the one that catches it.
+| Layer | Owns | Run by | Repo |
+|---|---|---|---|
+| Domain registration | NS delegation, glue records, DS records at the TLD | OpenTofu + Porkbun API[^porkbun-api] | `infra/dns-tf` |
+| Authoritative DNS | Zone data, DNSSEC signing, TSIG keys | knotd inside knotea (Fly.io anycast) | `infra/knotea` |
+| Edge proxy | TLS termination, ACME DNS-01 challenges, reverse proxy | Caddy on the [NixOS edge router](/reference/nixos-router-network-design/) | `infra/router` |
+
+The split keeps failures from cascading: a Caddy restart does not touch the authoritative zone, and a registrar-side glue push is independent of what knotd serves. The coupling points are narrow - the edge proxy calls `knotctl` over TSIG-authenticated RFC 2136 for ACME challenges, and the registrar layer holds the NS, glue and DS that point at the authority. Changing the serving anycast address means changing one `local.knotea_anycast_v4` in `main.tf` and re-applying, rather than editing records across every zone.
+
+### The 2026-09-05 glue-record outage
+
+On 2026-09-05 the erfi.io zone stopped resolving. The registrar's glue-record push to the TLD registry silently failed: the registrar UI displayed the NS A records as present, but the registry held the delegation with no A records attached. Because the nameservers are in-bailiwick (`ns1.erfi.io`), recursive resolvers deadlocked:
+
+1. A resolver follows the referral from the TLD: ask ns1.erfi.io.
+2. To ask ns1.erfi.io, the resolver must resolve its IP address.
+3. Resolving ns1.erfi.io's IP means querying the authoritative nameserver for erfi.io.
+4. That nameserver IS ns1.erfi.io - a loop.
+
+The glue A record in the referral breaks the cycle. Without it, no recursive resolver could resolve the zone. The outage was diagnosed by querying the TLD registry directly: `dig @a0.nic.io ns1.erfi.io A` showed the NS record with no address in the ADDITIONAL section. The fix was a glue re-push from the registrar, which landed within hours.
+
+The same day, 12 domains migrated from Namecheap to Porkbun. Namecheap's UI showed the glue as pushed while the registry never received it - the same silent-failure gap - and the registrar-side state had no independent verification path. Porkbun was chosen after an audit of the registrars that had an API, an OpenTofu provider (the `vitvio/porkbun` provider[^porkbun-provider]), and no known silent-failure history. `servarr.io` and `servarr.dev` were bought at Porkbun on 2026-09-14.
+
+### Registrar as infrastructure: Porkbun via OpenTofu
+
+The registrar side of every domain is now declarative OpenTofu: per-domain NS, glue A records, and DS records are state in git, imported from the live Porkbun account. The serving anycast address is centralised in one Terraform local (`local.knotea_anycast_v4`), so a future cutover changes one value in `main.tf`.
+
+State (`terraform.tfstate`, `terraform.tfstate.backup`) and secrets (`secrets.tfvars`) are committed SOPS-encrypted[^sops] with the same age key. A pre-commit hook blocks plaintext `.tfvars` and `.tfstate` files.
+
+The verification that matters is at the registry, not at the registrar API. The registrar can report the glue as pushed while the TLD never received it - the 2026-09-05 failure was exactly that gap. The checked-in verification queries the TLD registry directly:
+
+```bash
+dig @a0.nic.io ns1.erfi.io A | grep '137.66.57.23'
+```
+
+This checks the ADDITIONAL section rather than `+short`, which hides in-bailiwick glue. For DNSSEC, `dig +dnssec erfi.io SOA @1.1.1.1` confirms the `ad` flag is set.
+
+### The cutover method: blue-green with glue and DS re-pin
+
+Changing the serving Fly app is a blue-green cutover. The existing app keeps serving while a new Fly app stands up on a dedicated anycast address with a fresh volume and a repo-managed zone seed. Once every zone is verified serving from the new app, two things happen in the same OpenTofu apply:
+
+1. The `local.knotea_anycast_v4` value flips to the new anycast address.
+2. The DS records are re-pinned to the new app's live KSK CDS, read with `knotctl ds <zone>` and matched against `dig CDS <zone> @<new-ip>`.
+
+The cutover is verified with `dnsviz`[^dnsviz], a DNSSEC chain visualisation that shows the delegation, the DS at the parent, and the RRSIG chain from the zone's keys. The previous cutover on 2026-09-18 replaced the `glory-hole` app (`137.66.1.170`) with `knotea` on a new dedicated anycast (`137.66.57.23`). The old anycast address was released the same day - Fly dedicated anycast addresses cannot be re-allocated, so a rollback is a re-run of the cutover in reverse (new machine, new address, glue and DS repointed), not a pointer flip.
+
+### SOPS/OpenTofu gotcha: one file per invocation
+
+SOPS 3.13.3 takes only the first positional argument and warns: "More than one positional argument provided. Only the first one will be used!" Running `sops -e -i --age $AGE file1 file2` encrypts `file1` and silently leaves `file2` in plaintext. Both `terraform.tfstate` and `terraform.tfstate.backup` are committed encrypted, and a script that encrypts them in a single invocation leaks the backup file in plaintext into the repo.
+
+The fix is a per-file loop:
+
+```bash
+for f in terraform.tfstate terraform.tfstate.backup; do sops -e -i --age $AGE "$f"; done
+```
+
+The pre-commit hook blocks plaintext `.tfstate` files, so a leak is caught before it is committed, but the sops invocation must not rely on the hook as the first line of defence.
 
 ## The Cloudflare -> Knot migration, briefly
 
@@ -184,3 +238,7 @@ Run knotea (or this auth+resolver-in-one pattern) when you want your own zones a
 [^knot-dns]: CZ.NIC, "Knot DNS 3.5 Documentation - Configuration (confdb, TSIG keys, dynamic updates)." https://www.knot-dns.cz/docs/3.5/singlehtml/index.html
 [^fly-anycast]: Fly.io, "Networking on Fly.io (anycast, public/private networking)." https://fly.io/docs/networking/
 [^expr-lang]: expr-lang, "expr - expression language for Go." https://expr-lang.org
+[^porkbun-api]: Porkbun, "Porkbun API v3 - v3.84," Porkbun. https://porkbun.com/api/json/v3/documentation
+[^porkbun-provider]: vitvio, "terraform-provider-porkbun," GitHub. https://github.com/vitvio/terraform-provider-porkbun
+[^sops]: Mozilla / Getsops, "SOPS: Secrets OPerationS." https://getsops.io
+[^dnsviz]: Sandia National Laboratories, "DNSViz - A DNS visualization tool." https://dnsviz.net
