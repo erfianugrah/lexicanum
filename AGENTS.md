@@ -424,7 +424,7 @@ Run `bun run build` and confirm:
   tooling only (`new-doc.ts`, the scaffolder; `rentry-export.ts`, which turns a
   doc into rentry.co markdown for an off-site copy; `pasteriser-export.ts`, which
   turns a set of docs into a multi-page pasteriser.io paste with footnotes, page
-  links and dot diagrams as PNGs, published with `pasteriser publish <outdir>`) -
+  links and dot fences kept for pasteriser to draw, published with `pasteriser publish <outdir>`) -
   checks live here in `tests/`,
   after the old verify scripts were either absorbed or found to be vacuous.
   - `tests/docs.test.ts` - corpus-wide structure: split tables, footnote balance,
