@@ -1,0 +1,278 @@
+---
+title: "Recovering an AES key from power traces: method and controls"
+description: How correlation power analysis recovers an AES-128 key from software S-box transitions on a Cortex-M4 core rail, how sampling rate and block-offset tweaks shape the model, and which controls and oracle checks separate a real key from a correlation peak on noise.
+author: "Erfi Anugrah"
+category: reverse-engineering
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This reference explains how Correlation Power Analysis (CPA) recovers an AES-128 key from software table lookups on an unmasked ARM Cortex-M4 microcontroller, how block-offset tweaks and asynchronous oscilloscope sampling affect the leakage model, and which controls must pass before any candidate key is trusted. It is written for hardware-security work where flash readout protection is active and the microcontroller executes its firmware cipher in software.
+
+For the bench procedure, the Simple Power Analysis (SPA) experiment ladder, and the 50-ohm core-rail front-end, see the companion guide [Test a firmware cipher with power side-channel analysis on Cortex-M](/guides/sca-firmware-key-cortex-m/). For the Flash Memory Controller (`FMC`) lock model and the chronological evidence ledger from the same target, see [Nuvoton M483 flash locks and fault-injection readback](/reference/m483-flash-locks-and-glitch-oracles/). For the active SWD and crowbar fault-injection setup sharing the same core-rail tap, see [Read-only SWD and voltage-glitch harness on a locked Nuvoton M483](/guides/swd-and-voltage-glitch-harness-m483/). For the testing rule that requires positive and negative controls before running a campaign, see [The crux assumption: test what would collapse the plan, first](/reference/crux-assumption-test-first/).
+
+<Aside type="note" title="Provenance: offline-verified analysis versus unrun hardware capture">
+Ciphertext structure was measured on extracted 66,560-byte (65 pages of 1,024 bytes) firmware images across two release versions sharing a per-model key. The CPA solver (`cpa_aes.py`), its AES-128 key-schedule inversion (`invert_key_schedule`), and its synthetic self-test (`test_cpa_aes.py`, 400 traces of 60 samples, PRNG seed 1234) were verified offline. The SCPI/TMC waveform driver (`internal/rigol`, `MaxCapturePoints` raised from 1,000,000 to 25,000,000 samples per channel) was verified against synthetic fixtures (`testdata/rigol/`). No physical oscilloscope capture, `LDO_CAP` signal-to-noise ratio (SNR) measurement, differential SPA trace, or live CPA key recovery has been run on the `Nuvoton M483SIDAE` (`LQFP-64`) hardware. No firmware key or plaintext has been recovered.
+</Aside>
+
+## TL;DR
+
+- The `Nuvoton M483SIDAE` has no hardware cryptography accelerator (`Cryptography = "-"` in the selection table)[^m480ds], so any on-chip cipher executes as Cortex-M4 Thumb instructions over the 32-bit SRAM and flash buses[^cwstm32].
+- An asynchronous bench oscilloscope (`Rigol MHO954`, 12-bit ADC, 1 GSa/s per channel on 4 channels up to 4 GSa/s on 1 to 2 channels)[^mho900ds] samples a 192 MHz Cortex-M4 core at 5.2 to 20.8 samples per clock cycle. Its 25 Mpts to 100 Mpts buffer captures 25 ms to 100 ms continuously at 1 GSa/s, fitting all 64 block operations of a 1,024-byte page in a single acquisition.
+- The CPA attack point depends on cipher direction: boot or update decryption attacks the first round (`HW(InvSBox[C[b] ^ K0_dec[b]])`)[^oflynn], whereas read-egress encryption attacks the last round (`HW(InvSBox[C[b] ^ K10[b]])` with `ShiftRows` byte mapping).
+- Per-offset block tweaks do not block CPA when traces are partitioned by block offset `i` (`0..63`) across code pages or firmware versions that supply varying ciphertext at the same offset.
+- Maximising absolute Pearson correlation across sample points and 256 key guesses always returns a winning byte (`argmax`), even on Gaussian noise, constant inputs, or a non-AES cipher. A claimed recovery is qualified only when the inverted key schedule passes an independent encryption or decryption oracle check and agrees across block offsets.
+
+## Attack model and qualification pipeline
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  ctrl1 [label="1. Observer control\n50-ohm DC block on LDO_CAP\nknown event > noise floor"];
+  spa [label="2. Differential SPA\nread vs reference command\n64-block page structure"];
+  align [label="3. Block slicing & align\nUSB trigger + SAD/xcorr\nper-offset trace grouping"];
+  cpa [label="4. Byte-wise CPA\nHW(InvSBox(C[b] ^ k))\nvs shuffled-input floor"];
+  sched [label="5. Key-schedule check\ninvert K10 -> master K0\ncross-offset + oracle gate"];
+
+  ctrl1 -> spa [label="SNR qualified"];
+  spa -> align [label="10/12/14 round peaks"];
+  align -> cpa [label="varying C[i,b]"];
+  cpa -> sched [label="margin > null floor"];
+}
+```
+
+1. **Observer control**: verify the oscilloscope transport on a known source and confirm that the AC-coupled `LDO_CAP` core rail (pin 50, ~1.26 V) registers repeatable voltage ripple during a known peripheral operation before interpreting any quiet trace.
+2. **Differential SPA**: compare repeated power traces during page reads (`cmdRead`) and page writes (`cmdWrite`) against non-crypto reference commands (`cmdDone`, filler-page reads, or invalid selectors) to locate the cipher operation and check for 64 block macro-cycles with 10, 12, or 14 internal round peaks.
+3. **Block slicing and software alignment**: trigger on the USB `SetFeature` transfer boundary, slice each 1,024-byte page waveform into 64 block traces using windowed cross-correlation or Sum of Absolute Differences (SAD), and group traces by block offset `i` (`0..63`).
+4. **Byte-wise CPA**: for each byte index `b` (`0..15`) and key guess `k` (`0..255`), correlate the predicted Hamming weight `HW(InvSBox(C[i, b] ^ k))` against the aligned voltage samples and compare the peak against a shuffled-ciphertext permutation control.
+5. **Key-schedule and oracle gate**: invert the 16-byte round-10 key `K10` through the AES-128 key schedule to obtain the candidate master key `K0`, verify that independent block offsets recover the same key, and test `K0` against an encryption or decryption oracle.
+
+## Which model applies to which cipher topology
+
+The firmware images on the target are 66,560 bytes (65 pages of 1,024 bytes): 29 code pages (`0..28`), 35 identical filler pages (`29..63`), and 1 trailer page (`64`). Within each filler page, all 64 of the 16-byte blocks are distinct; across pages `29..63`, the 16-byte block at each offset `0..63` repeats 35 times. Across two firmware releases for the same microcontroller variant, pages `29..63` are byte-identical while code pages `0..28` and trailer page `64` differ in two isolated runs without cascading across the page-29 boundary.
+
+That block structure rules out stream ciphers with a per-image nonce, 8-byte block ciphers, and cross-page Cipher Block Chaining (CBC). It is consistent with a 128-bit block cipher using a per-offset tweak or a fixed per-page Initialization Vector (IV). The table below maps each architecture and tweak topology to the required CPA model.
+
+| Operation & tweak topology | Cipher equation for block offset `i` (`0..63`) | Known input | Attacked intermediate state | Offset grouping required |
+|---|---|---|---|---|
+| Arch A: boot/update decrypt, no tweak | `P_i = AES_Dec(K, C_i)` | Ciphertext `C_i` | Round 1 `InvSubBytes(C_i[b] ^ K10[b])` | No; all 1,920 code/trailer blocks per image pool together |
+| Arch A: boot/update decrypt, post-decrypt tweak | `P_i = AES_Dec(K, C_i) ^ Tweak(i)` | Ciphertext `C_i` | Round 1 `InvSubBytes(C_i[b] ^ K10[b])` | No; `Tweak(i)` is applied after `AES_Dec` and does not enter round 1 |
+| Arch A: boot/update decrypt, per-page fixed-IV CBC | `P_i = AES_Dec(K, C_i) ^ C_{i-1}` | Ciphertext `C_i` | Round 1 `InvSubBytes(C_i[b] ^ K10[b])` | No; `C_{i-1}` XORs after `AES_Dec` in CBC decryption[^oflynn] |
+| Arch A: boot/update decrypt, pre-decrypt or XEX tweak | `P_i = AES_Dec(K, C_i ^ Tweak1(i)) ^ Tweak2(i)` | Ciphertext `C_i` | Round 1 `InvSubBytes(C_i[b] ^ (K10[b] ^ Tweak1(i)[b]))` | Yes; group by offset `i` across pages to recover `K'_i = K10 ^ Tweak1(i)` |
+| Arch B: read-egress encrypt, no pre-ciphertext tweak | `C_i = AES_Enc(K, P_i)` | Egress ciphertext `C_i` | Round 10 pre-`SubBytes` state `InvSBox(C_i[b] ^ K10[b])` at pre-`ShiftRows` index | Only if an offset tweak XORs into round 10 |
+| Custom ARX or Feistel cipher | Non-Rijndael round function | Ciphertext `C_i` | None under AES `InvSBox`; use input correlation `corr(trace(t), HW(C_i[b]))` | Depends on cipher structure; stop AES CPA |
+
+## Trace acquisition requirements
+
+### Core-rail tap versus supply-pin probing
+
+The `M483SIDAE` feeds its ~1.26 V Cortex-M4 core logic, internal SRAM, and `FMC` from an internal linear regulator (LDO) supplied by the 3.3 V `VDD` rail (pin 51)[^m480ds]. Measuring power traces on the 3.3 V `VDD` pin attenuates instruction-level current spikes because the on-chip LDO acts as an active low-pass filter and injects low-frequency regulation drift[^cwreg].
+
+Pin 50 (`LDO_CAP`) connects directly to the output side of the internal regulator (`VCORE`). Because the regulator loop has finite bandwidth, cycle-by-cycle current draw from `SubBytes` table loads and ALU operations produces fast AC voltage ripple on `LDO_CAP`[^cwreg][^cwstm32].
+
+To resolve microvolt-to-millivolt ripple on `LDO_CAP`:
+
+- **Do not use a 10x passive probe.** The stock `RP3500A` 10x passive probe forces the oscilloscope's 1 MOhm input path and attenuates the signal by 10x, burying data-dependent Hamming-weight variations in front-end and quantisation noise[^mho900ds].
+- **Use an AC-coupled 50-ohm coaxial feed.** Connect `LDO_CAP` and the nearest ground through a BNC-to-grab-hook lead (`Pomona 5187-C-24`) and a series coaxial DC block (`Mini-Circuits BLK-222+`) into the oscilloscope's 50-ohm input at 200 uV/div with a 250 MHz bandwidth limit. The series capacitor blocks the ~1.26 V DC rail so the 50-ohm termination does not load the core regulator, while passing high-frequency switching transients[^cwreg].
+- **Disconnect any fault-injection MOSFET from the rail.** A crowbar wire attached to `LDO_CAP` adds output capacitance (`C_oss`) across the core rail and filters the high-frequency ripple.
+
+### Sampling rate versus S-box timing
+
+Synchronous capture hardware such as the `ChipWhisperer-Lite` or `ChipWhisperer-Husky` (12-bit ADC, up to 200 MS/s)[^cwhusky] clocks the ADC from the target clock (`1x` to `4x` oversampling), placing one sample at the exact phase of every instruction cycle. On a commercial peripheral clocked by its own internal oscillator or PLL (up to 192 MHz on `M483SIDAE`)[^m480ds], external clock injection is unavailable without hardware modification, so a bench oscilloscope samples asynchronously.
+
+| Parameter | Rigol MHO954 specification[^mho900ds] | ChipWhisperer-Husky reference[^cwhusky] | Impact on Cortex-M4 CPA |
+|---|---|---|---|
+| ADC resolution | 12-bit (8.1 ENOB typical at 10 MHz; up to 16-bit High-Res) | 12-bit | 4,096 vertical quantisation levels vs 256 on 8-bit scopes |
+| Sample rate | 4 GSa/s (1-2 ch) / 1 GSa/s per ch (4 ch) | 200 MS/s synchronous | 5.2 to 20.8 samples per 192 MHz CPU clock cycle[^uarksca] |
+| Analog bandwidth | 500 MHz (1-2 ch) / 400 MHz (4 ch) | ~100 MHz | Captures single-cycle instruction current transients |
+| Vertical sensitivity (50 ohm) | 200 uV/div to 1 V/div | Internal LNA (-6.5 dB to +55 dB) | Usable unamplified sensitivity when DC-blocked into 50 ohm |
+| Memory depth | 100 Mpts (1 ch) / 25 Mpts per ch (4 ch) standard | 131,124 samples | Captures a full 64-block page (25 ms to 100 ms at 1 GSa/s) in one shot |
+
+In software AES on a Cortex-M4, each byte substitution loads from a 256-byte `SBox` or `InvSBox` table in flash or SRAM over the 32-bit bus into a core register[^cwstm32][^ceur2940]. Because a single 25 Mpts capture at 1 GSa/s records 25 ms continuously (`MaxCapturePoints = 25000000` in `internal/rigol`), one oscilloscope acquisition covers an entire 1,024-byte page operation (64 blocks of 16 bytes) back-to-back. Capturing the 29 code pages of one firmware image requires 29 scope transfers and yields `29 * 64 = 1,856` single-block traces. Combining the 30 non-filler pages (`0..28` and `64`) across two same-key firmware releases provides `60 * 64 = 3,840` distinct 16-byte ciphertext blocks without crafting custom payloads.
+
+### Asynchronous jitter and two-stage resynchronisation
+
+Because the `M483SIDAE` internal oscillator runs independently of the oscilloscope timebase, clock phase drifts across the 64 blocks of a page. Correlating raw sample indices aligned only on the initial USB `SetFeature` hardware trigger smears single-cycle instruction peaks across adjacent sample columns by the time block 63 executes.
+
+Slicing a page waveform into aligned block traces requires two stages:
+
+1. **Coarse hardware trigger**: trigger Channel 2 on the USB transaction or GPIO marker at the start of the page operation (`:SINGle` acquisition mode).
+2. **Fine software resynchronisation**: locate the 64 periodic macro-cycles in the power envelope, slice the continuous waveform into 64 windows, and align each window `j` (`0..63`) to a reference template using windowed cross-correlation or minimum Sum of Absolute Differences (SAD) before stacking traces for CPA.
+
+## Correlation power analysis attack model
+
+### Hamming weight and Hamming distance on a 32-bit bus
+
+When the Cortex-M4 loads a byte `v = InvSBox[C[b] ^ k]` from memory into a register, dynamic CMOS switching power on the core rail scales with the number of bit transitions on the internal data bus and register file[^cwstm32]:
+
+- **Hamming weight (`HW`)**: models instantaneous power as proportional to the number of `1` bits in the intermediate byte, `HW(v) = popcount(v)` (ranging from 0 to 8, with mean 4 and variance 2 for uniformly distributed bytes).
+- **Hamming distance (`HD`)**: models power as proportional to the number of bits flipping between the previous value `v_prev` on the register or bus and the new value `v`, `HD(v_prev, v) = HW(v_prev ^ v)`.
+
+When `v_prev` is a constant instruction opcode, a zeroed register, or an independent variable across traces, the `HW(v)` model captures the first-order data-dependent variance directly. Because `SBox` and `InvSBox` are nonlinear bijections constructed over `GF(2^8)`, changing a single bit of the key guess `k` reassigns the output bytes nonlinearly across the 256 inputs:
+
+- For the **correct key byte** `k == K_true`, the predicted vector `HW(InvSBox[C[i, b] ^ k])` tracks the real physical Hamming weight on every trace `i`.
+- For any **wrong key guess** `k != K_true`, `InvSBox[C[i, b] ^ k]` permutes the bytes into an almost uncorrelated sequence whose theoretical correlation with `HW(InvSBox[C[i, b] ^ K_true])` drops toward zero as trace count `N` grows[^oflynn].
+
+### Decryption first round versus encryption last round
+
+A recurring mistake in side-channel planning is applying a single "first-round `InvSubBytes`" label to both firmware decryption and read-egress encryption (`2026-11-17-op1-sca-plan.md` review finding). The two architectures run the cipher in opposite directions:
+
+1. **Architecture A (bootloader decryption, `P = AES_Dec(K, C)`)**:
+   - The known input is the ciphertext block `C`.
+   - Decryption starts with `InvAddRoundKey` (XORing `C` with the final encryption round key `K10`), followed immediately by `InvShiftRows` and `InvSubBytes` (which commute up to byte position)[^oflynn].
+   - For ciphertext byte position `b` (`0..15`) and key guess `k` (`0..255`), the first-round intermediate byte is `InvSBox[C[b] ^ k]`, where the winning guess `k` is byte `b` of `K10`.
+2. **Architecture B (read-egress encryption, `C = AES_Enc(K, P)`)**:
+   - The plaintext `P` in flash is unknown; the known value is the output ciphertext block `C` returned over USB HID.
+   - Because `P` is unknown, round 1 (`SubBytes(P[b] ^ K0[b])`) cannot be predicted per trace. Instead, the attack targets the **final encryption round** (round 10, which omits `MixColumns`):
+     ```
+     C[b] = SBox[State_9[shift_inv(b)]] ^ K10[b]
+     ```
+   - Inverting that equation gives the round-9 state byte entering the final `SubBytes`:
+     ```
+     State_9[shift_inv(b)] = InvSBox[C[b] ^ K10[b]]
+     ```
+   - The leakage prediction for ciphertext byte `b` is still `HW(InvSBox[C[b] ^ k])`, or the Hamming distance `HW(InvSBox[C[b] ^ k] ^ C[b])` across the final register overwrite, and the winning guess `k` at ciphertext index `b` is still byte `b` of `K10`. However, the sample timestamp `time_index` where that leak occurs corresponds to the pre-`ShiftRows` byte index `shift_inv(b)` during round 10, not round 1.
+
+### Point-by-point Pearson correlation and key-schedule inversion
+
+The offline solver (`tools/sca/cpa_aes.py`) takes an aligned trace matrix `traces` of shape `(N, S)` (`N` traces by `S` time samples) and a known ciphertext array `cts` of shape `(N, 16)`.
+
+For each byte position `b` in `0..15` and each candidate key byte `k` in `0..255`:
+
+```python
+# Centre traces across the N acquisitions
+T = traces - traces.mean(axis=0, keepdims=True)
+Tstd = traces.std(axis=0) + 1e-12
+
+# Predict Hamming weight of InvSubBytes for byte b and guess k
+pred = HW[INVSBOX[(cts[:, b] ^ k) & 0xFF]]
+pc = pred - pred.mean()
+denom = pc.std() + 1e-12
+
+# Absolute Pearson correlation at every sample index 0..S-1
+corr = np.abs((pc[:, None] * T).mean(axis=0) / (denom * Tstd))
+```
+
+For each byte `b`, the solver records the peak correlation `corr_matrix[b, k] = corr.max()`, selects `best[b] = argmax_k corr_matrix[b, k]`, and computes the runner-up margin `srt[0] - srt[1]` between the highest and second-highest key guesses.
+
+Once all 16 bytes of the round-10 key `K10` (words `w[40]..w[43]`) are recovered, `invert_key_schedule(k10)` reverses the AES-128 key expansion step by step from word `i = 43` down to `i = 4` to recover the 128-bit master key `K0` (`w[0]..w[3]`):
+
+- When `i % 4 != 0`: `w[i - 4] = w[i] ^ w[i - 1]`
+- When `i % 4 == 0`: `w[i - 4] = w[i] ^ g(w[i - 1], RCON[i // 4 - 1])`, where `g` rotates the 4-byte word left by one byte (`word[1:] + word[:1]`), substitutes each byte through `SBOX`, and XORs the round constant `RCON` into byte 0.
+
+## Controls and qualification gates
+
+### False negatives from unverified capture chains
+
+On the same locked `M483SIDAE` peripheral, three separate debug results initially recorded as "chip locked" turned out to be broken probes:
+
+1. **Unpowered debug access port**: an OpenOCD safe-connect patch omitted `CONNECT_NORMAL`, leaving the `AHB-AP` unpowered so every memory read echoed the stale `DPIDR` word (`0x2ba01477`) across 10,157 fault-injection trials.
+2. **Disabled flash ISP engine**: a flash read probe wrote `ISPADDR`, `ISPCMD`, and `ISPTRG` without setting `FMC_ISPCTL.ISPEN`, returning `0x0` with `ISPFF = 0` because the ISP state machine never started.
+3. **Unpacked narrow bus writes**: an 8-bit `SRAM` write probe wrote raw byte values to `AP_DRW` without replicating the byte into the shifted 32-bit lane required by the ARM Debug Interface specification.
+
+Side-channel capture has the exact same failure mode. A flat `LDO_CAP` waveform or a low CPA correlation (`min_margin < 0.02`) is an unqualified negative until the measurement chain is proven live in the same session:
+
+- **Stale oscilloscope buffer (`scope_missed`)**: if the oscilloscope is already sitting in `STOP` before the command runs, reading `:WAVeform:DATA?` returns the previous acquisition. The capture driver (`internal/rigol`) requires observing a non-`STOP` state (`WAIT`, `TRIG'D`, or `AUTO`) after `:SINGle` before accepting the subsequent `STOP`.
+- **Byte-order corruption**: 16-bit `WORD` waveform reads over SCPI can return little-endian or big-endian byte order depending on instrument firmware. A byte-swapped waveform turns a clean signal into high-frequency noise unless verified first against the square-wave probe-compensation output (`rigol-bring-up.md`).
+- **Attenuated front-end or regulator filtering**: probing with a 10x passive probe, leaving a crowbar MOSFET wired to `LDO_CAP`, or capturing outside the time window where the CPU executes the cipher produces pure Gaussian noise that looks identical to a side-channel-resistant target.
+
+### False positives from extremum selection and constant inputs
+
+Running `cpa_aes.py` on any `(N, S)` array of numbers and any `(N, 16)` array of bytes always outputs a 16-byte round key and an inverted 16-byte master key. Three mechanisms produce false-positive keys when controls are skipped:
+
+1. **Extremum selection over `256 * S` hypotheses**:
+   For each key byte, `cpa_aes.py` takes the maximum absolute correlation across `S` time samples and 256 guesses (`256 * S` comparisons). Under a null hypothesis where traces are independent Gaussian noise unrelated to the ciphertext, each single-point correlation has variance `1 / N`, and the expected maximum across `M = 256 * S` independent trials grows as `sqrt(2 * ln(M) / N)`. With small trace counts (`n < 20` triggers an explicit warning in `cpa_aes.py`) and wide unwindowed captures, random noise produces large spurious correlation peaks and can randomly separate the top guess from the runner-up by more than the script's static `0.02` (`medium`) or `0.05` (`high`) margin thresholds.
+2. **Zero input variance (the single-block trap)**:
+   `cpa_aes.py` accepts a 16-byte binary file (`--ciphertexts block0.bin`) and tiles that single block across all `N` traces (`np.tile`). When every trace uses the identical ciphertext byte `C[0, b]`, the predicted vector `pred = HW[INVSBOX[cb ^ k]]` is constant across all `N` traces for every guess `k`. Centering gives `pc = pred - pred.mean() = 0`, and dividing by `denom = pc.std() + 1e-12` produces zero (or floating-point rounding residue). `argmax` then picks guess `k = 0` (or a rounding artifact) for every byte, and `invert_key_schedule` deterministically transforms those 16 bytes into a hex string that looks like a recovered master key.
+3. **Wrong cipher primitive or unmodelled pre-whitening**:
+   Because `invert_key_schedule` is a bijection on `{0, 1}^128`, *every* 16-byte array `best[0..15]` maps to a unique 16-byte `master_key_hex`. If the firmware actually uses an ARX cipher (such as TEA, XTEA, or SPECK)[^ietlightweight], a custom Feistel network[^blindsca], or an unmodelled non-linear tweak before AES, the AES `InvSBox` correlation picks whichever key bytes happen to align with residual byte-load correlations (`HW(C[b])`) and inverts them into a meaningless master key.
+
+### Pre-attack controls
+
+Before running CPA against an unknown firmware key, four controls must pass in order:
+
+| Control | What it tests | Pass criterion | Failure meaning |
+|---|---|---|---|
+| 1. Synthetic solver self-test (`test_cpa_aes.py`) | `cpa()` correlation math and `invert_key_schedule()` | Recovers exact 16-byte `K10` and `master` on 400 synthetic traces (`S = 60`, spike `3.0 * HW`, seed 1234) with `min_margin > 0.05` | Bug in Python environment, array shape handling, or key-schedule inversion |
+| 2. Bench & rail positive control (`rigol-bring-up` + E1 reference) | SCPI transport, `WORD` byte order, fresh `:SINGle` stop, and `LDO_CAP` 50-ohm SNR | Flat-topped compensation wave; `preamble points == requested points`; repeatable `LDO_CAP` ripple during USB/flash reference operations above idle baseline | Scope trigger race, wrong endianness, dead probe connection, or insufficient front-end gain (add 20 dB `CW502` LNA only if this fails) |
+| 3. Known-key Cortex-M4 control | Full physical capture, SAD alignment, and `HW(InvSBox)` leakage model on real silicon | Recovers all 16 known key bytes at rank 1 (guessing entropy 0) on an unlocked Cortex-M4 running known-key software AES-128 | Inadequate sample alignment, wrong vertical scale, or dominant Hamming-distance transition requiring a two-byte `HD` model |
+| 4. Shuffled-ciphertext permutation control | Empirical false-positive floor on the actual target traces | Permuting `cts` rows (`rng.permutation(cts)`) collapses all 16 byte peaks to the noise floor; unshuffled peak exceeds the 99th-percentile shuffled maximum at a consistent `time_index` | Unshuffled correlation peak is a sample-window extremum artifact or clock-synchronous interference, not data-dependent leakage |
+
+<Aside type="caution" title="A fixed filler page is a repeatability control, not a CPA input">
+In the 65-page firmware image, pages `29..63` repeat the same 64 ciphertext blocks 35 times. Capturing those 35 filler pages provides 35 identical executions per block offset to measure trace-to-trace SNR and oscillator drift (a fixed-versus-fixed repeatability control). Never feed those repeated filler pages into CPA for a fixed block offset `i`: because `C_{29,i} == C_{30,i} == ... == C_{63,i}`, input variance at offset `i` is zero. CPA requires pages `0..28` and `64` where `C_{p,i}` varies across pages `p`.
+</Aside>
+
+### Post-recovery qualification gates
+
+Three independent checks qualify a candidate key returned by CPA:
+
+1. **Split-half convergence and localized timing**:
+   Split the `N` aligned traces into two disjoint halves (for example, odd versus even traces, or code pages from release 1.09 versus release 1.10) and run `cpa_aes.py` on each half independently. A real physical leak converges to the same winning byte `best[b]` in both halves and peaks at the same cycle window `time_index` within the AES round (with all 16 byte peaks clustering inside the round-1 or round-10 execution window rather than scattering randomly across the 25 ms page trace).
+2. **Cross-offset key-schedule agreement**:
+   - Under an untweaked, CBC, or post-decrypt-tweaked cipher, running CPA independently on block offset `i = 0` and block offset `i = 1` across the varying code pages must yield the identical 16-byte `round10_key_hex` and `master_key_hex`.
+   - Under a pre-decrypt tweak (`K'_i = K10 ^ Tweak1(i)`), recovering `K'_i` at each offset `i` (`0..63`) allows computing the exact first-round output `InvSBox[C_i[b] ^ K'_i[b]]` and applying `InvShiftRows` and `InvMixColumns`. Running a second-round CPA against those known intermediate inputs must then recover a single, offset-invariant round-9 key `K9` across all 64 offsets.
+3. **Full key-schedule verification against an encryption or decryption oracle**:
+   The definitive gate is functional decryption or encryption outside the statistical model:
+   - **Known plaintext-ciphertext pair**: if a known block pair `(P, C)` is available (such as an all-zero or filler plaintext block, or an encryption oracle on the device), compute `AES_128_Enc(K0, P)` (with any recovered tweak) and require an exact 128-bit match with `C`.
+   - **Firmware image structural oracle**: on a locked Cortex-M4 firmware image where no plaintext block is given a priori, use the candidate `K0` (and any per-offset tweak derived from the constant filler page `29`, where plaintext is uniform `0xFF` or `0x00`) to decrypt code pages `0..28`. A genuine key produces valid ARMv7E-M Thumb-2 machine code whose vector table at offset `0x00` contains an initial Main Stack Pointer (`MSP`) in the `M483SIDAE` SRAM range (`0x20000000`-`0x20027fff`) and odd-valued Thumb exception handler pointers (`bit 0 == 1`) targeting the `APROM` execution range, with byte entropy dropping well below the 7.94 to 7.95 bits/byte ciphertext baseline. If the decrypted pages remain high-entropy noise with an invalid vector table, the candidate key is false regardless of its Pearson correlation score.
+
+## Evidence: tested versus design-only
+
+| Component or claim | Status | How it was checked |
+|---|---|---|
+| `M483SIDAE` lacks hardware AES/crypto (`Cryptography = "-"`) and `XOM` | Documented | Nuvoton M480 Series Datasheet Rev. 3.09 selection tables[^m480ds] and live `SYS_PDID = 0x00d48310` read |
+| Firmware image is 65 pages x 1,024 bytes (66,560 bytes), entropy 7.94-7.95 bits/byte | Measured (offline) | `analyze.py` over extracted updater resources and live HID `cmdRead` backups |
+| Filler pages `29..63` contain 64 distinct 16-byte blocks repeating 35x at matching page offsets | Measured (offline) | Block-repeat and 8-byte/16-byte alignment test in `cipher-mode.md`; rules out 8-byte block ciphers and cross-page CBC |
+| Two firmware releases (1.09 and 1.10) share the same per-model key and supply 3,840 varying 16-byte blocks | Measured (offline) | `cmp -n 35840 -i 29696:29696` returns exit 0 on filler pages `29..63`; 60 total code/trailer pages x 64 blocks |
+| CPA solver (`tools/sca/cpa_aes.py`) and AES-128 `invert_key_schedule()` | Tested (offline synthetic) | `tools/sca/test_cpa_aes.py`: 400 synthetic traces x 60 samples, PRNG seed 1234, exact 16-byte `K10` and `master` match |
+| SCPI/TMC driver (`internal/rigol`) with 25,000,000-point deep-memory cap | Tested (offline fixture) | Go unit tests against `testdata/rigol/` binary waveform fixtures (`MaxCapturePoints = 25000000`) |
+| Physical Rigol MHO954 bench bring-up and probe-compensation capture | Design-only (unrun) | Procedure written in `rigol-bring-up.md`; not yet executed on the physical instrument |
+| Passive 50-ohm DC-blocked `LDO_CAP` (`BLK-222+` + `5187-C-24`) SNR measurement | Design-only (unrun) | Front-end specified; no physical `LDO_CAP` waveform captured yet |
+| E1 differential SPA-on-read (arch A vs arch B discriminator) | Design-only (unrun) | Planned experiment; neither arch A nor arch B is confirmed by a power trace |
+| E2 SPA-on-write (64-block macro-cycle and 10/12/14 AES round fingerprint) | Design-only (unrun) | Planned experiment; software cipher primitive is not yet confirmed as AES |
+| E3 live CPA key recovery and oracle verification on target hardware | Design-only (unrun) | Conditional on E1/E2 and Control 3/4 passing; zero live traces collected, no key recovered |
+
+## What to do about it
+
+| Practice | Evidence |
+|---|---|
+| Run differential SPA on `LDO_CAP` before collecting CPA traces | Settles whether the key runs during `cmdRead` (arch B) or `cmdWrite`/boot (arch A) and checks for 10/12/14 AES rounds before committing to an `InvSBox` model |
+| Match the CPA model to the cipher direction (`AES_Dec` round 1 vs `AES_Enc` round 10) | Boot/update decryption attacks round 1 `InvSubBytes`; read-egress encryption attacks round 10 pre-`SubBytes` with `ShiftRows` byte mapping |
+| Probe `LDO_CAP` through a 50-ohm series DC block (`BLK-222+`) at 200 uV/div, never a 10x passive probe | A 10x passive probe forces the 1 MOhm scope path and attenuates core-rail ripple 10x; disconnect any crowbar MOSFET wire so its capacitance does not filter the rail |
+| Group traces by block offset `i` (`0..63`) across varying code pages, never across repeated filler pages | Pages `29..63` repeat identical ciphertext at each offset `i` (zero input variance); grouping code pages `0..28` by offset isolates any pre-decrypt tweak `Tweak1(i)` as a constant XOR |
+| Require a shuffled-ciphertext permutation control alongside every CPA run | Maximising correlation over `256 * S` points always picks a winning byte on noise; permuting ciphertext rows establishes the empirical false-positive floor |
+| Qualify a candidate key only by full key-schedule inversion and an encryption/decryption oracle | `invert_key_schedule` maps any 16-byte noise vector to a 128-bit master key; require cross-offset agreement and valid decrypted Cortex-M4 Thumb code or `E(K0, P) == C` |
+
+## Related docs
+
+- [Test a firmware cipher with power side-channel analysis on Cortex-M](/guides/sca-firmware-key-cortex-m/) - the step-by-step bench guide implementing the E1-E3 SPA/CPA ladder and the 50-ohm `LDO_CAP` front-end.
+- [Nuvoton M483 flash locks and fault-injection readback](/reference/m483-flash-locks-and-glitch-oracles/) - the `FMC` lock architecture, write-gate map, and unqualified-negative post-mortem on the same target.
+- [Read-only SWD and voltage-glitch harness on a locked Nuvoton M483](/guides/swd-and-voltage-glitch-harness-m483/) - the active fault-injection companion sharing the `LDO_CAP` and `VDD` harness.
+- [The crux assumption: test what would collapse the plan, first](/reference/crux-assumption-test-first/) - the control-first principle behind the architecture discriminator and observer qualification.
+- [Agent-assisted reverse engineering](/reference/agent-assisted-reverse-engineering/) - static decompilation and differential testing workflow for firmware analysis once code is in hand.
+
+## References
+
+[^m480ds]: Nuvoton Technology Corp., "NuMicro Family M480 Series Datasheet," Rev. 3.09. https://www.nuvoton.com/export/resource-files/en-us--DS_M480_Series_EN_Rev3.09.pdf
+
+[^mho900ds]: Rigol Technologies, "MHO900 Series Digital Oscilloscope Data Sheet," Rigol Docs. https://www.rigol.com/dam/global/downloads/brochures/en/data-sheet/oscilloscopes/MHO900-DataSheet.pdf
+
+[^oflynn]: C. O'Flynn and Z. Chen, "Side Channel Power Analysis of an AES-256 Bootloader," Cryptology ePrint Archive, Paper 2014/899. https://eprint.iacr.org/2014/899
+
+[^cwreg]: NewAE Technology, "Targets with Internal Regulators," ChipWhisperer Documentation. https://chipwhisperer.readthedocs.io/en/latest/cw_tips_tricks/advanced_usage/regulators.html
+
+[^cwstm32]: NewAE Technology, "CW308T-STM32F (Cortex-M0/M3/M4 Target Board)," ChipWhisperer Documentation. https://chipwhisperer.readthedocs.io/en/latest/chipwhisperer-target-cw308t/CW308T_STM32F/README.html
+
+[^cwhusky]: NewAE Technology, "ChipWhisperer-Husky Specifications," ChipWhisperer Documentation. https://chipwhisperer.readthedocs.io/en/latest/Capture/ChipWhisperer-Husky.html
+
+[^uarksca]: University of Arkansas, "Side-Channel Analysis on Post-Quantum Cryptography Algorithms," ScholarWorks@UARK. https://scholarworks.uark.edu/cgi/viewcontent.cgi?article=1106&context=csceuht
+
+[^ceur2940]: CEUR Workshop Proceedings, "Firmware extraction from real IoT devices through power analysis of AES," Vol. 2940, Paper 39. https://ceur-ws.org/Vol-2940/paper39.pdf
+
+[^ietlightweight]: A. T. Mozipo and J. M. Acken, "Residual vulnerabilities to power side channel attacks of lightweight ciphers cryptography competition finalists," IET Computers & Digital Techniques. https://oadoi.org/10.1049/cdt2.12057
+
+[^blindsca]: Cryptology ePrint Archive, "An End-to-End Framework for Profiled Blind Side-Channel Analysis," Paper 2026/2544. https://eprint.iacr.org/2026/2544.pdf

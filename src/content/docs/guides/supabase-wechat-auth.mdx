@@ -1,0 +1,808 @@
+---
+title: "WeChat login on Supabase with Edge Functions and a mock for testing"
+description: "Implement WeChat Mini Program code2Session login, encrypted-data decryption, and a Web QR OAuth2 adapter on Supabase Edge Functions, with a drop-in wechat-mock server and a proven-versus-assumed verification matrix."
+author: "Erfi Anugrah"
+category: supabase
+group: auth
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+WeChat login uses two different protocols that do not match standard OAuth 2.0 or OpenID Connect. Mini Program login (`wx.login()`) returns a one-time code that a backend exchanges at `GET /sns/jscode2session` with no browser redirect. Website QR login (`snsapi_login`) redirects the browser to `https://open.weixin.qq.com/connect/qrconnect`, but its token endpoint (`GET /sns/oauth2/access_token`) expects `appid` and `secret` query parameters instead of RFC 6749 `client_id` and `client_secret`[^rfc-6749], its profile endpoint (`GET /sns/userinfo`) requires both `access_token` and `openid`, it does not support PKCE, and it returns no email address.
+
+This guide builds four Supabase Edge Functions and two PostgreSQL tables that adapt both WeChat login flows to Supabase Auth, decrypt Mini Program encrypted payloads (`wx.getPhoneNumber`) server-side, and provide a deterministic `wechat-mock` replacement for `api.weixin.qq.com` so the entire stack can be tested on a throwaway Supabase project without a WeChat developer account. For the platform's custom OIDC, passkey, and SAML behaviour, see [Supabase Auth providers: custom OIDC, passkeys, SAML and a sign-in canary](/reference/supabase-auth-providers/). For token signing, JWKS caching, and Data API verification, see [Supabase Auth end to end](/reference/supabase-auth-end-to-end/).
+
+<Aside type="caution" title="Proven against wechat-mock, not live api.weixin.qq.com">
+Every automated test in this guide runs against `wechat-mock` on a live Supabase project (verified 2026-06-26 and 2026-06-30) or in-process unit mocks. No test in the source repository has exchanged a token with real `api.weixin.qq.com`. The [Proven versus assumed matrix](#proven-versus-assumed-matrix) below separates what is verified against Supabase Auth and the mock from the protocol details transcribed from WeChat documentation.
+</Aside>
+
+## Prerequisites
+
+- A Supabase project with the project reference (`<project-ref>`), anon key (`SUPABASE_ANON_KEY`), and service-role key (`SUPABASE_SERVICE_ROLE_KEY`).
+- Deno 2.x and the Supabase CLI (`supabase` v2.108.0 or newer; `supabase db push` requires the Go binary).
+- For production use only: a WeChat Mini Program (`wx...` AppID and AppSecret from `mp.weixin.qq.com`) and/or a WeChat Open Platform Website Application (`wx...` AppID and AppSecret from `open.weixin.qq.com`). Neither is needed to deploy and run the mock test suites.
+
+## Architecture overview
+
+The adapter splits WeChat integration into four Edge Functions and two `public` tables protected by Row Level Security (RLS) with no client policies:
+
+1. `wechat-miniprogram` accepts `{ code }` from `wx.login()`, calls `GET /sns/jscode2session`, maps `unionid` and `openid` to `auth.users` via `wechat_identities`, stores `session_key` in `wechat_session_keys` with a 2-hour expiry, and issues a Supabase session using `admin.generateLink({ type: "magiclink" })` followed by `verifyOtp({ token_hash, type: "magiclink" })`.
+2. `wechat-decrypt` validates the caller's Supabase Bearer JWT via `auth.getUser(jwt)`, reads `openid` from `user_metadata`, loads the stored `session_key` from `wechat_session_keys`, decrypts AES-128-CBC `encryptedData` and `iv` payloads using `node:crypto` with manual PKCS#7 padding removal, and checks `watermark.appid`.
+3. `wechat-web-proxy` exposes `POST /wechat-web-proxy/token` and `GET /wechat-web-proxy/userinfo` as an RFC 6749 bridge for a Supabase Auth `custom:wechat-web` OAuth2 provider[^sb-custom-oauth]. It translates `client_id` and `client_secret` to `appid` and `secret`, packs WeChat's `access_token`, `openid`, and `unionid` into a base64 JSON opaque token so no key-value store is needed between `/token` and `/userinfo`, and maps `unionid ?? openid` to `sub`.
+4. `wechat-mock` implements `GET /sns/jscode2session`, `GET /sns/oauth2/access_token`, `GET /sns/userinfo`, and `GET /connect/qrconnect`. Setting `WECHAT_API_BASE_URL` to the deployed `wechat-mock` URL routes all server-side WeChat calls to the mock.
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  MP [label="Mini Program\nwx.login / getPhoneNumber"];
+  Browser [label="Browser\nsignInWithOAuth"];
+  GoTrue [label="Supabase Auth\ncustom:wechat-web"];
+  FnMP [label="wechat-miniprogram\nEdge Function"];
+  FnDec [label="wechat-decrypt\nEdge Function"];
+  FnProxy [label="wechat-web-proxy\n/token + /userinfo"];
+  DB [label="Postgres\nwechat_identities\nwechat_session_keys"];
+  WeChat [label="api.weixin.qq.com\nor wechat-mock"];
+
+  MP -> FnMP [label="POST {code}"];
+  FnMP -> WeChat [label="GET /sns/jscode2session"];
+  FnMP -> DB [label="upsert identity + session_key"];
+  FnMP -> GoTrue [label="generateLink + verifyOtp"];
+
+  MP -> FnDec [label="POST {encryptedData, iv}\nBearer JWT"];
+  FnDec -> GoTrue [label="getUser(jwt)"];
+  FnDec -> DB [label="SELECT session_key"];
+
+  Browser -> GoTrue [label="/authorize"];
+  GoTrue -> WeChat [label="302 /connect/qrconnect"];
+  GoTrue -> FnProxy [label="POST /token\nGET /userinfo"];
+  FnProxy -> WeChat [label="GET /sns/oauth2/access_token\nGET /sns/userinfo"];
+}
+```
+
+1. **Mini Program login path**: the Mini Program client sends `POST /functions/v1/wechat-miniprogram` with `{ code }`. The function calls `/sns/jscode2session` on `api.weixin.qq.com` (or `wechat-mock`), upserts the user mapping in `wechat_identities` and `session_key` in `wechat_session_keys`, and calls `generateLink` + `verifyOtp` on Supabase Auth to return a session.
+2. **Mini Program decrypt path**: the Mini Program client sends `POST /functions/v1/wechat-decrypt` with `{ encryptedData, iv }` and `Authorization: Bearer <access_token>`. The function resolves the user via `getUser(jwt)`, reads `session_key` from `wechat_session_keys`, and returns the decrypted JSON payload.
+3. **Web QR OAuth2 path**: the browser calls `supabase.auth.signInWithOAuth({ provider: "custom:wechat-web" })`. Supabase Auth redirects to `/connect/qrconnect`, receives the callback `code`, calls `POST /wechat-web-proxy/token` and `GET /wechat-web-proxy/userinfo`, and persists the resulting identity in `auth.identities`.
+
+### Component versions
+
+| Component | Version / Runtime | Role |
+|---|---|---|
+| `@supabase/supabase-js` | `npm:@supabase/supabase-js@2` | Admin user creation, `generateLink`, `verifyOtp`, and `getUser` |
+| `hono` | `npm:hono@4` | HTTP routing for `wechat-web-proxy` and `wechat-mock` |
+| `zod` | `npm:zod@4` | Request body, opaque token, and WeChat response validation |
+| `@std/uuid` | `jsr:@std/uuid@1` | Deterministic `UUIDv5` generation from `openid` |
+| `@std/encoding` | `jsr:@std/encoding@1` | Base64 decoding for `session_key`, `iv`, and `encryptedData` |
+| `node:crypto` | Deno runtime built-in | `createDecipheriv("aes-128-cbc")` with `setAutoPadding(false)` |
+
+### Proven versus assumed matrix
+
+Every claim in the repository falls into one of three verification tiers: **Unit** (38 in-process tests with `globalThis.fetch` stubbed), **Mock-E2E** (13 E2E tests plus `scripts/verify-web-qr-flow.ts` against a live Supabase project wired to `wechat-mock`), or **Assumed** (transcribed from WeChat documentation and never tested against real `api.weixin.qq.com`).
+
+| Behaviour | Tier | Evidence |
+|---|---|---|
+| OAuth2 `/token` parameter translation (`client_id`/`client_secret` in body or HTTP Basic to `appid`/`secret`) | Unit | 12 unit tests in `supabase/functions/wechat-web-proxy/index.test.ts` |
+| Stateless opaque token (`btoa(JSON.stringify({ wat, oid, uid }))`) round-trip and Zod validation | Unit | `wechat-web-proxy/index.test.ts` and `supabase/functions/_shared/wechat.ts` |
+| Concurrent first-login race safety via deterministic `UUIDv5(WECHAT_USER_NAMESPACE, openid)` and duplicate-error check | Unit | 13 unit tests in `supabase/functions/wechat-miniprogram/index.test.ts` |
+| `resolveUserEmail` reads canonical email from `auth.users` via `getUserById` and fails closed instead of reconstructing `${openid}@wechat.local` | Unit | `supabase/functions/_shared/identity.ts` and `wechat-miniprogram/index.test.ts` |
+| `withRetry` exponential backoff (200 ms base, 3 retries) restricted to HTTP `429` so `verifyOtp` single-use `token_hash` is not consumed | Unit | 4 unit tests in `supabase/functions/_shared/retry.test.ts` |
+| AES-128-CBC decryption, strict PKCS#7 padding validation (`1..16`), and `watermark.appid` check | Unit | 5 unit tests in `supabase/functions/_shared/crypto.test.ts` |
+| Server-side session issuance via `admin.generateLink({ type: "magiclink" })` -> `anonClient.auth.verifyOtp` | Mock-E2E | `e2e/e2e.test.ts` (13 tests against a deployed Supabase sandbox) |
+| Custom OAuth2 provider registration, DNS resolution requirement on URLs, and identifier-based `DELETE` | Mock-E2E | Verified against `POST /auth/v1/admin/custom-providers` on 2026-06-26 |
+| Full Web QR PKCE redirect flow (`/authorize` -> `wechat-mock/connect/qrconnect` -> `/auth/v1/callback` -> `/token` + `/userinfo`) | Mock-E2E | Verified with `scripts/verify-web-qr-flow.ts` (`deno task verify:web-qr`) on 2026-06-30 |
+| `auth.identities.identity_data` keeps only standard claims (`sub`, `name`, `picture`, `email_verified`, `phone_verified`) and drops raw `openid`/`unionid` | Mock-E2E | Verified on 2026-06-30; `attribute_mapping` is stored by the API but does not persist extra fields |
+| Real `api.weixin.qq.com` JSON response shapes and `errcode` absence on success | **Assumed** | Zod schemas in `supabase/functions/_shared/types.ts` are written from WeChat documentation |
+| Real `https://open.weixin.qq.com/connect/qrconnect` tolerating `client_id` alongside `appid` on the authorize URL | **Assumed** | Supabase Auth always appends `client_id`; `authorization_params` adds `appid`. Untested on a live WeChat Open Platform app |
+| Real Open Platform `unionid` presence and real `wx.getPhoneNumber` ciphertext round-trip | **Assumed** | Requires a bound Open Platform account and WeChat DevTools simulator or device capture |
+| `generateLink` + `verifyOtp` throughput under production login bursts | **Assumed** | Two GoTrue round-trips per Mini Program login, mitigated only by `429` backoff |
+
+---
+
+## Part 1: Database schema and shared modules
+
+### Step 1: Create the identity and session-key migrations
+
+Create three migrations under `supabase/migrations/`. The first table, `wechat_identities`, maps each app-scoped `openid` (and optional cross-app `unionid`) to `auth.users(id)`:
+
+```sql
+-- supabase/migrations/20240601000000_wechat_identities.sql
+CREATE TABLE IF NOT EXISTS wechat_identities (
+  openid           TEXT        NOT NULL,
+  unionid          TEXT,
+  app_type         TEXT        NOT NULL
+                   CHECK (app_type IN ('miniprogram', 'web', 'mobile')),
+  supabase_user_id UUID        NOT NULL
+                   REFERENCES auth.users (id) ON DELETE CASCADE,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  PRIMARY KEY (openid)
+);
+
+CREATE INDEX IF NOT EXISTS wechat_identities_unionid_idx
+  ON wechat_identities (unionid)
+  WHERE unionid IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS wechat_identities_user_id_idx
+  ON wechat_identities (supabase_user_id);
+
+ALTER TABLE wechat_identities ENABLE ROW LEVEL SECURITY;
+```
+
+The second migration creates `wechat_session_keys` to hold the Mini Program `session_key` server-side and defines a cleanup function with an empty `search_path`:
+
+```sql
+-- supabase/migrations/20240601000001_wechat_session_keys.sql
+CREATE TABLE IF NOT EXISTS wechat_session_keys (
+  openid      TEXT        NOT NULL PRIMARY KEY,
+  session_key TEXT        NOT NULL,
+  expires_at  TIMESTAMPTZ NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE wechat_session_keys ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION cleanup_expired_wechat_session_keys()
+  RETURNS void
+  LANGUAGE sql
+  SET search_path = ''
+AS $$
+  DELETE FROM public.wechat_session_keys WHERE expires_at < now();
+$$;
+```
+
+The third migration schedules hourly pruning via `pg_cron` so expired keys do not accumulate:
+
+```sql
+-- supabase/migrations/20240601000002_schedule_session_key_cleanup.sql
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'cleanup-wechat-session-keys') THEN
+    PERFORM cron.unschedule('cleanup-wechat-session-keys');
+  END IF;
+END $$;
+
+SELECT cron.schedule(
+  'cleanup-wechat-session-keys',
+  '0 * * * *',
+  $$ SELECT cleanup_expired_wechat_session_keys(); $$
+);
+```
+
+### Step 2: Disable platform JWT verification in config.toml
+
+All four Edge Functions receive requests that do not carry a standard Supabase client JWT at the gateway layer: `wechat-miniprogram` receives a WeChat `code`, `wechat-web-proxy` is called server-to-server by Supabase Auth, `wechat-decrypt` validates its Bearer JWT inside the handler via `adminClient.auth.getUser(jwt)`, and `wechat-mock` is a sandbox endpoint. Declare `verify_jwt = false` in `supabase/config.toml` so a single-function deploy never re-enables the gateway check:
+
+```toml
+# supabase/config.toml
+project_id = "your-project-ref"
+
+[functions.wechat-miniprogram]
+verify_jwt = false
+
+[functions.wechat-web-proxy]
+verify_jwt = false
+
+[functions.wechat-decrypt]
+verify_jwt = false
+
+[functions.wechat-mock]
+verify_jwt = false
+```
+
+### Step 3: Add the shared WeChat client, schemas, and retry helper
+
+Create `supabase/functions/_shared/types.ts` with the Zod schemas for the three WeChat endpoints and the stateless opaque token (`{ wat, oid, uid }`):
+
+```ts
+// supabase/functions/_shared/types.ts
+import { z } from "zod";
+
+export const Code2SessionSchema = z.object({
+  openid: z.string(),
+  session_key: z.string(),
+  unionid: z.string().optional(),
+  errcode: z.number().optional(),
+  errmsg: z.string().optional(),
+});
+
+export const WebTokenSchema = z.object({
+  access_token: z.string(),
+  expires_in: z.number(),
+  refresh_token: z.string(),
+  openid: z.string(),
+  scope: z.string(),
+  unionid: z.string().optional(),
+  errcode: z.number().optional(),
+  errmsg: z.string().optional(),
+});
+
+export const UserInfoSchema = z.object({
+  openid: z.string(),
+  nickname: z.string(),
+  sex: z.number(),
+  province: z.string(),
+  city: z.string(),
+  country: z.string(),
+  headimgurl: z.string(),
+  privilege: z.array(z.string()),
+  unionid: z.string().optional(),
+  errcode: z.number().optional(),
+  errmsg: z.string().optional(),
+});
+
+export const MiniprogramRequestSchema = z.object({
+  code: z.string().min(1, "code must be a non-empty string"),
+});
+
+export const WebTokenRequestSchema = z.object({
+  grant_type: z.literal("authorization_code"),
+  code: z.string().min(1),
+  client_id: z.string().min(1),
+  client_secret: z.string().min(1),
+  redirect_uri: z.string().optional(),
+  code_verifier: z.string().optional(),
+});
+
+export const OpaqueTokenSchema = z.object({
+  wat: z.string(),
+  oid: z.string(),
+  uid: z.string().optional(),
+});
+
+export type Code2SessionResponse = z.infer<typeof Code2SessionSchema>;
+export type WebTokenResponse = z.infer<typeof WebTokenSchema>;
+export type UserInfoResponse = z.infer<typeof UserInfoSchema>;
+export type OpaqueTokenPayload = z.infer<typeof OpaqueTokenSchema>;
+export type AppType = "miniprogram" | "web" | "mobile";
+
+export interface WeChatConfig {
+  appid: string;
+  secret: string;
+  baseUrl?: string;
+}
+
+export interface WeChatIdentity {
+  openid: string;
+  unionid?: string;
+  appType: AppType;
+}
+
+export interface FoundOrCreatedUser {
+  userId: string;
+  placeholderEmail: string;
+  isNew: boolean;
+}
+```
+
+Create `supabase/functions/_shared/wechat.ts` to wrap `code2Session`, `exchangeWebToken`, `getUserInfo`, and the opaque token helpers. `WeChatClient` defaults to `https://api.weixin.qq.com` and switches to `wechat-mock` when `baseUrl` (`WECHAT_API_BASE_URL`) is passed:
+
+```ts
+// supabase/functions/_shared/wechat.ts
+import {
+  Code2SessionSchema,
+  OpaqueTokenSchema,
+  UserInfoSchema,
+  WebTokenSchema,
+} from "./types.ts";
+import type {
+  Code2SessionResponse,
+  OpaqueTokenPayload,
+  UserInfoResponse,
+  WeChatConfig,
+  WebTokenResponse,
+} from "./types.ts";
+
+export const WECHAT_ERROR_HINTS: Record<number, string> = {
+  [-1]: "WeChat system busy - retry shortly",
+  40013: "invalid appid",
+  40029: "invalid code - expired or already used (codes are single-use, ~5 min TTL)",
+  40125: "invalid appsecret - check WECHAT_*_SECRET",
+  40163: "code already used - request a fresh wx.login() / authorize code",
+  41008: "missing code parameter",
+  42001: "code expired - request a fresh one",
+  45011: "API rate limit hit (100/min per user) - back off and retry",
+  40226: "high-risk user blocked by WeChat risk control",
+  48001: "API unauthorized for this account - check Open Platform binding/scopes",
+};
+
+export class WeChatError extends Error {
+  constructor(public readonly code: number, message: string) {
+    const hint = WECHAT_ERROR_HINTS[code];
+    super(`WeChat error ${code}: ${message}${hint ? ` - ${hint}` : ""}`);
+    this.name = "WeChatError";
+  }
+}
+
+const DEFAULT_BASE_URL = "https://api.weixin.qq.com";
+
+export class WeChatClient {
+  private readonly _fetch: typeof fetch;
+  private readonly baseUrl: string;
+
+  constructor(
+    private readonly config: WeChatConfig,
+    fetchFn: typeof fetch = globalThis.fetch,
+  ) {
+    this._fetch = fetchFn;
+    this.baseUrl = config.baseUrl ?? DEFAULT_BASE_URL;
+  }
+
+  async code2Session(jsCode: string): Promise<Code2SessionResponse> {
+    const url = new URL(`${this.baseUrl}/sns/jscode2session`);
+    url.searchParams.set("appid", this.config.appid);
+    url.searchParams.set("secret", this.config.secret);
+    url.searchParams.set("js_code", jsCode);
+    url.searchParams.set("grant_type", "authorization_code");
+
+    const res = await this._fetch(url.toString());
+    if (!res.ok) throw new WeChatError(res.status, `HTTP ${res.status}`);
+    const data = Code2SessionSchema.parse(await res.json());
+    if (data.errcode) throw new WeChatError(data.errcode, data.errmsg ?? "unknown error");
+    return data;
+  }
+
+  async exchangeWebToken(code: string): Promise<WebTokenResponse> {
+    const url = new URL(`${this.baseUrl}/sns/oauth2/access_token`);
+    url.searchParams.set("appid", this.config.appid);
+    url.searchParams.set("secret", this.config.secret);
+    url.searchParams.set("code", code);
+    url.searchParams.set("grant_type", "authorization_code");
+
+    const res = await this._fetch(url.toString());
+    if (!res.ok) throw new WeChatError(res.status, `HTTP ${res.status}`);
+    const data = WebTokenSchema.parse(await res.json());
+    if (data.errcode) throw new WeChatError(data.errcode, data.errmsg ?? "unknown error");
+    return data;
+  }
+
+  async getUserInfo(accessToken: string, openid: string): Promise<UserInfoResponse> {
+    const url = new URL(`${this.baseUrl}/sns/userinfo`);
+    url.searchParams.set("access_token", accessToken);
+    url.searchParams.set("openid", openid);
+    url.searchParams.set("lang", "zh_CN");
+
+    const res = await this._fetch(url.toString());
+    if (!res.ok) throw new WeChatError(res.status, `HTTP ${res.status}`);
+    const data = UserInfoSchema.parse(await res.json());
+    if (data.errcode) throw new WeChatError(data.errcode, data.errmsg ?? "unknown error");
+    return data;
+  }
+}
+
+export function encodeOpaqueToken(payload: OpaqueTokenPayload): string {
+  return btoa(JSON.stringify(payload));
+}
+
+export function decodeOpaqueToken(token: string): OpaqueTokenPayload | null {
+  try {
+    const parsed = OpaqueTokenSchema.safeParse(JSON.parse(atob(token)));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+```
+
+---
+
+## Part 2: Configure the Web QR OAuth2 proxy and custom provider
+
+### Step 1: Implement wechat-web-proxy
+
+Supabase Auth's generic OAuth2 custom provider sends standard RFC 6749 token requests (`POST` with form-encoded `grant_type=authorization_code`, `code`, `client_id`, and `client_secret`, or HTTP Basic authentication headers per RFC 6749 Section 2.3.1[^rfc-6749]) and then calls `GET /userinfo` with `Authorization: Bearer <access_token>`. WeChat instead expects `GET /sns/oauth2/access_token?appid=...&secret=...&code=...&grant_type=authorization_code` and requires both `access_token` and `openid` on `GET /sns/userinfo`.
+
+`supabase/functions/wechat-web-proxy/index.ts` bridges the two protocols:
+
+1. `POST /wechat-web-proxy/token` parses form-encoded or HTTP Basic credentials, verifies `client_id === WECHAT_WEB_APPID` when `WECHAT_WEB_APPID` is set (so the `--no-verify-jwt` endpoint cannot be used as an open relay), calls `wechat.exchangeWebToken(code)`, and returns `{ access_token: encodeOpaqueToken({ wat, oid, uid }), token_type: "Bearer", expires_in }`.
+2. `GET /wechat-web-proxy/userinfo` decodes the Bearer opaque token back into `{ wat, oid, uid }`, calls `wechat.getUserInfo(wat, oid)`, and returns `{ sub: userInfo.unionid ?? userInfo.openid, openid, unionid, name: userInfo.nickname, picture: userInfo.headimgurl || null }`.
+
+```ts
+// supabase/functions/wechat-web-proxy/index.ts
+import { Hono } from "hono";
+import { WebTokenRequestSchema } from "../_shared/types.ts";
+import {
+  decodeOpaqueToken,
+  encodeOpaqueToken,
+  WeChatClient,
+  WeChatError,
+} from "../_shared/wechat.ts";
+
+export const app = new Hono().basePath("/wechat-web-proxy");
+
+function parseBasicAuth(header?: string): { id: string; secret: string } | null {
+  if (!header?.startsWith("Basic ")) return null;
+  try {
+    const decoded = atob(header.slice(6).trim());
+    const idx = decoded.indexOf(":");
+    if (idx === -1) return null;
+    return { id: decoded.slice(0, idx), secret: decoded.slice(idx + 1) };
+  } catch {
+    return null;
+  }
+}
+
+app.post("/token", async (c) => {
+  const raw = await c.req.parseBody();
+  const basic = parseBasicAuth(c.req.header("Authorization"));
+  const merged = basic
+    ? { client_id: basic.id, client_secret: basic.secret, ...raw }
+    : raw;
+
+  const parsed = WebTokenRequestSchema.safeParse(merged);
+  if (!parsed.success) {
+    return c.json(
+      {
+        error: "invalid_request",
+        error_description: parsed.error.issues[0]?.message ?? "Missing required parameters",
+      },
+      400,
+    );
+  }
+
+  const { code, client_id, client_secret } = parsed.data;
+  const expectedAppId = Deno.env.get("WECHAT_WEB_APPID");
+  if (expectedAppId && client_id !== expectedAppId) {
+    return c.json(
+      { error: "invalid_client", error_description: "Unrecognised client_id" },
+      401,
+    );
+  }
+
+  const wechat = new WeChatClient({
+    appid: client_id,
+    secret: client_secret,
+    baseUrl: Deno.env.get("WECHAT_API_BASE_URL"),
+  });
+
+  let tokenData;
+  try {
+    tokenData = await wechat.exchangeWebToken(code);
+  } catch (err) {
+    const msg = err instanceof WeChatError ? err.message : "WeChat API error";
+    return c.json({ error: "wechat_error", error_description: msg }, 400);
+  }
+
+  const opaqueToken = encodeOpaqueToken({
+    wat: tokenData.access_token,
+    oid: tokenData.openid,
+    ...(tokenData.unionid ? { uid: tokenData.unionid } : {}),
+  });
+
+  return c.json({
+    access_token: opaqueToken,
+    token_type: "Bearer",
+    expires_in: tokenData.expires_in,
+  });
+});
+
+app.get("/userinfo", async (c) => {
+  const authHeader = c.req.header("Authorization");
+  if (!authHeader?.startsWith("Bearer ")) {
+    return c.json(
+      { error: "unauthorized", error_description: "Missing or invalid Authorization header" },
+      401,
+    );
+  }
+
+  const tokenData = decodeOpaqueToken(authHeader.slice(7));
+  if (!tokenData) {
+    return c.json(
+      { error: "invalid_token", error_description: "Malformed or invalid opaque token" },
+      401,
+    );
+  }
+
+  const wechat = new WeChatClient({
+    appid: "",
+    secret: "",
+    baseUrl: Deno.env.get("WECHAT_API_BASE_URL"),
+  });
+
+  let userInfo;
+  try {
+    userInfo = await wechat.getUserInfo(tokenData.wat, tokenData.oid);
+  } catch (err) {
+    const msg = err instanceof WeChatError ? err.message : "WeChat API error";
+    return c.json({ error: "wechat_error", error_description: msg }, 400);
+  }
+
+  return c.json({
+    sub: userInfo.unionid ?? userInfo.openid,
+    openid: userInfo.openid,
+    ...(userInfo.unionid ? { unionid: userInfo.unionid } : {}),
+    name: userInfo.nickname,
+    picture: userInfo.headimgurl || null,
+  });
+});
+
+if (import.meta.main) {
+  Deno.serve(app.fetch);
+}
+```
+
+### Step 2: Register the custom:wechat-web provider
+
+Deploy `wechat-web-proxy` before registering the provider. Supabase Auth checks that the hostnames in `authorization_url`, `token_url`, and `userinfo_url` resolve via DNS during registration and returns HTTP `400` (`validation_failed: "Unable to resolve hostname"`) if a host does not resolve.
+
+Register `custom:wechat-web` via `POST /auth/v1/admin/custom-providers`[^sb-custom-oauth]:
+
+```bash
+curl -X POST "https://<project-ref>.supabase.co/auth/v1/admin/custom-providers" \
+  -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+  -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider_type": "oauth2",
+    "identifier": "custom:wechat-web",
+    "name": "WeChat",
+    "client_id": "wx_placeholder_web_appid",
+    "client_secret": "placeholder_web_secret",
+    "authorization_url": "https://open.weixin.qq.com/connect/qrconnect",
+    "token_url": "https://<project-ref>.supabase.co/functions/v1/wechat-web-proxy/token",
+    "userinfo_url": "https://<project-ref>.supabase.co/functions/v1/wechat-web-proxy/userinfo",
+    "scopes": ["snsapi_login"],
+    "pkce_enabled": false,
+    "email_optional": true,
+    "authorization_params": {
+      "appid": "wx_placeholder_web_appid"
+    }
+  }'
+```
+
+Three fields in this registration are mandatory for WeChat:
+
+- `pkce_enabled: false` stops Supabase Auth from sending `code_challenge` to WeChat's authorize endpoint (client-to-Supabase PKCE still works independently).
+- `email_optional: true` allows sign-in when `/userinfo` returns no `email` claim.
+- `authorization_params: { "appid": "wx_placeholder_web_appid" }` injects `appid` onto the authorize redirect alongside the standard `client_id` parameter that Supabase Auth always appends.
+
+To delete and recreate the provider, pass the identifier (`custom:wechat-web`), not the UUID, to `DELETE /auth/v1/admin/custom-providers/custom:wechat-web`.
+
+### Step 3: Read the surviving identity claims
+
+When verified against a live Supabase project (`deno task verify:web-qr`, 2026-06-30), a generic `oauth2` custom provider persists only standard OIDC claims into `auth.identities.identity_data`:
+
+```json
+{
+  "sub": "TEST_UNIONID_WEBQRE2E",
+  "name": "Test WeChat User",
+  "picture": "https://thirdwx.qlogo.cn/mmopen/test/0",
+  "email_verified": false,
+  "phone_verified": false
+}
+```
+
+The extra top-level `openid` and `unionid` fields returned by `wechat-web-proxy/userinfo` are dropped by Supabase Auth, `attribute_mapping` (both SAML-style `{ "keys": { "openid": { "name": "openid" } } }` and flat `{ "openid": "openid" }`) is stored by the API without effect, and `custom_claims_allowlist` is dropped on `POST`. Because the proxy sets `sub: userInfo.unionid ?? userInfo.openid`, the durable cross-app key survives in both `identity.id` (`provider_id`) and `identity_data.sub`:
+
+```js
+const { data: { user } } = await supabase.auth.getUser();
+const wechatIdentity = (user?.identities ?? [])
+  .find((i) => i.provider === "custom:wechat-web");
+
+const { sub, name, picture } = wechatIdentity?.identity_data ?? {};
+```
+
+---
+
+## Part 3: Wire the Mini Program flow and encrypted-data decryption
+
+### Step 1: Resolve or create users deterministically
+
+In `supabase/functions/_shared/identity.ts`, `findOrCreateUser` resolves a Mini Program login in three stages:
+
+1. **Lookup by `unionid`**: if `jscode2session` returned a `unionid`, query `wechat_identities` by `unionid`. When found, upsert the current `(openid, unionid, app_type, supabase_user_id)` row so a second Mini Program or mobile app under the same Open Platform account attaches to the same `supabase_user_id`.
+2. **Lookup by `openid`**: query `wechat_identities` by `openid`. If the user existed without a `unionid` and now has one, backfill `unionid`.
+3. **Deterministic creation**: compute `UUIDv5(WECHAT_USER_NAMESPACE, openid)` (`WECHAT_USER_NAMESPACE = "9f7c3e2a-5b1d-4c8e-a6f0-1d2e3f4a5b6c"`) and call `adminClient.auth.admin.createUser({ id: computedId, email: "${openid}@wechat.local", email_confirm: true, ... })`.
+
+Two concurrent first-time requests for the same `openid` compute the same `computedId`. If the second request receives HTTP `409` or a `422` whose code or message matches `/already.*(registered|exists)|email_exists|user_already_exists|duplicate/`, `isDuplicateUserError` treats it as a concurrent winner and continues with `computedId`. Other `422` validation errors throw immediately so `wechat_identities` never writes a foreign key to a nonexistent user.
+
+For returning users, `resolveUserEmail` reads the canonical email from `auth.users` via `adminClient.auth.admin.getUserById(userId)` instead of reconstructing `${openid}@wechat.local`. A user reached via `unionid` across two apps has a different `openid` on the second app than the creator `openid` stored in `auth.users.email`; guessing a reconstructed email and passing it to `generateLink` would mint a second user. If `getUserById` fails or returns no email, `resolveUserEmail` fails closed and throws.
+
+### Step 2: Issue sessions in wechat-miniprogram
+
+`supabase/functions/wechat-miniprogram/index.ts` exchanges `code` via `wechat.code2Session(code)`, calls `findOrCreateUser` before touching `wechat_session_keys` (so a failed user lookup leaves no orphan `session_key` row), upserts `wechat_session_keys` with a 2-hour TTL, and mints a Supabase session using `generateLink` + `verifyOtp` wrapped in `withRetry`:
+
+```ts
+// Session issuance excerpt from supabase/functions/wechat-miniprogram/index.ts
+const { data: linkData, error: linkError } = await withRetry(() =>
+  adminClient.auth.admin.generateLink({
+    type: "magiclink",
+    email: identity.placeholderEmail,
+  })
+);
+
+const { data: verifyData, error: verifyError } = await withRetry(() =>
+  anonClient.auth.verifyOtp({
+    token_hash: linkData.properties.hashed_token,
+    type: "magiclink",
+  })
+);
+```
+
+`withRetry` (`supabase/functions/_shared/retry.ts`) retries up to 3 times with exponential backoff (200 ms, 400 ms, 800 ms) **only** when `result.error?.status === 429`. Because GoTrue's rate limiter rejects HTTP `429` before processing the request, the single-use `hashed_token` is not consumed on a `429` and is safe to retry.
+
+From the Mini Program client, call `wx.login()` and post `res.code` to the function:
+
+```js
+wx.login({
+  success(res) {
+    if (!res.code) return;
+    wx.request({
+      url: "https://<project-ref>.supabase.co/functions/v1/wechat-miniprogram",
+      method: "POST",
+      header: { "content-type": "application/json" },
+      data: { code: res.code },
+      success({ data }) {
+        wx.setStorageSync("sb_access_token", data.access_token);
+        wx.setStorageSync("sb_refresh_token", data.refresh_token);
+      },
+    });
+  },
+});
+```
+
+### Step 3: Decrypt Mini Program payloads in wechat-decrypt
+
+WeChat Mini Program APIs such as `<button open-type="getPhoneNumber">` return `{ encryptedData, iv }` encrypted with AES-128-CBC using the user's 16-byte `session_key`. Deno's Web Crypto `AES-CBC` implementation rejects WeChat's padding in practice, so `supabase/functions/_shared/crypto.ts` uses `node:crypto` (`createDecipheriv("aes-128-cbc", key, iv)`) with `decipher.setAutoPadding(false)` and strips PKCS#7 padding manually (`stripPkcs7` verifies that the last byte `pad` is in `1..16` and that all trailing `pad` bytes equal `pad`). When `WECHAT_MINIPROGRAM_APPID` is set, `decryptWeChatData` also verifies `parsed.watermark.appid === expectedAppId` to block cross-app ciphertext replay.
+
+`supabase/functions/wechat-decrypt/index.ts` authenticates the caller via `Authorization: Bearer <access_token>`, resolves `user.user_metadata.openid` via `adminClient.auth.getUser(jwt)`, fetches `{ session_key, expires_at }` from `wechat_session_keys`, returns HTTP `409` (`no_session_key` or `session_key_expired`) when the key is missing or past `expires_at`, and otherwise returns `{ data: decrypted }`.
+
+---
+
+## Part 4: Run wechat-mock and the test suites
+
+### Step 1: Deploy all four functions wired to wechat-mock
+
+`supabase/functions/wechat-mock/index.ts` implements all four WeChat endpoints deterministically from the input `code` (or `mock_code` on `/connect/qrconnect`):
+
+| Code prefix | `jscode2session` and `oauth2/access_token` | `/connect/qrconnect` |
+|---|---|---|
+| `error_*` | HTTP `200` with `{ errcode: 40029, errmsg: "invalid code" }` | HTTP `302` to `redirect_uri?error=access_denied&state=...` |
+| `no_unionid_*` | Returns `TEST_OPENID_NOUNIONID...` and omits `unionid` (`/sns/userinfo` also omits `unionid` when `openid` contains `NOUNIONID`) | HTTP `302` to `redirect_uri?code=no_unionid_...&state=...` |
+| Anything else | Returns `TEST_OPENID_<CODE>` and `TEST_UNIONID_<CODE>` (16-byte base64 `session_key: "AAAAAAAAAAAAAAAAAAAAAA=="`) | HTTP `302` to `redirect_uri?code=<mock_code>&state=...` (default `WEBQR_E2E`) |
+
+Link your sandbox Supabase project and run `scripts/deploy.sh` (or the equivalent commands below) to deploy the functions, point `WECHAT_API_BASE_URL` at `wechat-mock`, and push the migrations:
+
+```bash
+supabase link --project-ref <project-ref>
+
+supabase functions deploy \
+  wechat-mock wechat-miniprogram wechat-web-proxy wechat-decrypt \
+  --no-verify-jwt
+
+supabase secrets set \
+  WECHAT_API_BASE_URL="https://<project-ref>.supabase.co/functions/v1/wechat-mock" \
+  WECHAT_MINIPROGRAM_APPID="fake_appid" \
+  WECHAT_MINIPROGRAM_SECRET="fake_secret" \
+  WECHAT_WEB_APPID="fake_web_appid" \
+  WECHAT_WEB_SECRET="fake_web_secret"
+
+supabase db push
+```
+
+### Step 2: Cut over to real WeChat credentials and run the smoke tester
+
+When real WeChat credentials are available, validate the four **Assumed** protocol behaviours with `scripts/wechat-smoke.ts` before wiring production traffic:
+
+```bash
+# 1. Print both authorize URLs (appid-only vs appid + client_id) to test in a browser
+deno run --allow-net scripts/wechat-smoke.ts authorize \
+  --appid=wx_placeholder_web_appid \
+  --redirect=https://example.com/auth/callback
+
+# 2. Test a fresh single-use wx.login() code against real jscode2session
+deno run --allow-net scripts/wechat-smoke.ts code2session \
+  --appid=wx_placeholder_mp_appid \
+  --secret=placeholder_mp_secret \
+  --code=081xyz
+
+# 3. Test a fresh Web QR authorization code and userinfo response
+deno run --allow-net scripts/wechat-smoke.ts token \
+  --appid=wx_placeholder_web_appid \
+  --secret=placeholder_web_secret \
+  --code=081xyz
+
+deno run --allow-net scripts/wechat-smoke.ts userinfo \
+  --token=ACCESS_TOKEN \
+  --openid=OPENID
+```
+
+Once both `authorize` URL variants render the WeChat QR page and the response payloads match `supabase/functions/_shared/types.ts`, unset `WECHAT_API_BASE_URL`, set the production secrets, and delete the sandbox `wechat-mock` function.
+
+---
+
+## Verification
+
+1. **Run the unit test suite** (no network or Supabase project required; stubs `globalThis.fetch`):
+
+   ```bash
+   deno task test
+   ```
+
+   Confirm all 38 tests pass across the 5 suites (`wechat-miniprogram`: 13, `wechat-web-proxy`: 12, `_shared/crypto`: 5, `_shared/retry`: 4, `wechat-mock`: 4).
+
+2. **Run the E2E suite against the deployed sandbox**:
+
+   ```bash
+   SUPABASE_FUNCTION_URL="https://<project-ref>.supabase.co/functions/v1" \
+     deno task test:e2e
+   ```
+
+   Confirm all 13 E2E tests pass: direct `wechat-mock` checks (`e2e_direct_001`, `no_unionid_direct`, `error_invalid`), `wechat-miniprogram` user creation, idempotent returning-user lookup, `no_unionid` handling, and `wechat-web-proxy` `/token` + `/userinfo` exchanges.
+
+3. **Run the full Web QR OAuth2 redirect verification**:
+
+   ```bash
+   SUPABASE_URL="https://<project-ref>.supabase.co" \
+   SUPABASE_ANON_KEY="<anon-key>" \
+   SUPABASE_SERVICE_ROLE_KEY="<service-role-key>" \
+     deno task verify:web-qr
+   ```
+
+   `scripts/verify-web-qr-flow.ts` registers `custom:wechat-web` with `authorization_url` pointing at `wechat-mock/connect/qrconnect`, runs `supabase.auth.signInWithOAuth` with `skipBrowserRedirect: true`, follows the three HTTP `302` hops (`/authorize` -> `/wechat-mock/connect/qrconnect` -> `/auth/v1/callback` -> `https://example.com/auth/callback?code=...`), exchanges the code via `exchangeCodeForSession`, and verifies that `identity.id === identity_data.sub`, `identity_data.sub` starts with `TEST_UNIONID_`, raw `openid` and `unionid` are absent from `identity_data`, and `admin.getUserById` returns the persisted `custom:wechat-web` identity.
+
+---
+
+## Gotchas and lessons learned
+
+- **`session_key` is plaintext at rest in `wechat_session_keys`.** RLS blocks client queries, but the service role, database administrators, and database backups can read the `TEXT` column, and each key decrypts that user's WeChat payloads (`wx.getPhoneNumber`). The 2-hour `expires_at` TTL and hourly `pg_cron` job (`cleanup-wechat-session-keys`) bound the window; for encryption at rest, store the secret through Supabase Vault (`pgsodium`).
+- **Mini Program and Web QR flows create separate `auth.users` rows.** `wechat-miniprogram` creates users via `admin.createUser` and tracks them in `public.wechat_identities`, whereas `custom:wechat-web` creates users inside Supabase Auth's OAuth callback and records `unionid` as `auth.identities.identity_data->>'sub'`. Because the `auth` schema is not exposed via PostgREST, cross-flow linking requires a `SECURITY DEFINER` RPC with `SET search_path = ''` that queries `auth.identities` where `provider = 'custom:wechat-web'` and `identity_data->>'sub' = p_unionid`, granted only to `service_role`.
+- **`WECHAT_WEB_APPID` gates the open-relay check on `wechat-web-proxy/token`.** Because `wechat-web-proxy` runs with `verify_jwt = false`, anyone who knows the function URL can POST to `/token`. The handler checks `client_id === WECHAT_WEB_APPID` only when `WECHAT_WEB_APPID` is set in the environment; always set `WECHAT_WEB_APPID` in production.
+- **WeChat omits `errcode` on success.** On a valid response from `jscode2session`, `oauth2/access_token`, or `sns/userinfo`, `errcode` is absent (or `0`), and on failure WeChat still returns HTTP `200` with a non-zero `errcode` JSON body (such as `40029` for an expired or reused code). Check `data.errcode` after parsing HTTP `200`.
+- **Supabase `.single()` returns HTTP `406` (`PGRST116`) when zero rows match.** When writing `globalThis.fetch` mocks for `wechat_identities` lookups, return HTTP `406` with `{ code: "PGRST116" }` on a cache miss rather than HTTP `200` with `[]`.
+
+---
+
+## File reference
+
+```text
+supabase-wechat-auth/
+├── deno.json
+├── scripts/
+│   ├── deploy.sh
+│   ├── verify-web-qr-flow.ts
+│   └── wechat-smoke.ts
+├── e2e/
+│   └── e2e.test.ts
+└── supabase/
+    ├── config.toml
+    ├── migrations/
+    │   ├── 20240601000000_wechat_identities.sql
+    │   ├── 20240601000001_wechat_session_keys.sql
+    │   └── 20240601000002_schedule_session_key_cleanup.sql
+    └── functions/
+        ├── _shared/
+        │   ├── crypto.ts
+        │   ├── crypto.test.ts
+        │   ├── identity.ts
+        │   ├── retry.ts
+        │   ├── retry.test.ts
+        │   ├── types.ts
+        │   └── wechat.ts
+        ├── wechat-miniprogram/
+        │   ├── index.ts
+        │   └── index.test.ts
+        ├── wechat-web-proxy/
+        │   ├── index.ts
+        │   └── index.test.ts
+        ├── wechat-decrypt/
+        │   └── index.ts
+        └── wechat-mock/
+            ├── index.ts
+            └── index.test.ts
+```
+
+## Related docs
+
+- [Supabase Auth providers: custom OIDC, passkeys, SAML and a sign-in canary](/reference/supabase-auth-providers/) - measured behaviour of `/auth/v1/admin/custom-providers` (3-provider default quota, `PUT` update rules, `email_optional`, and PKCE parameters) that this Web QR adapter builds on.
+- [Supabase Auth end to end](/reference/supabase-auth-end-to-end/) - how Supabase Auth signs sessions and how PostgREST verifies Bearer JWTs issued by the `generateLink` + `verifyOtp` and OAuth2 flows.
+- [Supabase Auth MFA trusted-device and admin impersonation audit](/guides/supabase-auth-mfa-trusted-device-and-impersonation-audit/) - another guide that pairs `admin.generateLink({ type: "magiclink" })` with Edge Functions and `public` audit tables under RLS.
+
+[^rfc-6749]: IETF, "RFC 6749: The OAuth 2.0 Authorization Framework," Section 2.3.1 (Client Password). https://datatracker.ietf.org/doc/html/rfc6749
+[^sb-custom-oauth]: Supabase, "Custom OAuth/OIDC providers," Supabase Docs. https://supabase.com/docs/guides/auth/custom-oauth-providers
