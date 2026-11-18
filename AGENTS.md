@@ -415,6 +415,10 @@ gate since 2026-11-18 (lexicanum#109): the `prose-tells` job runs
 `OPENROUTER_API_KEY` capped at 10 USD a month) on the paragraphs, titles and headings a push or PR
 touched, and any flag blocks `build-and-deploy`. Run it before pushing:
 `sx OPENROUTER_API_KEY=OPENROUTER_API_KEY -- bun run check:tells --changed`.
+With no revision it diffs against the upstream branch, the same base CI
+uses, so unpushed commits are covered (with `HEAD` as the base, run 15109
+failed on a commit the local run never saw). The model varies run to run:
+a paragraph that passed once can draw a flag on the next run.
 Reword a real flag; clear a wrong one for that doc with
 `{/* tells-ok: <quote> */}` (does not render). A quote not in the doc is
 dropped, and an unreachable model fails the job (exit 2). The model only

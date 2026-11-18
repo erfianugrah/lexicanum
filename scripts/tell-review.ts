@@ -4,7 +4,8 @@
  *
  *   bun scripts/tell-review.ts FILE...          review every prose paragraph
  *   bun scripts/tell-review.ts --changed [REV]  only paragraphs touched since REV
- *                                               (default HEAD, working tree incl.)
+ *                                               (default: the upstream branch, else
+ *                                               HEAD; working tree included)
  *
  * Exit 0: no flags. Exit 1: flags (the CI job blocks the deploy on this).
  * Exit 2: the model could not be asked or answered garbage - fail closed.
@@ -271,6 +272,11 @@ function git(args: string[]): string {
   return p.stdout.toString();
 }
 
+function defaultBase(): string {
+  const p = Bun.spawnSync(["git", "rev-parse", "--verify", "-q", "@{upstream}"], { stdout: "pipe", stderr: "pipe" });
+  return p.exitCode === 0 ? p.stdout.toString().trim() : "HEAD";
+}
+
 async function main(argv: string[]): Promise<number> {
   let jobs: { file: string; only?: Set<number> }[] = [];
   let concurrency = 4;
@@ -279,8 +285,11 @@ async function main(argv: string[]): Promise<number> {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i] ?? "";
     if (a === "--changed") {
-      const rev = argv[i + 1] && !argv[i + 1]?.startsWith("-") ? argv[++i] : "HEAD";
-      const diff = git(["diff", "-U0", rev ?? "HEAD", "--", "src/content/docs"]);
+      // Default to what CI will review: everything not yet on the upstream
+      // branch. HEAD alone missed unpushed commits and a push failed on them
+      // (run 15109, lexicanum#110).
+      const rev = argv[i + 1] && !argv[i + 1]?.startsWith("-") ? argv[++i] : defaultBase();
+      const diff = git(["diff", "-U0", rev, "--", "src/content/docs"]);
       for (const [file, lines] of changedLines(diff)) {
         if (/\.mdx?$/.test(file) && lines.size) jobs.push({ file, only: lines });
       }
