@@ -1,0 +1,319 @@
+---
+title: "Linear Film Negative Inversion & Develop Pipeline"
+description: "Inverting linear DNG film scans without Lightroom or Negative Lab Pro: DCP profile math, sRGB-axis spline curves, pre-curve vs post-curve stage ordering, and oracle parity."
+category: workstations
+tags:
+  - photography
+  - color-science
+  - image-processing
+  - dng
+  - python
+readingTime: 18
+lastUpdated: 2026-11-18
+---
+
+## Overview
+
+Film scanners driven in raw mode (such as VueScan writing 3-sample 16-bit `LinearRaw` DNG files) record linear sensor transmittance. Dense film highlights near maximum optical density produce low code values, while transparent shadow areas and the C-41 orange coupler mask near minimum density produce high code values. Converting those linear transmittance samples into a positive image requires removing the orange mask, inverting the tonal slope, and applying non-linear contrast and colour-grading operators.
+
+In a Lightroom Classic and Negative Lab Pro (NLP) workflow, the plugin writes a non-destructive recipe into the catalog's Camera Raw develop settings: a custom DNG camera profile, pre-conversion white-balance coordinates sampled from the unexposed film border, and per-channel point curves (`ToneCurvePV2012Red`, `ToneCurvePV2012Green`, `ToneCurvePV2012Blue`) whose endpoints span the measured channel histogram bounds in reverse order. Camera Raw then renders the positive by evaluating its fixed internal pipeline.
+
+Reproducing this workflow standalone (both to render existing catalog recipes without Lightroom and to convert newly scanned rolls from scratch) requires implementing the DNG SDK colour-profile pipeline, the ImageMagick pre-conversion histogram analysis chain, the per-channel spline curve solver, and the surrounding pre-curve and post-curve develop stages. The reference implementation, `rebate`, executes this pipeline in Python and NumPy against a two-tier Lightroom Classic oracle.
+
+For browser and edge delivery of exported rasters, see [Edge Media Transformation Architecture](/reference/media-transformation-architecture/) and [Supabase Image Transformations Billing and Architecture](/reference/supabase-image-transformations-billing/). For the web editor's interface tokens and optical layout checks, see [House UI Identity as Tooling](/reference/house-ui-identity-as-tooling/).
+
+---
+
+## Inversion Model
+
+### Dual-Illuminant DCP Profiles and Baseline Exposure
+
+The first half of the inversion model lives in a dual-illuminant DNG Camera Profile (`.dcp`) calibrated at CIE Standard Illuminant A (light-source code 17, correlated colour temperature 2856.0 K) and D65 (code 21, 6504.0 K).[^dng-spec] Following the Adobe DNG SDK (`dng_temperature.cpp` and `dng_color_spec.cpp`), the renderer maps the frame's pre-conversion `Temperature` and `Tint` sliders to CIE 1931 `xy` chromaticity coordinates using Robertson's 31-entry Planckian locus table (spanning 0 to 600 mireds in 20-mired steps) and a CIE 1960 `uv` normal offset scaled by `kTintScale = -3000.0`.
+
+Between 2856.0 K and 6504.0 K, the two calibration matrices (`ColorMatrix1` and `ColorMatrix2`, plus optional `ForwardMatrix1` and `ForwardMatrix2`) are interpolated linearly in inverse temperature (1/T). The camera white vector is computed as `ColorMatrix @ XYZ(white)`, normalized by its maximum channel, and clamped to `[0.001, 1.0]`. Because NLP camera profiles contain negative off-diagonal matrix entries, extreme white-balance coordinates can map to negative camera-space values; the 0.001 lower bound absorbs those excursions identically to `dng_color_spec::SetWhiteXY`.
+
+White-balance gains are the reciprocal of the camera white vector, and the combined camera-to-PCS transform maps white-balanced camera RGB to CIE XYZ under a D50 adaptation white before entering linear ProPhoto RGB (ROMM RGB).
+
+Every NLP camera profile declares `BaselineExposureOffset = -1.0` EV (0.5x linear gain). Empirical verification against Lightroom pre-curve exports (`docs/research/2026-10-17-curve-axis.md`) confirmed that omitting this offset leaves linear ProPhoto values 2.00x too bright at both the 5th percentile (0.2632 vs 0.1316 measured) and the 50th percentile (0.5792 vs 0.2908 measured). Applying the -1.0 EV baseline exposure brings the 5th percentile to 0.1321 and the 50th percentile to 0.2922 (within 0.5% of the oracle).
+
+### Default Tone Curve `G(x)` vs Profile Tone Curve
+
+In Camera Raw, the baseline -1.0 EV offset does not act as a flat 0.5x scalar across all recipes. Synthetic grey-ramp and film pre-conversion captures (`docs/research/2026-10-22-run7-tone.md`) revealed a fixed 1D default tone curve `Y = G(x)` applied in linear ProPhoto RGB when no Enhanced Profile `Look` is present (`edits.look is None`):
+
+| Linear input `x` | 0.003 | 0.01 | 0.05 | 0.10 | 0.20 | 0.30 | 0.50 | 0.70 | 0.90 | 0.98 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Measured `G(x)` | 0.0015 | 0.0050 | 0.0250 | 0.0500 | 0.1001 | 0.1519 | 0.2756 | 0.4424 | 0.7097 | 0.9117 |
+
+Across six exposure-shifted and density-weighted synthetic ramps, `G(x)` proved invariant to image statistics (differences at or below 7e-4), which confirms a fixed 1D operator:
+
+- Between x = 0.002 and x = 0.25, `G(x) = 0.5 * x`, with a shadow toe rolling off to `0.17 * x` at x = 2.4e-4.
+- Above x = 0.25, `G(x)` rises through a steep highlight shoulder (slope 1.0 at x = 0.7, 2.6 at x = 0.95, and 3.6 at x = 0.98) to reach (1.0, 1.0).
+- Because rational and cubic Hermite closed forms left residuals of 0.0028 to 0.03, `G(x)` is represented as a 69-knot PCHIP table (`deftone.py`) with a measured maximum fit residual of 1.3e-3 above 0.8 and below 2e-5 for inputs under 0.25.
+
+After the baseline exposure stage, the v2.3 DCP applies its embedded `ProfileToneCurve` (`y = min(2x, 1)`), interpolated as a natural cubic spline in linear ProPhoto RGB (`profile.py`). On no-Look v2.3 frames (n = 34), applying `G(x)` before `ProfileToneCurve` lowered pre-conversion quantile RMS error from 0.0117-0.0147 to 0.0033-0.0035 (measured), whereas reversing their order degraded RMS error to 0.065-0.070.
+
+### Pre-Conversion Histogram Analysis (`rgbOrigins`)
+
+To compute per-channel inversion curves for a new scan, NLP asks Lightroom to export an 8-bit ProPhoto RGB TIFF of the uninverted frame at `long_edge = 200` px for v1/v2 engines or `long_edge = 600` px for v3 (`ENGINE_LONG_EDGE`), then pipes that file through ImageMagick (7.0.8-5 Q16).[^imagemagick] The standalone pipeline reproduces every step in memory (`nlp_analysis.py` and `analysis_render.py`):
+
+1. Render the cropped, oriented linear scan through `sdk_render` at the frame's pre-conversion `Temperature`/`Tint` and `exposure_ev = -1.0`, then box-average downscale (`_block_average`) to 200 px or 600 px on the long edge.
+2. Apply ImageMagick's center crop `-gravity Center -crop PxP%+0+0 +repage`, where `P = 100 - 2 * filmBorder` (`FILM_BORDER_DEFAULT = 5`, keeping 90% per axis). Each dimension rounds half up via `floor(P * dim / 100.0 + 0.5)` with top-left offset `dim // 2 - size // 2` (verified with 0 misses across 251 tested dimensions against `convert.exe`).
+3. Convolve each channel with ImageMagick's separable `-blur 0x2` kernel (`BLUR_SIGMA = 2.0`). ImageMagick oversamples the Gaussian 3x per pixel (`_KERNEL_RANK = 3`) and sums three sub-samples per tap until the edge tap drops below 1 / 65535 (17 taps for sigma 2.0, effective variance `sigma^2 + 1/12 * (1 - 1/9)`) with edge-replicated boundaries (`mode="nearest"`). Measured maximum deviation against `convert.exe` on 16-bit inputs is 0.5 / 65535.
+4. Convert from the ProPhoto ICC profile embedded by Lightroom (pure gamma 461 / 256, approximately 1.8008, with an s15.16 matrix) to `MelissaRGB.icc` (ProPhoto primaries with the sRGB transfer curve) using absolute colorimetric intent and quantize to 8-bit `[0, 255]` via `(v + 128) // 257`. Using the exact embedded source profile rather than the standalone `ProPhoto.icc` reduced pixels differing by plus or minus 1 against `convert.exe` from 44.5% (mean absolute difference 0.184) to 0.28% (mean absolute difference 0.0009, per-channel histogram L1 0.0010 / 0.0012 / 0.0012, measured).
+5. Build a 256-bin histogram per channel and extract `origins_from_histogram`:
+   - `whitePointOrigin`: scanning upward from bin 0 to 255 (dense negative highlights), the first bin where cumulative pixel count exceeds `WHITE_CLIP * total` (`WHITE_CLIP = 1.0e-4` for negatives and positives).
+   - `blackPointOrigin`: scanning downward from bin 255 to 0 (clear film base), 255 minus the first reverse-cumulative index exceeding `BLACK_CLIP * total` (`BLACK_CLIP = 5.0e-4` for negatives, 1.0e-4 for positives).
+   - `meanPoint`: the normalized centroid of histogram mass between guard-banded bounds `lo = floor(white * 1.005 + 0.5)` and `hi = floor(black * 0.995 + 0.5)`, flipped to `1.0 - mean` for negatives so it expresses positive midtone density.
+
+### Curve Solver and Per-Frame Auto White Balance
+
+From `rgbOrigins` and the conversion settings dictionary, `curve_points` (`nlp_curve.py`) constructs per-channel knot lists in `[0, 255]`. For a negative, the output y-coordinates descend from 255 at `whitePointOrigin` to 0 at `blackPointOrigin`; this inverts the tonal slope and aligns the three channels' film-base and highlight bounds. Node count is determined either by preset resolution (`curveResolutionType` in v2/v3) or, on v1 conversions, by span width (`min(14, round(width / 4))` with `linearFixed` white balance, `wbTonality = addDensity`, and `colorFirst` layer ordering).
+
+For colour modes using automatic film balance (`film = smartColorNeutral`, `smartColorWarming`, `smartColorCooling`), `wbTemp` and `wbTint` shifts applied to the curve layers must be derived from each frame's own `autoWB` measurement (`nlp_wb.py`, matching the stored catalog values to an RMS residual of 5e-14 across 487 rows). In batch catalog conversions, NLP writes a single shared `wbTemp`/`wbTint` pair into every frame's `settings` dictionary while building each frame's `ToneCurvePV2012*` from that frame's individual `autoWB`. Computing `wbTemp`/`wbTint` per frame from `autoWB` resolved 107 of 109 mismatched v2.3 curves (`docs/research/2026-10-21-nlp-accuracy.md`).
+
+### sRGB Curve Axis and Natural Cubic Spline Evaluation
+
+A central question for standalone rendering is which encoding axis Camera Raw uses when evaluating `ToneCurvePV2012Red`, `ToneCurvePV2012Green`, and `ToneCurvePV2012Blue`. Taking Lightroom's pre-curve linear ProPhoto export, applying a frame's stored inversion curves across candidate axes, and comparing against Lightroom's full export (`docs/research/2026-10-17-curve-axis.md`) settled the axis and interpolator:
+
+| Candidate curve axis | Interpolation | Frame A mean abs error (0..1) | Frame B mean abs error (0..1) |
+|---|---|---:|---:|
+| ProPhoto gamma (1.8) | piecewise linear | 0.1734 | 0.1865 |
+| Linear ProPhoto (1.0) | piecewise linear | 0.4841 | 0.5167 |
+| Pure power gamma 2.0 | natural cubic spline | 0.0816 | 0.0897 |
+| Pure power gamma 2.2 | natural cubic spline | 0.0074 | 0.0109 |
+| Pure power gamma 2.4 | natural cubic spline | 0.0679 | 0.0785 |
+| Piecewise sRGB (IEC 61966-2-1) | piecewise linear | 0.0084 | 0.0095 |
+| Piecewise sRGB (IEC 61966-2-1) | natural cubic spline | 0.0006 | 0.0097 |
+
+On Frame A (which carries only the conversion curves and zero develop sliders), evaluating the point curves as a natural cubic spline (`bc_type="natural"`, matching DNG SDK `dng_spline_solver`) on linear ProPhoto primaries encoded with the piecewise IEC 61966-2-1 sRGB transfer function reproduces Lightroom's export to 0.0006 (roughly 39 / 65535, measured).[^iec-srgb]
+
+```python
+def curve_encode(lin01: np.ndarray) -> np.ndarray:
+    lin = np.clip(lin01, 0.0, 1.0)
+    return np.where(lin <= 0.0031308, 12.92 * lin, 1.055 * lin ** (1.0 / 2.4) - 0.055)
+
+def curve_decode(enc01: np.ndarray) -> np.ndarray:
+    v = np.clip(enc01, 0.0, 1.0)
+    return np.where(v <= 0.04045, v / 12.92, ((v + 0.055) / 1.055) ** 2.4)
+```
+
+---
+
+## Develop Pipeline Order
+
+### Why Stage Placement Relative to `ToneCurvePV2012` Matters
+
+In Camera Raw's fixed pipeline, basic tone controls (`Exposure2012`, `Contrast2012`, `Highlights2012`, `Shadows2012`, `Whites2012`, `Blacks2012`), the 4-region parametric curve (`Parametric*`), lens vignetting, camera calibration, `Dehaze`, `Saturation`, `Vibrance`, `Texture`, `Clarity2012`, and the 8-band HSL Color Mixer all execute before `ToneCurvePV2012`. Because NLP places the negative-to-positive inversion inside `ToneCurvePV2012`, every pre-curve operator acts on the uninverted negative:
+
+- Raising `Exposure2012` brightens the negative before the descending spline, which darkens the resulting positive image.
+- Lens vignette radial gain (`VignetteAmount`, `VignetteMidpoint`) multiplies linear negative values before the curve, so positive vignette amounts darken the positive corners.
+- The 8-band HSL mixer (`HueAdjustment*`, `SaturationAdjustment*`, `LuminanceAdjustment*`) classifies hues on the sRGB-encoded negative before inversion (for example, a cyan-blue sky on the positive occupies the orange-yellow hue bands on the negative).
+
+```d2
+direction: down
+
+scan: "16-bit LinearRaw DNG Scan" {
+  style.fill: "#1e293b"
+}
+geom: "1. Pre-Curve Geometry (Lens Vignette/Distortion, Upright Homography, Crop, Orientation)" {
+  style.fill: "#1e293b"
+}
+dcp: "2. DNG SDK Profile Render (WB Gains, Dual-Illuminant Matrix -> ProPhoto, Default Tone G(x) at -1 EV, ProfileToneCurve)" {
+  style.fill: "#1e293b"
+}
+lin_pre: "3. Linear Pre-Curve Ops (negtone Exposure/HSWB/Contrast/Parametric, Lens Vignette, Calibration, Dehaze)" {
+  style.fill: "#334155"
+}
+enc_pre: "4. sRGB-Encoded Pre-Curve Ops (_curve_encode -> Saturation/Vibrance, Texture, Clarity, 8-Band HSL Mixer)" {
+  style.fill: "#334155"
+}
+invert: "5. Inversion Stage (Per-Channel 256-Entry Natural Cubic Spline LUT on [0..255] -> _curve_decode to Linear ProPhoto)" {
+  style.fill: "#0f766e"
+}
+post: "6. Post-Curve Positive Stages (Post-WB, Post-Curve, NLP Look 3D LUT, B&W Grayscale Mix, Color Grading, Detail NR/Sharpen, Effects Grain/Post-Crop Vignette, Local Masks, Retouch)" {
+  style.fill: "#1e3a8a"
+}
+out: "7. Output Encoding (TIFF: Sqrt-Spaced 2^20 Inverse TRC LUT -> 16-bit ProPhoto; JPEG: ProPhoto-to-sRGB Matrix -> IEC sRGB Transfer -> 8-bit)" {
+  style.fill: "#1e293b"
+}
+
+scan -> geom -> dcp -> lin_pre -> enc_pre -> invert -> post -> out
+```
+
+### Pre-Curve Negative Stages (`render.py`)
+
+When rendering a full frame (`_positive_full`), pre-curve stages execute in the following exact sequence:
+
+1. Raw decode and geometry (`_crop_frame`, `_code`): Decode 16-bit scan samples to float32 in `[0, 1]`. Apply the stored 3x3 `Upright` projective homography to the uncropped raw frame first, extract the `Crop` window (or rotate the warped frame when `CropAngle != 0`), and compose the file's TIFF `Orientation` tag with the recipe's orientation code (`rot90` and optional horizontal mirror).
+2. DNG SDK camera profile render (`_precurve_strip` -> `sdk_render`): Apply camera-space white-balance gains, transform to linear ProPhoto RGB, apply the baseline -1.0 EV exposure stage (`G(x)` when `edits.look is None`, or `0.5 * x` when a Look is active), apply `ProfileHueSatMap` and `ProfileLookTable` in linear ProPhoto HSV, and apply `ProfileToneCurve` (`y = min(2x, 1)` on v2.3). This output is cached in the preview pyramid (`precurve`) so interactive develop edits do not re-decode the DNG or re-run the DCP matrices.
+3. Pre-curve tone (`negtone.apply`):
+   - Exposure (`Exposure2012`) is evaluated as a single family in total EV `t = baseline + slider`, where `t = -1` is `G(x)`, `t = 0` (slider +1.0) is the identity (max error 8.7e-4, RMS 4.4e-4 measured), `t = +1` (slider +2.0) is the numeric inverse `G^-1(x)` (max error 4.0e-4, RMS 1.9e-4 measured), and `t <= -1` applies a linear gain ahead of `G(x)` (`G(0.5 * x)` at slider -1.0, RMS 1.0e-4).
+   - Region tone (`Highlights2012`, `Shadows2012`, `Whites2012`, `Blacks2012`) halves its domain scale (`HSWB_LOOK_SIGMA = 0.5`) when a Look is active on the recipe. For `Blacks2012` on film negatives, the amplitude scales with the conversion white balance's camera-white vector (`_hswb_blacks_gain`).
+   - Contrast (`Contrast2012`) is applied around a frame-global pivot computed from a 384 px long-side proxy of the cropped raw scan with conversion WB gains (`_pivot_cached`). With a separately fitted per-target pivot the decompiled formula reproduces Lightroom to RMS at or below 3e-4 across all 7 synthetic targets; the production 384 px proxy pivot reaches RMS 0.0035 on grey, 0.0038 on bright, and 0.0006 on dark targets (`docs/research/2026-10-22-run7-tone.md`).
+   - Parametric curve (`paramcurve.py`) applies a four-region spline (`ParametricShadows`, `ParametricDarks`, `ParametricLights`, `ParametricHighlights` split at 25 / 50 / 75).
+4. Lens vignette (`_lv_gain`): Multiplies linear negative RGB by a radial gain field normalized by the full uncropped frame's half-diagonal.
+5. Camera calibration (`calibration.model`): Applies primary hue and saturation shifts (`RedHue`, `RedSaturation`, `GreenHue`, `GreenSaturation`, `BlueHue`, `BlueSaturation`) on linear negative RGB.
+6. Dehaze (`presence.dehaze`): Whole-frame spatial dark-channel dehaze in linear ProPhoto RGB.
+7. sRGB curve-axis encoding (`_curve_encode`): Transforms linear ProPhoto RGB `[0, 1]` to the IEC 61966-2-1 sRGB transfer curve.
+8. Pre-curve Presence and HSL (`presence.saturation_vibrance`, `texture`, `clarity`, `hsl_mixer.apply`): Evaluates global `Saturation` and `Vibrance` HSV kernels, spatial `Texture` and `Clarity2012` filters (with filter sigmas scaled by `max(H, W) / 11023`), and the 8-band HSL mixer on the sRGB-encoded negative.
+9. Inversion curves and decode (`_curves_decode`): Maps each channel on `[0, 255]` through its 256-entry natural cubic spline LUT via direct floor-and-fraction indexing (`_pw_channel`), then applies `_curve_decode` to return a positive image in linear ProPhoto RGB.
+
+### Post-Curve Positive Stages (`edits.py`)
+
+Once `_curves_decode` returns linear ProPhoto RGB for the inverted positive, `apply_edits` executes the `STAGES` tuple in order:
+
+| Order | Stage name | Scope | Operations applied |
+|---:|---|---|---|
+| 1 | `transform` | Frame | Lens profile distortion, manual distortion, perspective/upright warps, then crop |
+| 2 | `basic` | Per-pixel | Post-conversion white-balance delta (`_wb_scale`) relative to (6500 K, 0) |
+| 3 | `tone_curve` | Per-pixel | Post-conversion point curves (`ExtendedToneCurvePV2012*`) on the sRGB-encoded axis |
+| 4 | `profile` | Per-pixel | NLP v2.3 Enhanced Profile Look (`apply_look`): 90x30x30x3 HSV 3D LUT trilinear gather + tone curve (`Natural`, `Frontier`, `Crystal`, `Pakon`, `Cine`, `Tech`, `Evo`, `Chrome`) |
+| 5 | `color_mixer` | Per-pixel | B&W grayscale conversion (`ConvertToGrayscale` + 8-band `GrayMixer*` cosine-hat weights) and `PointColors` |
+| 6 | `color_grading` | Per-pixel | 3-way shadow/midtone/highlight colour wheels, global wheel, `ColorGradeBlending`, `ColorGradeBalance`, and `SplitToning*` |
+| 7 | `detail` | Spatial | Frame-relative luminance/colour noise reduction and unsharp-mask sharpening (`Sharpness`, `SharpenRadius = 1.0`, `SharpenDetail = 50.0`, `SharpenEdgeMasking`) |
+| 8 | `optics` | Frame | Lens profile vignette correction for non-camera sources |
+| 9 | `effects` | Spatial | Frame-relative post-crop vignette (`PostCropVignette*`) and synthesized film grain (`GrainAmount`, `GrainSize`, `GrainFrequency`) |
+| 10 | `calibration` | Per-pixel | Identity (no-op with warnings); primary calibration ran pre-curve, ShadowTint not applied |
+| 11 | `local` | Spatial | `MaskGroupBasedCorrections` / `CorrectionMasks` local adjustment masks |
+| 12 | `retouch` | Spatial | `RetouchAreas` heal/clone spots and `RedEyeInfo` |
+
+For 16-bit ProPhoto TIFF output, linear ProPhoto channels are encoded through a 2^20-entry (1,048,576-entry) lookup table (`_tone_encode`). Because the inverse TRC slope diverges near black, a uniform LUT quantizes dark shadows by roughly 1e-4 (around 16 uint16 counts); indexing the encode LUT by `sqrt(v)` (`_sqrt_lut_index`) keeps encoding error below 1e-6 everywhere and within 1 uint16 rounding unit (`docs/research/2026-10-18-render-speed.md`).
+
+---
+
+## Using Lightroom Classic as an Oracle
+
+### Two-Tier Oracle Design
+
+To verify each stage without guessing internal parameter scalings, the pipeline treats Lightroom Classic 15.6 as an offline black-box oracle (`docs/lrc-oracle.md`):
+
+1. Catalog metadata oracle: A SQLite reader inspects `.lrcat` tables (`Adobe_images`, `Adobe_imageDevelopSettings`, `AgLibraryFile`) to extract both NLP's serialized Lua tables (`rgbOrigins`, `settings`, `autoWB`, `roll`) and Camera Raw's develop dictionary (`CameraProfile`, `Temperature`, `Tint`, `ToneCurvePV2012*`, `Look`, `Crop*`, `Perspective*`). This isolates the NLP curve solver (`rgbOrigins + settings -> ToneCurvePV2012*`) from pixel rendering.
+2. Batch pixel oracle: An automated Lightroom SDK plugin (`.lrplugin`) reads generated `jobs.lua` manifests, applies target develop dictionaries to real film DNGs or synthetic test DNGs (`testdng.py` grey ramps, colour charts, and grid targets), exports 16-bit uncompressed ProPhoto RGB TIFFs (gamma 1.8, output sharpening off), and restores the catalog state. Because DNG SDK rendering is pure local file I/O, the oracle machine runs completely offline behind 16 inbound and outbound Windows Firewall rules blocking all Adobe executables.
+
+Across the verification campaign, the pixel oracle produced over 1,500 reference TIFFs: Run 1 (116 full-resolution exports across 6 film rolls), Run 6 (350 jobs covering develop sliders, geometry, and Upright at roughly 3 s per 35 mm frame), Run 7 (619 jobs across `preconv7`, `tone7`, `synth7`, `crop7`, `vig7`, `grain7`, and `lcp7` in 32 min, 6.8 GB), and Run 8/8b (428 camera-raw jobs).
+
+### How Parity Is Measured
+
+Oracle comparisons separate three distinct stages:
+
+- Curve-knot exactness: Across 823 catalog frames with stored `rgbOrigins`, generated `ToneCurvePV2012Red`, `ToneCurvePV2012Green`, and `ToneCurvePV2012Blue` integer knot coordinates (0..255) are compared directly against the catalog's stored curves (`check_curve_engine.py`).
+- Pre-conversion origin accuracy: Across 803 local DNGs (excluding 20 frames with `CameraProfile = "Embedded"` and 1 row without origins), `analyse()` is run from the raw scan and the absolute bin difference `|measured - stored|` (0..255) is summarized by median and 90th percentile (p90) for `blackPointOrigin` and `whitePointOrigin`.
+- End-to-end perceptual colour difference (`dE00`): Both the standalone render and the Lightroom 16-bit TIFF export are decoded to linear ProPhoto RGB, aligned via FFT cross-correlation on CIE Lab L* to remove sub-pixel crop rounding offsets, trimmed at the border, and compared pixel-by-pixel using CIEDE2000 (`dE00`)[^ciede2000] (reporting the median of per-frame pixel medians and the median of per-frame 95th percentiles) alongside linear ProPhoto mean absolute difference.
+
+---
+
+## Tolerance and Acceptance Numbers
+
+All figures below are copied from verification runs in `docs/research/`; each row labels whether the value is measured against the oracle or a design-only gate threshold.
+
+### Component-Level Parity
+
+| Component under test | Dataset / sample size | Metric | Value | Status |
+|---|---|---|---|---|
+| ImageMagick center crop (`im_center_crop_percent`) | 251 image dimensions vs `convert.exe` | Dimension or offset mismatches | 0 / 251 misses | Measured (`2026-10-21-nlp-accuracy.md`) |
+| ImageMagick `-blur 0x2` (`im_blur_kernel`, 17 taps) | 16-bit test frame vs `convert.exe` | Max absolute pixel difference | 0.5 / 65535 | Measured (`2026-10-21-nlp-accuracy.md`) |
+| Full IM analysis preparation (`MelissaRGB` 8-bit) | 600x476 pre-conversion export vs `convert.exe` | Pixels differing by +-1 / mean abs diff / histogram L1 (R/G/B) | 0.28% / 0.0009 / 0.0010, 0.0012, 0.0012 | Measured (`2026-10-21-nlp-accuracy.md`) |
+| `film_wb` autoWB-to-slider derivation | 322 + 165 catalog rows | RMS residual vs stored `wbTemp`/`wbTint` | 5e-14 | Measured (`2026-10-21-nlp-accuracy.md`) |
+| NLP curve solver (`curve_points`) | 823 catalog frames (v1: 257, v2.2: 29, v2.3: 435, v3.0: 102) | Frames with exact 0-level knot match across all 3 channels | 819 / 823 (99.5%: 256/257 v1, 29/29 v2.2, 433/435 v2.3, 101/102 v3.0) | Measured (`2026-10-21-nlp-accuracy.md`) |
+| Default tone curve `G(x)` 69-knot PCHIP table | Synthetic grey ramp (`tone7`) | Max fit residual (above 0.8 / below 0.25) | 1.3e-3 / below 2e-5 | Measured (`2026-10-22-run7-tone.md`) |
+| Pre-curve `Contrast2012` decompiled formula (separately fitted per-target pivot) | 7 synthetic targets (c = -100, -50, +50, +100) | RMS error vs Lightroom export | at or below 3e-4 all targets (production 384 px proxy: 0.0035 grey / 0.0038 bright / 0.0006 dark) | Measured (`2026-10-22-run7-tone.md`) |
+| Analysis render vs Lightroom `preconv7` bytes (with `G(x)`) | 40 acceptance frames (v1/v2 B&W and colour) | `blackPointOrigin` abs diff median / p90 (bins) | 1.0 / 5.1 bins (1.0 / 2.0 on v2 B&W) | Measured (`2026-11-09-run7-preconv.md`) |
+| `CameraProfile = "Embedded"` DNG fallback (SDK ramp + ACR3) | 20 catalog frames | Stored conversion median `dE00` / origins black & white median bin error | 2.01 `dE00` / 4 black, 1 white bins | Measured (`2026-10-21-nlp-accuracy.md`) |
+| Float32 pipeline equivalence gate vs float64 reference | 98 MP 6x7 full render | 16-bit output max abs diff | Gate at most 2 u16 (design-only); actual 1 u16 (2.8% of pixels, float32 linear max abs diff 2.1e-6, measured) | Design gate + Measured (`2026-10-18-render-speed.md`) |
+| Viewport 1:1 `render_region` with spatial halo vs full render | 5 rects x 6 edit combinations on 6x7 scans | Max `dE00` and max 16-bit abs diff | 0 `dE00`, 0 u16 (bit-identical) | Measured (`2026-10-21-perf-fullres.md`) |
+
+### End-to-End Pixel Parity (116-Frame Acceptance Suite)
+
+The 116-frame acceptance benchmark spans 6 rolls (37 frames of 35 mm colour, 39 frames of 35 mm B&W, 20 frames of 120 medium-format colour, and 20 frames of 120 medium-format B&W, `docs/research/2026-10-19-acceptance.md`). It compares stored NLP conversions against raw scans converted from scratch (`analyse()` + `curve_points()` + `render()`):
+
+| Stratum (n frames) | Stored NLP conversion median `dE00` (measured) | From-scratch conversion median `dE00` (measured) | From-scratch cost (delta) |
+|---|---:|---:|---:|
+| All frames (116) | 2.46 (p95 mid 11.0) | 3.29 (p95 mid 13.6) | +0.83 |
+| Black & white (59) | 1.86 | 2.37 | +0.51 |
+| Colour (57) | 3.56 | 5.67 | +2.11 |
+| 120 B&W roll A (10, v2.2/v2.3) | 1.46 | 2.00 | +0.54 |
+| 120 B&W roll B (10, v2.2/v2.3) | 1.58 | 1.62 | +0.04 |
+| 120 Colour roll A (10, v2.3) | 2.30 | 2.55 | +0.25 |
+| 120 Colour roll B (10, v2.3) | 1.56 | 3.44 | +1.88 |
+| 35 mm B&W roll (39, v2.3) | 1.94 | 2.58 | +0.64 |
+| 35 mm Colour roll (37, v1 era) | 4.44 | 6.77 | +2.33 |
+
+Rendering existing catalog recipes matches Lightroom Classic to a median of 2.46 `dE00` (1.86 on B&W). Converting a scan from scratch adds +0.83 `dE00` overall (+0.51 on B&W, +2.11 on colour), driven by `rgbOrigins` differences on historical 35 mm colour frames.
+
+---
+
+## What Did Not Match and Why (Open Gaps)
+
+The documented open discrepancies between the standalone pipeline and the Lightroom Classic + NLP oracle:
+
+- Open gap (Exposure2012 fractional-slider interpolation and extended EV range, `docs/research/2026-10-22-run7-tone.md`, `deftone.py`): Integer slider positions -1, 0, +1, and +2 EV are captured from Lightroom oracle exports. Fractional positions between those captured points, and values beyond +2 EV (pre-gain region), are interpolated as `x^(1-s) \\* C(x)^s` and not yet verified against oracle output (open).
+- Open gap (historical catalog `rgbOrigins` floor on `ProcessVersion = 11.0` frames, `docs/research/2026-11-09-run7-preconv.md`): Adding the 69-knot default-tone shoulder `G(x)` brought the standalone analysis render within a median of 1.0 bin (p90 = 5.1 bins) of Lightroom's own `preconv7` exported analysis bytes across the 40-frame acceptance subset. However, running the exact ImageMagick + histogram chain on Lightroom's own `preconv7` bytes still differs from the catalog's historically stored `blackPointOrigin` by a median of 8.0 bins (p90 = 18.1 bins; standalone Python render is 9.0 / 23.0 bins vs stored). Direct catalog inspection showed that all 40 frames carry `ProcessVersion = 11.0` alongside legacy pre-2012 develop keys (`Contrast = 25`, `Shadows = 5`, `Brightness = 50`) while their PV2012 keys sit at 0. Because the surviving `preconv7` capture specification does not prove whether those legacy keys were neutralized during export or active when NLP originally analysed the frames, the 8.0-bin catalog floor remains open pending a paired neutralized-vs-preserved capture sweep.
+- Open gap (unrecoverable pre-conversion white balance on 6500 K / +10 v1 rolls, `docs/research/2026-10-21-nlp-accuracy.md`): Across 803 catalog frames, 95 v1 frames in two 35 mm rolls record Lightroom's default `Temperature = 6500`, `Tint = 10` in the catalog rather than a film-border white-balance sample. On those 95 frames, median `blackPointOrigin` error is 38 bins (p90 = 70 bins), and most stored `blackPointOrigin` values sit clipped at 255. Either the pre-conversion white balance was reset after conversion or NLP re-analysed an already-inverted positive; in both cases, the original analysis render cannot be reconstructed from catalog metadata alone (open).
+- Open gap (internal Camera Raw mechanism for the `Look` vs `G(x)` switch, `docs/research/2026-10-22-run7-tone.md`, `render.py`): Empirically across 103 film frames, Camera Raw applies the default-tone highlight shoulder `G(x)` whenever `edits.look is None` and suppresses `G(x)` whenever a `Look` dictionary is present, even when `Look.Amount` is set to 0 (`ProcessVersion` is 11.0 in both groups). Similarly, the pre-curve HSWB domain scale halves (`HSWB_LOOK_SIGMA = 0.5`) when a Look is present. The pipeline reproduces this behaviour via `with_tone_mode` (`edits.look is None`), but the underlying Camera Raw profile/Look flag that disables the baseline shoulder remains unidentified (open).
+- Open gap (positive-source `Shadows2012` and `Whites2012 > 0` response curves, `render.py`): The pre-curve `Shadows2012` and positive `Whites2012` operators (`hswb.film_delta`) were fitted empirically on negative film scans. When editing a positive raster or digital camera raw, those two controls emit a warning and are skipped until positive-domain oracle sweeps are fitted (open).
+- Open gap (manual `film = custom` curve overrides and `autoColor` white balance, `docs/research/2026-10-21-nlp-accuracy.md`, `nlp_wb.py`): Of the 4 remaining non-exact curves out of 823 (819 exact), three use `film = custom` with manually adjusted WB sliders or post-preset node counts (7 stored nodes vs 14 from `precise_curve_pts`, or 4 to 10 levels of knot shift), and one B&W frame was re-analysed after positive conversion. Additionally, NLP's `autoColor` WB mode (which derives shifts from `meanPoints` rather than `autoWB`) is unported (`NotImplementedError` in `nlp_wb.py`; 0 frames in the catalog use it).
+- Open gap (full-frame geometry and local stages on the 1:1 region endpoint, `docs/research/2026-10-21-perf-fullres.md`): The interactive 1:1 `/tile.jpg` region renderer evaluates all per-pixel and spatial filter stages (`texture`, `clarity`, `denoise`, `sharpen`, `vignette`, `grain`) with exact halo padding, but skips `Upright`/`perspective`/`CropAngle` warps, local adjustment masks, and retouch spots at 1:1 (they render in fit-view pane previews and full exports).
+
+---
+
+## Render-Speed Results
+
+Medium-format 6x7 film scans digitized at 3200 DPI measure roughly 11123 x 8851 to 8851 x 11159 pixels (around 98.5 MP, 500 to 600 MB per 16-bit 3-channel DNG, or 296M scalar samples per frame). Optimising the Python/NumPy engine proceeded in two measured passes on a 16-core workstation (`docs/research/2026-10-18-render-speed.md` and `docs/research/2026-10-21-perf-fullres.md`).
+
+### Pass 1: Float32 Pipeline, Flat LUT Indexing, and Sqrt-Spaced TRC LUTs
+
+Moving full-resolution rendering from float64 with `np.interp` binary searches to float32 with direct LUT indexing (`2026-10-18-render-speed.md`, measured on an 11123 x 8851 6x7 frame with `Natural` Look and `Saturation = -10`):
+
+- 3D LookTable trilinear gather (`hsv.apply_hue_sat_map`): Profiling showed that 8-corner int64 fancy-index gathers on the 90x30x30x3 HSV LookTable consumed 73% of `sdk_render`. Replacing the 8 index arrays with a single flat int32 base index plus constant stride offsets (+1 on value, +vdiv on saturation, wrapped row offset on hue) cut the 8-corner gather on a 35M-pixel strip from 6.6 s to 4.4 s and `sdk_render` from 51.6 s to 42.9 s (measured).
+- 256-entry point-curve gather (`_pw_channel`) and 2^20-entry TRC LUTs (`_tone_encode`, `_tone_decode`): Replacing `np.interp` with direct floor-and-fraction `ndarray.take` indexing on the 256-entry curve LUTs and 2^20-entry sqrt-spaced TRC LUTs cut `_tone_encode` from 23.0 s to 8.8 s, `_tone_decode` from 11.6 s to 2.9 s, and `write_image` from 14.0 s to 4.3 s (measured). Standalone `render()` wall time dropped from 156.4 s to 113.6 s.
+
+### Pass 2: Strip Threading, Resident Pre-Curve Memmap, Single-Region 1:1 View, and In-Place Export
+
+The second pass (`2026-10-21-perf-fullres.md`, measured across n = 5 runs on two 8851 x 11159 6x7 frames, 2560 x 1440 viewport) addressed both full-resolution export memory and interactive 1:1 editing latency:
+
+1. In-place export and strip threading (`render()`): Moving from the main-line float32 whole-frame pipeline with multiple full-resolution buffer copies (80.8 s / 67.3 s, 20.0 GiB / 19.7 GiB RSS) to in-place export with strip threading cut time to 29.1 s / 24.4 s and RSS to 8.48 GiB / 8.30 GiB. A further memory fix (freeing the decoded scan array before `apply_edits` and sharing one scratch buffer between retouch and red-eye) reduced peak RSS to 4.46 GiB / 4.35 GiB with a minor time cost (30.1 s / 25.7 s; measured, bit-identical max abs diff 0). On the same machine, Lightroom Classic 15.6 GPU batch export averaged 5.3 s / 5.7 s per frame (4.5x to 5.7x faster on batch export). Lightroom's interactive 1:1 viewport latency on 98 MP scans is known to lag (user's report; not measured against the oracle).
+2. Resident pre-curve memmap and single-region 1:1 viewport (`render_region`): Instead of requesting up to 20 separate 1024 x 1024 tiles per 2560 x 1440 viewport (each paying redundant spatial halo overhead), the frontend `ZoomView` requests a single debounced region (viewport + 256 px margin aligned to a 32 px block grid, 120 ms debounce, design-only parameter). On frame open, the server builds a resident full-resolution pre-curve map in the background (roughly 1.2 GiB disk-backed memmap in page cache, capped at 2 frames) and evaluates spatial filters (`texture`, `clarity`, `denoise`, `sharpen`, `vignette`, `grain`) with halo padding and frame-global noise statistics.
+
+| Interactive / export operation (8851 x 11159 6x7 frames A / B) | Baseline tile grid (s, measured) | Single-region + memmap (s, measured) | Speedup |
+|---|---:|---:|---:|
+| 1:1 Exposure slider (pre-curve, per-pixel) | 4.39 / 2.16 | 0.44 / 0.38 | 10.0x / 5.7x |
+| 1:1 Temperature slider (post-curve, per-pixel) | 1.58 / 0.47 | 0.44 / 0.35 | 3.6x / 1.3x |
+| 1:1 Sharpening slider (spatial USM) | 1.55 / 0.45 | 0.17 / 0.17 | 9.1x / 2.6x |
+| 1:1 Luminance noise reduction (spatial) | 1.74 / 0.57 | 0.30 / 0.28 | 5.8x / 2.0x |
+| 1:1 Colour noise reduction (spatial) | 1.53 / 0.44 | 0.18 / 0.16 | 8.5x / 2.8x |
+| 1:1 Texture slider (pre-curve spatial) | 1.44 / 0.46 (spatial skipped) | 0.54 / 0.42 (full spatial) | 2.7x / 1.1x |
+| 1:1 Viewport pan (512 px step) | 1.81 / 1.97 | 0.45 / 0.34 | 4.0x / 5.8x |
+| Fit-view Exposure slider at 2240 px | 0.84 / 0.86 | 0.48 / 0.42 | 1.8x / 2.0x |
+| Fit-view Exposure slider at 1600 px | 0.47 / 0.37 | 0.25 / 0.22 | 1.9x / 1.7x |
+| Full-res 16-bit TIFF export (`POST /api/export`) | 80.8 / 67.3 (20.0 / 19.7 GiB RSS) | 30.1 / 25.7 (4.46 / 4.35 GiB RSS) | 2.7x / 2.6x (4.5x lower RSS) |
+
+---
+
+## Build vs Darktable Decision
+
+Before committing to a standalone develop engine and web editor, Darktable (v5.6.2, GPL-3.0) was evaluated across three integration architectures (`docs/research-darktable-vs-scratch.md`): using Darktable's built-in `negadoctor` module, compiling a custom inversion module (`iop`) inside Darktable, or running the NLP inversion externally and handing a 16-bit positive TIFF to `darktable` / `darktable-cli`.[^dt-negadoctor]
+
+### Why `negadoctor` Cannot Replace the NLP Pipeline
+
+Darktable's `negadoctor` module models film inversion physically in scene-referred linear RGB using the Beer-Lambert optical density law (`D = -log10(T)`).[^dt-negadoctor]
+
+The user samples or enters `D_min` (film base + orange mask colour), dynamic range `D_max`, and scan exposure bias; `negadoctor` converts transmittance `T` to density `D`, subtracts `D_min`, applies shadow and highlight colour-cast vectors in density space, and maps the result through virtual paper black, print exposure, and paper grade (gamma). While effective for manual frame-by-frame darkroom work, `negadoctor` is incompatible with an NLP-based catalog workflow:
+
+1. Mathematical incompatibility: `negadoctor` operates in logarithmic density space with manual `D_min` and `D_max` controls, whereas NLP combines a dual-illuminant inverting DCP matrix, a -1.0 EV baseline shoulder `G(x)`, an ImageMagick `MelissaRGB` histogram origin analyser, per-channel sRGB-axis natural cubic splines (`ToneCurvePV2012*`), and 90x30x30x3 Enhanced Profile Look LUTs (`Frontier`, `Natural`, `Crystal`, `Pakon`, `Cine`). No measured mapping from these 823 catalog recipes to `negadoctor` parameters exists.
+2. Closed pixelpipe in Darktable's Lua API: Darktable's Lua scripting environment (`docs.darktable.org/lua/stable/`) exposes collection queries, tagging, GUI panel registration (`register_lib`), and export triggers (`pixelpipe-processing-complete`), but cannot process pixel buffers or define an image-operation (`iop`) module.[^dt-lua]
+3. ABI-locked C `iop` compilation: All 97 pixelpipe modules in Darktable are compiled in-tree via `src/iop/CMakeLists.txt` (`add_iop`) and verified at load time by `dt_module_dt_version() == dt_version()` in `src/common/module_api.h`. Shipping the NLP pipeline inside Darktable's pixelpipe would require porting the Python/NumPy solver to C and maintaining a private Darktable fork across every upstream release.
+4. Split state and pre-curve ordering in an external TIFF handoff: Pre-converting a scan to a 16-bit positive TIFF and importing that TIFF into Darktable splits non-destructive history across two sidecar systems, prevents interactive re-conversion or pre-curve slider adjustments (`Exposure2012`, `Contrast2012`, `HSL` on the negative) without leaving the editor, and forfeits the cached pre-curve memmap that delivers 0.16 to 0.54 s 1:1 viewport response on 98 MP medium-format scans.
+
+| Criterion | Standalone Python/NumPy Engine | Darktable (`negadoctor`) | Darktable + External Pre-Convert | Darktable Custom C `iop` Fork |
+|---|---|---|---|---|
+| Reproduces existing Lightroom + NLP catalog recipes (2.46 `dE00`) | Yes (819 / 823 exact curves) | No (Beer-Lambert log density model) | Conversion only; Lightroom develop sliders lost | Conversion only; Lightroom sliders differ |
+| Pre-curve slider semantics (`Exposure`, `HSL`, `Contrast` before inversion) | Exact Camera Raw stage order | N/A (different module pipe) | Requires external re-render + re-import | Requires maintaining custom C `iop` |
+| Unattended batch & headless browser UI | Native FastAPI + single-region 1:1 view | Desktop GTK app + `darktable-cli` subprocess | Two sidecar formats + CLI re-render script | Desktop GTK app; ABI-locked fork per release |
+| Scanner `LinearRaw` DNG compatibility (`Vuescan RAW`, `Nikon LS-9000`) | Direct `tifffile` IFD reader | Generic `UNIQUECAMERAMODEL` fallback in `rawspeed` (0 / 1402 `cameras.xml` hits; 4-ch RGB+IR unsupported) | Handed 16-bit TIFF after external decode | Generic `rawspeed` DNG path |
+
+[^dng-spec]: Adobe Systems Incorporated, "Digital Negative (DNG) Specification, Version 1.7.1.0," Sept. 2023, ch. 6 ("Mapping Camera Color Space to CIE XYZ Space" and "Applying the Hue/Saturation/Value Mapping Table"). https://helpx.adobe.com/content/dam/help/en/photoshop/pdf/DNG_Spec_1_7_1_0.pdf
+[^imagemagick]: ImageMagick Studio LLC, "ImageMagick v7 Kernel Convolution (`AcquireKernelInfo` / `-blur` and `-crop` Geometry)," 2026. https://imagemagick.org/script/command-line-options.php
+[^iec-srgb]: International Electrotechnical Commission, "IEC 61966-2-1:1999 - Multimedia systems and equipment - Colour measurement and management - Part 2-1: Colour management - Default RGB colour space - sRGB," 1999. https://webstore.iec.ch/en/publication/6169
+[^ciede2000]: M. R. Luo, G. Cui, and B. Rigg, "The development of the CIE 2000 colour-difference formula: CIEDE2000," *Color Research & Application*, vol. 26, no. 5, pp. 340-350, 2001. https://doi.org/10.1002/col.1049
+[^dt-negadoctor]: darktable developers, "darktable 5.6 User Manual - Processing Modules: negadoctor," 2026. https://docs.darktable.org/usermanual/5.6/en/module-reference/processing-modules/negadoctor/
+[^dt-lua]: darktable developers, "darktable Lua API Reference Manual," 2026. https://docs.darktable.org/lua/stable/
