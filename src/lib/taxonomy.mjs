@@ -63,7 +63,7 @@ export const TAXONOMY = [
   },
   {
     id: "homelab",
-    label: "Homelab and self-hosting",
+    label: "Homelab",
     blurb: "Storage and backups, the hosts and how they are deployed, the services they run, and the home sensors.",
     groups: [
       { id: "storage", label: "Storage and backups" },
@@ -94,7 +94,7 @@ export const TAXONOMY = [
   },
   {
     id: "coding-agents",
-    label: "Coding agents and LLMs",
+    label: "Agents and LLMs",
     blurb: "The agent harness, the models behind it, and how agent work is reviewed.",
     groups: [
       { id: "harness", label: "Harness and tooling" },
@@ -104,7 +104,7 @@ export const TAXONOMY = [
   },
   {
     id: "workstations",
-    label: "Workstations and tooling",
+    label: "Workstations",
     blurb: "Windows, WSL2 and Steam Deck setup, latency measurements, and graphics, film and site design.",
     groups: [
       { id: "windows", label: "Windows, WSL2 and Steam Deck" },
