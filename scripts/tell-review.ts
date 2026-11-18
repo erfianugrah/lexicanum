@@ -88,7 +88,8 @@ export function paragraphs(doc: Doc): Para[] {
 }
 
 /**
- * The page title and section headings, one paragraph each, prefixed "Title:" so
+ * The page title, section headings and homepage blurb, one paragraph each;
+ * titles and headings are prefixed "Title:" so
  * the prompt can judge them as titles. A title is short by design; the model
  * looks for slogan subtitles and teases, which no regex in tests/lib/mdx.ts
  * can tell from a plain "Subject: scope" title.
@@ -103,6 +104,9 @@ export function titles(doc: Doc): Para[] {
           ? l.raw.match(/^#{1,6}\s+(.*\S)\s*$/)?.[1]
           : undefined;
     if (t) out.push({ line: l.n, lines: [l.n], text: `Title: ${t}` });
+    // The homepage card text: read as an ordinary sentence, not a title.
+    const blurb = l.kind === "frontmatter" ? l.raw.match(/^blurb:\s*["']?(.*?)["']?\s*$/)?.[1] : undefined;
+    if (blurb) out.push({ line: l.n, lines: [l.n], text: blurb });
   }
   return out;
 }
