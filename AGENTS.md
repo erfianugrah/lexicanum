@@ -387,12 +387,22 @@ post-contract docs and normalised their prose spelling to British -ise; the
 regex-able subset of those tells gates the build via `LLM_MARKERS` in
 `tests/lib/mdx.ts`, and `REJECTED_MARKERS` there records the candidates
 rejected because the author's own pre-contract writing uses them. Tells the
-regex cannot see (participle tails, rhythm triplets, mystery teases, mixed
-metaphors, "not X" framings) get an advisory pass before each prose commit:
-`erfi-review --changed` (local model on the author's own hardware, flags
-only as `file:line: kind: "quote"`, exit 0). Fix the real tells by hand and
-ignore wrong flags; it never rewrites, and it does not gate CI (the runner
-has no model). New docs must conform fully. When
+regex cannot see (announce-before-stating sentences, aphorisms, self-grading,
+negative parallelism, participle tails, rhythm triplets, metaphors) are a CI
+gate since 2026-11-18: the `prose-tells` job runs
+`bun run check:tells --changed <base>` (`scripts/tell-review.ts`, prompt in
+`scripts/tell-review-prompt.md`, gemini-4-argon via OpenRouter, repo secret
+`OPENROUTER_API_KEY` capped at 10 USD a month) on the paragraphs a push or PR
+touched, and any flag blocks `build-and-deploy`. Run it before pushing:
+`sx OPENROUTER_API_KEY=OPENROUTER_API_KEY -- bun run check:tells --changed`.
+Reword a real flag; clear a wrong one for that doc with
+`{/* tells-ok: <quote> */}` (does not render). A quote not in the doc is
+dropped, and an unreachable model fails the job (exit 2). The model only
+sees touched paragraphs, so an old doc's existing tells block nothing until
+someone edits that paragraph; the 2026-11-18 corpus sweep is in
+`docs/research/raw/2026-11-18-tell-sweep/`. `erfi-review --changed` (local
+model, exit 0) is still there as a free pre-check, but it missed most of the
+tells the gate catches. New docs must conform fully. When
 making a substantial edit to an older doc, bring the touched sections into
 conformance (heading case, ASCII punctuation, section skeleton); a wholesale
 rewrite just for style is not required.
