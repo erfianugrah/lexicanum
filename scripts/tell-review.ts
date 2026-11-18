@@ -167,20 +167,24 @@ const PROMPT = readFileSync(join(import.meta.dir, "tell-review-prompt.md"), "utf
 const MODEL = process.env.TELL_MODEL ?? "google/gemini-4-argon";
 const ENDPOINT = process.env.TELL_ENDPOINT ?? "https://openrouter.ai/api/v1/chat/completions";
 
-class ModelError extends Error {}
+export class ModelError extends Error {}
 
-async function ask(group: Para[]): Promise<unknown[]> {
+/**
+ * One JSON-mode chat call. Retries 429/5xx and unparseable answers; throws
+ * ModelError when it cannot get a usable object, so callers fail closed.
+ */
+export async function chatJson(model: string, system: string, user: string, maxTokens = 4000): Promise<Record<string, unknown>> {
   const key = process.env.OPENROUTER_API_KEY;
   if (!key) throw new ModelError("OPENROUTER_API_KEY is not set");
   const body = {
-    model: MODEL,
+    model,
     temperature: 0,
     seed: 7,
-    max_tokens: 4000,
+    max_tokens: maxTokens,
     response_format: { type: "json_object" },
     messages: [
-      { role: "system", content: PROMPT },
-      { role: "user", content: group.map((p) => `L${p.line}: ${p.text}`).join("\n\n") },
+      { role: "system", content: system },
+      { role: "user", content: user },
     ],
   };
   let last = "";
@@ -203,9 +207,9 @@ async function ask(group: Para[]): Promise<unknown[]> {
       }
       const content = String(JSON.parse(text)?.choices?.[0]?.message?.content ?? "");
       const json = content.replace(/^\s*```(?:json)?/, "").replace(/```\s*$/, "");
-      const flags = JSON.parse(json)?.flags;
-      if (!Array.isArray(flags)) throw new Error("answer has no flags array");
-      return flags;
+      const obj = JSON.parse(json);
+      if (!obj || typeof obj !== "object") throw new Error("answer is not an object");
+      return obj as Record<string, unknown>;
     } catch (e) {
       if (e instanceof ModelError) throw e;
       last = String(e);
@@ -213,6 +217,12 @@ async function ask(group: Para[]): Promise<unknown[]> {
     }
   }
   throw new ModelError(`no usable answer after 3 attempts (${last})`);
+}
+
+export async function ask(group: Para[]): Promise<unknown[]> {
+  const obj = await chatJson(MODEL, PROMPT, group.map((p) => `L${p.line}: ${p.text}`).join("\n\n"));
+  if (!Array.isArray(obj.flags)) throw new ModelError("answer has no flags array");
+  return obj.flags;
 }
 
 export async function reviewFile(file: string, only?: Set<number>): Promise<Flag[]> {

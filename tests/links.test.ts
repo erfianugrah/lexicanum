@@ -60,32 +60,37 @@ describe.skipIf(!ENABLED)("external links", () => {
       const dead: string[] = [];
       const limited: string[] = [];
       let checked = 0;
+      // 429 and the gateway errors are the host saying "not now", not "gone":
+      // github.com answered 112 cited URLs with 504 in one run (2026-11-09,
+      // lexicanum#111) while every one of them loaded in a browser.
+      const TRANSIENT = new Set([429, 502, 503, 504]);
       const check = async (url: string, docs: string[]) => {
         let status = 0;
         for (const method of ["HEAD", "GET"] as const) {
-          for (let attempt = 0; attempt < 2; attempt++) {
+          for (let attempt = 0; attempt < 3; attempt++) {
+            let retryAfter = 0;
             try {
               const res = await fetch(url, {
                 method,
                 redirect: "follow",
-                signal: AbortSignal.timeout(15000),
+                signal: AbortSignal.timeout(20000),
                 headers: { "user-agent": "lexicanum-link-check" },
               });
               status = res.status;
-              if (status !== 429 || attempt === 1) break;
-              // Rate limited: honour Retry-After once (capped), then retry.
-              const wait = Math.min(Number(res.headers.get("retry-after")) || 10, 30);
-              await new Promise((r) => setTimeout(r, wait * 1000));
+              retryAfter = Number(res.headers.get("retry-after")) || 0;
             } catch {
               status = 0;
-              break;
             }
+            if (!(TRANSIENT.has(status) || status === 0) || attempt === 2) break;
+            // Honour Retry-After (capped), else back off 5 s, 10 s.
+            const wait = Math.min(retryAfter || 5 * (attempt + 1), 30);
+            await new Promise((r) => setTimeout(r, wait * 1000));
           }
           if (status < 400 && status !== 0) break;
         }
         checked++;
-        // A host still throttling after a retry is not evidence the page is gone.
-        if (status === 429) limited.push(`${url} (${docs[0]})`);
+        // A host still throttling after retries is not evidence the page is gone.
+        if (TRANSIENT.has(status)) limited.push(`${status} ${url} (${docs[0]})`);
         else if (status === 0 || status >= 400) dead.push(`${status || "no response"} ${url} (${docs[0]})`);
       };
       const PER_HOST = 4;
@@ -101,8 +106,8 @@ describe.skipIf(!ENABLED)("external links", () => {
           await Promise.all(Array.from({ length: Math.min(PER_HOST, entries.length) }, worker));
         }),
       );
-      console.log(`checked ${checked} URLs on ${byHost.size} hosts; rate-limited (not counted dead): ${limited.length}`);
-      for (const l of limited) console.log(`  429 ${l}`);
+      console.log(`checked ${checked} URLs on ${byHost.size} hosts; throttled (not counted dead): ${limited.length}`);
+      for (const l of limited) console.log(`  ${l}`);
       expect(dead).toEqual([]);
     },
     { timeout: 900000 },

@@ -455,7 +455,7 @@ Run `bun run build` and confirm:
     `tests/code-glue.test.ts` unit-tests the kit's `src/lib/code-glue.mjs`.
   - `tests/pins.test.ts` - per-doc pins: corrections that must not regress, claims
     that must not creep back, required sections, and the anchors other docs link to.
-    Adding a pin is a row in the table.
+    Adding a pin is a row in the table in `tests/lib/pins.ts`, which `scripts/tell-fix.ts` also reads.
   - `tests/identifiers.test.ts` - banned identifiers, read from `BANNED_IDENTIFIERS`
     or `BANNED_IDENTIFIERS_FILE` (default `~/.config/lexicanum/banned-identifiers`)
     so account ids never reach shell history or CI logs. An absent list FAILS; the
