@@ -87,6 +87,26 @@ export function paragraphs(doc: Doc): Para[] {
   return out;
 }
 
+/**
+ * The page title and section headings, one paragraph each, prefixed "Title:" so
+ * the prompt can judge them as titles. A title is short by design; the model
+ * looks for slogan subtitles and teases, which no regex in tests/lib/mdx.ts
+ * can tell from a plain "Subject: scope" title.
+ */
+export function titles(doc: Doc): Para[] {
+  const out: Para[] = [];
+  for (const l of doc.lines) {
+    const t =
+      l.kind === "frontmatter"
+        ? l.raw.match(/^title:\s*["']?(.*?)["']?\s*$/)?.[1]
+        : l.kind === "prose"
+          ? l.raw.match(/^#{1,6}\s+(.*\S)\s*$/)?.[1]
+          : undefined;
+    if (t) out.push({ line: l.n, lines: [l.n], text: `Title: ${t}` });
+  }
+  return out;
+}
+
 /** Quotes a person has cleared for this doc. */
 export function allowedQuotes(raw: string): string[] {
   return [...raw.matchAll(/\{\/\*\s*tells-ok:\s*([\s\S]*?)\s*\*\/\}/g)].map((m) =>
@@ -227,7 +247,8 @@ export async function ask(group: Para[]): Promise<unknown[]> {
 
 export async function reviewFile(file: string, only?: Set<number>): Promise<Flag[]> {
   const raw = readFileSync(file, "utf8");
-  let paras = paragraphs(parseMdx(file, raw));
+  const doc = parseMdx(file, raw);
+  let paras = [...titles(doc), ...paragraphs(doc)].sort((a, b) => a.line - b.line);
   if (only) paras = touched(paras, only);
   const allowed = allowedQuotes(raw);
   const flags: Flag[] = [];

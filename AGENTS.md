@@ -341,6 +341,23 @@ Cite the source path when answering from docs.erfi.io in chat, too.
   all-caps acronyms (RLS, DNS, TLS, API, JWT, WAF); camelCase / product phrases
   (PostgREST, WebSocket, Cache Rules, Data API, Edge Functions, Docker Compose).
   Lowercase generic nouns (Overview -> overview, Configuration -> configuration).
+- **Titles and headings name the subject.** A title is what a reader would
+  search for: the system, the task or the question ("Supabase Edge Function
+  limits", "Migrating a NAS with migctl", "Why UCI SSIDs disappear from a
+  Flint 2 after reboot"). A colon is fine when the second half is scope
+  ("Supabase Storage large objects: multipart, ranges and TUS"). Never a
+  verdict, slogan or tease after the subject: "A PCB as code, and proving its
+  checks work", "checked before the vendor checks it", "the glitch-oracle
+  trap", "one ceiling at a time", "who owns the mount" were all retitled on
+  2026-11-18. Drop "measured" from a title; the provenance
+  note says it. `check:tells` reviews a changed title or heading too.
+- **Backticks mark what a reader would type, grep or match**: commands,
+  paths, identifiers, register names, literal values such as `0x2ba01477`.
+  A count, duration, size or rate in running text stays plain (8,651
+  trials, 13.70 s, 128 KB, 200 kHz). Every backticked span renders as a
+  boxed chip, and a paragraph of chips is hard to read (the M483 page had
+  70 boxed numbers; the corpus has about 1,100). Tables follow the same
+  rule.
 - **ASCII punctuation only** in prose/headings/commits. No em/en dashes (use `-`),
   no smart quotes, no ellipsis char. The `ascii-punctuation-guard` enforces this.
 - Arrows in prose: `->` (renders literally; SmartyPants leaves it alone).
@@ -394,7 +411,7 @@ negative parallelism, participle tails, rhythm triplets, metaphors) are a CI
 gate since 2026-11-18: the `prose-tells` job runs
 `bun run check:tells --changed <base>` (`scripts/tell-review.ts`, prompt in
 `scripts/tell-review-prompt.md`, gemini-4-argon via OpenRouter, repo secret
-`OPENROUTER_API_KEY` capped at 10 USD a month) on the paragraphs a push or PR
+`OPENROUTER_API_KEY` capped at 10 USD a month) on the paragraphs, titles and headings a push or PR
 touched, and any flag blocks `build-and-deploy`. Run it before pushing:
 `sx OPENROUTER_API_KEY=OPENROUTER_API_KEY -- bun run check:tells --changed`.
 Reword a real flag; clear a wrong one for that doc with

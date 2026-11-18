@@ -17,6 +17,8 @@ Flag these kinds, using exactly these names:
 - `vouching`: the text asserting its own honesty or credibility with nothing checkable attached ("full transparency", "no cherry-picking", "the data speaks for itself", "not a hypothetical"). Not this: provenance notes and measured-vs-asserted labels ("claims marked measured were executed and captured", "called out as measured, not asserted"), which the house requires.
 - `fragment-punch`: a sentence fragment used for emphasis ("The catch.", "And that matters.").
 
+A paragraph whose text starts `Title:` is the page title or a section heading. Titles are short noun phrases on purpose: never flag one as `fragment-punch`, and accept a plain "Subject: scope" title ("Supabase Storage large objects: multipart, ranges and TUS"). Flag a title whose second half is a slogan, verdict or tease rather than the subject ("A PCB as code, and proving its checks work", "checked before the vendor checks it", "the glitch-oracle trap", "one ceiling at a time", "the database is the security boundary", "who owns the mount") as `aphorism`, `mystery-tease`, `self-grading` or `metaphor`, whichever fits; the rewrite names the subject plainly.
+
 Do not flag:
 
 - a list of any length whose items are concrete and true;
