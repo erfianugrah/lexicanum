@@ -1,0 +1,225 @@
+---
+title: "Worker-to-Worker authentication with ES256 JWTs on Cloudflare"
+description: How to authenticate cross-account Worker-to-Worker calls with ES256 JWTs when mTLS certificate bindings are unavailable, the three identity layers, and how the trust model compares to AWS IAM, SPIFFE and OAuth.
+author: Erfi Anugrah
+category: cloudflare
+group: edge
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+Authenticating Workers calling other Workers across Cloudflare accounts without a shared secret, a per-request API charge, or an external control plane. The receiver holds the public keys and assigns identity - the sender cannot self-assert who it is.
+
+Provenance: the design-property claims in this doc - the 520 on orange-clouded mTLS, the 13-step verifier, the JTI Durable Object consistency - are cross-checked against the implementation in `worker-mtls-jose` but not against a multi-colo measurement run. The comparison-table properties for AWS IAM, SPIFFE and Istio are documented architecture, not a measurement from this rig.
+
+**TL;DR:**
+
+- Cloudflare mTLS certificate bindings return `520` when the destination Worker sits behind an orange-clouded (proxied) zone, leaving no built-in mechanism for authenticated Worker-to-Worker calls[^cf-mtls-bindings]
+- Access service tokens work but couple you to the Zero Trust control plane
+- ES256 JWTs with a receiver-owned key registry give you authenticated calls without vendor lock-in, access charges or a shared secret
+- The `CF-Worker` header Cloudflare adds to Worker subrequests is a useful signal but spoofable - identity comes from the JWT signature, not the header[^cf-subrequest-headers]
+- Durable Object-backed JTI storage gives strongly consistent replay protection with no eventual-consistency gap
+
+---
+
+## The mTLS gap
+
+Cloudflare offers [mTLS certificate bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/mtls/) (`mtls_certificate`) for Workers to present a client certificate to an origin. When the target is an orange-clouded (proxied) zone, the connection returns `520`, the catch-all origin-unreachable status[^cf-mtls-bindings]. The bindings work for grey-clouded (DNS-only) origins but that gives up the CDN - caching, DDoS protection and the Workers runtime are all behind the proxy.
+
+Access service tokens (Cloudflare Zero Trust) authenticate Workers but introduce a dependency on the Access control plane and a per-token management model. For a small number of well-known Worker pairs, a shared HMAC secret works. For any scale beyond that, neither pattern fits.
+
+ES256 JWTs fill this gap: asymmetric keys held by the sender, public keys held by the receiver, identity assigned by the receiver through its key registry.
+
+<Aside type="note">
+  Reference implementation: the `worker-mtls-jose` library exports `signRequest()` and `verifyRequest()` functions that handle JWT signing and the 13-step verification pipeline. It is not an npm package - copy `lib/` into your own project and depend on the `jose` library directly.
+</Aside>
+
+---
+
+## How it works
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  sender [label="Sender Worker\n(Account A)", shape=box];
+  receiver [label="Receiver Worker\n(Account B)", shape=box];
+  cf_edge [label="Cloudflare edge\nadds CF-Worker header", shape=ellipse, fontsize=9];
+  registry [label="Key registry\n(kid -> identity)", shape=folder];
+  do [label="JTI Durable Object\n(replay check)", shape=component];
+
+  sender -> cf_edge [label="Authorization: Bearer <jwt>"];
+  cf_edge -> receiver [label="POST /api/data\n+ CF-Worker: example.com"];
+  receiver -> registry [label="lookup kid"];
+  receiver -> do [label="check jti"];
+  receiver -> sender [label="200 or 403", style=dashed, color=gray];
+}
+```
+
+| Step | What happens | Where |
+|------|-------------|-------|
+| 1 | Sender signs an ES256 JWT with claims: `method`, `path`, `bodyHash`, `iss`, `aud`, `exp`, `jti`, `iat`, plus optional `srcZone`/`dstZone` | Sender Worker |
+| 2 | Sender attaches the JWT as `Authorization: Bearer <jwt>` and calls the receiver | Sender Worker |
+| 3 | Cloudflare edge adds `CF-Worker: <zone>` to the subrequest | Cloudflare edge |
+| 4 | Receiver decodes the JWT header, extracts `kid`, and looks up the key in its registry | Receiver Worker |
+| 5 | Receiver verifies the ES256 signature against the registered public key | `jose.jwtVerify()` |
+| 6 | Receiver checks `iss`, `aud`, `exp`, `maxTokenAge` | `jose.jwtVerify()` options |
+| 7 | Receiver runs JTI replay check against the Durable Object store | `JTI DO` |
+| 8 | Receiver resolves identity from the key registry entry (not from the JWT claims) | `RegisteredKey.identity` |
+| 9 | Receiver checks the `CF-Worker` header matches the registered identity zone | Runtime check |
+| 10 | Receiver checks the destination zone (from `request.url.hostname`) matches `dstZone` claim | Runtime check |
+| 11 | Receiver checks the request method matches the JWT `method` claim | Runtime check |
+| 12 | Receiver checks the request path matches the JWT `path` claim | Runtime check |
+| 13 | Receiver hashes the request body (SHA-256, base64url) and checks it matches `bodyHash` if present | `crypto.subtle.digest()` |
+
+---
+
+## Three identity layers
+
+The receiver builds identity from three independent signals. Only one - the key registry - is load-bearing.
+
+| Layer | Source | Trust level | Spoofable |
+|-------|--------|-------------|-----------|
+| Key registry (`kid` -> identity) | Receiver's `KEY_REGISTRY` env var | Receiver-controlled - highest | No (needs private key) |
+| `CF-Worker` header | Cloudflare edge, added to Worker subrequests | Cloudflare-attested | Yes, by non-Worker clients |
+| Destination hostname | `request.url.hostname` at runtime | Runtime-derived | Needs DNS/routing attack |
+
+**Key registry**: the receiver holds a list of `{ kid, publicKeyPem, identity: { zone, account?, worker? } }` entries. When it sees a JWT with `kid: "sender-a"`, it finds that entry, verifies the signature against the stored public key, and reads the identity from the entry. The sender's `srcZone`/`srcAccount` claims in the JWT are ignored. Identity is receiver-assigned, not self-asserted.
+
+This is the fundamental difference from a shared-secret HMAC: the receiver can revoke a sender by removing its registry entry; the sender cannot assert a zone it does not own.
+
+**`CF-Worker` header**: Cloudflare adds `CF-Worker: <zone>` to all Worker subrequests[^cf-subrequest-headers]. It is set by the edge, not by user code. However, Cloudflare does not document stripping it from non-Worker requests - a direct client could set this header and it would pass through. The equivalent trustworthy field (`cf.worker.upstream_zone`) exists only in the WAF/Rules Engine, not the Workers runtime API[^cf-waf-fields].
+
+In this system, `CF-Worker` is a defence-in-depth signal. The JWT signature + key registry is the real proof. A `CF-Worker` mismatch is rejected; an absent header is logged as "skip" rather than failure.
+
+**Destination hostname**: the receiver derives its own zone from `request.url.hostname` at runtime, so a misconfigured `receiverZone` env var does not silently accept tokens meant for another hostname.
+
+---
+
+## JTI replay prevention
+
+Each JWT carries a `jti` (JWT ID) claim - a unique token identifier[^rfc7519]. The receiver stores seen JTIs and rejects any that appear a second time.
+
+The library provides two backends:
+
+| Store | Consistency | Storage | When to use |
+|-------|-------------|---------|-------------|
+| Durable Object (`createDoJtiStore()`) | Strong - single writer per DO instance, no replication lag | DO storage, automatically expires entries after token TTL | Production. No replay can slip through during a write propagation window. |
+| KV (`createKvJtiStore()`) | Eventual - KV writes are globally consistent within 60 seconds but reads can be stale | KV namespace, TTL-based expiry | Non-critical or budget-constrained paths where a short replay window is acceptable. |
+
+The DO store is the recommended default. A DO instance is a single-threaded actor: every JTI check+store is serialised, so two requests with the same JTI arriving at the same DO instance are linearised and only one succeeds.
+
+---
+
+## Trust model comparison
+
+The table positions this system against the authentication primitives available on other platforms. The fundamental gap: AWS, GCP and Kubernetes platforms cryptographically attest a caller's identity at the infrastructure layer because they control the runtime. Cloudflare's Workers runtime does not expose an account ID or Worker-level identity certificate, so the application must supply its own.
+
+| System | Identity attested by | Self-assertion | Consistency |
+|--------|---------------------|----------------|-------------|
+| This system (ES256 JWT + registry) | Private key + receiver key registry + `CF-Worker` header | No (registry mode) | Strong (DO) |
+| AWS IAM (STS) | AWS platform | No | Strong |
+| GCP Workload Identity | External IdP + GCP STS | No | Strong |
+| SPIFFE/SPIRE | Platform attestation (kernel, kubelet) | No | Strong |
+| Istio mTLS | Kubernetes service account + CA | No | Strong |
+| OAuth client_credentials | Auth server + client secret | No | Strong |
+
+Systems that do platform attestation have a structural advantage - the platform can prove who the caller is without the application holding a secret. On Cloudflare, the application must carry a secret (the private key), so key hygiene matters: short-lived tokens (60 s default), per-JWT request binding (method + path + body hash), and receiver-side revocation (remove the registry entry).
+
+### Attack vectors
+
+| Attack | Impact | Mitigated by |
+|--------|--------|-------------|
+| Private key compromise | Full impersonation | Short-lived tokens (60 s), receiver-side revocation (remove key entry) |
+| `CF-Worker` spoofing | None - JWT signature must pass first | Signature verification runs before `CF-Worker` check |
+| Token replay | None | JTI stored in DO with TTL, strong consistency |
+| Token reuse on different endpoint | None | Method + path + body hash bound in JWT |
+| Receiver misconfiguration | Reduced - destination derived from hostname | `request.url.hostname` used at runtime |
+
+---
+
+## Key resolution strategies
+
+The receiver supports three strategies for resolving which key to verify against:
+
+| Strategy | How it works | When to use |
+|----------|-------------|-------------|
+| Key registry (`keys`) | `kid` in JWT header -> registry entry -> public key + identity | Recommended. Identity is receiver-controlled. |
+| Single key (`publicKeyPem`) | One public key without `kid`. Identity from JWT claims, filtered by `allowedSourceZones`. | Legacy single-sender. Sender self-asserts identity. |
+| JWKS URL (`jwksUrl`) | Fetches keys from an OIDC provider (Authentik, Keycloak). Identity from the OIDC token's claims. | Delegate identity to an external IdP. |
+
+The key registry is the recommended mode. It supports key rotation via `publicKeyPemOld` on each entry: the receiver tries both current and old keys during rotation, with zero downtime.
+
+---
+
+## Which approach to use
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  start [label="Need Worker-to-Worker auth?", shape=diamond];
+  both_my_acct [label="Both Workers in same\nCloudflare account?", shape=diamond];
+  service_bindings [label="Use service bindings\n(fetch binding, no auth needed)"];
+  orange [label="Destination orange-clouded\n(proxied)?", shape=diamond];
+  mtls [label="Use mTLS cert bindings\n(mtls_certificate)"];
+  scale [label="More than 2-3 senders\nor churn expected?", shape=diamond];
+  hmac [label="Shared HMAC secret\n(simple, static)"];
+  jwt_registry [label="ES256 JWT + key registry\n(this system)"];
+  jwks [label="ES256 JWT + JWKS from IdP"];
+
+  start -> both_my_acct;
+  both_my_acct -> service_bindings [label="Yes"];
+  both_my_acct -> orange [label="No"];
+  orange -> mtls [label="No (DNS-only)"];
+  orange -> scale [label="Yes"];
+  scale -> jwt_registry [label="Yes"];
+  scale -> hmac [label="No"];
+  jwt_registry -> jwks [label="Need external IdP?"];
+}
+```
+
+| Scenario | Approach | Effort |
+|----------|----------|--------|
+| Same account, no auth policy needed | Service bindings | None |
+| Cross-account, DNS-only (grey-clouded) | mTLS cert bindings | Low |
+| Cross-account, 2-3 static senders | Shared HMAC secret | Low |
+| Cross-account, many senders or key rotation | ES256 JWT + key registry (this system) | Medium |
+| Cross-account, external identity provider | ES256 JWT + JWKS from IdP | Medium-high |
+
+---
+
+## Evidence
+
+| Claim | How it was checked | Evidence |
+|-------|-------------------|----------|
+| mTLS cert bindings return 520 on orange-clouded destinations | Documentation. The binding type registers a client certificate that Cloudflare presents on the TLS handshake to the origin; on an orange-clouded zone the handshake terminates at Cloudflare's edge, not the origin, so the binding does not apply. | `worker-mtls-jose` README "Why" section (design-property claim cross-checked against CF docs) |
+| `CF-Worker` header added automatically | Documented Cloudflare behaviour. The header is added to all Worker subrequests; a header transform rule example in the CF docs shows how to detect cross-zone subrequests using it. | [Cloudflare Rules examples](https://developers.cloudflare.com/rules/transform/examples/add-request-header-subrequest-other-zone/) |
+| 13-step verification pipeline | Code review of `lib/verify.ts` in `worker-mtls-jose` | `worker-mtls-jose/lib/verify.ts` `verifyRequest()` function |
+| JTI Durable Object provides strong consistency | Code review. The DO-backed store uses `state.storage.get()` + `state.storage.put()` in the same `fetch()` handler - single-threaded DO execution linearises all JTI operations. | `worker-mtls-jose/lib/jti.ts` `JtiDurableObject` class |
+| 24 E2E tests pass | Read from README | `worker-mtls-jose` README "E2E tests" section |
+| Key rotation with `publicKeyPemOld` | Code review. In `verifyWithRegistry()`, the verifier tries both current and old keys when a `publicKeyPemOld` is present, allowing a new key to deploy before the old one is removed. | `worker-mtls-jose/lib/verify.ts` lines 72-85 |
+| Request binding (method + path + body hash) | Code review. The `signRequest()` function includes `method`, `path`, and optional `bodyHash` in JWT claims; the receiver verifies all three. | `worker-mtls-jose/lib/sign.ts` and `lib/verify.ts` |
+
+---
+
+## Related docs
+
+- [Caching with Cloudflare Workers](/reference/caching/): covers cross-zone Worker fetch behaviour, including the `cf` caching-option gap this authentication layer sits below
+- [Gatekeeper IAM Gateway](/reference/cloudflare-iam-gateway/): a deny-first IAM policy evaluator that gates cache purge and DNS API calls - complementary: IAM rules authorise WHAT, this system authenticates WHO
+- [Cloudflare + Supabase architecture reference](/reference/cloudflare-supabase-architecture/): the Workers-to-Supabase auth model (Hyperdrive, JWKS, RLS identity) that this system extends to Worker-to-Worker calls
+- [Magic WAN interoperability](/guides/magic-wan-interop/): private-path connectivity for Worker backends, useful when the receiver Worker sits behind Magic WAN rather than a public hostname
+
+[^cf-mtls-bindings]: Cloudflare, "mTLS," Cloudflare Docs. https://developers.cloudflare.com/workers/runtime-apis/bindings/mtls/
+
+[^cf-subrequest-headers]: Cloudflare, "Add a request header for subrequests from other zones," Cloudflare Docs. https://developers.cloudflare.com/rules/transform/examples/add-request-header-subrequest-other-zone/
+
+[^cf-waf-fields]: Cloudflare, "Available fields and functions - Request fields," Cloudflare Docs (cf.worker.upstream_zone). https://developers.cloudflare.com/ruleset-engine/rules-language/fields/#field-cf-worker-upstream_zone
+
+[^rfc7519]: M. Jones, J. Bradley, N. Sakimura, "JSON Web Token (JWT)," RFC 7519, IETF. https://datatracker.ietf.org/doc/html/rfc7519
