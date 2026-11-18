@@ -11,6 +11,7 @@ import {
   markerLines,
   mathRiskLines,
   mdxSyntaxError,
+  mismatchedTableRows,
   parseMdx,
   REJECTED_MARKERS,
   smartPunctLines,
@@ -151,6 +152,32 @@ describe("tables", () => {
     const doc = parseMdx("t.mdx", fm("| a | b |\n|---|---|\n| 1 | 2 |\n"));
     expect(headlessTableRuns(doc)).toHaveLength(0);
     expect(splitTables(doc)).toHaveLength(0);
+    expect(mismatchedTableRows(doc)).toHaveLength(0);
+  });
+
+  test("a delimiter row with fewer columns than the header is flagged", () => {
+    // reference/m483-flash-locks-and-glitch-oracles.mdx shipped a 4-column
+    // header over `|---|---:|---|` (3 columns); remark-gfm rendered the entire
+    // table as a paragraph of literal pipes.
+    const doc = parseMdx(
+      "t.mdx",
+      fm("| Run | Trigger | Attempts | Outcome |\n|---|---:|---|\n| a | b | c | d |\n"),
+    );
+    expect(mismatchedTableRows(doc)).toEqual([
+      { line: 7, cells: 3, expected: 4, tableStart: 6 },
+    ]);
+  });
+
+  test("an unescaped pipe inside inline code in a table cell is flagged", () => {
+    // GFM splits table cells on `|` before parsing inline code spans, so
+    // `` `ls | wc -l` `` splits into two cells unless written `` `ls \| wc -l` ``.
+    const doc = parseMdx(
+      "t.mdx",
+      fm("| Claim | Check |\n|---|---|\n| 81 files | `ls | wc -l` |\n| ok | `ls \\| wc -l` |\n"),
+    );
+    expect(mismatchedTableRows(doc)).toEqual([
+      { line: 8, cells: 3, expected: 2, tableStart: 6 },
+    ]);
   });
 
   test("a pipe table inside a fence is not a table", () => {

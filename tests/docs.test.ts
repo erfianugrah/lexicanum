@@ -18,6 +18,7 @@ import {
   markerLines,
   mathRiskLines,
   mdxSyntaxError,
+  mismatchedTableRows,
   smartPunctLines,
   splitTables,
 } from "./lib/mdx";
@@ -94,6 +95,16 @@ describe.each(docs.map((d) => [d.path, d] as const))("%s", (_path, doc) => {
     // it, but a run at the top of the doc has nothing to pair with.
     const headless = headlessTableRuns(doc).map((t) => `rows ${t.startLine}-${t.endLine}`);
     expect(headless).toEqual([]);
+  });
+
+  test("every table row matches its header column count", () => {
+    // A delimiter row with the wrong column count makes remark-gfm render the
+    // whole table as a literal pipe paragraph; an unescaped `|` inside a code
+    // span in a body cell splits the cell and drops trailing columns.
+    const bad = mismatchedTableRows(doc).map(
+      (r) => `L${r.line}: ${r.cells} cells vs ${r.expected} in header at L${r.tableStart}`,
+    );
+    expect(bad).toEqual([]);
   });
 
   test("no smart punctuation outside code", () => {

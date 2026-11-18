@@ -288,6 +288,52 @@ export function headlessTableRuns(doc: Doc): Table[] {
 }
 
 /**
+ * GFM table cell count for a pipe-delimited row. GFM splits a table row on
+ * unescaped `|` BEFORE parsing inline code spans (GFM spec 4.10), so an
+ * unescaped `|` inside `` `a | b` `` still splits the cell.
+ */
+export function tableCellCount(raw: string): number {
+  return raw
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/(?<!\\)\|$/, "")
+    .split(/(?<!\\)\|/).length;
+}
+
+export interface TableRowMismatch {
+  line: number;
+  cells: number;
+  expected: number;
+  tableStart: number;
+}
+
+/**
+ * Rows in a table run whose cell count differs from the header row. Two defects
+ * surface here:
+ * - Row 2 (the delimiter row) has the wrong column count, so remark-gfm refuses
+ *   to parse the entire block as a `<table>` and renders literal pipe text
+ *   (shipped in reference/m483-flash-locks-and-glitch-oracles.mdx:43).
+ * - A body row has an unescaped `|` inside an inline code span (e.g.
+ *   `` `ls | wc -l` ``), which splits the cell in GFM and drops trailing
+ *   columns off the row.
+ */
+export function mismatchedTableRows(doc: Doc): TableRowMismatch[] {
+  const out: TableRowMismatch[] = [];
+  for (const t of doc.tables) {
+    const rows = doc.lines.slice(t.startLine - 1, t.endLine);
+    if (rows.length === 0) continue;
+    const expected = tableCellCount(rows[0]!.raw);
+    for (let i = 1; i < rows.length; i++) {
+      const cells = tableCellCount(rows[i]!.raw);
+      if (cells !== expected) {
+        out.push({ line: t.startLine + i, cells, expected, tableStart: t.startLine });
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * Unescaped dollars that remark-math could pair into a formula. Frontmatter,
  * fences and inline code are exempt - verified against built output: a dollar in
  * frontmatter renders literally in og:description, and one in a code span
