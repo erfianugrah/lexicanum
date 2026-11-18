@@ -1,0 +1,194 @@
+---
+title: Patching Pulsar X2 CrazyLight Mini firmware
+description: "A bad patch on a related mouse led to a recovery-first process for the X2 CrazyLight Mini: rehearse the stock updater, validate each change against the whole firmware image, and use a decompiler to check what the change means. The current V3.05 image fixes a USB enqueue-loss path, gives the mouse a unique serial number, and adds opt-in diagnostics; USB captures show normal report cadence but no measured latency win."
+author: "Erfi Anugrah"
+category: reverse-engineering
+---
+
+I patched my Pulsar X2 CrazyLight Mini (X2CL), an nRF52840 mouse running firmware V3.05, and left its 8K dongle on stock V2.25. The mouse now retries a failed USB motion-report enqueue, has a unique USB serial number, and exposes opt-in diagnostic commands that read raw sensor frames, one at a time or as a slow live stream over USB. An earlier patch bricked the related X2N CrazyLight Mini, so this work started with recovery and validation rather than features.
+
+This guide records what I changed, which checks caught bad patches, and what the hardware and USB captures actually establish. I could rebuild update packages that the stock updater accepts. Package cryptography and byte-level patch recipes are outside this guide; the process and evidence are the useful parts.
+
+Prerequisites for this kind of work are an exact stock image for the hardware revision, a recovery image and boot path tested on that same unit, a disassembler, and a way to capture USB traffic. A successful flash shows that the updater accepted the package, not that the new firmware boots. Do not use another model's firmware, addresses, or recovery assumptions.
+
+## Architecture
+
+| Component | State | Role |
+|---|---|---|
+| X2 CrazyLight Mini | Patched V3.05, nRF52840 | Sensor reads, click processing, wired USB, and wireless radio |
+| Wired USB | Stock full-speed path | One 1 ms USB frame limits interrupt reports to 1 kHz |
+| 8K dongle | Stock V2.25 | Radio receiver plus high-speed USB to the PC |
+| Patch specification | Declarative, per image | Names the stock image, protected ranges, relocations, and register contracts |
+| Offline gate | Run before every flash | Rebuilds the image and checks the patch in its whole-image context |
+| Recovery path | Tested on this mouse before patching | Boot mode plus a known-good stock package |
+| Measurement | USBPcap at the PC | Shows host-visible report timing, with capture and buffering caveats |
+
+The patch gate can establish that code is structurally sound. It cannot decide whether a change preserves the firmware's intended behaviour. I used headless Ghidra decompilation as a second opinion for that separate question.
+
+## Part 1: prove recovery before patching
+
+### The X2N brick
+
+The earlier X2N Mini failure came from a defective patch on the correct stock base. Its added guard code occupied bytes that belonged to a live interrupt handler used for SoftDevice dispatch. The patch also branched into the middle of two instructions. The result still entered boot mode and displayed its normal boot banner, but USB, motion, and buttons never started.
+
+The vector table led to the damaged handler, and a byte comparison against stock established the rest. Boot mode accepted the stock package and recovered the mouse in about 15 seconds. The flash path had worked; the generated image was bad.
+
+That distinction drove the X2CL process. I reconstructed the brick as an offline regression case, then treated protected live code, instruction boundaries, and whole-image references as release requirements.
+
+### The recovery rehearsal
+
+Before changing the X2CL, I entered its boot mode and installed a rebuilt stock V3.05 package. The stock updater accepted it and the mouse returned to normal operation. That proved the recovery path on the unit I was about to modify, including the package format and boot-entry route.
+
+Every later experiment kept a matching stock recovery image ready. Changes to boot-entry code or settings loaded before USB stayed out of scope until a lower-level hardware recovery method exists.
+
+## Part 2: validate the whole image
+
+Each patch describes its changes against one exact stock image. The gate rebuilds the output and checks the final firmware rather than inspecting an isolated assembly fragment.
+
+| Check | What it establishes |
+|---|---|
+| Entry-point provenance | The interrupt table and boot entry change only where the specification explicitly allows |
+| Protected ranges | Stock handlers and other live code stay byte-identical |
+| Free-space references | A claimed unused region has no code or data references pointing into it |
+| Static RAM use | Added state does not collide with known RAM users; a complete dynamic RAM map is still a separate burden of proof |
+| Relocation | Displaced instructions still encode correctly at their new location |
+| Decode round trip | The intended instructions survive assembly, and decoding the final image produces the same instruction stream |
+| Branch boundaries | Control flow lands on instruction starts, including computed and literal-target branches |
+| Call contracts | Stack depth and alignment, argument registers, callee-saved registers, and flags survive each wrapper and return path |
+| Literal pools | Constants resolve to the intended aligned pool entries, including references reached through helper branches |
+
+### The failures behind the checks
+
+| Patch or candidate | Failure | Disposition |
+|---|---|---|
+| X2N brick | A patch overwrote a live interrupt handler and entered instructions at invalid boundaries | Recovered with stock firmware; retained as a regression case |
+| Retry v1 | Changing `cbz r0` into an unconditional branch left the stack depth and a live register wrong for the enqueue-failure path | The original failed the offline contract harness and the corrected version passed; v1 never shipped |
+| Normal-gate candidate | Its initial review treated text references as proof that 14 changes were safe | Full caller and reference analysis replaced that claim; I did not flash the candidate |
+| F3 sensor access | A literal resolved into nearby data rather than an aligned pool entry | This reached hardware before literal checking existed and hung the mouse; I reverted it and replaced the feature |
+| R3 counter wrappers | A wrapper loaded the stock callee into `r1`, clobbering the callee's second argument | Literal-target following caught it before that version flashed |
+
+The F3 failure matters because it crossed the same structural gate that had passed offline. The fix was to make the gate follow and resolve the literal, then add a fixture that distinguishes the bad image from the corrected one. A passing gate says the image is structurally sound; whether a change is a good idea is a separate review.
+
+## Part 3: identify the changes on the mouse
+
+The current image contains a small set of changes. The dongle remains stock.
+
+| Change | Current behaviour | Evidence and limit |
+|---|---|---|
+| USB enqueue retry | The motion-report builder checks whether enqueue succeeded and retries on the failure path instead of clearing the report | Static analysis found the loss window; the patched mouse works normally. I have not induced a controlled queue-full condition, so the benefit is unmeasured |
+| Unique USB serial | The descriptor uses a unique per-unit string rather than the same hardcoded string on every mouse | Verified in Windows Device Manager; pairing does not use this string |
+| Diagnostic command framework | Opt-in host commands queue work to the main loop, with bounded waits, watchdog feeding, and reset-safe arming | Framework and command replies ran on hardware. The interrupt handler stays short and sensor work runs outside it |
+| Raw sensor frame | A single-shot command reads the 36 x 36 pixel array and returns 1,296 bytes in 100 thirteen-byte chunks; a stream mode pushes the chunks unasked, about 3.8 frames per second. USB only | Repeat captures and a 10-frame stream completed on hardware; this is a diagnostic view, not a tracking-quality test |
+| Diagnostic counters | One counter records USB enqueue failures; two others record entries to specific dispatcher and pairing-loop call sites | The enqueue-failure label is direct. The other two are event counters, not RF retransmit or 8K-slot counters |
+
+The counter block is not initialised at boot, so I clear it explicitly before a run. I initially labelled the two event counters as radio retransmits and slots. Tracing their call sites disproved that interpretation, and the current names describe only what the code increments.
+
+The diagnostic RAM range sits above the initial stack and avoids known static users. No complete RAM ownership map proves that every dynamic firmware path leaves it unused. Normal operation and the diagnostic runs passed within that narrower limit.
+
+### The sensor frame
+
+The pixel-read sequence was adapted from a public PAW3395 driver, then integrated with the stock firmware's own sensor read and write helpers so each transfer retained the expected chip-select cycle and timing.[^paw3395-driver] My sensor is PAW3950-class, so the public PAW3395 sequence was a lead to test, not proof of compatibility. The first integration attempt aborted during capture; using the stock helpers and preserving state across helper calls produced the complete frame below.
+
+![A real 36 by 36 raw sensor frame captured from the patched X2 CrazyLight Mini, enlarged eight times. Grey pixels show the surface texture seen by the sensor. This image demonstrates the capture path; it does not measure tracking performance.](../../../assets/pulsar-x2cl-firmware-patching/x2cl-raw-frame.png)
+
+The capture path is off at boot, runs once when armed, feeds the watchdog during long operations, and gives up after bounded timeouts. Those are recovery properties. I have not measured a latency or tracking benefit from exposing the image.
+
+The first version worked once per power cycle. After one frame, every later capture timed out waiting for the first pixel, while tracking carried on. The mouse keeps the last good frame in RAM, and my first host tools showed that stale frame as a new one, which looked like a sensor that never changed; both tools now refuse a capture that did not finish. A small diagnostic command that reads sensor registers from the PC showed the cause: after a grab, the pixel-status and pixel-data registers read zero on every poll. The sensor produces no more pixels until it is powered up again. The stock firmware powers the sensor up at boot and on every wake from sleep, which is why a few captures had worked mid-session. The capture now ends by calling that stock power-up routine, and repeat captures work.
+
+The power-up re-applies the stock sensor settings for the mode the mouse is in. On USB that is the configuration the stock firmware itself chooses when it starts on the cable, so a capture does not leave the sensor in a state the stock code never uses.
+
+The reference sequence also overwrote the sensor's mode register with a fixed value, which dropped the stock performance-mode bits. Keeping those bits and setting only the grab bit cut the grab from 450 ms to 104 ms per frame, timed with a hardware timer the stock firmware leaves unused. With my hand off the mouse, consecutive frames in a 15-frame run differed by 0.9 to 1.2 raw pixel units on average, apart from one step right after the start. The slower mode gave 0.9, so the faster grab did not add noise.
+
+For a live view, the mouse now pushes the 100 chunks of each frame on its own, one per 1 ms main-loop pass, through the stock report-sending routine and only when no stock reply is waiting. A 10-frame run arrived complete at 3.8 frames per second. The power-up after each grab (57 ms) and the register reads set most of the remaining time, and the mouse cannot track while the sensor is sending pixels.
+
+The view works only over USB. I patched the mouse's wireless command path to accept these commands too, but the dongle answers them itself: it replied in under a millisecond with the same rejection when the mouse was switched off. A wireless view needs a dongle firmware change, which I have not made.
+
+## Part 4: rule out suspected defects
+
+Several attractive patch targets survived review unchanged.
+
+| Suspected flaw | Finding | Evidence |
+|---|---|---|
+| Click debounce is hardcoded | The main buttons read the user-facing Debounce setting on both press and release | Static trace plus Ghidra review |
+| Debounce 0 still waits for a fixed counter | With Debounce 0, an ordinary press is accepted on the first qualifying scan | Static trace of the threshold and state transition |
+| Wired scans add an unknown long delay | The wired button loop waits for USB start-of-frame and scans once per 1 ms frame | Code-derived period; mode scaling makes Debounce N correspond to N ms wired |
+| The dongle corrupts motion by clearing an accumulator | The suspected clear in V2.25 resets channel-scoring state, not motion | Dongle disassembly and caller trace |
+| Other suspect dongle regions need preventive patches | Their boot-table placement and reference checks found no live corruption to fix | Static whole-image review; no patch flashed |
+| Wired USB can reach 8K with a firmware change | The mouse's nRF52840 USB controller is full-speed; the separate high-speed dongle provides 8K wireless reporting | Hardware architecture and measured USB cadence |
+| Wired start-of-frame pacing is broken | Both stock and current images measured a 999.9 us median wired report interval | USBPcap, one 30-second motion run per image |
+
+For wired clicks with Debounce 0, the scan period and following 1 kHz poll give a computed roughly 0.5-2 ms path under the traced conditions. That is an estimate from the code and USB schedule, not a click-latency measurement. The wireless scan timing is less completely traced, so I do not apply the same conversion there.
+
+### The stock slam-click filter
+
+Ghidra caught a behavioural mistake that the structural gate had accepted. I had added a patch that forced debounce to zero while the sensor reported lift. The stock code instead forces an eight-scan debounce during lift, independent of the user's ordinary setting. After landing, a mode-scaled countdown of 20, 40, 80, or 160 scans suppresses a second transition; at the wired 1 ms scan period, those values correspond to an 8 ms lift threshold and a 20 ms landing window.
+
+A hard set-down can produce a short pulse without producing eight consecutive qualifying scans. Removing the lift override disabled that protection on both main buttons. I removed the patch and flashed the corrected image, and ordinary clicks still work with the user setting. I have not run a controlled lift-and-slam test on it, so the filter's effect rests on the code reading.
+
+The gate checked where the patch went, and Ghidra showed what the replaced stock code did.
+
+## Part 5: measure report cadence
+
+I captured 15 seconds idle followed by 30 seconds of hand-driven circles and side-to-side motion for each image. The dongle stayed on stock V2.25. The current mouse image contained the enqueue retry and unique serial. These were single runs without a repeatable motion rig.
+
+| Image and path | Reports in motion phase | Median interval | P99 interval | Maximum gap |
+|---|---:|---:|---:|---:|
+| Stock, wired | 30,028 | 999.9 us | 1012.8 us | 8477.9 us |
+| Current, wired | 30,027 | 999.9 us | 1012.1 us | 4394.1 us |
+| Stock, wireless | 239,870 | 124.9 us | 133.0 us | 33150.9 us |
+| Current, wireless | 240,319 | 124.9 us | 133.0 us | 3517.2 us |
+
+The medians establish the expected host-visible cadence: 1 ms wired and 125 us wireless. The smaller maximum gaps on the current runs are not evidence that the patch improved them. Hand motion differed, there was one run per condition, and the retry acts only when the USB queue is full.
+
+My first wireless loss estimate was also wrong. It assumed that delayed motion would return as one unusually large catch-up report. The dongle instead places records into a 96-entry ring, so delayed motion can emerge as a run of ordinary-sized reports or be tail-dropped when that ring fills. I withdrew the wireless loss percentages rather than compare them across images.
+
+Wired gaps remain ambiguous too. A stopped host poll followed by an ordinary report could mean undelivered motion, but missed USBPcap records can look the same. Resolving that needs sensor, radio, and USB observations at the same time, plus repeatable motion and several runs per image.
+
+## Part 6: bound the remaining latency claims
+
+The PC capture shows all eight 125 us wireless slots populated during motion. That does not show how old a sample was when the mouse sent it to the dongle.
+
+The mouse-side radio trace found an eight-entry ring of 125 us motion samples. The transmit callback takes one buffered entry for each follow-up slot. A sample can therefore be up to about 1 ms old when sent, computed from the buffer depth and sample period. The PC still sees evenly spaced reports because the dongle has its own buffering and USB schedule. A fix would change this mouse-side slot path; I have not built or flashed one, and no latency gain has been measured.
+
+SensorLock is the useful comparison for a more complete solution. XBAB reports 37 us from sensor-frame capture to USB on the wired XA25 and 80 us on the wireless Kunai, achieved by phase-locking sensor frames, SPI reads, radio traffic where present, and USB polls. The same article reports 205 us wired and 285 us wireless for Razer's Frame Sync implementation.[^xbab-sensorlock] Those are the authors' reported measurements, not measurements I reproduced.
+
+The exact SensorLock sensor-timing method has not been published. Having a PAW3950-class sensor does not supply that missing mechanism. Motion Sync is a different feature: the same article describes per-read motion rescaling that adds most of one polling interval of latency, and Pulsar already exposes it as a toggle. My raw-frame command and evenly populated PC traces do not implement or demonstrate SensorLock.
+
+## Verification
+
+| Claim | Verification performed | Remaining limit |
+|---|---|---|
+| Stock recovery works on this X2CL | Boot-mode stock-package rehearsal before patching | Does not make an unrelated model recoverable by the same procedure |
+| Current image is functional | Flashed, enumerated, and checked motion and buttons | No long power-cycle and sleep soak has been completed |
+| Unique serial is visible | Checked in Windows Device Manager | Identity change only; no performance effect |
+| Raw capture and live view work | 11 repeat captures and a 10-frame stream over USB, all complete | Not over the dongle; the mouse stops tracking during each grab; not a sensor-performance result |
+| Counter command works | Exercised the command and explicit clear | Two counters describe local call-site entries; they are not radio-slot measurements |
+| Stock slam filter is active | Decompile review; the overriding patch was removed and the stock code is byte-identical | No controlled lift-and-slam test yet |
+| Wired and wireless cadence | USBPcap medians and percentiles in the table above | One hand-driven run per image; no click or sensor-to-USB latency result |
+| Enqueue retry helps under back-pressure | Failure path exists statically and the corrected patch is functional | No controlled back-pressure experiment has quantified its benefit |
+
+## Gotchas and lessons learned
+
+- Prove recovery on the same unit first. A working flasher and a successful write say nothing about whether the new application can boot.
+- Keep structural and semantic review separate. The literal and register checks caught broken code; Ghidra caught a validly installed change that removed a useful stock behaviour.
+- Treat each image as a new target. The X2N and X2CL share a family resemblance, but their handlers, addresses, and behaviour cannot be carried across without fresh evidence.
+- Name counters after their call sites. A counter near radio code can still count dispatcher entries rather than retransmissions.
+- Measure the boundary you care about. PC report cadence cannot reveal sample age inside the mouse or dongle. The separate Windows host-side investigation is in [Fixing merged reports from an 8 kHz mouse on Windows](/guides/8khz-mouse-merged-reports-windows/).
+- Keep a negative result when the method collapses. The invalid wireless loss estimate was more useful as a correction than as a flattering before-and-after number.
+
+## File reference
+
+The records behind this guide, by local file name:
+
+| Artifact | Role |
+|---|---|
+| `x2cl-v305-stock.bin` | Matching stock image and recovery baseline |
+| `x2cl-v305-next.bin` | Current mouse image |
+| `x2cl-v305-next.spec.json` | Declarative patch and protected-range specification |
+| `x2cl-v305-next.bin.patchgate.json` | Whole-image gate result for the flashed image |
+| `x2cl-raw-20261118-204350-00.png` | Real sensor frame shown above |
+| `stream-session.jsonl` | Every report of the 10-frame live-stream run |
+| `x2cl-baseline.ps1` | USBPcap capture script used for the cadence runs |
+
+[^paw3395-driver]: "PAW3395_Arduino_ESP32," public PAW3395 Arduino/ESP32 driver, including the `Pixel_Burst_Read` sequence. https://github.com/kirltrz/PAW3395_Arduino_ESP32
+[^xbab-sensorlock]: XBAB Tech, "SensorLock - minimizing timing jitter and latency simultaneously," including the frame-to-USB measurements and the distinction between Motion Sync and sensor-frame phase locking. https://xbabtech.com/blog/sensorlock/
