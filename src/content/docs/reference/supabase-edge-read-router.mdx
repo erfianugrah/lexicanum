@@ -1,0 +1,270 @@
+---
+title: "Read/write split for Postgres at the Cloudflare edge"
+description: "How a Cloudflare Worker on your own domain splits reads and writes across a Supabase primary and its read replicas - request classification, health-checked replica fan-out with failover, GraphQL read rewrite, read-your-writes, an append-only ingest spool, and an execute-only promotion control plane."
+author: Erfi Anugrah
+category: supabase
+group: architecture
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+A Cloudflare Worker that splits reads and writes across a Supabase primary and its read replicas, under your control on your own domain. It mirrors the stock Data API load balancer's routing, rewrites GraphQL reads so they reach replicas, and adds read-your-writes, health-checked replica failover, and an append-only ingest spool - each opt-in.
+
+Every claim below comes from the read-router source, which is a tested Cloudflare Worker published under MIT on a private repository (no public link). Claims from the Cloudflare and Supabase docs carry footnotes.
+
+**TL;DR:**
+
+- **Read/write split mirrors the stock Data API LB:** `GET`/`HEAD` on `/rest/v1/*` is replica-eligible; `POST`/`PUT`/`PATCH`/`DELETE` and everything else goes to the primary. Behaviour is predictable and reversible: remove read-router and clients still work against the primary or the stock LB.
+- **GraphQL reads are rewritten to `GET /rest/v1/rpc/<fn>`** so they balance to replicas. Classification is conservative: mutations, multi-op documents without `operationName`, and non-JSON bodies stay a `POST` to the primary - a possible mutation is never sent to a read-only replica.
+- **Health-checked replica fan-out with failover:** a passive circuit breaker ejects a replica after repeated 5xx/network failures; within a request, the router retries healthy replicas, then degrades to the primary (`x-read-router-degraded: 1`). State is isolate-local - a courtesy model, not a global consensus.
+- **Read-your-writes via a `WriteTracker` Durable Object:** after a user write (identified by the JWT `sub` claim), that user's reads pin to the primary for a configurable window. Anon/service keys have no `sub`, so RYW does not apply to them.
+- **Promotion is execute-only:** the router flips routing on an authenticated `PUT /__admin/routing` with `acknowledgeFencing: true`, after DB-layer promotion and fencing. It never decides a promotion from its own health detection - that is split-brain by false-positive.
+- **The only edge-write path is an append-only, idempotency-keyed Queues spool.** General writes are never buffered in D1 or KV: that path was rejected because it cannot validate against constraints, RLS, or triggers, and cannot produce real `RETURNING` values.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  client  [label="Client"];
+  cftls   [label="Cloudflare\n(TLS / WAF / DDoS)"];
+  pgrouter [label="read-router Worker"];
+
+  subgraph cluster_sb {
+    label="Supabase"; style=rounded; fontsize=12; margin=12;
+    primary  [label="Primary", shape=cylinder];
+    replica1 [label="Replica 1", shape=cylinder];
+    replica2 [label="Replica 2", shape=cylinder];
+  }
+
+  subgraph cluster_cf {
+    label="Cloudflare resources"; style=rounded; fontsize=12; margin=12;
+    cfq      [label="Queues\n(ingest spool)"];
+    do_wt    [label="WriteTracker DO\n(read-your-writes)"];
+    do_rs    [label="RoutingState DO\n(promotion control)"];
+  }
+
+  client -> cftls [label="HTTPS"];
+  cftls -> pgrouter;
+
+  pgrouter -> replica1 [label="GET /rest/v1/*\n(round-robin)"];
+  pgrouter -> replica2;
+  pgrouter -> primary  [label="POST / PUT / DELETE\nGraphQL mutations\nauth / storage / rpc"];
+
+  pgrouter -> do_wt [label="markWrite /\nwroteWithin"];
+  client -> cfq [label="POST /spool/v1/*\n(opt-in)"];
+  cfq -> primary [label="replay\n(at-least-once)"];
+
+  { rank=same; replica1; replica2; }
+}
+```
+
+The pattern is `Client -> Cloudflare -> read-router Worker -> Supabase primary + replicas`: the Worker owns the read path, the primary owns writes, and the replica set is under your control. Pooled Postgres connections (Supavisor `:5432`/`:6543`) and Realtime (WebSocket) bypass the Worker entirely - it only sees the HTTP Data API (`/rest`, `/graphql`).
+
+## Which path to use
+
+| You want | Path | Why |
+|---|---|---|
+| Standard Data API CRUD with RLS | Point `GET`/`HEAD` `/rest/v1/*` at replicas; everything else at the primary | mirrors the stock LB exactly; predictable and reversible |
+| GraphQL reads to reach replicas | Rewrite to `GET /rest/v1/rpc/graphql_get` | GraphQL is a `POST` by protocol, so the stock LB never balances it |
+| A user to see their own writes immediately | Enable read-your-writes (`READ_YOUR_WRITES_MS`) | pins that user's reads to the primary for a window after their write |
+| Reads to survive a replica outage | Circuit breaker + degrade-to-primary | ejects a dead replica and retries healthy ones; all replicas failed = short-circuit to primary |
+| Safe writes during a primary blip | Enable the ingest spool (`SPOOL_ENABLED`) | append-only, idempotency-keyed inserts through Cloudflare Queues; queues buffer until the primary returns |
+| Promotion after DB-layer failover | `PUT /__admin/routing` with `acknowledgeFencing: true` | the router executes the flip; a human or consensus orchestrator decides |
+
+---
+
+## How the read path works
+
+### Request classification
+
+The router mirrors the stock Data API load balancer exactly[^sb-rr]:
+
+- `GET`/`HEAD`/`OPTIONS` on `/rest/v1/*` -> replica-eligible (round-robin).
+- `POST`/`PUT`/`PATCH`/`DELETE` on `/rest/v1/*` -> primary.
+- `/auth/*`, `/storage/*`, `/functions/*`, `/graphql/v1` -> primary (by default; GraphQL gets its own rewrite path).
+- Any request already carrying `x-sb-lb: 1` -> primary (loop guard: prevents a downstream LB from re-balancing back to a replica infinitely).
+
+Every proxied response carries `x-read-router-via: primary|replica` so the routing split is measurable at the edge.
+
+### GraphQL read rewrite
+
+GraphQL is a `POST /graphql/v1` by protocol, so the stock LB sends every GraphQL request to the primary. The router rewrites a read query into a load-balanceable form:[^sb-db-functions]
+
+```
+POST /graphql/v1
+  { "query": "query { items { id name } }" }
+->
+GET /rest/v1/rpc/graphql_get?query=query+%7B+items+%7B+id+name+%7D+%7D
+```
+
+Classification is conservative, so a possible mutation is never sent to a replica:
+
+- **Read:** only `query` operations, no `mutation` or `subscription` fields.
+- **Ambiguous/unknown:** multi-operation documents without an `operationName`, non-JSON bodies, and anything the classifier cannot parse -> `POST` to the primary.
+- **URL ceiling:** GET has a length limit (~16 KB). A rewritten URL that exceeds `GRAPHQL_MAX_GET_URL` (default 6,000) falls back to a `POST` on the primary.
+- **RPC gating:** the rewrite depends on a `graphql_get` PostgREST RPC. On an older PostgREST without it, `GRAPHQL_REPLICA_READS=false` disables the replica path entirely and GraphQL stays on the primary. Even with it on, a `PGRST202` (function not exposed) from the replica triggers a transparent fallback to a `POST` on the primary.
+
+### Health-checked replica fan-out
+
+The router uses a passive per-replica circuit breaker (`health.ts`):
+
+- After `CIRCUIT_FAILURE_THRESHOLD` (default 3) consecutive 5xx or network failures, the replica is ejected for `CIRCUIT_OPEN_MS` (default 10 s), after which one half-open trial is allowed.
+- Within a single request, the router retries up to `MAX_REPLICA_TRIES` (default 2) healthy replicas.
+- If no replica succeeds, the read **degrades to the primary** and the response is tagged `x-read-router-degraded: 1`.
+
+State is isolate-local: each edge isolate learns independently, with no cross-isolate coordination. This is a courtesy health model - it matches the isolate-local round-robin and adds no I/O to the hot path. Lag-based ejection (a replica that is up but far behind) needs an active probe and is deferred to a future phase.
+
+<Aside type="note">
+To exercise the circuit breaker against a real Supabase project for validation, point a
+replica origin at a host that genuinely fails to connect (e.g. a `.invalid` TLD). Supabase
+serves all projects behind wildcard DNS (`*.supabase.co`) and the gateway routes by the
+project ref in the API key, not the hostname - so a made-up `*.supabase.co` "dead replica"
+still resolves and returns real data, and failover never triggers.
+</Aside>
+
+---
+
+## Read-your-writes
+
+Async replicas mean a client that writes then immediately reads may read stale data. When `READ_YOUR_WRITES_MS` is set (default 0 = off), the router pins a user's reads to the primary for that window after their write:
+
+- **Identity** is the JWT `sub` claim, parsed (not verified - upstream verifies) from `Authorization: Bearer`. Anon and service keys have no `sub`, so RYW does not apply to them (it would otherwise pin *all* shared-key traffic after any write).
+- **State** is a single `lastWriteAt` timestamp in a `WriteTracker` Durable Object keyed by `sub:<id>`. Because the write colo and a later read colo may differ, the state lives in a DO so all isolates see the same timestamp - in-memory only, so DO eviction simply degrades to replica reads (safe).
+- **Cost:** one DO round-trip on reads (to check `wroteWithin`) and a fire-and-forget `ctx.waitUntil(markWrite())` on writes.
+
+---
+
+## Ingest spool (append-only, degraded-mode)
+
+The only edge-write path. `POST /spool/v1/<table>` with an `Idempotency-Key` header enqueues the row to a Cloudflare Queue[^cf-queues] and returns **202 Accepted** with no row and no `RETURNING` - the semantics are explicitly async. A consumer Worker replays each message to `POST /rest/v1/<table>` on the primary with `Prefer: resolution=ignore-duplicates`.
+
+This:
+
+- tides over a primary blip for append-only inserts (the queue buffers; the consumer retries with backoff until the primary returns, up to the queue retention window);
+- is at-least-once, so the target table needs a unique constraint on the idempotency-key column;
+- creates no read-your-writes or `RETURNING` contract - callers must not expect the row back.
+
+Only whitelisted tables (`SPOOL_TABLES`) are accepted; everything else is `403`. The spool is off by default; the Queue binding is created deliberately.
+
+---
+
+## Promotion control plane (execute-only)
+
+read-router can **execute** a promotion but never **decide** one. The decision and fencing happen at the DB layer first (a consensus orchestrator, a promote API, or a human); the edge routing flip is the last step.
+
+When `CONTROL_PLANE_ENABLED`, the effective primary/replica set is held in a durable `RoutingState` DO (seeded from env on first use) and read through a short-TTL isolate cache (`ROUTING_CACHE_TTL_MS`, default 5 s). Authenticated endpoints (`X-Admin-Key`):
+
+```
+GET  /__admin/routing   -> current routing + per-replica circuit snapshot
+PUT  /__admin/routing   -> flip routing to a newly-promoted primary
+GET  /__admin/metrics   -> per-origin circuit counters (isolate-local)
+```
+
+The `PUT` is refused without `"acknowledgeFencing": true`, because flipping edge routing does **not** fence direct pooler/psql connections. Other isolates converge on the new routing within the cache TTL.
+
+<Aside type="caution">
+A Worker seeing the primary as unreachable may be observing a Cloudflare-to-origin path
+issue, not a dead primary. Promoting on that false positive creates two primaries.
+Workers are stateless and spread across hundreds of isolates with no single authority to
+grant a new leader term. The router therefore never triggers a promotion from its own
+health detection.
+</Aside>
+
+---
+
+## Rejected: edge write WAL (D1/KV as a durable log)
+
+Buffering *general* writes at the edge (D1 or KV as a "WAL") to keep writes flowing during a primary outage was considered and rejected. For a SQL/PostgREST/regulated workload it breaks correctness:
+
+- You would ACK writes you cannot validate against unique/FK/check constraints, RLS, or triggers - a rejection surfaces minutes later with no client to receive it (phantom success).
+- You cannot produce real `RETURNING` values (server-generated serial/uuid/timestamps); clients that use the returned id immediately break.
+- You cannot offer read-your-writes without reimplementing a query engine at the edge.
+- KV is last-write-wins with ~60 s propagation; a DO is single-instance at roughly 1,000 req/s and evictable. Neither gives the globally-ordered, fsync'd, replicated durability of the Postgres WAL you would be replacing - it is a durability *downgrade* dressed as availability.
+
+The correct answer to "keep writes flowing when the primary dies" is consensus-based promotion (synchronous replica -> primary). The append-only Queues spool above is the only edge-write carve-out, and only because it makes no durability/ordering/`RETURNING` promises it cannot keep.
+
+---
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="Reads need to reach\nreplicas, writes the\nprimary?"];
+  q2 [label="GraphQL reads also\nneed replicas?"];
+  q3 [label="Users need to see\ntheir own writes\nimmediately?"];
+  q4 [label="Need writes to survive\na primary blip?"];
+  q5 [label="Need to promote after\nDB-layer failover?"];
+
+  a1 [label="Deploy read-router with\nPRIMARY_ORIGIN +\nREPLICA_ORIGINS"];
+  a2 [label="Enable GraphQL read\nrewrite (on by default)"];
+  a3 [label="Set READ_YOUR_WRITES_MS\n> 0"];
+  a4 [label="Enable the ingest spool\n(append-only)"];
+  a5 [label="Enable the control plane\n(execute-only; never\nauto-promote)"];
+
+  q1 -> a1 [label="yes"];
+  q1 -> q2;
+  q2 -> a2 [label="yes"];
+  q2 -> q3;
+  q3 -> a3 [label="yes"];
+  q3 -> q4;
+  q4 -> a4 [label="yes"];
+  q4 -> q5;
+  q5 -> a5 [label="yes"];
+}
+```
+
+The same choices as a list:
+
+1. **Reads to replicas, writes to the primary** - deploy read-router with `PRIMARY_ORIGIN` and a comma-separated `REPLICA_ORIGINS`. The circuit breaker is on by default. Leave `REPLICA_ORIGINS` empty and set `LB_ORIGIN` to defer to the stock Data API LB.
+2. **GraphQL reads also need replicas** - the rewrite is on by default. Create the `graphql_get` RPC on PostgREST and reload its schema cache. If the RPC cannot be deployed, set `GRAPHQL_REPLICA_READS=false`.
+3. **Users need to see their own writes immediately** - set `READ_YOUR_WRITES_MS` to the desired window. Anon/service keys are unaffected; only user JWTs with a `sub` claim are pinned.
+4. **Need writes to survive a primary blip** - enable the ingest spool (`SPOOL_ENABLED`, `SPOOL_TABLES`, create the queue). Only append-only, idempotency-keyed inserts qualify; general writes do not go through this path.
+5. **Need to promote after DB-layer failover** - enable the control plane, set `ADMIN_KEY`, and `PUT /__admin/routing` with `acknowledgeFencing: true` after DB-layer promotion and fencing. Never let edge detection trigger it automatically.
+
+---
+
+## Evidence
+
+Claims below are marked by how they were checked: **tested** (an automated test in the repo exercises the behaviour) or **design-only** (the code implements the design, the decision is documented, but the behaviour has not been validated end-to-end against a live project with real replicas).
+
+| Claim | How it was checked | Source |
+|---|---|---|
+| `GET`/`HEAD` `/rest/v1/*` routes to replicas; `POST`/`PUT`/`DELETE` go to primary | Tested: `test/worker.test.ts` mocks upstreams and asserts routing by method and path | `src/router.ts:8-25` |
+| GraphQL read query is rewritten to `GET /rest/v1/rpc/<fn>` and balanced to replicas | Tested: `test/graphql.test.ts` classifies operations and rewrites to GET URLs | `src/graphql.ts:1-120` |
+| GraphQL mutation or ambiguous document stays a `POST` to primary | Tested: same graphql test file, mutation/multi-op/unknown cases | `src/graphql.ts:25-60` |
+| Circuit breaker ejects a replica after `CIRCUIT_FAILURE_THRESHOLD` consecutive 5xx/network failures | Tested: `test/health.test.ts` feeds failure sequences and asserts circuit state transitions | `src/health.ts:51-86` |
+| Within a request, the router retries `MAX_REPLICA_TRIES` healthy replicas, then degrades to primary | Tested: `test/worker.test.ts` simulates replica failures and asserts `x-read-router-degraded: 1` | `src/router.ts:60-90` |
+| Read-your-writes pins a user's reads to the primary after a write | Tested: `test/worker.test.ts` writes as a JWT user, then reads as the same user (primary) and a different user (replica) | `src/write-tracker.ts:1-40`, `src/jwt.ts:1-30` |
+| Anon/service keys are unaffected by RYW | Tested: same test, anon write then read -> replica | `src/write-tracker.ts:25-30` |
+| Ingest spool enqueues a whitelisted table and returns 202; rejects unknown tables with 403 | Tested: `test/spool.test.ts` POSTs to `/spool/v1/<table>` and asserts response + queue message shape | `src/spool/producer.ts:1-50` |
+| Spool consumer replays to primary with `Prefer: resolution=ignore-duplicates`; acks on 2xx, retries on 5xx | Tested: same test file, mocks primary responses and asserts ack/retry | `src/spool/consumer.ts:1-80` |
+| `PUT /__admin/routing` is refused without `acknowledgeFencing: true` | Tested: `test/routing-state.test.ts` sends PUT with and without the field | `src/admin.ts:40-55` |
+| `PUT /__admin/routing` flips routing and isolates converge within `ROUTING_CACHE_TTL_MS` | Tested: same test file, reads routing after a flip from a "different" isolate | `src/routing-state.ts:1-50`, `src/routing-cache.ts:1-40` |
+| Circuit breaker is isolate-local (no cross-isolate coordination) | Design-only: `UpstreamHealth` is a plain class, no DO, no KV, no cross-isolate channel | `src/health.ts:1-20` |
+| Active lag-based replica ejection (probe-based) | Design-only: deferred to Phase 4, not implemented | `docs/PLAN.md:80-82` |
+| Edge-triggered auto-promotion from health detection | Design-only: explicitly rejected by D8, never implemented, guarded by `acknowledgeFencing` gate | `docs/DESIGN.md:115-135` |
+| Edge write buffer over D1/KV for general writes | Design-only: rejected in DESIGN.md, code path does not exist | `docs/DESIGN.md:137-155` |
+
+---
+
+## Related docs
+
+- [Cloudflare Workers + Supabase: an architecture reference](/reference/cloudflare-supabase-architecture/) - every path a Worker uses to reach Supabase; read-router is a deployment of the routing patterns that doc describes
+- [Supabase read replicas](/reference/supabase-read-replicas/) - which requests a replica can serve through the stock load balancer, what it costs, and where each request lands; read-router extends that read path with health-checked fan-out, GraphQL rewrite and read-your-writes
+
+{/* References: cited inline as [^slug]; the numbered list renders below under "References". */}
+[^sb-rr]: Supabase, "Read replicas," Supabase Docs. https://supabase.com/docs/guides/platform/read-replicas
+[^sb-db-functions]: Supabase, "Database Functions," Supabase Docs. https://supabase.com/docs/guides/database/functions
+[^cf-queues]: Cloudflare, "Queues," Cloudflare Docs. https://developers.cloudflare.com/queues/
