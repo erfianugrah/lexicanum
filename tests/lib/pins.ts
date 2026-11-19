@@ -1188,9 +1188,9 @@ export const pins: Pin[] = [
     mustContain: [
       "269 repositories",
       "206 push mirrors",
-      // Current versions since the 2026-11-17 server upgrade (16.0.7 -> 17.0.1)
-      // and the postgres pin to 18.7.
-      "17.0.1-rootless",
+      // Current versions since the 2026-11-19 server patch (17.0.1 -> 17.0.2;
+      // 16.0.7 -> 17.0.1 on 2026-11-17) and the postgres pin to 18.7.
+      "17.0.2-rootless",
       "PostgreSQL | `postgres:18.7-alpine`",
       "capacity 4",
       "Silo",
