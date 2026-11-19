@@ -86,3 +86,12 @@ of 5 defensible and Gemini's 7 of 13.
   judgment; the sheet is still in the repo for a second, independent pass
   (`2026-11-19-erfi-review-labels.md`), and the file:line key is local at
   `~/.<local path>` (local only).
+
+## Owner follow-up (2026-11-19)
+
+The owner judged the whole sample in need of rewriting, not just the three
+labelled paragraphs. 20 paragraphs across 20 docs were rewritten plainer in
+place (aphors, announcements, self-grading and filler removed, numbers and
+identifiers kept), the grafana pin and its test fixture moved to the new
+wording, and `check:tells` passes on all 20. The labels above therefore
+record the first, too-lenient pass, not the owner's bar.

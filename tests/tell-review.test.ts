@@ -182,7 +182,7 @@ describe("tell-fix guards", () => {
       "removes a pinned string",
     );
     expect(pinnedFor("src/content/docs/guides/supabase-grafana-monitoring.mdx")).toContain(
-      "Coverage is a property of vantage points, not of rule count",
+      "Pair the rule set with a synthetic probe that exercises the real surfaces from outside",
     );
   });
 

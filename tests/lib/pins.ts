@@ -867,7 +867,10 @@ export const pins: Pin[] = [
       // (Heading renamed pack -> rule set 2026-08-20 when the doc standardized
       // the term; the pinned thing is the section existing, not its label.)
       "When the rule set helps, and when it cannot",
-      "Coverage is a property of vantage points, not of rule count",
+      // The coverage-by-vantage-point point. Reworded 2026-11-19 from
+      // "Coverage is a property of vantage points, not of rule count"
+      // when the owner asked for plainer prose.
+      "Pair the rule set with a synthetic probe that exercises the real surfaces from outside",
       // PG17 verified empirically 2026-08-17: the endpoint still serves
       // bgwriter checkpoint counters. Pin so nobody "fixes" the rule to
       // the upstream pg_stat_checkpointer naming.
