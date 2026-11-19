@@ -1,0 +1,164 @@
+---
+title: Estimate a backend read cache's effect on Supabase logs ingest
+description: For a Supabase project whose Logs Ingest is mostly API gateway rows, estimate per path and per cache lifetime how many of those rows a read cache in the project owner's backend would remove, from the project's own edge_logs. The queries were tested 2026-11-19 through the Management API logs endpoint; the same bucket method, keyed on a business id, was checked against a cache that ran in the logs-volume lab (LV07) and came out as a lower bound on one 600-read trace.
+author: Erfi Anugrah
+category: supabase
+group: operations
+---
+
+This guide estimates how much a read cache in your backend would cut a Supabase project's Logs Ingest, before you build the cache. It reads the project's own `edge_logs`, groups the GET requests by path, and counts how often the same request repeats within a given cache lifetime. It is the how-to for one lever in [Supabase log volume per request](/reference/supabase-logs-volume/), which measured that a cached read writes no gateway row and compared this bucket method with a cache that actually ran (LV07).
+
+You need a project on a paid plan with real traffic, and either the Logs Explorer's SQL mode or a personal access token for the Management API logs endpoint. The queries below ran on 2026-11-19 through the Management API logs endpoint against one of the author's own projects in `eu-central-1` (not the LV07 project). The Logs Explorer takes the same ClickHouse dialect for `edge_logs` in the docs' own examples,[^sb-cdn-metrics] but these exact queries were not run there.
+
+---
+
+## What the estimate rests on
+
+| Fact | Value | Source |
+|---|---|---|
+| Logs Ingest price | \$0.50 per GB after 20 GB included on paid plans | documented[^sb-logs-ingest] |
+| Gateway rows per request reaching the project | 0.83-0.97 per request in LV01b, LV01c and LV01h (84-92, 86-91 and 83-97 of 100); 600 of 600 reads in LV07a | measured, [log volume per request](/reference/supabase-logs-volume/) |
+| Gateway rows for a read the backend cache answered | 0: 154 and 40 REST calls through a 5 s and a 30 s cache wrote 154 and 40 `edge_logs` rows for the same 600 reads | measured, LV07b, LV07c |
+| The bucket method against the live cache | 0.682 against 0.743 at 5 s, 0.92 against 0.933 at 30 s, on one trace | measured, LV07a-c |
+| A Supabase CDN cache HIT | still writes a gateway row | measured, LV01j |
+
+The estimate splits time into fixed buckets of the cache lifetime and counts a request as a hit when the same path and query string already appeared in its bucket. A real cache keeps an entry for the full lifetime after it was filled, across a bucket boundary, so it hits more often. On the LV07 trace the gap was 0.061 at 5 s and 0.013 at 30 s; it depends on traffic shape. Read the estimate as a lower bound for one shared cache whose key is the path and query string; for reads keyed per user it can be too high (Step 4).
+
+---
+
+## Step 1: confirm the gateway carries the volume
+
+Group the project's log rows by source first. A cache moves `edge_logs` (and `auth_logs` for cached Auth calls, and any `postgres_logs` an `authenticator` role setting adds per request); if `postgres_logs` or `function_logs` lead without that, the levers are elsewhere on the reference page.
+
+```sql
+select source, count() as rows
+from logs
+group by source
+order by rows desc
+```
+
+Through the Management API, send it with a time window; the endpoint answers a query with no window with a generic error ([logs endpoint guide](/guides/supabase-management-api-logs-endpoint/)):
+
+```bash
+# REF and SUPABASE_ACCESS_TOKEN set; GNU date shown
+# (the test ran the macOS form: date -u -v-23H +%Y-%m-%dT%H:%M:%SZ)
+curl -sG "https://api.supabase.com/v1/projects/$REF/analytics/endpoints/logs" \
+  -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  --data-urlencode "sql=select source, count() as rows from logs group by source order by rows desc" \
+  --data-urlencode "iso_timestamp_start=$(date -u -d '23 hours ago' +%Y-%m-%dT%H:%M:%SZ)" \
+  --data-urlencode "iso_timestamp_end=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+```
+
+The queries in this guide ran with a 23-hour window. Pick a window that covers your busy hours, and use the same window in every step.
+
+---
+
+## Step 2: estimate hit rates per path
+
+```sql
+select
+  log_attributes['request.path'] as path,
+  count() as requests,
+  round(1 - uniqExact(log_attributes['request.search'], intDiv(toUnixTimestamp(timestamp), 10)) / count(), 3) as hit_10s,
+  round(1 - uniqExact(log_attributes['request.search'], intDiv(toUnixTimestamp(timestamp), 300)) / count(), 3) as hit_300s
+from logs
+where source = 'edge_logs'
+  and log_attributes['request.method'] = 'GET'
+group by path
+order by requests desc
+limit 10
+```
+
+`hit_10s` and `hit_300s` are the bucket estimate of the share of each path's GET requests a cache with a 10-second or 5-minute lifetime would have answered; LV07 checked the method at 5 s and 30 s only. Change the divisor in `intDiv(..., 10)` for other lifetimes. On the project the queries ran on, the GETs to `/customer/v1/privileged/metrics` (2,750 in 23 hours, about one every 30 seconds, no query string) came back at 0.0 for 10 s and 0.899 for 5 minutes, which is what one call per 30 seconds should give.
+
+Only the path and query string are compared. Use the result for GETs: a POST carries its filter in the body, which the logs do not hold.
+
+---
+
+## Step 3: check how often the cached rows change
+
+The cache lifetime sets how stale a cached read can get, so count the non-GET requests to the paths you plan to cache. The count includes writes plus any OPTIONS, HEAD or read-only RPC POSTs; writes made over a direct Postgres connection do not appear here.
+
+```sql
+select
+  log_attributes['request.path'] as path,
+  log_attributes['request.method'] as method,
+  count() as n
+from logs
+where source = 'edge_logs'
+  and log_attributes['request.method'] != 'GET'
+group by path, method
+order by n desc
+limit 10
+```
+
+A table read far more often than it is written can take a lifetime of minutes. A table written every few seconds needs a short lifetime, or the backend clears the entry when it writes the row: in LV07e a read after a PATCH returned the old value until `cache.delete()` ran, and the new value after it.
+
+---
+
+## Step 4: turn hit rates into a share of the logs
+
+For each path you would cache, multiply its requests by the hit rate you expect at your chosen lifetime, then divide the sum by the `edge_logs` total from Step 1, run over the same window as Step 2. That gives the share of `edge_logs` rows; divide by the all-source total from Step 1 for the share of all log rows. Gateway rows are of similar size for similar requests (a REST GET row was 1,807 bytes in LV01b, or 1,659 bytes per request since 0.91 rows were found per request), so the share of rows is a first approximation of the share of `edge_logs` bytes. A cached `auth.admin.getUserById` also saves its `auth_logs` row (LV07f: 2,015 plus 789 bytes per call).
+
+Three things change the real figure:
+
+- Several backend instances, each with its own in-process cache, each miss separately. A shared cache (Redis or similar) should get the single-cache figure back; LV07 measured one in-process cache only.
+- Reads that run under row-level security as the end user need the user in the cache key, so two users never share an entry. The logs show the same path and query string for both users, so this estimate counts their requests as hits and overstates the hit rate for those paths.
+- The estimate covers the window you queried. A batch job outside it changes the mix.
+
+---
+
+## Step 5: build the cache
+
+The LV07 cache was lru-cache 11.5.3 under Bun 1.3.14 with a `fetchMethod`: `fetch(key)` returns the cached value, or runs the fetch once, and concurrent calls for one missing key share that one fetch (50 concurrent calls on an empty cache made 1 REST call and wrote 1 `edge_logs` row, LV07d).
+
+```ts
+import { LRUCache } from "lru-cache";
+
+const products = new LRUCache<string, Product[]>({
+  max: 5000,
+  ttl: 10_000,
+  fetchMethod: async (storeId) => {
+    const { data, error } = await supabase.from("products").select("*").eq("store_id", storeId);
+    if (error) throw error;
+    return data;
+  },
+});
+
+const rows = await products.fetch(storeId);
+// after this service writes to products for storeId
+products.delete(storeId);
+```
+
+Table and column names are placeholders, and the LV07 reads were plain `fetch()` calls to the REST API rather than supabase-js. For `auth.admin.getUserById`, key the cache by user id. If the backend only needs the user's id, email or role from a signed-in request, those are in the JWT: on a project with asymmetric signing keys, `getClaims()` reads them with almost no logging (27 bytes per call, 2 rows per 100 calls in LV01i).
+
+---
+
+## Verification
+
+After the cache ships, run Step 2 again over a comparable window. The cached paths' `requests` should drop by about their hit rate, and the Logs Ingest figure on the organisation's usage page, which can be narrowed to one project, shows the metered effect.[^sb-logs-ingest]
+
+---
+
+## Gotchas and lessons learned
+
+- **A Supabase CDN cache HIT does not cut ingest.** A Storage read served from the CDN cache still wrote a gateway row (LV01j). The cache has to stop the request before it reaches the project.
+- **Opening a pooler connection per query writes more log bytes than the REST call it replaces.** On the shared pooler in transaction mode, 30 reads on fresh connections wrote 4.1 `supavisor_logs` rows and 2,924 bytes per connection (LV07i), against 1,659 bytes per REST GET in LV01b; 200 reads over one kept pool wrote 3 rows in total (LV07h). Move reads to Postgres only with a persistent pool.
+- **The estimate keys on the path and query string.** Two requests with the same filters but different `Authorization` headers count as one key here.
+
+---
+
+## Modules
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| LV07 | logs-volume | [`lv07-backend-cache.ts`](https://github.com/erfianugrah/supabase-lab/blob/5e78760/experiments/logs-volume/tests/lv07-backend-cache.ts) | [`run-2026-11-19T07-03-49-866Z`](https://github.com/erfianugrah/supabase-lab/blob/5e78760/experiments/logs-volume/out/2026-11-19/run-2026-11-19T07-03-49-866Z.facts.md) |
+
+## Related docs
+
+- [Supabase log volume per request](/reference/supabase-logs-volume/): rows and bytes per action by source, and the LV07 comparison this guide's lower bound rests on.
+- [Query Supabase project logs through the Management API](/guides/supabase-management-api-logs-endpoint/): the endpoint, its dialect and the required time window.
+- [Per-project cost attribution](/guides/supabase-per-project-cost-attribution/): where a logs line sits in a per-project cost breakdown.
+
+[^sb-logs-ingest]: Supabase, "Manage Logs Ingest usage," Supabase Docs. https://supabase.com/docs/guides/platform/manage-your-usage/logs-ingest
+[^sb-cdn-metrics]: Supabase, "Cache Metrics," Supabase Docs. https://supabase.com/docs/guides/storage/cdn/metrics
