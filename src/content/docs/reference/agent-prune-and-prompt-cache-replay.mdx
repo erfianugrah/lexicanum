@@ -1,0 +1,255 @@
+---
+title: "Tool-output pruning and the prompt cache: a replay of long agent sessions"
+description: "What pruning old tool output costs on a prompt cache, measured by replaying recorded pi sessions: a per-request prune layer that never applied, why a prune re-bills the whole conversation on Anthropic's breakpoint cache and only the suffix on a prefix cache, the cache gate (cold, near the window limit, reclaim ratio) and its defaults, why the 'waste' estimate was gross and never pruning costs 12-19 % more, why a 5-minute cold check is wrong for DeepSeek and a local llama.cpp engine, and two other cache leaks: background-worker wakeups and a prompt header rebuilt on resume."
+author: Erfi Anugrah
+category: coding-agents
+group: harness
+---
+
+This page measures what pruning old tool output costs once a provider caches the prompt, and what the pi harness changed after measuring it. It is for anyone running long coding-agent sessions on a cached model who wants to know when replacing old tool results with a marker saves money and when it re-bills the conversation. How pruning works (protect window, trigger floor, low watermark) is covered in [Context, prompt cache, and compaction in a coding-agent harness](/reference/agent-context-and-prompt-cache/); this page is the cost analysis that followed it.
+
+Every number comes from the harness's own session files, dated 2026-10-16 to 2026-11-20, replayed on 2026-11-20 with a deterministic cost model: four long sessions on Claude Opus 5.5 (997 to 3768 calls), five on DeepSeek V4 Pro through OpenRouter (two of them through a DeepSeek "latest" alias) and four on a local llama.cpp-based engine. Provider caching rules are cited to the providers' documentation. Where the replay's model is an estimate, the [evidence table](#evidence) says so.
+
+**TL;DR:**
+
+- The per-request prune layer never applied: it pruned a copy and returned the original array, and the runner treats an unchanged array as "no change". Had it applied, each prune would have cost two cache misses instead of one. It was deleted.
+- On Anthropic's cache a prune re-bills the whole conversation, not the part after the pruned message: a cache read looks back at most 20 blocks from each breakpoint, and a pruned result sits further back than that. After every recorded prune the next call read about 108k tokens, the system prompt.
+- The "\$46 wasted on prune re-writes" estimate was gross. The same prunes saved about \$85 of cache reads. Never pruning costs 12-19 % more than pruning on every batch.
+- A gate on turn-end pruning (cache cold, context near the window limit, or reclaimed bytes at least 0.25 of the bytes to re-cache) gives 31-40 % fewer prune batches on three of four Opus sessions at the same cost within the replay's error of 1.1-2.4 %. It saves no money; it removes multi-hundred-k-token cache re-writes.
+- Prefix caches (DeepSeek, the local engine) re-cache only the suffix after the first pruned message and do not expire on a 5-minute timer. There the ratio is 0.1 and there is no idle-time cold check; 0.25 with the timer cost up to 3.8 % more.
+- Two other leaks cost more than pruning: background workers waking an idle parent one at a time after the cache expired (10 wakeups, 4.61M tokens re-written), and a dynamic prompt header rebuilt on resume (806,801 tokens re-written 46 s after the previous call). Wakeups are now batched per dispatch and the header is frozen per session.
+
+---
+
+## Topology
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.6;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  req [label="request N\n(system, tools, messages)"];
+  resp [label="model response\n+ tool calls"];
+  te [label="turn_end:\nplan prune"];
+  gate [label="cache gate\n(cold / near limit /\nratio / images)", shape=diamond];
+  edit [label="context_edit entries\n(persisted)", shape=note];
+  next [label="request N+1"];
+
+  req -> resp -> te -> gate;
+  gate -> edit [label="prune"];
+  gate -> next [label="defer"];
+  edit -> next;
+}
+```
+
+A prune is decided once per turn, after the response and before the next request, and persisted to the session file. The gate decides whether a planned prune runs now or waits for a later turn end.
+
+## Which rule applies
+
+| Cache kind | Providers measured | What a prune re-caches | Ratio threshold | Idle-time cold check |
+|---|---|---|---|---|
+| Breakpoint cache | Anthropic (direct, or through OpenRouter) | The whole conversation | 0.25 | Yes, the model's cache TTL (default 300 s) |
+| Prefix cache, no idle expiry | DeepSeek (direct and through OpenRouter), local llama.cpp-based engine | The suffix from the first pruned message | 0.1 | No |
+| Prefix cache with idle expiry | OpenAI, Gemini (not replayed) | The suffix | 0.1 | Yes, 300 s default |
+
+Every row also prunes when the context passes 80 % of the window, and when an image-budget prune is forced to keep the request under the provider's size limit.
+
+## The per-request layer that never applied
+
+The pruning extension had two layers: one at `turn_end` that persisted `context_edit` entries, and one on the per-request `context` event as a safety net within a long turn. The second one cloned the messages, pruned the clone and returned `{ messages }`, the original. pi's runner deep-clones the messages before calling the handler and compares what comes back by element identity, so the returned original read as "unchanged" and the request went out unpruned. The extension's own clone copied the whole transcript a second time on every call for nothing.
+
+It was deleted instead of fixed, for two reasons:
+
+- `turn_end` fires after every model response and before the next request[^pi-ext]. A turn is one response plus its tool calls, so there is no gap between requests for a per-request layer to cover.
+- A changed message list makes pi fold every mid-conversation system message (prompt and tool patches) into one head. The next request, built from the persisted edits, is an unchanged list with the patches back in place. The system block differs between the two requests, so the cache misses twice instead of once. The session with the most prune batches had 5 such system messages.
+
+## Why a prune costs the whole conversation on Anthropic
+
+pi marks three Anthropic cache breakpoints: the system prompt, the last tool definition and the last message. Anthropic finds a cached prefix by walking back from each breakpoint, and "the lookback window is 20 blocks": it checks at most 20 positions per breakpoint and stops if none matches an entry an earlier request wrote[^anthropic-cache]. A pruned tool result sits behind at least 80 KB of newer protected output, usually more than 20 blocks back, so after a prune the lookback from the last message finds nothing and the only hit is the system-prompt entry. The session records agree: after every recorded prune batch the next call's cache read was about 108k tokens (median) in one session and 119k-121k in the other three, wherever the first pruned message sat.
+
+On a prefix cache (DeepSeek, the local engine) the provider reuses the longest matching prefix, so a prune re-caches only the suffix from the first pruned message. DeepSeek documents this as cache prefix units persisted at request boundaries and at fixed token intervals, with a hit requiring a full match of a unit[^deepseek-cache].
+
+The price of re-caching differs too. On Anthropic a 5-minute cache write costs 1.25 times the base input price and a cache hit on Opus 5.5 0.05 times[^anthropic-cache], so a written token costs 25 times a read one. On DeepSeek a miss is billed at the input price with no write premium.
+
+## The gate
+
+`decidePrune` runs at `turn_end` only when the planner would prune; the planner's trigger, low watermark and monotone pruned set are unchanged.
+
+| Condition | Rule | Default |
+|---|---|---|
+| Forced | The plan includes an image-budget prune | Always applied (request-size limit) |
+| Cold | Idle time since the last request or cache-warm entry exceeds the cache TTL | The model's declared cache TTL, else 300 s; off for DeepSeek and the local engine |
+| Near limit | Context tokens at or above a fraction of the window | 0.8 (800k on a 1M window; compaction triggers at 850k) |
+| Ratio | Text bytes reclaimed divided by bytes re-cached | 0.25 on breakpoint caches, 0.1 on prefix caches |
+| Otherwise | Defer; the same plan is re-evaluated at the next turn end | |
+
+Re-cached bytes are the whole conversation on a breakpoint cache and the suffix from the first pruned message on a prefix cache. An image counts as 6.4 KB of text, about 1600 tokens, because Anthropic bills an image by its pixels; counting base64 length made images 16.5 MB of one session's 26 MB of message bytes and the token fit fell to R² 0.30.
+
+The ratio comes from a break-even. A prune re-writes R tokens once at the write price and saves S tokens of reads on each of the next H calls. It pays when S/R is at least (W - 1)/H, with W the write-to-read price ratio. Opus 5.5 has W = 25, so a ratio of 0.25 means "pays back within about 96 calls"; ungated batches in these sessions came about every 100-150 calls. On DeepSeek the highest miss-to-read price ratio recorded was 12, and 0.1 means "pays back within about 110 calls".
+
+## Replaying the sessions
+
+The replay streams a session file and rebuilds the context at every turn end: message entries, with compaction summaries replacing the prefix at their recorded points. It ignores the recorded `context_edit` entries; each policy runs the shipped planner and gate and keeps its own pruned set. Tokens per call are fitted as a fixed system prefix plus message bytes divided by bytes per token, by least squares against the recorded prompt tokens. Prices are each session's own.
+
+On Anthropic, cold calls and the first call after a compaction or model switch write everything; a call right after a prune reads the median recorded post-prune read and writes the rest; any other call reads the previous prompt and writes the growth. On prefix caches a prune re-reads the prefix before the first pruned message and misses the rest; other calls read the session's median hit fraction of the previous prompt, and the calls that missed in the record miss in the replay. The local engine is free, so its cost is prefill time, fitted per call from duration against missed, read and output tokens.
+
+| Validation | Opus (4 sessions) | DeepSeek (5) | Local engine (4) |
+|---|---|---|---|
+| Token fit R² | 0.90-0.95 | 0.956-0.999 | 0.608-0.998 |
+| Old-policy simulated vs recorded cache spend | within 1.1-2.4 % on three; one off by 2.8x | within 0.8 % on all five | off by -32 % to +90 % |
+| Recorded prune targets reproduced | 96-98 % | 100 % | 100 % on single-model sessions |
+
+The Opus session that does not validate had 430 calls writing more than 200k tokens from causes outside the model (pruning accounts for 15 batches), so only its direction is kept. The local engine's misses are the small growth between calls, the same size as the fit noise, so its rows are direction only.
+
+## Results on Anthropic: fewer batches, same cost
+
+Simulated cache spend (USD) / prune batches / Mtok re-written by the calls right after a prune, four Opus 5.5 sessions:
+
+| Policy | Session A | Session B | Session C | Session D (unvalidated) |
+|---|---|---|---|---|
+| Old (no gate) | 539.37 / 26 / 10.45 | 459.68 / 15 / 5.26 | 244.99 / 25 / 14.34 | 384.27 / 15 / 5.57 |
+| Ratio 0.5 | 563.25 / 10 / 5.35 | 482.27 / 5 / 2.07 | 250.27 / 22 / 12.96 | 405.72 / 5 / 2.91 |
+| Ratio 0.25 (default) | 534.38 / 18 / 7.27 | 457.79 / 10 / 2.85 | 246.65 / 24 / 13.60 | 383.35 / 9 / 3.25 |
+| Ratio 0.1 | 539.48 / 26 / 10.46 | 459.68 / 15 / 5.26 | 244.99 / 25 / 14.34 | 384.66 / 15 / 5.60 |
+| Ratio 0.25, near limit 0.9 | 528.80 / 15 / 5.36 | 459.51 / 10 / 2.30 | 243.49 / 23 / 12.92 | 389.09 / 8 / 2.73 |
+| Cold and near limit only | 572.50 / 10 / 5.75 | 488.60 / 4 / 1.65 | 250.27 / 22 / 12.96 | 405.72 / 5 / 2.91 |
+| Never prune (forced images only) | 624.65 / 0 / 0 | 545.95 / 0 / 0 | 273.32 / 18 / 11.96 | 439.26 / 0 / 0 |
+
+The default against the old policy moves spend by -0.9 %, -0.4 %, +0.7 % and -0.2 %, inside the model's own error, and cuts batches 26 -> 18, 15 -> 10 and 15 -> 9. Session C is dominated by forced image prunes (18 of its 24 gated prunes), so it moves 25 -> 24. Ratio 0.5, the first proposal, costs 2.2-5.6 % more. Never pruning costs 12-19 % more on all four.
+
+Near limit 0.9 is cheapest on session A but runs more calls above the 850k compaction threshold (264 against 154). The replay keeps compactions at their recorded points, so in a live session those calls would have compacted earlier; it was rejected for that.
+
+The cold condition almost never fires at turn end: by then the next request is seconds away, and pi's cache warmer refreshes the prefix during long tool runs.
+
+### Gross and net
+
+A first analysis of session A counted 25 prune-triggered cache misses re-writing 9.60M tokens for \$47.94, \$46.01 above the read price, and called it waste. That is the gross cost. The replay's never-prune row costs \$624.65 against \$539.37 for the old policy: the same prunes saved about \$85 of cache reads, because every pruned byte is not read again on the next 140 or so calls. Cache reads are about 70 % of spend in that session (1899.6 Mtok read, about \$380 of \$545.32 recorded). The gate exists for the size of individual re-writes, each a time-to-first-token stall on a 400-900k context, not for the total.
+
+## Results on prefix caches
+
+Cache spend (USD) / prune batches, five DeepSeek sessions through OpenRouter at their recorded per-component prices. A later check against OpenRouter's billed total per call found those component prices overstate the bill (one week: about \$269 by components against \$171 billed), so the absolute dollars below run high; the comparisons between policies use the same prices on every row and still hold.
+
+| Policy | E | F | G | H | I |
+|---|---|---|---|---|---|
+| Old (no gate) | 21.41 / 2 | 17.86 / 1 | 29.34 / 2 | 5.55 / 4 | 36.01 / 35 |
+| Ratio 0.5 | 21.54 / 1 | 19.74 / 0 | 35.04 / 0 | 6.33 / 2 | 37.59 / 28 |
+| Ratio 0.25 with 300 s cold check (first default) | 21.41 / 2 | 17.86 / 1 | 30.28 / 2 | 5.55 / 4 | 36.06 / 35 |
+| Ratio 0.1 (default) | 21.41 / 2 | 17.86 / 1 | 29.34 / 2 | 5.55 / 4 | 36.01 / 35 |
+| Never prune | 27.01 / 0 | 19.74 / 0 | 35.04 / 0 | 8.38 / 0 | 138.17 / 0 |
+
+Session I without pruning spends 740 calls above 85 % of the window. At the highest miss-to-read price ratio recorded (\$0.898 against \$0.075 per Mtok), the first default costs 3.8 % more on session G and 0.6 % more on session I; ratio 0.1 matches the old policy on every session, as does 0.05, so the threshold between them cannot be resolved from these data.
+
+A prune on a prefix cache re-wrote 0.09-2.5 Mtok per session, against 10.45 Mtok on Opus session A, while reads were 54-355 Mtok. Pruning almost always pays there, and the gate's job is to stay out of the way.
+
+On the local engine every gated ratio from 0.05 to 0.5 gives the same prefill time as the old policy (75-318 s per session, direction only). Decode, at 7-10 ms per output token, dominates its time. Never pruning runs 10-70 calls past 85 % of its 262,144-token window.
+
+### What "cold" means on each provider
+
+The first gate used a 300 s idle check on every provider. Anthropic's cache has a 5-minute default lifetime, refreshed on each use[^anthropic-cache]. DeepSeek says an unused cache is "automatically cleared, usually within a few hours to a few days"[^deepseek-cache]. The local engine keeps its KV prefix until another request or a model swap evicts it. Recorded hit rates by idle gap, over every local session from 2026-10-21 to 2026-11-20 (hit = cache read divided by prompt tokens, calls after a prune, compaction or model switch excluded):
+
+| Gap since previous call | DeepSeek via OpenRouter: n / median hit / hit below 0.5 | Local engine: n / median hit / hit below 0.5 |
+|---|---|---|
+| 0-60 s | 40830 / 0.920 / 1.8 % | 10183 / 0.998 / 0.3 % |
+| 60-300 s | 1973 / 0.916 / 2.9 % | 188 / 0.998 / 9.0 % |
+| 300-600 s | 45 / 0.919 / 2.2 % | 19 / 0.998 / 5.3 % |
+| 600-1800 s | 25 / 0.999 / 4.0 % | 16 / 0.999 / 18.8 % |
+
+After a 5-30 minute gap DeepSeek through OpenRouter missed about as often as after a gap under a minute. Its misses, about 2 % of calls, do not track idle time. The 0.92 median is not a cache effect either: a later check found every call in these sessions served by one pinned host with no fallbacks, and that host never reports more than 92 % of a prompt as cached, even for an identical repeated prompt, while another host serving the same weights reported 12,800 of 12,827 tokens cached. About 8 % of every prompt was billed at the miss price, which a provider-order change fixes and no prune policy can. OpenRouter's 60-minute stickiness[^or-cache] did not matter here because the order was pinned. On the local engine 13 of the 16 gaps over 10 minutes were warm, and an idle timer cannot tell which 3 were not. An idle check on these providers marked warm caches cold, so it was removed for them. At ratio 0.1 that changed no replayed decision; it was wrong in principle.
+
+## Two other cache leaks
+
+The session with the most prune batches had 63 cache misses that each wrote more than 50k tokens. Pruning caused 25 of them, plus one that coincided with an idle gap. Long tool runs and the user stepping away for more than 5 minutes caused 26 (11.97M tokens), which no harness change avoids short of the 1-hour cache tier. Background workers waking an idle parent caused 10, and a session resume caused 1; the harness fixes for those two follow.
+
+### Background workers waking an idle parent one at a time
+
+Ten background-worker completions each woke an idle 500-700k-token parent after the 5-minute cache had expired, re-writing 4.61M tokens (\$23.04). Four of them in a row only acknowledged one worker while its siblings still ran.
+
+Completions are now batched. A batch is the background workers of one kind dispatched during one parent run, from the first `agent_start` after the parent settled to the next `agent_settled`, so workers dispatched across two tool calls of the same run are siblings. While the parent is idle and a sibling is still running, a finished worker's result is appended to the session without starting a turn; it is persisted and visible at once. The last sibling's result starts one turn that sees all of them. A max hold of 600 s from the first held result wakes the parent with a note naming the workers still running, and any run that starts meanwhile (the user typed, another group woke the parent) clears the held batch, since its results are already in the session. A busy parent gets each result at the next turn boundary as before. Agent workers, background shell commands and background loops are separate groups and never hold each other: a build watch or a loop has a duration unrelated to the workers and is usually the event the parent is waiting for.
+
+In a live probe a parent dispatched two workers, one replying at once and one sleeping 40 s. The old code started three parent runs, one per result; the new code started two, the second carrying both results. The first probe also showed that extension `message_end` handlers do not fire for an idle append that starts no turn, so the bookkeeping that clears pending results never saw the held message and the settle handler appended it a second time. The hold path now clears its own entry.
+
+### A prompt header rebuilt on resume
+
+Two extensions prepend live data to the system prompt: recent memories and a list of recent sessions in the project. Resuming a session is a new process, so both blocks were rebuilt from changed data and token 0 moved. One resume 46 s after the previous call re-wrote all 806,801 cached tokens (\$4.03). The session list also raced a 600 ms timer on every turn, so a slow first answer gave turn 1 no list and turn 2 the list, changing the prompt within one process.
+
+The first build of each block is now stored in the session file as a custom entry that is never sent to the model, and every later build, in the same process or after a resume, returns the stored string. A fork copies the entry and shares the parent's cached prefix; an explicit refresh command appends a reset entry and accepts one deliberate miss. The first build waits up to 1500 ms (the `LEDGER_BRIEF_WAIT_MS` default) for the session list, after which the block never changes. A probe resumed a session after writing a new memory: with the fix the first and resumed system prompts were identical (143,025 characters each) and only a new session showed the new memory; without it the two shared the first 536 characters.
+
+## Reading the numbers
+
+- Limiter: cache reads. On Opus session A reads were about 70 % of spend, on DeepSeek session E 75 %. Every policy trades read volume (unpruned bytes read on every call) against write volume (re-caching after a prune), and the read side is larger than the first analysis assumed.
+- Same conditions: one planner, one compaction schedule, one price table and one cache model per session; only the gate configuration differs between rows.
+- Error: the gap between the old-policy simulation and recorded spend, 1.1-2.4 % on the validated Opus sessions and at most 0.8 % on DeepSeek. Differences inside it are reported as "no measurable difference".
+- Reproducible: the replay is deterministic; re-runs gave identical rows, and the Opus session reproduced to the cent after the replay gained prefix-cache support. It covers 13 sessions and only the providers named.
+- Not modelled: compaction is replayed at its recorded points, not re-decided, so a policy that keeps a larger context would compact sooner in a live session; misses from other causes (prompt drift, model switches beyond a cold flag) are not simulated.
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.4;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q0 [label="Image budget\nexceeded?", shape=diamond];
+  q1 [label="Context at 80 %\nof the window?", shape=diamond];
+  q2 [label="Breakpoint cache\n(Anthropic)?", shape=diamond];
+  q3 [label="Idle past the\ncache TTL?", shape=diamond];
+  r1 [label="reclaimed / whole\nconversation >= 0.25?", shape=diamond];
+  r2 [label="reclaimed / suffix\n>= 0.1?", shape=diamond];
+  prune [label="Prune now"];
+  defer [label="Defer to the\nnext turn end"];
+
+  q0 -> prune [label="yes"]; q0 -> q1 [label="no"];
+  q1 -> prune [label="yes"]; q1 -> q2 [label="no"];
+  q2 -> q3 [label="yes"]; q2 -> r2 [label="no"];
+  q3 -> prune [label="yes"]; q3 -> r1 [label="no"];
+  r1 -> prune [label="yes"]; r1 -> defer [label="no"];
+  r2 -> prune [label="yes"]; r2 -> defer [label="no"];
+}
+```
+
+The same guide as a list:
+
+1. The image budget is exceeded: prune now, or the request fails on size.
+2. The context is at 80 % of the window: prune now.
+3. Anthropic's breakpoint cache: prune if the cache has been idle past its TTL, or if the reclaimed bytes are at least 0.25 of the whole conversation; otherwise defer.
+4. A prefix cache (DeepSeek, a local llama.cpp server): prune if the reclaimed bytes are at least 0.1 of the suffix from the first pruned message; otherwise defer. Do not use an idle timer unless the provider's cache expires by time.
+
+Separately from pruning: hold background results until the last sibling finishes, and freeze any dynamic system-prompt block for the life of the session.
+
+## Evidence
+
+| Claim | How it was checked | Status |
+|---|---|---|
+| Per-request layer returned the unmodified array; runner compares by identity | The extension source at the time; pi 1.5.2's runner read from the installed binary | project result |
+| `turn_end` runs after each response, before the next request | pi extension docs[^pi-ext] | documented |
+| 20-block lookback; 5-minute lifetime refreshed on use; write 1.25x, Opus 5.5 hit 0.05x | Anthropic prompt caching docs[^anthropic-cache] | documented |
+| Post-prune read about 108k (median) and 119k-121k | Recorded usage after each recorded prune batch, four Opus sessions | measured |
+| DeepSeek prefix units, best-effort, cleared within hours to days | DeepSeek context caching docs[^deepseek-cache] | documented |
+| OpenRouter sticky routing, 60-minute expiry | OpenRouter prompt caching docs[^or-cache] | documented |
+| Gate decisions and replay tables | Replay of 13 recorded sessions, 2026-11-20; validation in the table above | measured (model) |
+| \$46.01 gross, about \$85 saved | Session cache-miss analysis; replay never-prune vs old rows | measured (model) |
+| Hit rate by idle gap | Every local session 2026-10-21 to 2026-11-20 | measured |
+| Pinned DeepSeek host reports at most 92 % cached; another host 12,800 of 12,827 | 52 generation records and a live two-host probe, 2026-11-20 | measured |
+| Per-component prices overstate the DeepSeek bill (about \$269 vs \$171 billed in a week) | OpenRouter billed total per call vs component sum, 2026-11-13 to 11-20 | measured |
+| 10 wakeups, 4.61M tokens, \$23.04; resume miss 806,801 tokens | Session usage records, worker analysis, not re-derived | project result |
+| Wakeup coalescing: 3 parent runs -> 2 | Live RPC-mode probe on pi 1.5.2, 2026-11-20 | measured |
+| Frozen header identical after resume (143,025 chars); old code 536 shared | Live probe on pi 1.5.2, 2026-11-20 | measured |
+
+## Related docs
+
+- [Context, prompt cache, and compaction in a coding-agent harness](/reference/agent-context-and-prompt-cache/) - how pruning, spilling and compaction work; this page is the cost measurement of the pruning described there
+- [Subagents, worktrees, and parallel agent work](/reference/agent-subagents-and-worktrees/) - the background workers whose completions are batched here
+- [Scheduling one GPU between LLM, image and training work](/reference/llmc-single-gpu-stack/) - the local engine whose KV prefix survives idle time
+- [The pi harness journey](/reference/pi-harness-journey/) - the series hub
+
+[^pi-ext]: pi, "Extensions: turn_start / turn_end," pi repository docs. https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md
+
+[^anthropic-cache]: Anthropic, "Prompt caching," Claude Docs. https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+
+[^deepseek-cache]: DeepSeek, "Context Caching," DeepSeek API Docs. https://api-docs.deepseek.com/guides/kv_cache
+
+[^or-cache]: OpenRouter, "Prompt Caching," OpenRouter Docs. https://openrouter.ai/docs/guides/best-practices/prompt-caching
