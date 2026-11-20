@@ -1,0 +1,141 @@
+---
+title: "Proving a replacement firmware image in simulation before flashing it"
+description: "How a replacement USB-bridge app for an 8K wireless mouse dongle (CH32V305 + nRF52820) was checked before its second hardware flash, after the first own image bricked a dongle: run the dumped stock bootloader from reset in Unicorn, require the stock app to pass first, rehearse the recovery flash including a corrupted-data control, and check every reviewer claim against the bytes. Covers what the simulation proved, what only hardware could show, and the hardware result."
+author: Erfi Anugrah
+category: reverse-engineering
+---
+
+I wrote my own app for the CH32V305 USB bridge in an 8K wireless mouse dongle, to replace the vendor app while keeping the vendor bootloader and the stock nRF52820 radio firmware behind it. The first build bricked a dongle: every host test passed, and the image faulted before USB on its first boot. Before flashing the second build I made a simulator run the real vendor bootloader from reset, hand over to the new app, and take a full recovery flash, so the failure modes that matter could be seen on a desk instead of on a dongle. This guide is how that was set up, what it caught, and where it stops.
+
+**TL;DR:**
+
+- Run the dumped vendor bootloader from reset instead of assuming how it starts the app. Here it enters the app from inside an interrupt handler, which no hand-written handoff model had assumed.
+- Require the vendor app to pass every scenario on the same peripheral model first. A model the vendor firmware cannot pass tells you nothing about yours.
+- Rehearse the way back. A recovery flash through the real bootloader, plus one run with a corrupted data report, showed that a failed flash drops the dongle back into update mode, and that the host tool ignored the bootloader's error report.
+- A negative control has to be able to fail, and a test fixture must not contain the answer it checks. Both went wrong once here.
+- The simulation models no USB signal timing and no radio link. The hardware flash was still the final test. It passed on 2026-11-21: the dongle enumerates and the cursor moves.
+
+## The setup
+
+| Part | What it is |
+|---|---|
+| Vendor bootloader | 28,672 bytes at flash `0x08000000`, dumped over USB with a patched vendor app ([how](/guides/nrf52840-usb-flash-dump-without-debugger/)) |
+| Vendor app | 29,584 bytes, linked at `0x00007000` (the bootloader jumps through the `0x0` flash alias) |
+| Replacement app | 12,948 bytes, own USB device stack, same descriptors as the vendor app, polls the radio over SPI |
+| Radio | nRF52820 with its stock firmware, untouched |
+| Simulator | Unicorn (RISC-V), with peripheral models for the clocks, interrupt controller, flash controller, watchdog, USB high-speed controller and SPI, each citing the CH32V305 reference manual section it follows |
+
+The first replacement build was linked at `0x08007000` instead of `0x00007000`. The bootloader jumped to `0x7000` as always, the image computed its RAM addresses from the wrong base, and its first store went to `0x18000000`. On hardware that meant no USB at all and no way back over USB.
+
+## 1. Run the real bootloader from reset
+
+The bootloader enters the app from inside a software-interrupt handler. In the disassembly, `0x0218`-`0x0220` is a software-interrupt handler that loads `0x7000` and jumps there (`lui a6,0x7` at `0x021e`, `jr a6` at `0x0220`, followed by `j .`). The bootloader arms that interrupt and lets it fire, so the app starts with the interrupt still active, the bootloader's trap vector still installed, and the bootloader's registers still in place. The simulated run from reset with an erased update-flag page records the path:
+
+| Instruction | PC | Step |
+|---:|---|---|
+| 0 | `0x0000` | reset |
+| 1 | `0x2fd2` | startup |
+| 1,759 | `0x2b86` | clock setup |
+| 2,107 | `0x2b22` | update-flag check |
+| 3,521 | `0x2b6e` | arm software interrupt 14 |
+| 3,560 | `0x0218` | interrupt 14 handler |
+| 3,565 | `0x7000` | app entry |
+
+What the app inherits, against what my earlier harness assumed:
+
+| Register | Assumed | Real |
+|---|---|---|
+| `sp` | `0x20008000` | `0x20007fc0` |
+| `gp` | `0` | `0x20000820` |
+| `mstatus` | `0x00001880` | `0x80006080` |
+| `mtvec` | `0` | `0x0000003b` (bootloader vector table) |
+| `mcause` | `0` | `0x8000000e` (interrupt 14) |
+| Interrupt controller, active | none | interrupt 14 |
+
+The replacement's startup code was already written to leave that interrupt context with `mret` (a multi-model review had found it missing in an earlier build). Running both apps from the real handoff confirmed it: the vendor app answered the host's handshake, version and update commands, and the replacement ran its normal path and its update-command path, all from the same inherited state.
+
+The same runner caught the first build. Booted through the real bootloader, the bricked image stores to `0x18000000` at `0x722e`, takes a store-access fault into the bootloader's trap vector, and never touches the USB controller in the 250,000 instructions the run allows. The packaging tool now refuses that image on its own: the vector-table base word at offset `0x38` is `0x08007000` where the vendor app and the replacement have `0x00007000`.
+
+## 2. Check the update flag against the real bootloader
+
+The only way back from a broken app is the bootloader's update mode, and the bootloader enters it only when the app has written a record to the flag page at `0x0801F000` before resetting. The record the replacement writes is byte for byte the one the vendor app writes (`12 34 56 78 9a bc d3 18` followed by zeros). With that record in place, the simulated bootloader skips the app, starts its USB device and sits in its update loop at `0x13fe` after 3,095 instructions. With the page erased it starts the app. The update-mode USB identity is in the bootloader's own descriptor bytes.
+
+## 3. Rehearse the recovery flash, including a failure
+
+The recovery dry run checks the way back from the replacement to the vendor app in one deterministic run:
+
+1. Boot the replacement through the real bootloader and send the update command.
+2. The app writes the flag and resets; the bootloader enters update mode.
+3. Enumerate it, then send the exact report sequence the host flashing tool produces for the vendor package: a prepare report and 925 data reports of 32 bytes (the last one 16), each echoed back.
+4. Expect the bootloader's states: erase `(2,0)`, `(2,1)`, then check-OK `(5,0)`.
+5. Read the flash back: the app region equals the vendor app by SHA-256 and the flag page is erased. Reset, and the vendor app boots and passes its host scenario.
+
+It passes from the replacement and, as the control, from the vendor app.
+
+The negative control flips one encrypted payload byte in data report 17 and leaves the host framing intact, so every echo still matches. The bootloader's final check fails: it sends an error report (`5a a5 03`), waits briefly and resets without erasing the flag, so the dongle comes back in update mode and can be flashed again. The disassembly agrees (the check at `0x1744` fails into the error routine at `0x198e`, which never reaches the flag erase at `0x1758`).
+
+That run also found a bug in the host side. The flashing tool defined the error report's command byte but never acted on it: after a failed flash it polled for about 10 s and reported "no matching state", with the dongle already waiting in update mode. It now stops on the error report and says to flash again from update mode. The browser flasher had the same gap and got the same fix.
+
+The first version of this control did not work. Its harness only recognised state reports (`5b b5`), skipped the error report, and timed out on the reset, which looked like a simulator bug. Jumping the simulated bootloader straight into its error routine showed the real behaviour in a fraction of a second, and that fast case is now a unit test.
+
+## 4. Compare peripheral writes against the vendor app
+
+Both apps run through the same peripheral model and the same simulated host, every MMIO write is recorded, and the writes are diffed per phase after removing declared differences (polling, waits, read-back checks).
+
+| Phase | Diff groups | Matching writes |
+|---|---:|---:|
+| clocks | 7 | 19 |
+| USB init | 6 | 14 |
+| enumeration | 20 | 39 |
+| command | 10 | 38 |
+| flash | 0 | 21 |
+| reset | 0 | 1 |
+
+The two phases that decide whether the dongle can be recovered, the flag write and the reset, are identical to the vendor app. The other 43 groups are listed for review, not hidden behind an allow-list. They come from my own USB stack resetting all endpoints, writing control-endpoint status in more steps, and setting up clocks and pins in a different order.
+
+## 5. Check the checkers
+
+Most of the analysis was done by agent workers on several model families. Their reports were claims, and several were wrong in ways only the bytes showed:
+
+- A radio review reported three SPI handshake rules as missing from the replacement (a request line left floating, chip-select delays, waiting for the radio to release its ready line). All three were in the source already. It also misread the SPI clock divider.
+- A theory that an earlier dumper patch had cut the radio poll, and caused a cursor loss, failed against the disassembly: the call it removed forwards host pairing requests, and the poll is elsewhere and intact. The cause of that cursor loss is still open.
+- A simulator test for a patch that forces the reported model ID to 1 passed because the fixture already held a record with ID 1. It now loads the real record and expects the patch to change it.
+- The corrupted-data control above could not tell a correct bootloader from a broken harness until the harness learned the error report.
+
+Since then, every claim a decision rests on gets checked against the binary or the source before it is used, every negative control is run once in a state where it must fail, and no fixture holds the result it is supposed to test.
+
+## What the simulation did not cover, and the hardware result
+
+The simulation has no USB signal timing, no radio link, and no electrical behaviour after a reset, and its instruction counts say nothing about real timing. The radio side was only reviewed statically. That review concluded that the stock radio loads its pairing from its own flash after reset and streams motion to the bridge without any setup frame, so the replacement's poll frame is enough; I checked its reading of the radio's SPI handler against the disassembly, not its trace of the radio's startup code.
+
+The second hardware flash ran on 2026-11-21 on a different dongle, with the stock radio:
+
+| Check | Simulation | Hardware |
+|---|---|---|
+| Flash through the vendor bootloader | rehearsed for the recovery path | completed, success state |
+| Bootloader starts the replacement | passed from the real handoff | dongle came back as the normal app and stayed; no fallback to update mode |
+| Handshake | passed with the simulated host | verified |
+| Vendor-only memory read | not implemented in the replacement | returns nothing |
+| Cursor through the stock radio | not modelled | moves |
+| USB report timing vs the vendor app | not modelled | not yet measured |
+| Corrupted-flash recovery | passed | not fault-injected on hardware |
+
+## Evidence
+
+| Claim | How it was checked |
+|---|---|
+| Handoff path, inherited state, update-mode entry, brick reproduction | Simulator boot proof, run 2026-11-21; handoff instructions read in the bootloader disassembly |
+| Recovery flash, vendor control, corrupted-data control | Simulator recovery proof (three full runs of about 388 million instructions each, 2026-11-21) and a fast unit test of the error path |
+| Error-report handling in the host tools | Unit tests in the native flasher and the browser flasher |
+| Peripheral write diff | Simulator register-diff report against the vendor app |
+| Image sizes, hashes, vector base words | Read from the dumped and built images |
+| Radio needs no setup frame | Static review of the radio and bridge disassembly; not simulated |
+| Hardware result | Flash log, USB enumeration, handshake probe and the owner moving the mouse, 2026-11-21 |
+
+## Related docs
+
+- [Dumping a locked nRF52840's flash over USB with a patched app](/guides/nrf52840-usb-flash-dump-without-debugger/) - how the bootloader and vendor app used here were dumped
+- [Patching an nRF52840 gaming mouse's firmware](/guides/nrf52840-mouse-firmware-patching/) - the patch gate whose whole-app entry check now rejects the bricked image
+- [CH32V305 WCH-LinkE read-only debug triage](/guides/ch32v305-wch-linke-read-only-triage/) - the debug-probe route for this chip, which the bricked dongle now needs
+- [Reverse engineering with a coding agent and headless Ghidra](/reference/agent-assisted-reverse-engineering/) - the decompiler tooling and claim verification behind the disassembly reads
+- [Testing the assumption a plan depends on before building it](/reference/crux-assumption-test-first/) - the habit the bootloader-from-reset run applies
