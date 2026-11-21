@@ -1,0 +1,286 @@
+---
+title: An escape hatch for a radio chip with no debug access
+description: "How to make an nRF52820 radio firmware recoverable when there is no SWD access to it and the dongle's CH32V305 USB bridge cannot reset it. The vendor bootloader enters update mode only on an 8-byte marker that the running app writes, with no app check, so a radio app that hangs is unrecoverable. This guide builds a layered way back: a 424-byte shim at the reset vector that writes the marker on a pulse key from the USB bridge or on the fourth unhealthy power-on, proves it in a Unicorn simulation on the real MBR and vendor bootloader from a flash dump, puts the stock radio app behind it unchanged for the first flash, and records the hardware result of 2026-11-21: a real power-up handed off, the key put the radio in update mode, and a normal update recovered it."
+author: Erfi Anugrah
+category: reverse-engineering
+---
+
+An 8K wireless mouse dongle holds two chips: a CH32V305 that is the USB bridge, and an nRF52820 that is the radio. I replaced the bridge app first and proved that in simulation ([the guide on proving a replacement image](/guides/prove-replacement-firmware-in-simulation/) covers the bridge side). The radio is harder. Its vendor bootloader jumps to whatever app is at the reset vector without checking it, the bridge has no wire that can reset the radio, and no debug pads for the radio are known. A radio app that hangs on its first instruction would leave the dongle with no way back. This guide is how I built a way back that does not depend on the app being alive, proved it before any hardware saw it, and then used it on a real dongle.
+
+Prerequisites: a full flash dump of the radio (MBR, vendor bootloader, stock app), a way to flash the radio through the vendor bridge firmware, a Thumb disassembler, Ghidra and Unicorn. Everything here was done on 2026-11-21.
+
+**TL;DR:**
+
+- The vendor bootloader enters update mode on an 8-byte marker at flash `<marker address>` and never checks the app. Writing that marker and resetting is the whole hatch.
+- A shim at the app's reset vector can write the marker on request. The request has to survive a USB replug: a pulse key sent by the bridge on the request line, plus a power-on counter that needs no bridge at all.
+- The request line is held low for long periods in normal use, so a plain level cannot be the trigger. An 8-symbol pulse train can.
+- The shim, the counter and the stock app behind it ran from reset on the real MBR and vendor bootloader in Unicorn, each behaviour with a near-miss negative control, a fuzz run against a reference decoder and mutation tests that must fail.
+- The first image is the stock radio app, bytes unchanged, plus the shim. On a real dongle the shim handed off on a power-up, the key put the radio in update mode, and a normal update recovered it.
+- The simulation models are written from the same beliefs as the shim, and several facts were unmeasured on silicon when it worked. The list is at the end.
+
+## Constants
+
+These are the fixed facts the rest of the guide depends on. Facts marked recalled come from the product specification of a sibling part or from memory, and were not verified on the nRF52820 itself.
+
+### The boot path and the marker
+
+| Fact | Value | How it was established |
+|---|---|---|
+| Reset path | MBR -> vendor bootloader at `0x38000` -> app reset handler read from `0x1000` | Disassembly of the dump |
+| App check on the normal path | none: no CRC, no signature, no vector sanity check | Disassembly of the bootloader path from `0x39250` to `0x392b6` |
+| Update mode trigger | 8-byte marker at `<marker address>`: `<marker>` | Bytes read in the stock app and checked in the bootloader |
+| Marker checksum | byte 7 = `0x55` minus the sum of bytes 0 to 6, here `0x18` | Disassembly of the stock marker writer |
+| Marker lifetime | the bootloader erases it only after a CRC32-verified image | Disassembly; a failed check reports an error, waits 200 ms and resets with the marker intact |
+| Flash protection while the app runs | `0x0` to `0x2e000` and `0x38000` to `0x40000` write-protected; `0x2e000` to `0x37fff` writable | Access-control writes captured from the real bootloader in simulation |
+| Time from MBR reset to the stock app's reset handler | 4,087 instructions, about 0.1 ms at 64 MHz | Simulation |
+| Radio request line | P0.14, driven by the bridge's PB11, active low | Radio side read from disassembly; the wire between the chips was inferred |
+| Radio answer line | P0.15, read by the bridge's PB10 | Same |
+| Radio pins used by the bridge link | SCK 6, MISO 5, MOSI 4, CSN 7 | PSEL register writes of the stock app and the bootloader |
+
+### What the bridge can and cannot do to the radio
+
+| Fact | Value | How it was established |
+|---|---|---|
+| Bridge GPIO wired to the radio | PB10 to PB15 only: PB10 and PB11 are the two handshake lines, PB12 to PB15 the SPI | Disassembly of the stock bridge app: no other GPIO is configured |
+| Radio pin reset | not enabled: `PSELRESET` is unset in the UICR | Dump |
+| Radio debug access | protection enabled: `UICR+0x208` = `0xFFFFFF00` | Dump |
+| Radio debug pads | none identified; the pad map known for the bridge chip says nothing about the radio | Continuity records |
+| Stock waveform on PB11 | low without bound while the radio does not answer | Disassembly of the stock bridge app |
+
+### Waveforms the key must not collide with
+
+| Source | Shape on the request line |
+|---|---|
+| Forwarded command or update relay | low until the radio answers, up to 140 ms |
+| Retry after a timeout | 2 ms high gap, then low again, up to 5 attempts |
+| Wake pulses after USB resume | 5 x (1 ms low, 1 ms high) |
+
+### Flash and watchdog behaviour (recalled)
+
+| Fact | Status |
+|---|---|
+| A flash word can be written at most twice between erases (nWRITE = 2) | Recalled from the nRF52805 product specification v1.3; the nRF52820 page was not reachable |
+| The watchdog survives a soft reset; power-on, brown-out, pin and watchdog resets clear it | Same source, same caveat |
+| A page erase takes up to 85 ms and stalls the CPU | Recalled from the nRF52 product specification, not verified |
+
+## Architecture
+
+The hatch has five layers. Each one covers a failure the layer above it cannot.
+
+| Layer | Trigger | Depends on | Survives |
+|---|---|---|---|
+| L0 normal update | host sends the vendor update command; the radio app writes the marker and soft-resets, as the stock app does | the radio app alive and its bridge link working | normal use |
+| L1 hatch key | the bridge, armed by a host command, sends a pulse key during the radio's boot window after a replug; the shim sees it and writes the marker | the bridge alive; the request-line wire; the shim | a radio app that hangs or crashes at any point after the shim |
+| L2 power-on counter | the shim counts power-ons in a flash page; the app erases the page once it is healthy; four counted power-ons without that make the shim write the marker | the shim and the flash controller only | everything L1 covers, plus a bridge that cannot send the key or a wrong guess about the wire; recovery is replugging the dongle |
+| L3 interrupted update | power lost or a CRC failure during a radio update | the vendor bootloader | the update path itself |
+| L4 SWD | a probe on the radio's debug pins, erase-all, restore the dump | debug pads, which are not identified | anything, including a broken shim |
+
+The shim sits first in every image. The boot path through it:
+
+```dot
+digraph {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box, style=rounded];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  mbr [label="MBR\nreset"];
+  boot [label="vendor bootloader\n0x38000"];
+  shim [label="shim at the app\nreset vector"];
+  dec [label="power-on reset?\nkey seen?\n4th unhealthy count?", shape=diamond];
+  app [label="radio app\n(reset handler)"];
+  mark [label="write marker\nat <marker address>\nSYSRESETREQ"];
+  upd [label="bootloader\nupdate loop"];
+  mbr -> boot;
+  boot -> shim [label="no marker"];
+  shim -> dec;
+  dec -> app [label="no: hand off"];
+  dec -> mark [label="yes"];
+  mark -> mbr [label="reset", constraint=false];
+  boot -> upd [label="marker valid"];
+}
+```
+
+Text fallback:
+
+1. The MBR resets into the vendor bootloader at `0x38000`.
+2. With no valid marker the bootloader jumps to the app's reset handler, which is the shim.
+3. The shim hands off to the radio app at once unless this is a power-on reset.
+4. On a power-on reset it listens on the request line for the key and, if the counter is enabled, counts the power-on.
+5. If it sees the key, or this is the fourth counted power-on, it writes the marker and resets.
+6. After that reset the bootloader finds a valid marker and runs its update loop, where the host flashes a known-good image.
+7. Otherwise the shim hands off to the radio app.
+
+## Part 1: the shim
+
+The shim is a position-independent Thumb blob of 424 bytes. It is the app's reset handler: vector entry 1 of the image points at it. It uses registers only, with no RAM, no stack, no interrupt, no clock task, no SPIS and no watchdog, and it hands off with the stack pointer the bootloader loaded from the app's vector table. Every image's initial stack pointer must be at most `0x20007FF8`: the bootloader pops two words from the new stack right after switching to it, and a top-of-RAM value faults. App RAM starts at `0x20000400`, because the MBR owns the first 1 KB.
+
+### Step 1: act on power-on resets only
+
+The shim reads `RESETREAS` first. Any non-zero value (soft reset, watchdog, pin reset, wake) hands off at once with nothing touched. A power-on or brown-out reads 0 and the shim continues. Nothing in the shim sets a bit in that register, and the app reads it as it was, so there is nothing to clear. That a USB replug reads 0 is an inference, and the closing section returns to it.
+
+Acting on power-on resets only leaves normal operation unchanged. A power-on reset also clears the watchdog, so the key and the counter never run with a watchdog counting.
+
+### Step 2: the pulse key on the request line
+
+A plain "low for N ms" level cannot work. The stock bridge holds the request line low without bound whenever the radio is silent, which is exactly when the shim is listening. The key is a pulse train that none of the waveforms in the constants tables produces: 8 x (LOW, HIGH), each segment 2,300 to 3,700 us (nominally 3 ms, plus or minus 0.7 ms), and the 8th HIGH only has to last 2,300 us. The segment before the first observed edge is ignored. Any segment of the wrong level or outside the window restarts the match.
+
+The shim configures P0.14 as an input with pull-up and timestamps its edges with TIMER0 at 1 MHz, for at most 300 ms. The timer is the clock because nothing is known about flash wait states or the instruction cache on this part, and a 3 ms symbol has to be judged within plus or minus 23%. The pin is polled about every 10 us (31,171 polls in 300 ms in the simulation, at one cycle per instruction).
+
+The window arithmetic fixes how the bridge must send the key. One train is 8 x 6 ms + 20 ms = 68 ms, and a key needs 47.3 ms from its first falling edge, so a key that starts up to 252 ms after the shim starts listening is seen. The bridge repeats trains for 1,500 ms after its own boot, so a bridge boot latency up to about 230 ms still gives the listener a whole train. The cost is that a cold plug-in delays the radio app by 300 ms. Soft resets cost nothing.
+
+### Step 3: the power-on counter
+
+The counter page is `0x2f000`: writable, blank, never addressed by the stock app. Because a word can be written at most twice between erases, each power-on programs the first erased word from `0xffffffff` to 0, once. With K = 4, three programmed words mean this power-on is the fourth, and the shim goes to the marker. A torn word (anything except `0xffffffff`) counts as programmed.
+
+The radio app erases the page once it is healthy. In the shim-fronted app that means one SPIS transaction whose frame has a correct outer checksum, then 10 s of timer time, and only with no frame offered and no request waiting. The outer checksum is the one checked because idle poll frames carry no inner checksum, so an inner check would never pass on an idle dongle.
+
+K = 4 keeps three quick replugs from stranding a working dongle. A stranded one sits in the vendor bootloader's update mode and takes a normal update.
+
+The shim erases the counter page itself right after it writes the marker. Without that, the three counted words survive the recovery, and the first power-on after the new image would re-enter update mode before the 10 s health check could clear them.
+
+### Step 4: write the marker the way the stock app does
+
+The sequence copies the stock marker writer: `CONFIG` = 2, `ERASEPAGE` of `<marker address>` (one 4 KiB page), poll `READY`, `CONFIG` = 0, `CONFIG` = 1, two word writes with a `READY` poll after each, then the counter erase, `CONFIG` = 0 and a `SYSRESETREQ` through `AIRCR`.
+
+### Step 5: bound every wait, then hand off
+
+Every `READY` wait is bounded at 1.6 million polls (at least 150 ms, against an erase of at most 85 ms that stalls the CPU anyway). The timer loop is bounded at 50,000 polls, 1.6 times the polls of a full window at one cycle per instruction, which ends the loop in 0.5 to 1.5 s if TIMER0 does not run. A bound that trips sets `CONFIG` back to 0 and hands off. After `SYSRESETREQ` a bounded spin hands off if the reset somehow does not happen. The hand-off stops and clears TIMER0, restores `BITMODE` and `PIN_CNF[14]` to their reset values, and branches to the target.
+
+The shim's last two words are patched by the image builder: the hand-off target and a flags word whose bit 0 enables the counter. Every image carries the same shim bytes except those two words.
+
+## Part 2: prove it in simulation
+
+The simulator boots the real MBR and the real vendor bootloader from the dump, from reset, with the candidate image at `0x1000`. Models exist only as far as a scenario exercises them: the flash controller with access control, the write and erase rules and a violation log; reset reasons; GPIO with the request line driven by a script of (level, microseconds) pairs per power-on; TIMER0; the watchdog with expiry and retention across a soft reset; and later the SPIS slave, interrupt controller and a radio state machine. Time is executed instructions at 64 MHz, one cycle each. Real silicon is only slower, so the poll counts and instruction budgets are conservative.
+
+The first prototype was 62 lines of assembly, 156 bytes, with a level-only trigger and no key or counter. It wrote the exact marker, and the real bootloader reached its update loop. A control with the checksum byte off by one (`0x19`) did not enter update mode.
+
+### Step 1: scenarios, each with a near-miss negative control
+
+Every scenario asserts that the violation list is empty (no write to protected flash, no erase-all, no UICR write, no store into the MBR's RAM, no write to the marker page except by the shim) and that the flash operations are exactly the expected ones.
+
+| Behaviour | Positive case | Near-miss controls that must not fire |
+|---|---|---|
+| Key | the key with 2.35 and 3.65 ms symbols, started at 20, 240 and 250 ms, enters update mode | 7 symbols; 2.2 and 3.8 ms segments; a 1 ms glitch; the bridge's wake pulses; its retry gaps; line held low; line held high; keys starting at 255 and 320 ms |
+| Reset reason | key present on a power-on | the same key on a soft reset: never listens, never counts |
+| Counter | 3 power-ons do nothing, the 4th enters update mode | soft resets never count; a healthy app clears the count; a torn word counts; the counter restarts after a recovery |
+| Counter off | stock image with flags 0 | 5 power-ons never fire it |
+| Bounds | dead TIMER0 and stuck `READY` | hand-off, never a hang |
+| Stock app behind the shim | the stock reset handler and the SPIS pins 6, 5, 4, 7 reached | same GPIO and watchdog writes as the stock app alone; nothing read from the flash appended behind the stock image |
+
+The shim suite is 25 scenarios. The key fuzz run uses 20 seeded scripts and compares the shim with a reference decoder written separately in Python: every script on which the two disagree must never enter update mode.
+
+### Step 2: mutation tests that must fail
+
+The test suite mutates the shim source in six places (window, K, the reset-reason gate, the tolerance, a marker byte, the counter flag) and requires the scenario that guards each one to fail, the same check the sibling guide applies to its corrupted-flash control.
+
+### Step 3: the watchdog finding
+
+The stock bootloader starts its own watchdog with a reload value of 131,072 (4 s) and feeds it on every update-loop pass, starting 96 us after reset, and again after every page erase. A watchdog armed by the app survives into the update loop in the model, so the question was which reload values are safe. A reload of at least 3 ticks (0.12 ms) outlasts the bootloader's first-feed latency. A reload of 1 or 2 ticks is shorter than 96 us and costs one watchdog reset.
+
+The binding limit is longer. The app's own update path erases the marker page, which stalls the CPU for up to 85 ms in the model (a figure recalled from the product specification, not verified), and the inherited watchdog must also outlast one such erase in the bootloader's prepare step. An app watchdog shorter than that can reset the app in the middle of an erase, forever. An app watchdog reload must be at least 3,277 ticks (100 ms). The stock app uses 131,072 (4 s), and the shim never starts a watchdog. The retention of a running watchdog across a soft reset is an inference from the nRF52805 product specification, so the finding rests on it.
+
+### Step 4: check the stock app runs unchanged behind the shim
+
+The stock app is the oracle for every model: on the same peripheral models it has to reach its pin setup and its SPIS setup. The stock+shim scenarios check that. Separate SPIS session scenarios run the stock app and the real bootloader through their real SPIS exchange, including the bootloader's update frames with a CRC failure and power cuts after the app erase and mid-write. In both power-cut cases the marker stays and the update loop restarts (L3).
+
+## Part 3: the smallest first flash
+
+The first radio image I flashed is the stock radio app with its bytes unchanged, plus the shim appended. My own radio app comes after the shim has been proven on hardware.
+
+| Item | Value |
+|---|---|
+| Radio app | stock the stock firmware bytes, unchanged |
+| Shim | 424 bytes at `0x5200`, hand-off `0x1215` (stock reset handler, Thumb bit set), flags 0 |
+| Vector entry 1 | `0x1215` -> `0x5201` |
+| Image | 17,320 bytes |
+| Package | 25,520 bytes, single image, built with the vendor package as template, round trip verified |
+
+Flags are 0 because the stock app never reports itself healthy. The same shim with the counter on would put a dongle running the stock app into update mode on its fourth replug. This image carries L1 only.
+
+### Step 1: diff the patched image against the stock one in Ghidra
+
+A Ghidra patch-diff of stock against stock+shim reported:
+
+- Changed stock bytes: only `0x1004` and `0x1005`, which are vector entry 1.
+- Added code: `0x5200` to `0x53a7`, the shim.
+- One new exit: `bx r0` at `0x537c`, to `0x1214` (the stock reset handler, with the Thumb bit in the patched literal `0x1215`).
+- "Unreachable blocks" at `0x521e` to `0x5234`: the counter scan of `0x2f000`, skipped by a `bpl` at `0x521c` because the flags word at `0x53a4` is 0 in this image. That matches the intent.
+- "Register input only in patched" for r4, r5 and r9 in two helpers: they are reached by `bl` with the shim's register state (r9 holds the flash controller base, set at the start). The shim uses no stack by design.
+
+### Step 2: gates before the flash
+
+Before the flash the image passed the packaging gate for Thumb images, the simulation scenarios that run it (stock reset handler reached 300 ms after the shim, key to update loop, counter off, line held low) and the Ghidra diff above.
+
+## Part 4: the hardware result
+
+The plan was to run the first radio flash on a spare dongle, since a radio that cannot reach its bootloader has no proven way back. The spare had not arrived. On 2026-11-21 I flashed the dongle I use daily, with all the safeties above, through the vendor bridge firmware's own update relay. That relay was already proven on this dongle, while my bridge app's relay had no hardware result yet.
+
+### Before the shim
+
+On the same dongle, with the stock radio and no shim, I armed my bridge app for one attempt and replugged. The first "replug" did not cut power (see the gotchas). The second did: the key ran, the arm record was consumed, the cursor kept working, and no timeouts or checksum failures followed. The stock radio tolerates the key.
+
+### The flash and the hatch
+
+| Step | Result |
+|---|---|
+| Pre-flight | one dongle on the bus; package byte-identical to the gated one; recovery bundle present; bridge app healthy, no timeouts on the answer line |
+| Bridge -> stock app | flash complete; the cursor moves |
+| Radio -> stock+shim through the vendor bridge | flash complete; the radio bootloader's CRC check passed and the marker was cleared; the cursor moves right after, and after a real replug. The shim ran on a power-up, listened and handed off |
+| Bridge -> my app | flash complete; receive counter `rx02` at 3,784, no timeouts, no checksum failures |
+| L1: arm for 1 attempt, real replug | the cursor stops, the arm record is consumed, `rx02` stays 0, one stale echo frame arrives from the bootloader (the simulation had predicted it), and the radio is in update mode. The bridge's key diagnostic `hatch_pb10` reads 149 lows answered and 27 highs released |
+| Bridge -> stock app again | flash complete, after the host tool's recovery of a failed reset write; the radio is flashed through the vendor relay, so the bridge goes back to stock first |
+| Radio (in update mode) -> stock+shim through the vendor bridge | flash complete: the normal update sequence reaches a radio that is already in its bootloader |
+| Bridge -> my app again | flash complete; `rx02` at 4,238, no timeouts; the cursor moves |
+
+End state: my bridge app on the CH32V305 and the stock radio app behind the shim on the nRF52820, with the hatch available and the counter off.
+
+### What the timing says about the wire
+
+With the stock radio, before the shim, the same diagnostic read 176 lows answered and 0 highs released: the answer line stayed low through the whole key. The radio answers the first request and then waits for a transfer that never comes, so the key alone does not show the answer line following the request line. A separate forward probe does: in 11 of 11 forwards the answer line was high when the request line went low, and it went low after it (mean 24.2 us, maximum 34 us). The stock radio configures P0.14 as its only bridge-request input, so this makes the PB11 to P0.14 wire strong evidence rather than inference. A continuity measurement on the spare would make it proof.
+
+## Verification
+
+| Check | Expected | Where |
+|---|---|---|
+| Marker bytes written by the shim | `<marker>`, nothing else on the page | Simulation: exact flash operation list |
+| Marker checksum control | checksum `0x19` does not enter update mode | Simulation |
+| Key positives and near-misses | positives enter update mode, every near-miss hands off | Simulation, 25 scenarios |
+| Key against a reference decoder | 0 disagreements entering update mode, 20 seeded scripts | Simulation |
+| Mutation of the shim | each of 6 mutations fails its guarding scenario | Test suite |
+| Counter | 3 power-ons nothing, 4th enters update mode, soft resets never count | Simulation |
+| Dead timer, stuck `READY` | hand-off, no hang | Simulation |
+| Stock app behind the shim | same GPIO and watchdog writes as stock alone, nothing read from the appended flash | Simulation |
+| Patched image against stock | only `0x1004` and `0x1005` changed, one new exit to `0x1214` | Ghidra patch-diff |
+| Shim on silicon | cursor moves after the flash and after a real replug | Hardware, watched by hand |
+| Key on silicon | after arming and a real replug, cursor dead and a bootloader echo frame | Hardware |
+| Recovery on silicon | a normal update reports flash complete and the cursor moves | Hardware |
+
+## Gotchas and lessons learned
+
+- A replug does not always cut power. On the first attempt the bridge's commands-received counter continued at 58 after the "replug", so the radio never saw a power-on reset. The second replug restarted the counter at 2. A counter that restarts on a real power cycle shows whether the cycle happened, before anyone concludes the key failed.
+- Stock holds the request line low. The stock bridge app waits on the radio without bound, so a level trigger would fire by accident. Look up every waveform on the wire before choosing a key, and keep the key outside all of them.
+- The simulation shares the shim's assumptions. The flash and access-control models came from the bootloader's own writes and the stock sequence, so a wrong belief about the silicon would not have shown. That is why the first hardware proof was a test with a recovery path, and why the list of unmeasured items matters.
+- A pin map from notes was wrong. The map handed over for the radio's SPI pins did not match the register writes. The register writes give SCK 6, MISO 5, MOSI 4, CSN 7. The stock app builds the pins in a config struct as 5, 4, 6, 7 (MISO, MOSI, SCK, CSN), and the notes had assigned those values in the wrong field order. The shim does not use SPI, but the radio app does.
+- The hatch needs the vector table at `0x1000` and the shim bytes intact. A blank vector table at `0x1000` has no shim, so it is not recoverable this way. The vendor bootloader's update path erases the app pages from `0x1000` for the image size, which rewrites the shim on every update, so the packaging step has to check that the shim bytes and the vector table are intact in every image.
+- An inherited watchdog is a limit on the app. It survives into the bootloader's update loop, so an app watchdog reload below the erase time of about 85 ms (recalled) can reset the app mid-erase forever.
+- A dongle stranded by the counter is not lost. Four counted power-ons without a healthy app put it in update mode, and a normal update flash recovers it. K = 4 exists so that three quick replugs never do that to a working dongle.
+
+## What is not measured
+
+These were left for the spare dongle or an instrument session. The hatch worked on this unit, so each was good enough here, and none of them is known.
+
+- The bridge's time from power to its first request-line edge. The 300 ms window is a guess against it.
+- The reset reason after a real USB replug. That the shim handed off and later answered the key is consistent with it reading 0, but the register was not read.
+- TIMER0 counting with no clock task started. The simulation assumes it. If it does not count, the poll cap ends the window in 0.5 to 1.5 s and no key is seen.
+- Flash page erase and word write timing on the real part. The 85 ms figure is recalled.
+- Watchdog retention across a soft reset on the nRF52820, which rests on the sibling part's specification.
+- The counter (L2) on silicon: the first image runs with it off.
+- My bridge app's update relay against the real radio bootloader. The vendor bridge firmware's relay was used for the flash instead.
+- The request-line wire by continuity, and whether the radio's reset pin is wired to anything.
+- The radio's debug pads (L4), which would make a broken shim recoverable.
+
+## Related docs
+
+- [Proving a replacement firmware image in simulation before flashing it](/guides/prove-replacement-firmware-in-simulation/) - the bridge-side guide this one follows, and the simulation method it reuses
+- [Dumping a locked nRF52840's flash over USB with a patched app](/guides/nrf52840-usb-flash-dump-without-debugger/) - how a flash dump is taken without a debugger, the input the simulator needs
+- [Patching an nRF52840 gaming mouse's firmware](/guides/nrf52840-mouse-firmware-patching/) - the patch gate for Thumb images that the stock+shim image passes
