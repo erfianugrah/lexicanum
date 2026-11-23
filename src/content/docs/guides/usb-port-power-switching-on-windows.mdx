@@ -1,0 +1,191 @@
+---
+title: Cutting USB port power from software on Windows
+description: "How to turn VBUS off and on for one port of a per-port power switching (PPPS) USB 3 hub from a Windows command line, so a dev board, debug probe or wedged target gets a real power-on reset without anyone pulling a cable. Covers the hub-class request that does it, why Windows needs a filter driver for it, the setting that makes Windows switch the port straight back on, and the trap measured on 2026-11-23: after a filter switches a port off, Windows' own hub driver keeps reporting the device as connected, so the only trustworthy answers are the hub's own port status and a request the device itself must answer."
+author: Erfi Anugrah
+category: reverse-engineering
+---
+
+Firmware work wedges things in ways a reset pin does not fix: a debug port that only clears on power-on, a radio that has to see a cold boot, a probe that hangs. On my desk the fix was to pull the cable. A USB hub with per-port power switching (PPPS) can do that from a command line, so a script can cut a port, hold it off, turn it back on and wait for the device to come back.
+
+On Linux that is one tool and one command. On Windows the hub driver stands in the way, and once you get past it, Windows' own view of the port can no longer be trusted. This guide covers the request that switches the port, what it takes on Windows, and how to prove each switch happened, with measurements from a 4-port USB 3 PPPS hub on a Windows 11 desktop on 2026-11-23.
+
+## Summary
+
+- The USB hub class has the request: `ClearPortFeature(PORT_POWER)` turns a port's VBUS off and `SetPortFeature(PORT_POWER)` turns it back on. It only works on a hub whose descriptor declares per-port power switching. Many hubs switch all ports together or not at all.
+- A USB 3 hub is two hubs in one box, a USB 2 hub and a SuperSpeed hub, whose matching ports share one VBUS switch. Send the request to both halves.
+- Windows' hub driver owns every hub, so a user-mode program cannot send hub-class requests. It needs a lower filter driver on the USB device class to pass them through.
+- Windows power management must be off for the hub, or Windows switches the port back on.
+- After a switch, Windows' cached view of the port is stale: it reported "connected", at the old address, for the whole time the port had no power. The hub's own `GetPortStatus` and a string-descriptor read are what show the truth.
+
+## The request
+
+The USB 2.0 specification defines the hub's class requests in chapter 11 and port power switching in section 11.11 [^usb2]. Turning a port off is:
+
+| Field | Value |
+|---|---|
+| bmRequestType | `0x23` (host to device, class, recipient "other" = a port) |
+| bRequest | `0x01` CLEAR_FEATURE (`0x03` SET_FEATURE to turn it on) |
+| wValue | `0x0008` PORT_POWER |
+| wIndex | the port number, from 1 |
+| wLength | 0 |
+
+Whether a hub honours it per port is declared in its hub descriptor. Bits 1..0 of `wHubCharacteristics` are `00` for ganged switching (all ports together), `01` for per-port, and `1x` for none [^usb2]. Some hubs advertise per-port switching but only cut the data lines and never remove VBUS. uhubctl's README says to test each model with a phone, USB light or USB fan on the port, and does not count such hubs as supported [^uhubctl].
+
+A USB 3 hub contains a USB 2 hub and a SuperSpeed hub. Each half enumerates as its own device, and each physical socket appears as one port on each half. VBUS belongs to the socket, so the request has to go to both halves; uhubctl does that by default [^uhubctl].
+
+GET_STATUS sent to a port (`bmRequestType 0xA3`, `bRequest 0x00`, `wIndex` = port, 4 bytes back) returns `wPortStatus`. Its PORT_POWER bit is `0x0100` on a USB 2 hub and `0x0200` on a SuperSpeed hub [^usb2] [^linuxch11].
+
+## Linux: one command
+
+uhubctl sends these requests from user space, and handles the companion half [^uhubctl]:
+
+```sh
+uhubctl                                   # list hubs that support per-port power
+sudo uhubctl -l 1-2 -p 3 -a cycle -d 2    # hub at location 1-2, port 3: off, wait 2 s, on
+```
+
+Since Linux 6.0 the kernel has a standard interface for this, a `disable` file per hub port in sysfs, and uhubctl uses it instead of libusb where it exists [^uhubctl]. Its README also gives a udev rule that lets a non-root user write those files.
+
+From WSL2 none of this works: usbipd can forward a device into WSL, but not the hub it hangs off.
+
+## Windows: why it needs a driver
+
+Windows binds its hub driver (`usbhub3.sys` for USB 3 hubs) to every hub. A user-mode program can open a hub through the hub device interface and use the IOCTLs that tools like USBView use. Those read descriptors and connection state, and `IOCTL_USB_HUB_CYCLE_PORT` power-cycles the port behind a device [^cycleport]. None of them sends a hub-class request or holds a port off. libusb does not help either: on Windows it goes through WinUSB, which cannot be bound to a hub, and uhubctl's README says power switching does not work there [^uhubctl].
+
+The way through is a lower filter driver registered on the USB device class (`{36fc9e60-c465-11cf-8056-444553540000}`, value `LowerFilters`). It ends up in the stack of every USB device, hubs included, and can submit control transfers to the hub on the caller's behalf. My hub's vendor ships a free, signed filter of this kind. It switched the hub on this page, and listed two other PPPS-capable hubs on the same PC, so it is not tied to one hub model. I am not naming it here.
+
+After installing, replug the hub and turn off its power management:
+
+1. **The filter only joins a stack when the stack is built.** Hubs already plugged in keep their old stack. Requests to them failed with `ERROR_NOT_FOUND` (1168) until I replugged the hub. A reboot also works. The hub's `DEVPKEY_Device_Stack` property shows whether the filter is in its stack:
+
+   ```powershell
+   (Get-PnpDeviceProperty -InstanceId 'USB\VID_xxxx&PID_yyyy\...' -KeyName DEVPKEY_Device_Stack).Data
+   ```
+
+2. **Power management must be off for the hub.** With "Allow the computer to turn off this device to save power" ticked in Device Manager, Windows powers a switched-off port straight back on. The box is the `IdleInWorkingState` DWORD under the hub's `Device Parameters\WDF` key in `HKLM\SYSTEM\CurrentControlSet\Enum\<instance id>`, where 0 is off. Set it on both halves of a USB 3 hub, then replug the hub.
+
+A filter that passes arbitrary control transfers for every USB device is a large hole: any local process that can open its control device can send requests to any device whose stack was built after the install. Treat it as a bench-machine tool and uninstall it elsewhere.
+
+## Windows keeps saying "connected"
+
+My first verification asked Windows whether the device on the port had gone. It never went. On 2026-11-23 I switched off the port holding a Raspberry Pi Debug Probe and polled every 5 ms for 3 s:
+
+| Source | While the port was off |
+|---|---|
+| `IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX` (hub driver's port state) | "connected", at the old USB address, the whole time |
+| SetupAPI / Device Manager | device present |
+| `IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION`, device and configuration descriptors | returned data, instantly: served from the hub driver's cache |
+| the same IOCTL, string descriptor 0 | failed: "A device attached to the system is not functioning" |
+| the hub's own `GetPortStatus`, sent through the filter | PORT_POWER clear |
+| the probe forwarded into WSL, a descriptor read from Linux | `broken pipe` |
+
+The hub driver is not told that the filter switched the port, so it keeps its last state until something forces it to talk to the device. A string-descriptor read forces it; a cached descriptor does not.
+
+Here is the check as a script for Windows PowerShell 5.1, needing no admin and no filter. Point it at the USB 2 half of the hub for a full- or high-speed device:
+
+```powershell
+# Ask a hub (by instance ID) about one downstream port, through the hub driver.
+#   .\hubport.ps1 -Hub 'USB\VID_xxxx&PID_yyyy\...' -Port 2
+param([Parameter(Mandatory)][string]$Hub, [Parameter(Mandatory)][int]$Port)
+
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class HubPort {
+  [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr sa, uint disp, uint flags, IntPtr tmpl);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool DeviceIoControl(IntPtr h, uint code, byte[] inBuf, int inLen, byte[] outBuf, int outLen, out int ret, IntPtr ov);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+
+  // Returns the reply bytes, or throws with the Win32 error.
+  public static byte[] Ioctl(string hubInstanceId, uint code, byte[] input, int outLen) {
+    string path = @"\\?\" + hubInstanceId.Replace('\\', '#') + "#{f18a0e88-c30c-11d0-8815-00a0c906bed8}";
+    IntPtr h = CreateFile(path, 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+    if (h == new IntPtr(-1)) throw new System.ComponentModel.Win32Exception();
+    try {
+      byte[] buf = new byte[Math.Max(outLen, input.Length)];
+      Array.Copy(input, buf, input.Length);
+      int n;
+      if (!DeviceIoControl(h, code, buf, buf.Length, buf, buf.Length, out n, IntPtr.Zero))
+        throw new System.ComponentModel.Win32Exception();
+      Array.Resize(ref buf, n);
+      return buf;
+    } finally { CloseHandle(h); }
+  }
+}
+'@
+
+# IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX (0x220448): the hub driver's
+# view of the port. Packed struct: status ULONG at offset 31, address USHORT at 25.
+$in = [BitConverter]::GetBytes([uint32]$Port)
+$ci = [HubPort]::Ioctl($Hub, 0x220448, $in, 512)
+$status = [BitConverter]::ToUInt32($ci, 31)
+$addr = [BitConverter]::ToUInt16($ci, 25)
+$vid = [BitConverter]::ToUInt16($ci, 12); $pid_ = [BitConverter]::ToUInt16($ci, 14)
+
+# IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION (0x220410) for string
+# descriptor 0: a request the hub driver does not answer from its cache.
+$req = New-Object byte[] 16
+[BitConverter]::GetBytes([uint32]$Port).CopyTo($req, 0)
+$req[4] = 0x80; $req[5] = 0x06; $req[7] = 0x03   # IN, GET_DESCRIPTOR, wValue 0x0300
+$req[10] = 4                                     # wLength 4
+try { [void][HubPort]::Ioctl($Hub, 0x220410, $req, 16); $answers = $true }
+catch { $answers = $false; $why = $_.Exception.InnerException.Message }
+
+[pscustomobject]@{ Port = $Port; Status = $status; Address = $addr
+  Device = '{0:X4}:{1:X4}' -f $vid, $pid_; AnswersString0 = $answers; Error = $why }
+```
+
+Run before, during and after an off period, with the probe on port 2:
+
+```
+Port Status Address Device    AnswersString0 Error
+---- ------ ------- ------    -------------- -----
+   2      1      33 2E8A:000C           True
+   2      1      33 2E8A:000C          False A device attached to the system is not functioning
+   2      1      34 2E8A:000C           True
+```
+
+Status 1 (connected) at address 33 while the device had no power; after power-on it answered again at address 34.
+
+## Proving each switch
+
+The tool I use now checks three things, each against a source that cannot be stale:
+
+1. **Off: the hub's own port status.** GET_STATUS to the port, through the filter, on both halves. PORT_POWER cleared within the first 5 ms poll after every off and set again after every on, on empty ports too. On this hub the USB 2 half went from `0x0100` to `0x0000`, and the SuperSpeed half from `0x06A0` to `0x04A0` (power bit `0x0200` cleared, link state Rx.Detect).
+2. **Off: the device stops answering.** If a device was on the port, read its string descriptor 0 while the port is still powered (the control), then again after the switch until it fails. It failed within 1-2 ms. If the hub reports no power but the device keeps answering, the device gets power from somewhere else (next section). A device with no string descriptors fails the control, and the check has to be skipped.
+3. **On: a new address.** The hub driver gives the device a new USB address only when it enumerates it again. The probe went from "no device" at 166 ms to "enumerating" at 249 ms to connected at a new address at 456-476 ms, against the hub's declared power-on-to-power-good time of 510 ms.
+
+A whole cycle, as the tool prints it:
+
+```
+  port 2 before: USB3 no device | USB2 connected full-speed 2E8A:000C @35
+  USB3 half: port 2 power off sent
+  USB2 half: port 2 power off sent
+  +0s hub reports port 2: USB3 0x04a0 [NO POWER,link Rx.Detect] USB2 0x0000 [NO POWER]
+  +1ms device stopped answering on the USB2 half
+  holding VBUS off 999ms
+  USB3 half: port 2 power on sent
+  USB2 half: port 2 power on sent
+  +0s hub reports port 2: USB3 0x06a0 [power,link Rx.Detect] USB2 0x0100 [power]
+  +166ms USB3 no device | USB2 no device
+  +249ms USB3 no device | USB2 enumerating
+  +476ms USB3 no device | USB2 connected full-speed 2E8A:000C @46
+  2E8A:000C re-enumerated on the USB2 half (address 35 -> 46) after 476ms
+```
+
+## Gotchas
+
+- **Back-feeding.** VBUS off does not mean the target is off. A debug probe wired to a board with its own supply keeps both alive, and so does a target powered through its own USB cable while a probe is attached. Cut the port that feeds the part you want reset, and have one power source per rail.
+- **Hold time.** I hold VBUS off for 1.5 s by default. That is a starting point, not a measured minimum: a board with bulk capacitance on VBUS needs longer to reach a real power-on reset. Check it on a scope before trusting a short hold. My [radio escape-hatch guide](/guides/radio-escape-hatch-without-swd/) records a hand replug that did not cut power at all.
+- **Forwarded devices.** A device forwarded into WSL with usbipd is detached when it re-enumerates. Attach it again after each cycle.
+- **USB 2 upstream.** Behind a USB 2-only hub, only the hub's USB 2 half enumerates. Switching still works, but USB 3 devices run at USB 2.
+- **"Self-powered" without a supply.** This hub has no power jack but declares itself self-powered in its descriptor. With several boards on it, check the upstream port can feed them all.
+
+## Sources
+
+[^usb2]: USB Implementers Forum, "Universal Serial Bus Specification, Revision 2.0," chapter 11 (Hub Specification): section 11.11 (Hub Port Power Control) and the hub class requests. https://www.usb.org/document-library/usb-20-specification
+[^uhubctl]: uhubctl, "USB hub per-port power control," GitHub (README: supported hubs, VBUS test, companion ports, Linux 6.0 interface, Windows). https://github.com/mvp/uhubctl
+[^linuxch11]: Linux kernel, `include/uapi/linux/usb/ch11.h` (hub class definitions: `USB_PORT_STAT_POWER` 0x0100, `USB_SS_PORT_STAT_POWER` 0x0200). https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/uapi/linux/usb/ch11.h
+[^cycleport]: Microsoft, "IOCTL_USB_HUB_CYCLE_PORT IOCTL (usbioctl.h)," Microsoft Learn. https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/usbioctl/ni-usbioctl-ioctl_usb_hub_cycle_port
