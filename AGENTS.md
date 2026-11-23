@@ -299,6 +299,12 @@ experiment has none. It exists because module ids collide across experiments:
 - Do not add one for a single borrowed module - link it inline in the prose that
   already attributes it (`reference/caching` is the case that established this).
 
+Claims need proof: cite inline to a source that actually says it, mark it measured
+(method in Reading-the-numbers), or mark it undocumented. Hedged inference is not a
+fourth option, and no legal-conclusion verdicts. Never hand-write a `## References`
+heading (the rehype pass renames Footnotes, so a manual one renders two h2s); check
+with a count of `<h2[^>]*>References` in `dist`, not `grep -c`.
+
 Cite the source path when answering from docs.erfi.io in chat, too.
 
 ## House style
@@ -487,6 +493,11 @@ Run `bun run build` and confirm:
   - `tests/pins.test.ts` - per-doc pins: corrections that must not regress, claims
     that must not creep back, required sections, and the anchors other docs link to.
     Adding a pin is a row in the table in `tests/lib/pins.ts`, which `scripts/tell-fix.ts` also reads.
+    Canary a new pin before trusting it: for `mustContain` / `mustNotContain`, `sd` the string
+    back and confirm the expected count fails, then revert. For `anchors`, rename the heading so
+    the SLUG differs and rebuild (a rename that slugifies the same is a no-op canary).
+    Restore the file from a backup copy afterwards, never `git checkout <file>`: it destroys
+    uncommitted edits in the same file.
   - `tests/identifiers.test.ts` - banned identifiers, read from `BANNED_IDENTIFIERS`
     or `BANNED_IDENTIFIERS_FILE` (default `~/.config/lexicanum/banned-identifiers`)
     so account ids never reach shell history or CI logs. An absent list FAILS; the
