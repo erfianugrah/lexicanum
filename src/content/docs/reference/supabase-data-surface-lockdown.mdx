@@ -313,6 +313,29 @@ create policy allowed_ip on app.t for select to anon
 
 The same form works on Storage. The Storage API sets `request.headers` for `storage.objects` policies, with `cf-connecting-ip` in it: on a private bucket, a SELECT policy comparing that key with the caller's address served the object (`200`), and the same policy against `203.0.113.9` refused it (`400` `NoSuchKey: Object not found`), each stage reading an object never fetched before (S25d, 2026-11-17, two runs). The policy is evaluated on a cache miss: a caller who read a private object before the policy was narrowed was still served the cached copy after the policy refused them, while a caller who had never read it was refused ([Supabase data residency](/reference/supabase-data-residency/), R05c).
 
+#### Behind your own edge, key on a secret header
+
+An address check stops working once your own Cloudflare Worker sits in front of the project. On 2026-11-23 (edge-private-flow, three passes) an RPC returning `request.headers`, called through a Worker, saw `cf-connecting-ip` `2a06:98c0:3600::103` for the caller (H2), the address Cloudflare documents for a Worker's cross-zone subrequests,[^cf-connecting-ip] so every user behind the Worker shares one address. Called directly it saw the caller's own address (H3). `cf-worker` read `supabase.co` both ways, so it cannot show that a request came through your Worker. What the Worker can do is add a header from its own secret store and have a policy check it, the same form as the address check with a secret compared against a row in a schema the API roles cannot read:
+
+```sql
+create schema private;
+create table private.gw (secret text not null);
+revoke all on schema private from anon, authenticated;
+
+create function public.via_front() returns boolean
+  language sql stable security definer set search_path = '' as $fn$
+  select coalesce(current_setting('request.headers', true)::json ->> 'x-gw-secret', '')
+         = (select secret from private.gw limit 1)
+$fn$;
+
+alter table public.items enable row level security;
+create policy via_front on public.items for select to anon, authenticated
+  using (public.via_front());
+grant select on public.items to anon, authenticated;
+```
+
+Through the Worker the table returned 2 rows; directly it returned 0 with no header, 0 with a wrong one, and 0 with a valid user JWT and no header (D1-D4). A direct request carrying client-set `cf-connecting-ip`, `cf-worker`, `x-forwarded-for` and `x-real-ip` together got `403` before reaching SQL (H4), consistent with S22a; which header triggered it was not isolated. The same edge cannot prove itself with a client certificate: in one handshake the project edge sent no client-certificate CA names (`openssl s_client`: `No client certificate CA names sent`, T1), and Cloudflare's Workers mTLS binding cannot present one to a Cloudflare-proxied hostname.[^cf-workers-mtls-binding] The outbound side of the same setup, from an Edge Function to a private API, is in [calling a private API from Edge Functions](/guides/supabase-edge-function-private-api/).
+
 Volatility is a planner property, so it decides whether the check runs per request at all, whichever header you read. Marking that function `immutable` gives it constant arguments, and a zero-argument constant expression is evaluated when the statement is planned rather than when it runs (S22c, same body, same qual):
 
 ```text
@@ -530,6 +553,7 @@ Each row names the module id it rests on (security-lockdown unless prefixed); a 
 | Query `edge_logs` and `auth_logs` through `/analytics/endpoints/logs`. | `logs.all` answers `410` since 2026-09-23. On `logs`, `where source = 'edge_logs'` rows carry `log_attributes['request.path']` and `log_attributes['request.headers.cf_connecting_ip']` or `x_real_ip` (2026-10-10; the 2026-09-03 form on `logs.all` was `metadata.request.path` and `metadata.request.headers.cf_connecting_ip`); `auth_logs` carries `auth_event.actor_username` for logins and request lines with `error_code` for failures. `/auth/v1/admin/audit`, which reads the optional `auth.audit_log_entries` copy (separate from Platform Audit Logs), returned 0 entries, and Log Drains have no `/v1` path. | [S18](https://github.com/erfianugrah/supabase-lab/blob/a497199/experiments/security-lockdown/tests/s18-audit-and-bans.ts) (2026-09-03), [S18 port](https://github.com/erfianugrah/supabase-lab/blob/899fef3/experiments/security-lockdown/tests/s18-audit-and-bans.ts) (2026-10-10) |
 | Expect a ban only at the DB socket. | Failed pooler authentications add the caller to `network-bans`, `DELETE /network-bans` lifts it; no ban lever exists for the HTTP tier. | [S18](https://github.com/erfianugrah/supabase-lab/blob/a497199/experiments/security-lockdown/tests/s18-audit-and-bans.ts) |
 | On your own PostgREST, make the edge the only route to the container. | Have the edge set `X-Forwarded-For $remote_addr`: direct to the container the client's header is what the filter sees (`403` on a spoofed ban value), through the edge the edge's peer address is (`200`). | [S20](https://github.com/erfianugrah/supabase-lab/blob/a497199/experiments/security-lockdown/tests/s20-xff-trust-boundary.ts), [S04](https://github.com/erfianugrah/supabase-lab/blob/a497199/experiments/security-lockdown/tests/s04-self-hosted-postgrest.ts) |
+| Behind your own Worker, gate rows on a secret header the Worker adds. | Through the Worker 2 rows; direct 0 with no header, a wrong one, or a valid user JWT. Every user behind the Worker shared one `cf-connecting-ip`, and `cf-worker` read `supabase.co` either way. | edge-private-flow D1-D4, H2, H3 |
 
 ## Reading the numbers
 
@@ -644,6 +668,7 @@ Two API-shape disagreements are recorded above: the `404 PGRST205` of the SELECT
 | W27b, W27d | edge-resilience | [`w27-pgrst303-edge-logs.ts`](https://github.com/erfianugrah/supabase-lab/blob/899fef3/experiments/edge-resilience/tests/w27-pgrst303-edge-logs.ts) | none published |
 | OB04 | observability-surface | [`ob04-log-drain.ts`](https://github.com/erfianugrah/supabase-lab/blob/899fef3/experiments/observability-surface/tests/ob04-log-drain.ts) | [`run-2026-10-10T00-39-42-004Z`](https://github.com/erfianugrah/supabase-lab/blob/efc7203/experiments/observability-surface/out/2026-10-10/run-2026-10-10T00-39-42-004Z.facts.md) |
 | F08a | platform-facts | [`f08-plan-gate-responses.ts`](https://github.com/erfianugrah/supabase-lab/blob/fc5634e/experiments/platform-facts/tests/f08-plan-gate-responses.ts) | [`run-2026-11-12T03-44-01-588Z`](https://github.com/erfianugrah/supabase-lab/blob/fc5634e/experiments/platform-facts/out/2026-11-12/run-2026-11-12T03-44-01-588Z.facts.md) |
+| D1-D4, H2-H4, T1 (probe rows, not harness modules) | edge-private-flow | [`probe.ts`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/probe.ts), [`probe2.ts`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/probe2.ts) | [`out/2026-11-23/facts.md`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/out/2026-11-23/facts.md), [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/RUNLOG.md) |
 
 [^sb-netrestrict]: Supabase, "Network Restrictions," Supabase Docs. https://supabase.com/docs/guides/platform/network-restrictions
 
@@ -728,3 +753,4 @@ Two API-shape disagreements are recorded above: the `404 PGRST205` of the SELECT
 [^sb-logsall]: Supabase, "Migration of Supabase Management API logs.all analytics endpoint to logs endpoint," Supabase Changelog, 2026-07-23. https://supabase.com/changelog/48235-migration-of-supabase-management-api-logs-all-analytics-endpoint-to-logs-endpoint
 
 [^cc-hooks]: Anthropic, "Hooks reference" (Elicitation), Claude Code Docs. https://code.claude.com/docs/en/hooks
+[^cf-workers-mtls-binding]: Cloudflare, "mTLS," Cloudflare Workers Docs. https://developers.cloudflare.com/workers/runtime-apis/bindings/mtls/

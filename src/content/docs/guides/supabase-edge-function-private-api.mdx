@@ -1,0 +1,263 @@
+---
+title: "Calling a private API from Supabase Edge Functions"
+description: "Hosted Edge Functions have no private network path and no fixed egress address, so a call to an internal API has to prove who it is over the internet. Present an mTLS client certificate and forward the user's JWT to one gateway in front of the internal APIs, or reach the API through a Cloudflare Tunnel with an Access service token. Measured on hosted Supabase: certificate formats, gateway refusals, region placement, certificate rotation and client reuse."
+author: Erfi Anugrah
+category: supabase
+group: services
+---
+
+This guide connects a hosted Supabase Edge Function to an API that is not on the public internet, such as an internal service behind an API gateway. It covers the certificate, the function code, the gateway checks, the edge in front of the function, and two alternatives (a tunnel with a service token, and a fixed-IP forward proxy). It assumes you can deploy an Edge Function and that you, or the API's owners, control the gateway in front of the API.
+
+Everything marked measured ran on 2026-11-23 on throwaway projects in ap-southeast-1, invoked from Singapore, on `supabase-edge-runtime-1.79.1 (compatible with Deno v2.1.4)`: a micro project for the 06:41 and 07:02 passes, the same experiment rebuilt as a second project for run 3 and the two repeat passes, and a separate project for the egress-address probe. The gateways were Cloudflare Workers standing in for the API's gateway: one behind Cloudflare mTLS with the Cloudflare-managed CA, one trusting only a CA we created (Cloudflare bring-your-own-CA, which needs an Enterprise zone), one behind a Cloudflare Access service token, and a local origin behind a Cloudflare Tunnel. Runs 1 and 2 were each run three times, run 3 once ([RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/RUNLOG.md), [facts](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/out/2026-11-23/facts.md)). No commercial API gateway was tested.
+
+## Constants
+
+These hold for hosted Supabase whatever your setup. If a design depends on one of them being otherwise, it will not work.
+
+| Fact | Detail | Source |
+|---|---|---|
+| No private path out | Edge Functions cannot join a VPN or peer into another network. PrivateLink carries traffic from your AWS VPC into the database only ([AWS PrivateLink](/reference/supabase-aws-privatelink/)). | documented |
+| No fixed egress address | Functions on three projects left from 13.214.168.194 and 13.214.202.160 (one project), 56.10.122.236 (a second) and 54.179.73.206 (a third, two passes) in ap-southeast-1, and from 34.227.61.74 when pinned to us-east-1. Supabase documents that there are no static egress IPs.[^sb-egress] | measured, [egress probe](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/docs/research/raw/2026-11-23-edge-egress-ip/README.md), F3; documented |
+| No mTLS into Supabase | In one handshake the project edge sent no client-certificate CA names (`openssl s_client`: `No client certificate CA names sent`). Cloudflare Workers cannot present a client certificate to a Cloudflare-proxied hostname either (it returns `520`).[^cf-workers-mtls] | measured T1; documented |
+| Placement | A function runs in the region closest to the caller unless the call is pinned with `x-region` or `forceFunctionRegion`;[^sb-region] a pinned call is not re-routed in an outage. | measured R3, ABR (placement); documented (no re-route) |
+
+On `supabase-edge-runtime-1.79.1`, X.509 v3 client certificates on RSA and on named-curve P-256 keys worked (F3, GW1, OWN1); a version 1 certificate and an EC key with explicit curve parameters were refused (V1, E1). That is a property of one runtime version, so recheck it after an upgrade.
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+  app [label="App"];
+  edge_w [label="Your edge (Cloudflare Worker)\nadds secret header, pins region"];
+  fn [label="Edge Function\nchecks header + user JWT\nholds client cert as secrets"];
+  gw [label="Gateway in front of the internal APIs\nverifies client cert + validates JWT"];
+  a [label="Internal API A"];
+  b [label="Internal API B"];
+  app -> edge_w [label="HTTPS 443"];
+  edge_w -> fn [label="HTTPS 443"];
+  fn -> gw [label="HTTPS 443, client cert + user JWT"];
+  gw -> a;
+  gw -> b;
+}
+```
+
+The app calls your edge, the edge calls the function, and the function calls one gateway over HTTPS with a client certificate and the user's Supabase access token. The gateway checks both before routing to the internal APIs, so each internal API needs no public endpoint of its own.
+
+## Which approach
+
+| Approach | What proves the caller | What the API side runs | Measured here |
+|---|---|---|---|
+| mTLS + forwarded JWT to one gateway | client certificate from your CA, and the user's token | a gateway with a truststore and a JWT policy | yes (GW1, OWN1) |
+| Cloudflare Tunnel + Access service token | a service token (two headers), and the user's token | `cloudflared` next to the API; no inbound port | yes (TUN1) |
+| Fixed-IP forward proxy + IP allowlist | the proxy's address | an allowlist, plus a proxy you run | proxy option only (P1) |
+| The API side pushes data into Postgres on a schedule | the API side's database credentials | a scheduled job on the API side | no |
+
+The first two prove the caller with something it holds. The proxy proves only where traffic came from, so pair it with a token if you use it.
+
+## Step 1: issue the client certificate
+
+Issue the certificate from the CA the gateway trusts, as X.509 v3 with `extendedKeyUsage = clientAuth`, on an RSA key or a named-curve EC key:
+
+```sh
+openssl ecparam -name prime256v1 -genkey -noout -out client.key
+openssl req -new -key client.key -subj "/CN=edge-function-client" -out client.csr
+printf 'extendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n' > ext.cnf
+openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -days 90 -extfile ext.cnf -out client.crt
+```
+
+Generate an EC key with `openssl ecparam -name prime256v1 -genkey`. On macOS LibreSSL, `openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256` wrote the key with explicit curve parameters (`Field Type: prime-field`, no `ASN1 OID`), and the hosted runtime refused it with `failed to parse private key as RSA, ECDSA, or EdDSA` (E1; local Deno 2.9.8 said `KeyMismatch`). On the same LibreSSL, `openssl x509 -req` without `-extfile` produced a version 1 certificate, and the runtime refused that with `UnsupportedCertVersion` (V1). Check both before handing the files over: `openssl x509 -in client.crt -noout -text | grep -E 'Version|ASN1 OID'`.
+
+## Step 2: store the certificate as function secrets
+
+Set the certificate and key as two Edge Function secrets through the Management API:
+
+```sh
+jq -n --rawfile c client.crt --rawfile k client.key \
+  '[{name: "CLIENT_CERT", value: $c}, {name: "CLIENT_KEY", value: $k}]' |
+  curl -s -X POST "https://api.supabase.com/v1/projects/$PROJECT_REF/secrets" \
+    -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" -H "Content-Type: application/json" -d @-
+```
+
+Multi-line PEM set this way worked as a client certificate in the function (F2, GW1). The lab function also turned any literal `\n` in a secret into a newline, so whether the value arrived byte-identical was not checked; the sample below keeps that step. `supabase secrets set` is the CLI form of the same call and was not run with PEM values. A certificate and key fit well inside the per-secret ceiling covered in [Edge Function limits](/reference/supabase-edge-function-limits/).
+
+## Step 3: call the gateway from the function
+
+`Deno.createHttpClient` has been available to user functions since edge-runtime v1.69.0, and a bad client certificate stopped crashing the runtime in v1.78.1.[^er-515][^er-766] Create the client once per worker, at module scope, and pass it to `fetch`:
+
+```ts
+import { createClient } from "npm:@supabase/supabase-js@2";
+
+const env = (k: string) => Deno.env.get(k) ?? "";
+const pem = (k: string) => env(k).replaceAll("\\n", "\n");
+const sb = createClient(env("SUPABASE_URL"), env("SUPABASE_ANON_KEY"));
+const gw = Deno.createHttpClient({ cert: pem("CLIENT_CERT"), key: pem("CLIENT_KEY") });
+
+Deno.serve(async (req) => {
+  if (req.headers.get("x-gw-secret") !== env("FRONT_SECRET")) return new Response("forbidden", { status: 403 });
+  const token = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+  const { data, error } = await sb.auth.getClaims(token);
+  if (error || !data?.claims?.sub) return new Response("unauthorized", { status: 401 });
+
+  const r = await fetch(`${env("GW_URL")}/orders`, {
+    client: gw,
+    headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(15_000),
+  } as RequestInit);
+  return new Response(r.body, { status: r.status, headers: { "content-type": "application/json" } });
+});
+```
+
+Deploy it with `--no-verify-jwt` so the function's own `getClaims` check is the one that decides; the platform's `verify_jwt` check also passes a request that carries only the anon key (iap-lockdown [L07](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/iap-lockdown/RUNLOG.md)).
+
+A module-scope client reuses the connection. Over six interleaved sets to a gateway on Cloudflare's Singapore edge (n = 20 or 50 per side per set), the reused client's outbound call had a median of 12-24 ms and a new client per call 61-243 ms; one new-client call of 210 did not return ok (run 2 L, run 3 LAT). The reused-client minimum was 10 ms. The limiter is the new TCP and TLS connection, with the certificate exchange, on every call (inferred from the mechanism, not counted). Only the gap carries over to your gateway: the absolute times depend on where it runs.
+
+Changing the certificate secrets needs no redeploy. The lab changed one pair of certificate secrets once; the first call on each client style afterwards already presented the new certificate, 5 s after the change was sent for a per-call client and 10 s for a module-scope client (one sample per style, subject read from a certificate echo server; ROT).
+
+## Step 4: check the certificate and the token at the gateway
+
+The gateway has to refuse a request with no certificate or with a certificate from another CA before any API logic runs, then validate the forwarded token against the project's JWKS: signature, issuer `https://<ref>.supabase.co/auth/v1` (with your project ref), audience `authenticated`, expiry. The JWKS is at `https://<ref>.supabase.co/auth/v1/.well-known/jwks.json`. The project created on 2026-11-23 had its ES256 signing key in use and the HS256 key retired at creation (setup log), and user tokens carried `alg` ES256 with a `kid` present in the JWKS (F4). The legacy JWT secret and the shared-secret signing key are symmetric,[^sb-signing-keys] so a project still on one of them gives the gateway no public key to verify against; move it to an asymmetric signing key first.
+
+Measured against the stand-in gateways:
+
+| Request from the function | Gateway trusting the Cloudflare-managed CA (GW1) | Gateway trusting only our own CA (OWN1) |
+|---|---|---|
+| no certificate, valid token | 403 | 403 |
+| certificate from another CA, valid token | 403 | 403 (Cloudflare-managed CA certificate, and a third CA) |
+| trusted certificate, no token | 401 | not run |
+| trusted certificate, valid token | 200 on two internal APIs | 200 with an RSA certificate and with a named-curve EC certificate |
+
+Two things depend on the gateway product and were not tested here. Whether it refuses a request with no certificate at the TLS layer or passes it through for a policy to reject: test that on the real gateway, and remove any default hostname that skips the mTLS listener. And which claims its JWT policy requires by default: a Supabase user token carries `sub`, `role`, `aud` and `iss`, and a policy that also requires a client id claim would refuse it.
+
+## Step 5: put your edge in front of the function
+
+`<ref>.supabase.co` stays reachable whatever sits in front of it, so the edge needs something the function can check. In the lab a Worker added a shared-secret header and pinned the region:
+
+```ts
+const h = new Headers();
+for (const k of ["authorization", "apikey", "content-type", "accept"]) {
+  const v = req.headers.get(k);
+  if (v) h.set(k, v);
+}
+h.set("x-gw-secret", env.FRONT_SECRET);
+h.set("x-region", "ap-southeast-1");
+const target = new URL(`${env.SUPABASE_URL}/functions/v1/relay${url.search}`);
+target.searchParams.set("forceFunctionRegion", "ap-southeast-1");
+return fetch(target, { method: req.method, headers: h, body: req.body });
+```
+
+The Worker forwards an allow-list of headers rather than the whole request, and sets both region controls: the egress probe's notes record a GET that ignored `x-region` and honoured `forceFunctionRegion` ([Edge Function limits](/reference/supabase-edge-function-limits/)).
+
+The function then refused direct calls without the header (403, G1) and with a wrong one (403, G2). Pin when callers are outside the project's region. The relay, forced into us-east-1 and then into eu-central-1 with `forceFunctionRegion`, called itself again: unpinned and direct, the second invocation ran in us-east-1 and in eu-central-1; through the Worker, which pins ap-southeast-1, it ran in ap-southeast-1 (ABR). Without a pin, a caller far from the database runs the function far from it, and every query and gateway call then crosses that distance (inferred; not timed).
+
+Behind a Worker every user reaches Supabase from the Worker's egress address: through the Worker, the function and Postgres both saw `cf-connecting-ip` `2a06:98c0:3600::103` (H1, H2), which Cloudflare documents for cross-zone Worker subrequests.[^cf-headers] Per-IP limits on the Supabase side would then count all users as one (inferred; the Auth rate limit itself was not measured). What else the edge can and cannot gate - the Data API through RLS on `request.headers`, and Auth and Storage not at all - is covered in [restricting access to a Supabase project](/reference/supabase-data-surface-lockdown/).
+
+## Variant: Cloudflare Tunnel and an Access service token
+
+When the API side wants no inbound port at all, run `cloudflared` next to the API, route a hostname to it through a tunnel,[^cf-tunnel] and protect that hostname with a Cloudflare Access application whose policy admits one service token.[^cf-service-tokens] The function sends the token as two headers alongside the user's JWT:
+
+```ts
+await fetch(`${env("TUN_URL")}/rates`, {
+  headers: {
+    authorization: `Bearer ${token}`,
+    "CF-Access-Client-Id": env("TUN_ID"),
+    "CF-Access-Client-Secret": env("TUN_SECRET"),
+  },
+  redirect: "manual",
+});
+```
+
+With the token and a user JWT the origin answered 200 and saw `cf-access-jwt-assertion`; with the token and no user JWT the origin answered 401; without the token Access answered 403 with its block page (TUN1). The same service-token policy in front of a Worker gave 200 with the token and 403 without (SV1). A service token is a shared secret that proves the calling system, not the user, which is why the origin still validates the forwarded user JWT. `redirect: "manual"` is a guard; with a service-token policy the lab's refusal was a 403, not a redirect.
+
+## Variant: a fixed-IP forward proxy
+
+If the API side insists on an IP allowlist, a proxy you run on a fixed address can carry the calls. Pass it explicitly on the client:
+
+```ts
+const viaProxy = Deno.createHttpClient({ proxy: { url: env("PROXY_URL") } });
+```
+
+The option is honoured: pointed at a closed port, the call failed with `tcp connect error` (P1). An `HTTPS_PROXY` function secret is not: it was visible in `Deno.env`, and a plain `fetch` still went out directly in 3 of 3 calls in each of three passes, the first 30 s after the secret was set (X1-X3). Proxy and client certificate on one client was not run.
+
+## Verification
+
+Run these from outside your edge, then through it. Each line except the last is a probe row in the lab's RUNLOG.
+
+| Check | Expect |
+|---|---|
+| function URL directly, no secret header | 403 |
+| through the edge, no user JWT | 401 |
+| through the edge, valid JWT | 200, and `x-sb-edge-region` is your project's region |
+| function calls the gateway with no certificate | 403 from the gateway |
+| function calls the gateway with a certificate from another CA | 403 |
+| function calls the gateway with the right certificate and no JWT | 401 |
+| function calls the gateway with both | 200 |
+| change the certificate secrets, then call again | the server you call reports the new certificate's subject (the lab saw it by 10 s, ROT) |
+
+## Gotchas and lessons learned
+
+- An EC key with explicit curve parameters fails while the certificate and key still match, and the error does not mention the curve (E1).
+- `Deno.createHttpClient` takes the certificate as `cert` and the key as `key` in Deno 2.1.4, the version the hosted runtime reports.[^deno-client]
+- A failed mTLS call does not take the worker down: after a v1 certificate error the next request on the same function answered normally (V1, V2).
+- `cf-worker` read `supabase.co` in the function through your Worker (H1) and in Postgres both through it and directly (H2, H3), so it cannot show that a request came through your edge. A secret header can.
+- A direct request carrying client-set `cf-connecting-ip`, `cf-worker`, `x-forwarded-for` and `x-real-ip` together got 403 before reaching Postgres (H4); which of the four triggered it was not isolated.
+- End to end from Singapore through the Worker, calls whose function made one mTLS request to a public echo server had a median of 1.3 s in each of three passes and a maximum of 1.4-1.8 s (run 1 L, n = 20 per pass). Distance and a new client per call dominated that (inferred).
+
+## What to do about it
+
+| Practice | Evidence | Module |
+|---|---|---|
+| Issue client certificates as X.509 v3, RSA or named-curve EC. | v3 RSA and P-256 worked; v1 refused with `UnsupportedCertVersion`; an explicit-parameters EC key refused. | F3, GW1, OWN1, V1, E1 |
+| Create the HttpClient once per worker, at module scope. | Reused median 12-24 ms vs new client 61-243 ms per call, 6 of 6 sets. | L, LAT |
+| Rotate the client certificate by changing the secrets; no redeploy. | The first post-change call on each client style presented the new certificate (one change). | ROT |
+| Forward the user's JWT and validate it at the gateway against the JWKS. | ES256 token verified against the project JWKS; no token 401. | F4, GW1 |
+| Make the gateway refuse no-cert and foreign-CA requests. | Both got 403 at the gateway trusting the Cloudflare-managed CA and at the one trusting only our CA. | GW1, OWN1 |
+| Pin the function region at your edge. | Unpinned, the function ran in the calling function's region (us-east-1, eu-central-1); pinned, in ap-southeast-1. | ABR |
+| Check a secret header in the function, not `cf-worker`. | Wrong or missing header 403; `cf-worker` read `supabase.co` both ways in Postgres. | G1, G2, H2, H3 |
+| Pass a forward proxy on the client, not as `HTTPS_PROXY`. | Proxy option honoured; the secret ignored by `fetch`. | P1, X1-X3 |
+| Use a Tunnel + Access service token when no inbound port is allowed. | 200 with token and JWT, 401 without JWT, 403 without token. | TUN1, SV1 |
+| Put a timeout on every outbound call. | Design choice: the lab relay used 15 s against the 150 s request idle limit. | none |
+
+## File reference
+
+| File | Role |
+|---|---|
+| [`supabase/functions/relay/index.ts`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/supabase/functions/relay/index.ts) | the function: header gate, `getClaims`, every outbound arm |
+| [`workers/front/index.ts`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/workers/front/index.ts) | the edge: secret header, region pin |
+| [`workers/gateway/index.ts`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/workers/gateway/index.ts) | the gateway stand-in: mTLS gate, JWT check, two internal APIs |
+| [`workers/gateway/tunnel-origin.ts`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/workers/gateway/tunnel-origin.ts) | the origin behind the tunnel |
+| [`cf.ts`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/cf.ts), [`cf3.ts`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/cf3.ts) | Cloudflare client certificate, mTLS hostnames, own CA, tunnel, Access apps |
+| [`probe.ts`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/probe.ts), [`probe2.ts`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/probe2.ts), [`probe3.ts`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/probe3.ts) | the three probe matrices |
+
+## Modules
+
+The ids are probe rows in the experiment's RUNLOG and facts table, not harness modules.
+
+| Module | Experiment | Test | Artifact |
+|---|---|---|---|
+| G1, G2, F2-F4, R3, T1, L (run 1) | edge-private-flow | [`probe.ts`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/probe.ts) | [`run-2026-11-23T06-41-57-722Z.json`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/out/2026-11-23/run-2026-11-23T06-41-57-722Z.json) and two repeats, [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/RUNLOG.md) |
+| GW1, SV1, P1, X1-X3, V1, V2, E1, H1-H4, L (run 2) | edge-private-flow | [`probe2.ts`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/probe2.ts) | [`run2-2026-11-23T07-02-14-605Z.json`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/out/2026-11-23/run2-2026-11-23T07-02-14-605Z.json) and two repeats |
+| OWN1, TUN1, ABR, ROT, LAT | edge-private-flow | [`probe3.ts`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/probe3.ts) | [`run3-2026-11-23T07-32-15-132Z.json`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/edge-private-flow/out/2026-11-23/run3-2026-11-23T07-32-15-132Z.json) |
+| L07 | iap-lockdown | [`l07-ef-verify-jwt.ts`](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/iap-lockdown/tests/l07-ef-verify-jwt.ts) | [RUNLOG](https://github.com/erfianugrah/supabase-lab/blob/c954e7e/experiments/iap-lockdown/RUNLOG.md) |
+
+## Related docs
+
+- [Supabase Edge Function limits](/reference/supabase-edge-function-limits/) - the secrets ceilings, egress addresses and region pinning this guide relies on.
+- [Restricting access to a Supabase project](/reference/supabase-data-surface-lockdown/) - what an edge in front of Supabase can and cannot gate.
+- [Put an IAP over the Supabase Data API](/guides/supabase-iap-data-api/) - the inbound counterpart: only an external identity provider's tokens reach the data.
+- [AWS PrivateLink to Supabase](/reference/supabase-aws-privatelink/) - the one private path, database-inbound only.
+
+[^sb-egress]: Supabase, "Why Supabase Edge Functions cannot provide static egress IPs for allow listing," Supabase Docs. https://supabase.com/kb/troubleshooting/why-supabase-edge-functions-cannot-provide-static-egress-ips-for-whitelisting-3d78b0
+[^cf-workers-mtls]: Cloudflare, "mTLS," Cloudflare Workers Docs. https://developers.cloudflare.com/workers/runtime-apis/bindings/mtls/
+[^sb-region]: Supabase, "Regional Invocations," Supabase Docs. https://supabase.com/docs/guides/functions/regional-invocation
+[^er-515]: supabase/edge-runtime, "fix(ext/runtime): expose Deno.createHttpClient," pull request 515, merged 2025-03-18, GitHub. https://github.com/supabase/edge-runtime/pull/515
+[^er-766]: supabase/edge-runtime, "fix(deno_tls): vendoring deno_tls and removed the unwrap assertions scattered throughout," pull request 766, merged 2026-11-05, GitHub. https://github.com/supabase/edge-runtime/pull/766
+[^sb-signing-keys]: Supabase, "JWT Signing Keys," Supabase Docs. https://supabase.com/docs/guides/auth/signing-keys
+[^cf-headers]: Cloudflare, "Cloudflare HTTP headers," Cloudflare Docs. https://developers.cloudflare.com/fundamentals/reference/http-headers/
+[^cf-tunnel]: Cloudflare, "Cloudflare Tunnel," Cloudflare One Docs. https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/
+[^cf-service-tokens]: Cloudflare, "Service tokens," Cloudflare One Docs. https://developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens/
+[^deno-client]: Deno, "lib.deno_net.d.ts" (`TlsCertifiedKeyPem`), v2.1.4, GitHub. https://github.com/denoland/deno/blob/v2.1.4/ext/net/lib.deno_net.d.ts
