@@ -95,7 +95,8 @@ the rows specific to a region move:
 | Task | Manual checklist | UI / API | pgmig |
 |---|---|---|---|
 | Create the target project in the new region | dashboard > New project | `supabase projects create --region` | `sandbox up --src-region --tgt-region` (rehearsal) |
-| Roles + schema + auth users | pg_dump/pg_dumpall + single-transaction `psql` | `supabase db dump` (add `-x auth.schema_migrations` for auth data) | `bootstrap --with-auth-data --confirm` |
+| Roles + schema | pg_dump/pg_dumpall + single-transaction `psql` | `supabase db dump --role-only`, then `supabase db dump` | `bootstrap --confirm` |
+| Auth rows | `pg_dump --data-only --schema auth --exclude-table-data=auth.schema_migrations` inside the write stop | `supabase db dump --data-only` carries them (it excludes only `auth.schema_migrations` from `auth`) | `cutover --with-auth-data` (inside the write stop) |
 | Move table data | `pg_dump --data-only` + restore (downtime = copy time) | not offered cross-region by the dashboard | `replicate` + `watch` |
 | Copy config + secrets | transcribe settings pages; dashboard re-entry | Management API GET/PATCH per endpoint; `POST /secrets` | `config-sync` (+ `projectSecrets` opt-in) |
 | Storage buckets + bytes | recreate buckets; `rclone`/`aws s3 sync` | `POST /storage/v1/bucket`; `supabase storage cp` | `storage <localDir>` (auto-creates buckets **private**) |
@@ -172,30 +173,47 @@ supabase projects create <name> --org-id <your-org-id> \
 export SRC='postgresql://postgres.<src-ref>:<pw>@aws-<N>-<src-region>.pooler.supabase.com:5432/postgres'
 export TGT='postgresql://postgres.<tgt-ref>:<pw>@aws-<N>-<tgt-region>.pooler.supabase.com:5432/postgres'
 
-# 2. roles + schema + auth users (no downtime yet - nothing is writing yet)
-supabase db dump --db-url "$SRC" -f roles.sql --role-only
-supabase db dump --db-url "$SRC" -f schema.sql
-supabase db dump --db-url "$SRC" -f auth.sql --data-only --schema auth --use-copy \
-  -x auth.schema_migrations   # SELECT-only for postgres on managed targets
+# 2. before the window: dump roles and schema, and run the save queries in
+#    Part 3 items 5, 6, 8 and 9 (storage.objects policies, cron.job,
+#    vault.decrypted_secrets, functions anon may execute)
+supabase db dump --remote="$SRC" -f roles.sql --role-only
+supabase db dump --remote="$SRC" -f schema.sql
 
-psql -d "$TGT" -f roles.sql        # errors on pre-existing roles are expected
-psql --single-transaction -v ON_ERROR_STOP=1 -d "$TGT" -f schema.sql
-psql --single-transaction -v ON_ERROR_STOP=1 -d "$TGT" \
-  -c 'SET session_replication_role = replica' -f auth.sql
-
-# 3. STOP WRITES on the source - the downtime window starts here
-supabase db dump --db-url "$SRC" -f data.sql --data-only --use-copy
-psql --single-transaction -v ON_ERROR_STOP=1 -d "$TGT" \
+# 3. STOP WRITES on the source, Auth included (no sign-ins or refreshes
+#    there from now on) - the downtime window starts here. The data dump
+#    carries the auth rows too, so it runs inside the window.
+supabase db dump --remote="$SRC" -f data.sql --use-copy --data-only \
+  -x "storage.buckets_vectors" -x "storage.vector_indexes"
+psql --single-transaction -v ON_ERROR_STOP=1 -d "$TGT" -f roles.sql -f schema.sql \
   -c 'SET session_replication_role = replica' -f data.sql
 ```
 
-Sequence values come with the data dump at their write-stop state, so no
-resync is needed (contrast with Variant B, where they must be resynced by
-hand). `session_replication_role = replica` defers triggers/FK enforcement
-during the load - required for the auth rows and for any FK-ordered restore.
-Then: storage bytes (Part 3 item 5), config + secrets (the matrix above),
-cron jobs (Part 3 item 6), and the repoint (Part 3). Downtime ends when the
-app points at the new project.
+This is the command set on Supabase's "Backup and Restore using the CLI"
+page;[^sb-cli-restore] CLI 3.2.0 warns that `--db-url` is deprecated in
+favour of `--remote`. The CLI's data-only dump takes every schema except a
+platform list that includes `vault`, `realtime`, `extensions` and
+`supabase_migrations`, and inside `auth` it skips only
+`auth.schema_migrations` (CLI 3.2.0 `--dry-run`, read 2026-11-23), so the
+auth rows travel with the data. Do not also restore a separate `--schema
+auth` dump: the data dump carries the same rows, and with `ON_ERROR_STOP`
+the second load fails on duplicate keys and rolls back. Dump everything
+that changes while the app runs inside the write stop.
+
+In a hand-run rehearsal on 2026-11-11 (ap-southeast-1 to eu-west-3, Micro,
+PostgreSQL 17.11 on both, CLI 3.1.0, one run) the single `psql` call above
+exited 0 under `ON_ERROR_STOP=1`, and the target had the tables and rows,
+RLS policies, the Realtime publication, `auth.users` (a password login
+answered 200), and the `storage.buckets` and `storage.objects` rows.
+Sequence values come with the data dump at their write-stop state; the next
+insert did not collide, so no resync is needed (contrast with Variant B,
+where `cutover` resyncs them). `session_replication_role = replica` defers
+triggers/FK enforcement during the load - required for the auth rows and for
+any FK-ordered restore. What did not arrive is in Part 3: object bytes and
+`storage.objects` policies (item 5), cron jobs (item 6), Vault secrets
+(item 8) and function `EXECUTE` revokes (item 9). The rehearsal record is in
+supabase-lab, [`docs/research/2026-11-11-cli-region-move-rehearsal.md`](https://github.com/erfianugrah/supabase-lab/blob/10e3b30/docs/research/2026-11-11-cli-region-move-rehearsal.md). Then:
+config + secrets (the matrix above) and the repoint (Part 3). Downtime ends
+when the app points at the new project.
 
 ### Variant B: replicate and cut over (near-zero downtime)
 
@@ -214,10 +232,13 @@ supabase projects create <name> --org-id <your-org-id> \
 # 2. migrate.config.yaml: refs, enumerated table list, watchdog threshold
 #    .env: SOURCE/TARGET_DB_URL (+ SOURCE_REPLICATION_URL for the IPv6 split)
 
-# 3. restore what replication does not carry (roles, schema, extensions, auth rows)
-bun start bootstrap --with-auth-data --confirm
+# 3. restore what replication does not carry (roles, schema, extensions);
+#    the auth rows move at cutover, step 6
+bun start bootstrap --confirm
 
-# 4. gates - do not proceed past a NOT READY
+# 4. gates - do not proceed past a NOT READY; with a Supabase source and an
+#    access token, doctor also checks the source's network restrictions
+#    against the target's outbound address
 bun start doctor
 bun start preflight
 
@@ -228,7 +249,8 @@ bun start watch
 
 # 6. cutover window (the only downtime): STOP source writes first
 bun start reconcile    # must print RECONCILE PASSED
-bun start cutover      # drains lag to 0, resyncs sequences, drops subscription
+bun start cutover --with-auth-data   # drains lag to 0, resyncs sequences,
+                                     # reloads auth rows, drops subscription
 bun start config-sync --dry-run && bun start config-sync
 bun start provision    # match compute size; preview unless --confirm
 bun start verify       # advisor health gate on the target
@@ -244,8 +266,9 @@ create publication region_move for table public.t1, public.t2;
 
 -- target: subscription (creates its slot on the source, takes a consistent
 -- initial copy, then streams WAL)
+-- options: a Supabase source cancels any initial COPY that runs past 2 min
 create subscription region_move_sub
-  connection 'host=db.<src-ref>.supabase.co port=5432 dbname=postgres user=postgres password=<pw> sslmode=require'
+  connection 'host=db.<src-ref>.supabase.co port=5432 dbname=postgres user=postgres password=<pw> sslmode=require options=''-c statement_timeout=0'''
   publication region_move
   with (slot_name = 'region_move_slot', copy_data = true);
 
@@ -273,9 +296,57 @@ By hand, you own the prerequisites the tooling otherwise checks:
 privilege on the target's postgres role (granted on Supabase), and replica
 identity on every published table - a primary key is enough; a table without
 one needs `alter table <t> replica identity full` or deletes/updates will
-not replicate. Schema, roles, extensions, and auth users must already exist
-on the target (same dump/restore as Variant A step 2) before creating
-the subscription, or the initial copy fails row by row.
+not replicate. Schema, roles and extensions must already exist on the
+target (the roles and schema half of Variant A) before creating the
+subscription. Auth rows need not: the subscriber's initial-copy and apply
+workers run with `session_replication_role = replica`, so an FK from a
+replicated table into `auth.users` does not block the copy. The app needs
+those rows before it writes to the target, and Auth keeps writing them on the
+source until the write stop, so load them inside the write stop: dump
+`--data-only --schema auth --exclude-table-data=auth.schema_migrations`
+(managed targets give `postgres` SELECT only on that table), then in one
+transaction on the target empty its auth tables, `SET
+session_replication_role = replica` and load the dump. `cutover
+--with-auth-data` does exactly this. The write stop covers the source's
+Auth too: a sign-in or token refresh there after the dump is not on the
+target. Before pgmig `e82168e` (2026-11-13) the auth
+rows came from `bootstrap --with-auth-data`, a snapshot, and rows Auth wrote
+after it were lost.
+
+Three more prerequisites fail quietly rather than with an error:
+
+- **`statement_timeout` on the connection.** The `postgres` role on a
+  Supabase source is capped by the 2 min global default,[^sb-timeouts] and
+  the target's tablesync worker dials the CONNECTION string, so a table whose
+  initial COPY takes longer is cancelled and restarted indefinitely and never
+  reaches `r`. On 2026-11-09 the 4,000,000-row `documents` table (with a
+  STORED tsvector) restarted its copy 16 times in 30 min, while a
+  4,000,000-row table without one finished; with `options='-c
+  statement_timeout=0'` in the keyword form above, or
+  `?options=-c%20statement_timeout%3D0` in a URI (pgmig adds it since
+  `ae33443`), the same 3.65 GB source copied in 196.9 s, one run in one
+  region (ap-southeast-1, Small).[^pgmig-pg17-live] The
+  [pgmig reference](/reference/pgmig-logical-replication-migrator/) has the
+  log lines to look for.
+- **Network restrictions on the source.** On a source without the IPv4
+  add-on the target connects from its own IPv6 address, the AAAA record of
+  `db.<target-ref>.supabase.co`; with the add-on it arrives over a
+  non-static IPv4 address (the reference's RR13 section). In supabase-lab
+  replica-routing RR12 (2026-11-11, two runs, one region), a subscription
+  disabled and re-enabled after the source's list stopped admitting that
+  address had not reconnected 60 s later: no walsender on the source, none
+  of 100 new rows, while its worker on the target still had a pid. A new
+  `CREATE SUBSCRIPTION` from an unlisted target ended at 120 s on a
+  statement timeout; that the restriction caused it is inference, as the
+  same timeout was later seen with the source open (RR13). Add the
+  target's address to the source's list first; pgmig `doctor` checks it and
+  `watch` warns. Details: [the reference's RR12
+  section](/reference/pgmig-logical-replication-migrator/#a-source-with-network-restrictions-on-rr12).
+- **One new subscriber per source at a time.** Several targets subscribing to
+  one source at once can compute the same initial-copy slot name and strand a
+  table in `f` (RR10, RR11, 2026-11-10). Start the next target only after
+  every table of the previous one is `r`; pgmig `replicate` refuses to start
+  while another subscription's copy slot is on the source.
 
 While the subscription is live, freeze DDL on the source: a
 source-only `ALTER` stalled every table's stream - zero rows arrived on the
@@ -298,8 +369,9 @@ only).
 
 ## Part 3: repoint - the region-specific checklist
 
-Do it in this order; items 1-3 break loudly if forgotten, 4-8 silently. Item 8 is
-the only one that becomes unrecoverable, so read it before you start Part 2.
+Do it in this order; items 1-3 break loudly if forgotten, 4-9 silently. Item 8 is
+the only one that can become unrecoverable (on a raw `pg_dump` path), so read
+it before you start Part 2.
 
 1. **App env: URL, keys, AND the pooler hostname.** Three values change -
    `SUPABASE_URL`, the anon key, and the service key - plus the pooler host
@@ -332,9 +404,35 @@ the only one that becomes unrecoverable, so read it before you start Part 2.
    <new-ref>`; invoke URLs change with the ref. Re-set function secrets (or
    opt into `configSync.projectSecrets`). Import maps / `deno.json` are not
    downloaded by the CLI - re-add those by hand if your functions use them.
-5. **Storage: buckets, then bytes, then visibility.** Nothing storage-related
-   arrives by itself - the schema restore excludes the managed `storage`
-   schema, so the target starts with **zero buckets** (verified:
+5. **Storage: buckets, then bytes, then visibility, then policies.** Object
+   bytes never arrive by themselves, and what else arrives depends on the
+   variant. After Variant A's CLI data dump the target has the
+   `storage.buckets` and `storage.objects` rows, so the listing looks
+   complete, but a GET of an object answers 400 until its bytes are copied,
+   and the policies on `storage.objects` are absent (2026-11-11 rehearsal).
+   Save them from the source before the window and re-run them on the
+   target:
+
+   ```sql
+   select format('create policy %I on storage.objects as %s for %s to %s%s%s;',
+     policyname, permissive, cmd, array_to_string(roles, ', '),
+     coalesce(' using (' || qual || ')', ''),
+     coalesce(' with check (' || with_check || ')', ''))
+   from pg_policies where schemaname = 'storage' and tablename = 'objects';
+   ```
+
+   Supabase's storage-copy script on the CLI restore page lists each folder
+   with `limit: 1000` and does not page: in one folder of 1,100 objects it
+   found 1,000. Loop the `list` call with an increasing `offset` until a page
+   comes back short. In the 2026-11-11 rehearsal (one run, client in
+   Singapore) the paged version copied 1,130 of 1,130 small objects in
+   94 s, every byte through the client machine. On Variant A the
+   `storage.objects` row counts already match before the copy, so check
+   the bytes instead: fetch a sample of objects from the target and expect
+   200, not 400.
+
+   On the pgmig path (Variant B) the schema restore excludes the managed
+   `storage` schema, so the target starts with **zero buckets** (verified:
    `storage.buckets` empty after bootstrap). The flow: download the source
    objects, push them with `bun start storage <localDir>` (or the S3-sync
    procedure in the [upgrade guide's storage
@@ -353,7 +451,9 @@ the only one that becomes unrecoverable, so read it before you start Part 2.
 6. **Cron jobs: re-create after cutover.** The schema restore carries your
    job *functions* but not `cron.schedule(...)` rows (schedules are data, not
    DDL), so nothing double-fires - but nothing fires at all until you re-add
-   the schedules on the target. Enumerate the source's jobs before the window
+   the schedules on the target. Variant A's CLI data dump brought no
+   `cron.job` rows either (2026-11-11). A job command that calls the old
+   project's URL with its key needs both swapped when you re-add it. Enumerate the source's jobs before the window
    so re-adding them is a copy from this list:
 
    ```sql
@@ -361,8 +461,14 @@ the only one that becomes unrecoverable, so read it before you start Part 2.
    ```
 7. **Plan for sessions at cutover.** A new project means a new JWT signing
    secret, so every access token the source issued stops verifying at
-   cutover. Without the auth-row copy described below, every session dies
-   with it. Web apps absorb this as a re-login. Mobile and distributed clients need the new anon key shipped
+   cutover: on the 2026-11-11 rehearsal the target's Data API answered
+   `401 PGRST301` to one, while a password login on the target answered 200.
+   Without the auth-row copy described below, every session dies with it.
+   Both variants now load the auth rows inside the write stop: Variant A's
+   data dump includes them, and pgmig's `cutover --with-auth-data` reloads
+   them after the lag drain. The 2026-11-11 rehearsal checked a password
+   login, not a refresh token, so session carry on either path rests on
+   session-carry (2026-09-25), not on these runs. Web apps absorb this as a re-login. Mobile and distributed clients need the new anon key shipped
    *before* cutover (or a forced upgrade) - options: ship the new key in an
    app update ahead of the window and flip the backend endpoint at cutover,
    dual-read both projects briefly (only viable for read-mostly apps), or
@@ -433,6 +539,45 @@ the only one that becomes unrecoverable, so read it before you start Part 2.
    the ciphertext is all you have left, so there is no recovery path. If you have no Vault secrets, confirm it rather than assume:
    `select count(*) from vault.secrets;`
 
+   The paragraphs above are about a raw `pg_dump` that includes the `vault`
+   schema. The CLI's data-only dump in Variant A leaves the `vault` schema out
+   entirely (its `--dry-run` script lists `vault` under `--exclude-schema`),
+   so no ciphertext arrives and the root key never comes into it. Save the
+   plaintext before the window, keep that output somewhere safe and delete it
+   afterwards, then re-create each secret on the target:
+
+   ```sql
+   -- source, before the window
+   select name, description, decrypted_secret from vault.decrypted_secrets;
+   -- target, once per row
+   select vault.create_secret('<value>', '<name>', '<description>');
+   ```
+9. **Function `EXECUTE` revokes: re-apply them.** On the 2026-11-11 rehearsal
+   (Variant A), functions whose `EXECUTE` had been revoked from `anon` and
+   `authenticated` on the source were callable by both on the target. The
+   schema dump carried only `REVOKE ... FROM PUBLIC`, and the target's default
+   privileges granted `EXECUTE` to `anon` and `authenticated` as the restore
+   created each function. Before the window, list what `anon` and
+   `authenticated` may execute on the source, for each schema the app
+   exposes; after the restore, run the same query on the target, re-run the
+   revokes for every function the two lists disagree on, and query again:
+
+   ```sql
+   select p.oid::regprocedure,
+     has_function_privilege('anon', p.oid, 'EXECUTE') as anon,
+     has_function_privilege('authenticated', p.oid, 'EXECUTE') as authenticated
+   from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public'
+     and (has_function_privilege('anon', p.oid, 'EXECUTE')
+       or has_function_privilege('authenticated', p.oid, 'EXECUTE'));
+   -- then repeat each source revoke, adding authenticated where the
+   -- source had revoked it from authenticated too:
+   revoke execute on function public.<name>(<argument types>) from public, anon;
+   ```
+
+   Only the CLI path was run; whether pgmig's `bootstrap` schema restore
+   behaves the same is not measured.
+
 ## Part 4: validation window and decommission
 
 - Keep the old project, not deleted, for a few days as a safety net:
@@ -478,6 +623,14 @@ the rows below cover the region-move surface.
 | anon keys, source vs target | different ref-scoped JWTs - old-project tokens cannot validate on the new project | documented, not executed |
 | `provision` preview | no-op when the target already matches the (default) source infra | executed against the sandbox pair |
 
+Later runs, each covered in the section it changed:
+
+| Date | Run | Result | Where |
+|---|---|---|---|
+| 2026-11-09 | pgmig, PostgreSQL 15.19 to 17.11, one region (ap-southeast-1), Small, 3.65 GB | copy 196.9 s, reconcile identical, cutover 1.6 s with no writer running, after the `statement_timeout` fix | Variant B prerequisites[^pgmig-pg17-live] |
+| 2026-11-11 | replica-routing RR12, network restrictions on the source | a target re-enabled after its address was dropped received none of 100 new rows in 60 s | Variant B prerequisites |
+| 2026-11-11 | CLI dump/restore, ap-southeast-1 to eu-west-3, Micro, PostgreSQL 17.11, hand-run | carried rows, RLS, Realtime publication, auth users, storage rows; not bytes, `storage.objects` policies, cron jobs, Vault secrets or function revokes | Variant A, Part 3 items 5-9 |
+
 ## What to do about it
 
 Module ids are supabase-lab drills (edge-resilience W, platform-facts F,
@@ -488,7 +641,12 @@ procedure rather than a measurement.
 |---|---|---|
 | Enumerate creatable regions and the capacity recommendation before `projects create` | Use `GET /v1/projects/available-regions?organization_slug=<slug>`; without the slug the call answers 400 | [F04c](https://github.com/erfianugrah/supabase-lab/blob/a497199/experiments/platform-facts/tests/f04-regions.ts) (measured 2026-08-20) |
 | Freeze DDL on the source between `replicate` and `cutover`, or apply migrations on the target first | A source-only `ALTER` stalled every table's stream, and the same `ALTER` on the target resumed it in about 6.1 s with backfill | [W15](https://github.com/erfianugrah/supabase-lab/blob/a497199/experiments/edge-resilience/tests/w15-ddl-during-replication.ts) (measured) |
-| Register the source issuer as third-party auth on the target before cutover | The issuer is `https://<old-ref>.supabase.co/auth/v1`, and registering it keeps existing access tokens reading; expect about 30 s of `401 PGRST301` the first time and about 302 ms once seen, so keep the source Auth endpoint up for the window | [W05](https://github.com/erfianugrah/supabase-lab/blob/a497199/experiments/edge-resilience/tests/w05-standby-replication.ts), [W01](https://github.com/erfianugrah/supabase-lab/blob/a497199/experiments/edge-resilience/tests/w01-jwt-skew.ts) (measured); refresh-token behaviour across a cutover not measured |
+| Register the source issuer as third-party auth on the target before cutover | The issuer is `https://<old-ref>.supabase.co/auth/v1`, and registering it keeps existing access tokens reading; expect about 30 s of `401 PGRST301` the first time and about 302 ms once seen, so keep the source Auth endpoint up for the window | [W05](https://github.com/erfianugrah/supabase-lab/blob/a497199/experiments/edge-resilience/tests/w05-standby-replication.ts), [W01](https://github.com/erfianugrah/supabase-lab/blob/a497199/experiments/edge-resilience/tests/w01-jwt-skew.ts) (measured); the bridge covers access tokens only, refresh tokens carry through the auth-row copy only if no client refreshes at the source after the dump (Part 3 item 7, session-carry 2026-09-25) |
+| Load the auth rows inside the write stop, not at bootstrap | Variant A: one data dump in the window carries them. Variant B: `cutover --with-auth-data` reloads them after the lag drain in one transaction; a failed reload commits nothing and leaves the subscription for a re-run | pgmig `e82168e` (2026-11-13), integration tier (Postgres 15 to 17 in containers); no managed-to-managed run yet |
+| On a hand-rolled subscription from a Supabase source, add `options='-c statement_timeout=0'` (keyword form) or `?options=-c%20statement_timeout%3D0` (URI form) to the CONNECTION string | Without it the 4,000,000-row `documents` table's initial COPY restarted 16 times in 30 min; with it the 3.65 GB copy finished in 196.9 s and cutover took 1.6 s with no writer running | pgmig live runs, 2026-11-09, one region[^pgmig-pg17-live] |
+| Before `CREATE SUBSCRIPTION`, add the target's database IPv6 address to the source's network restrictions | A subscription disabled and re-enabled without it had not reconnected 60 s later and got none of 100 rows; a new subscription ended at 120 s on a statement timeout (cause inferred) | replica-routing RR12, 2026-11-11, two runs ([reference section](/reference/pgmig-logical-replication-migrator/#a-source-with-network-restrictions-on-rr12)) |
+| After a CLI dump/restore, re-run every function `EXECUTE` revoke and re-create the `storage.objects` policies, cron jobs and Vault secrets | The restore re-granted `EXECUTE` to `anon` and `authenticated`, and brought no `storage.objects` policies, `cron.job` rows or Vault secrets | 2026-11-11 hand-run rehearsal, one run (Part 2 Variant A) |
+| Page the storage listing when copying objects | The docs script's unpaged `list` found 1,000 of 1,100 objects in one folder; the paged version copied 1,130 of 1,130 in 94 s | 2026-11-11 hand-run rehearsal, one run |
 | Backfill users through `POST /auth/v1/admin/users`, not hand-built `auth.users` rows | Send the bcrypt `password_hash`, `id` and `app_metadata`; duplicate and case-variant emails are refused with `422 email_exists` | [C03](https://github.com/erfianugrah/supabase-lab/blob/a497199/experiments/tenant-consolidation/tests/c03-users-merge-api.ts) (measured 2026-08-04) |
 | Re-password every custom LOGIN role on the target before repointing anything that uses it | Run `ALTER ROLE <name> WITH PASSWORD '...'`; the role arrives with `rolpassword` NULL | measured run above; RUNBOOK sections 0 and 9 |
 | After `config-sync`, poll the config readback until it matches, and diff auth defaults | The apply is asynchronous: in the W17 drill a readback straight after its restore PATCH returned the pre-restore value. Diff between the two projects, because `custom_oauth_max_providers` defaulted to 32767 on one project generation and 3 on another | edge-resilience battery 2026-08-17 ([W17](https://github.com/erfianugrah/supabase-lab/blob/a497199/experiments/edge-resilience/tests/w17-config-parity.ts)) |
@@ -519,14 +677,15 @@ against rclone) are design choices; no run measured them.
 
 ## Gotchas and lessons learned
 
-- **A dump-and-restore silently destroys Vault secrets.** `pg_dump` copies
+- **A raw `pg_dump` and restore silently destroys Vault secrets.** `pg_dump` copies
   `vault.secrets` and the restore accepts the ciphertext, but the new project
   holds a different encryption root key, so the failure surfaces at the first
   read, when the source may be gone. Move the root key first and verify a
   decrypt on the target before deleting anything (Part 3, item 8).
 - **Hand-built `auth.users` rows make GoTrue return `Database error querying
-  schema`.** Only bites the manual path - `pgmig bootstrap --with-auth-data`
-  handles it. Eight varchar token columns default to empty string rather than
+  schema`.** Only bites hand-built rows - a `pg_dump --data-only` of `auth`
+  (Variant A's data dump, or pgmig `cutover --with-auth-data`) carries the
+  columns as they are. Eight varchar token columns default to empty string rather than
   NULL, and an insert that leaves them NULL fails the driver's scan, so every
   login on the target 500s while the row looks correct in `psql`. Fix:
 
@@ -585,7 +744,7 @@ against rclone) are design choices; no run measured them.
 - **Do not confuse "paused" with "free".** The old project bills until
   deleted; pausing only stops compute serving, and only a Free project can
   pause at all.
-- **If `bootstrap` fails mid-way, re-running it re-plans the schema
+- **If `bootstrap --with-auth-data` fails mid-way, re-running it re-plans the schema
   restore** against tables that now exist. Recover by running the auth-data
   dump/restore commands it printed (they are in the preview output) rather
   than re-applying the whole schema.
@@ -622,3 +781,6 @@ A module whose Artifact cell lists a dated `out/` directory was re-run in that d
 [^sb-redirect]: Supabase, "Redirect URLs," Supabase Docs. https://supabase.com/docs/guides/auth/redirect-urls
 [^sb-custom-domains]: Supabase, "Custom Domains," Supabase Docs. https://supabase.com/docs/guides/platform/custom-domains
 [^sb-vault]: Supabase, "Supabase Vault," Supabase Docs. https://supabase.com/docs/guides/database/vault
+[^sb-cli-restore]: Supabase, "Backup and Restore using the CLI," Supabase Docs. https://supabase.com/docs/guides/platform/migrating-within-supabase/backup-restore
+[^sb-timeouts]: Supabase, "Timeouts," Supabase Docs. https://supabase.com/docs/guides/database/postgres/timeouts
+[^pgmig-pg17-live]: pgmig, "docs/research/2026-11-09-pg15-to-17-live.md," GitHub, commit `cd29532`. https://github.com/erfianugrah/pgmig/blob/cd29532/docs/research/2026-11-09-pg15-to-17-live.md
