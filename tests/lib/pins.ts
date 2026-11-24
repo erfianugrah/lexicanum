@@ -324,7 +324,7 @@ export const pins: Pin[] = [
       "what-carries-over-and-what-does-not",
     ],
     linksTo: [REGION],
-    htmlContains: ["Manual checklist", "UI / API", "pgmig", "https://github.com/erfianugrah/pgmig"],
+    htmlContains: ["Manual checklist", "UI (user interface) / API", "pgmig", "https://github.com/erfianugrah/pgmig"],
   },
   {
     doc: REGION,
@@ -430,7 +430,7 @@ export const pins: Pin[] = [
       "the window is the consumer's cache",
       // Promotion covers MFA-enrolled accounts, and the source identity has to
       // be retired explicitly or two projects issue for one tenant.
-      "MFA travels",
+      "MFA (multi-factor authentication) travels",
       "refresh_token_not_found",
     ],
     mustNotContain: [
@@ -588,7 +588,7 @@ export const pins: Pin[] = [
       // The failure that motivated host mode. If this softens to "may not
       // work", the page stops being actionable.
       "policy-drop host",
-      "answers on its bridge IP and nowhere else",
+      "answers on its bridge IP (Internet Protocol) and nowhere else",
       // The measured series count is the proof the nft rule works end to end.
       "717",
       // The lock incident: an idempotent-looking DDL is not lock-free, and the
@@ -979,7 +979,7 @@ export const pins: Pin[] = [
       "6 rows to 0 and left the stream at 6",
       // A07b plus the Dashboard read: the platform audit log records
       // control-plane calls and no SQL execution.
-      "SQL execution is absent from it",
+      "SQL (Structured Query Language) execution is absent from it",
       // A09e: a chain does not catch truncation. This is the one most likely
       // to be softened into "a chain detects tampering".
       "it does not detect truncation",
@@ -998,7 +998,7 @@ export const pins: Pin[] = [
       "55P03 canceling statement due to lock timeout",
       // AL01c: the customer-visible symptom, which is a hang rather than an
       // error, and the 15 s is the probe's client, not the platform's.
-      "hung until the probe's 15 s HTTP client timeout",
+      "hung until the probe's 15 s HTTP (Hypertext Transfer Protocol) client timeout",
       "The 15 s is the probe's own client timeout, not a platform timeout",
       // AL02b: the reason the two-statement path works. Softening this to
       // "takes a weaker lock" loses the mode that does not conflict.
@@ -1104,7 +1104,7 @@ export const pins: Pin[] = [
     mustContain: [
       // S20: the through-edge behaviour is measured, with the lab config named.
       "edge.nginx.conf",
-      "one RFC 1918 address and no client value",
+      "one RFC (Request for Comments) 1918 address and no client value",
     ],
     mustNotContain: ["the through-nginx behaviour is not measured", "reasoned, not measured"],
   },
@@ -1326,7 +1326,7 @@ export const pins: Pin[] = [
       "capacity 4",
       "stop_grace_period: 15m",
       "effectively root on the router",
-      "3-day TTL and a 10 GiB cap",
+      "3-day TTL (time to live) and a 10 GiB cap",
     ],
     mustNotContain: [
       // The stale nix comment must not be read back as the CURRENT policy.
@@ -1643,7 +1643,7 @@ export const pins: Pin[] = [
       // The CLI shape that makes OpenBao's single-item read leak-safe.
       "bao kv get -field=<name>",
       // HashiCorp Vault's licensor, re-verified against its own LICENSE file.
-      "names the licensor as IBM Corp",
+      "names the licensor as IBM (International Business Machines) Corp",
       // Infisical's open-core licence split, re-verified against its own
       // LICENSE file rather than inferred from marketing copy.
       "MIT core, separate licence under its `ee/` (Enterprise) directories",
