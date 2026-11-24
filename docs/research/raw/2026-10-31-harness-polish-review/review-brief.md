@@ -1,17 +1,17 @@
 # Adversarial review brief
 
-Worktree: ~/<worktree>. READ-ONLY: do not edit any file anywhere.
+Worktree: .worktrees/<card>-harness-polish. READ-ONLY: do not edit any file anywhere.
 Writers just did an edit pass on agent-harness doc pages (presentation, diagrams, AI-slop removal,
 voice). Writer drafts are known to invent numbers, dates, counts and code excerpts, and to "correct"
 facts wrongly. Assume the diff contains fabrications and find them.
 
-For each assigned file, run `git -C ~/<worktree> diff HEAD -- <file>`
+For each assigned file, run `git -C .worktrees/<card>-harness-polish diff HEAD -- <file>`
 and examine every ADDED or CHANGED claim (numbers, dates, counts, file:line refs, config values,
 behaviour statements, quoted strings). Check each against the source:
-- harness source: ~/dotfiles (.pi/agent/extensions, .pi/agent/extensions/lib, .pi/agent/skills,
+- harness source: <harness repo> (.pi/agent/extensions, .pi/agent/extensions/lib, .pi/agent/skills,
   .pi/agent/prompts, .claude/, .config/git/hooks, docs/plans, docs/research, bin/, git log)
-- other repos named in the page (e.g. ~/infra/<repo>, ~/infra/<repo>/llmc, ~/infra/<repo>,
-  ~/infra/<repo>) - read-only. Never read .env or sops files; never print secrets.
+- other repos named in the page (e.g. <forgejo stack repo>, <llmc repo>, <knowledge-graph repo>,
+  <resume repo>) - read-only. Never read .env or sops files; never print secrets.
 Also check: a fact the writer DELETED as "unverifiable" or "wrong" that is actually true and
 load-bearing (search the source for it).
 

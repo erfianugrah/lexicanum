@@ -16,13 +16,13 @@
 
 **Primary file:**
 
-- Modify: `~/<local path>`
+- Modify: `src/content/docs/reference/postgres-entity-graphs.mdx`
 
 **Verification files:**
 
-- Inspect: `~/<local path>`
-- Inspect: `~/<local path>`
-- Run from: `~/lexicanum`
+- Inspect: `tests/docs.test.ts`
+- Inspect: `tests/pins.test.ts`
+- Run from: `<repo root>`
 
 Preserve these facts in the final document, even if their section or sentence changes:
 
@@ -65,7 +65,7 @@ Do not alter the experiment repo or deploy infrastructure in this plan.
 ### Task 1: Map the existing document into reader-facing sections
 
 **Files:**
-- Read: `~/<local path>`
+- Read: `src/content/docs/reference/postgres-entity-graphs.mdx`
 
 - [ ] **Step 1: Inventory every measured claim before editing**
 
@@ -91,7 +91,7 @@ Keep the existing section anchors where possible. The final shape should be:
 Run:
 
 ```bash
-cd ~/lexicanum
+cd <repo root>
 rg -n "postgres-entity-graphs|entity-graphs|#topology|#evidence|#reading-the-numbers" src tests
 ```
 
@@ -102,7 +102,7 @@ Expected: identify any internal links before changing heading text. Keep existin
 ### Task 2: Rewrite the public status and provenance prose without dropping details
 
 **Files:**
-- Modify: `~/<local path>`
+- Modify: `src/content/docs/reference/postgres-entity-graphs.mdx:8-75`
 
 - [ ] **Step 1: Replace the lede with availability plus design scope**
 
@@ -153,7 +153,7 @@ Use "not measured" or "not discoverable". Do not use "still open", "resumed", "n
 ### Task 3: Reorganize detailed findings while preserving the evidence table
 
 **Files:**
-- Modify: `~/<local path>`
+- Modify: `src/content/docs/reference/postgres-entity-graphs.mdx:150-end`
 
 - [ ] **Step 1: Keep the extension and traversal measurements in their current sections**
 
@@ -196,14 +196,14 @@ If the article already has a reproduction section, rewrite it to describe the fi
 ### Task 4: Update pins only if the public wording needs regression protection
 
 **Files:**
-- Modify: `~/<local path>` only if needed
+- Modify: `tests/pins.test.ts` only if needed
 
 - [ ] **Step 1: Inspect whether this document already has pins**
 
 Run:
 
 ```bash
-cd ~/lexicanum
+cd <repo root>
 rg -n "POSTGRES|entity-graphs|postgres-entity" tests/pins.test.ts
 ```
 
@@ -244,15 +244,15 @@ The editorial change does not add runtime logic. Do not create a new test file. 
 ### Task 5: Verify the public document and commit the cleanup
 
 **Files:**
-- Verify: `~/<local path>`
-- Verify: `~/<local path>`
+- Verify: `src/content/docs/reference/postgres-entity-graphs.mdx`
+- Verify: `tests/pins.test.ts`
 
 - [ ] **Step 1: Search for internal leakage and lost details**
 
 Run:
 
 ```bash
-cd ~/lexicanum
+cd <repo root>
 rg -n -i "Resumed|~/work|supabase-lab|make up|make destroy|bills while|Cloudflare-side|RUNLOG|Track B|Track D|G08|G09|G10|tmux|judge|reboot" src/content/docs/reference/postgres-entity-graphs.mdx
 ```
 

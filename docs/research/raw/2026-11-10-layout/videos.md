@@ -1,7 +1,7 @@
 # Video Typography Research: Hierarchy, Layout, and Web Type Rules
 
 Source: 6 YouTube design tutorials transcribed 2026-11-10 (turbo, en).
-Raw transcripts saved to `~/.<local path>/<id>.txt` (local only).
+Raw transcripts saved to `<local scratch>/lexicanum-layout-videos/<id>.txt` (local only).
 
 ## Video Index
 

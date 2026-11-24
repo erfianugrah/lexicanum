@@ -3,7 +3,7 @@
 Date: 2026-11-19. Labels: agent hand-read of the blind sheet
 (`2026-11-19-erfi-review-labels.md`), written before looking at either model's
 output. Gemini (tell-review) flags come from the full-corpus sweep in
-`~/.<local path>` (local only); erfi-review 2026-11-19 run
+`<local scratch>/lex-tells/flags2.json` (local only); erfi-review 2026-11-19 run
 on the sheet itself. P09's Gemini flag refers to a paragraph that was edited
 after the sweep and is excluded.
 
@@ -85,7 +85,7 @@ of 5 defensible and Gemini's 7 of 13.
 - Neither model's flags are a verdict. The three labels here are one reader's
   judgment; the sheet is still in the repo for a second, independent pass
   (`2026-11-19-erfi-review-labels.md`), and the file:line key is local at
-  `~/.<local path>` (local only).
+  `<local scratch>/lex-tells/label-key.tsv` (local only).
 
 ## Owner follow-up (2026-11-19)
 

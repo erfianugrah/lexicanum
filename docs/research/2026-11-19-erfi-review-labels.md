@@ -1,7 +1,6 @@
 ---
 title: erfi-review blind label sheet (30 paragraphs)
 date: 2026-11-19
-card: a card
 ---
 
 # erfi-review blind label sheet
@@ -159,7 +158,7 @@ Your marks:
 
 ## P25
 
-It was left unbuilt because the queue drained, and that turned out to be the expensive call. A new backlog of 143,000 rows appeared later, and because `FOR UPDATE SKIP LOCKED` blocks the top-N sort, every poll sorted all pending rows with an external merge on disk: 8.1 TB of temporary files on the host's NVMe in 46 days, on a drive rated for 600 TBW. The index was built then (session-history-store migration 038), with a predicate copied literally from the worker's query so the planner can use it. The hourly snapshot refreshes had the same disk problem at a smaller scale: at the default 16 MB `work_mem` each run spilled about 1.5 GB of sorts, fixed by `SET work_mem = '256MB'` on the refresh functions only (migration 039). A `CREATE OR REPLACE FUNCTION` resets such a per-function setting, so every later redefinition has to repeat it.
+It was left unbuilt because the queue drained, and that turned out to be the expensive call. A new backlog of 143,000 rows appeared later, and because `FOR UPDATE SKIP LOCKED` blocks the top-N sort, every poll sorted all pending rows with an external merge on disk: 8.1 TB of temporary files on the host's NVMe in 46 days, on a drive rated for 600 TBW. The index was built then (migration 038 of the session-history store), with a predicate copied literally from the worker's query so the planner can use it. The hourly snapshot refreshes had the same disk problem at a smaller scale: at the default 16 MB `work_mem` each run spilled about 1.5 GB of sorts, fixed by `SET work_mem = '256MB'` on the refresh functions only (migration 039). A `CREATE OR REPLACE FUNCTION` resets such a per-function setting, so every later redefinition has to repeat it.
 
 Your marks: 
 

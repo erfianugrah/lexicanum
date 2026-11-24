@@ -1,11 +1,10 @@
 /**
- * Identifier hygiene: account ids and throwaway project refs must never reach
- * src/.
+ * Identifier hygiene: banned identifiers must never reach src/.
  *
  * This is the one genuinely environment-shaped check in the suite - the list is
  * not in the repo, because publishing the list of strings that must not be
- * published defeats the exercise. It comes from BANNED_IDENTIFIERS (CI secret)
- * or BANNED_IDENTIFIERS_FILE (a local file outside the repo).
+ * published defeats the exercise. It comes from a CI secret or a local file
+ * outside the repo (see bannedList below).
  *
  * An absent list is a FAILURE, not a skip. The check it replaces spent weeks
  * reporting a cheerful PASS on a runner where the list was unset.

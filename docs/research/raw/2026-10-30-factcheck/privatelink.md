@@ -17,7 +17,7 @@ Files: `reference/supabase-aws-privatelink.mdx`, `guides/supabase-aws-privatelin
 | Guide @ 972b477 | https://raw.githubusercontent.com/supabase/supabase/972b477/apps/docs/content/guides/platform/privatelink.mdx | 2025-07-01 ("privatelink feature" - alpha) |
 | Features page | https://supabase.com/features/privatelink | 2026-10-30 (live) |
 | Read replicas doc | https://supabase.com/docs/guides/platform/read-replicas | 2026-10-30 (live) |
-| Lexicanum corpus | `rg` across ~/<local path> | HEAD @ 3ec4737 |
+| Lexicanum corpus | `rg` across src/content/docs | HEAD @ 3ec4737 |
 | Git log (guide) | gh api repos/supabase/supabase/commits?path=...privatelink.mdx | 30 commits, 2025-07 to 2026-10 |
 
 ## Findings table

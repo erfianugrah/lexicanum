@@ -137,7 +137,7 @@ Files edited: 19 of the 23 in `batches/batch-2.txt`. No git operations run.
 - `guides/singapore-weather-ha-grafana.mdx` - no edit, no open finding.
 - `guides/sks8300-openwrt.mdx` - A: File reference added (the six `files/`
   overlay entries, the CI workflow, the deploy script, the 17-check script,
-  the router-cli inventory file, `~/.ssh/id_sks8300`, the stock partition dump,
+  the router CLI inventory file, the switch SSH key, the stock partition dump,
   the two CI images).
 - `guides/slskd-wireguard-port-forward.mdx` - A: File reference added
   (compose file, `scripts/update-port.sh`, `./pia-state` and `./pia-shared`,

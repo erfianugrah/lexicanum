@@ -11,7 +11,7 @@ slug or anchor changed (only two inbound links exist, both page-level from
 frontmatter (unchanged)
 Lede - real prose, written from the doc's own description (folds in the old
   fragment lede + intro paragraph; drops the decorative bold on the repo name)
-Provenance note - 725MB figures measured on videos.erfi.io; tier latency
+Provenance note - 725MB figures measured on <service>.example.com; tier latency
   ranges stated, not benchmarked; test counts are what the repo commands report
 ## TL;DR - 5 bullets, figures copied verbatim (tier table latencies, the
   "Verified" 725MB .mov -> 31MB .mp4 / 0.1s line, _transformed/ revalidation)

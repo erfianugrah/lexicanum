@@ -15,8 +15,7 @@ say about each?
 > `2026-11-10-layout.md`. The `house check` type step (house v0.1.21)
 > enforces both rules; its measure maximum is 100 characters since 0.1.28
 > (90 in 0.1.25-0.1.27). Changes 3 and 4 were decided by owner A/B on 2026-11-10
-> (`house preview` of Newsreader / Source Serif 4 / Literata,
-> 18 / 19 / 20px, strong / hairline / no code box): keep Newsreader at
+> (a `house preview` of Newsreader / Source Serif 4 / Literata, 18 / 19 / 20px, strong / hairline / no code box): keep Newsreader at
 > 18px with the strong inline-code box. No change shipped. The numbers in "What the page does now" are the
 > pre-change state.
 

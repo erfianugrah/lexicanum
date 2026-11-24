@@ -81,7 +81,7 @@ Fixed: 0 edits.
 
 Unfixed (author judgment):
 - [A] no File Reference section, though the guide names `deploy.sh`, the `/etc/config/*`
-  overlay files, the check script and `router-cli switch` subcommands -> a small File Reference
+  overlay files, the check script and the router CLI `switch` subcommands -> a small File Reference
   table would close the skeleton.
 
 ## src/content/docs/guides/pg-analyser-bench-methodology.mdx
@@ -217,7 +217,7 @@ Fixed: 0 edits.
 
 Unfixed (author judgment):
 - [A] no File Reference section, though the guide names the fork overlay files, `deploy.sh`,
-  the 17-check script and the `stock-cli` rollback kit -> a File Reference table would close it.
+  the 17-check script and the stock-OS rollback kit -> a File Reference table would close it.
 
 ## src/content/docs/guides/slskd-wireguard-port-forward.mdx
 

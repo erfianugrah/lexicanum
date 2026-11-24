@@ -1,4 +1,4 @@
-# Second adversarial review (already published)
+# Second adversarial review
 
 Repo: ~/lexicanum (main, commit c8aa999). READ-ONLY everywhere: do not edit, stage or commit anything.
 The commit dd5557e..c8aa999 rewrote agent-harness doc pages (presentation, diagrams, AI-prose cleanup)
@@ -10,9 +10,9 @@ For each assigned file: `git -C ~/lexicanum diff dd5557e c8aa999 -- <file>`.
 
 1. Every ADDED or CHANGED factual claim (number, date, count, file:line reference, config value,
    flag, default, behaviour statement, quoted code): open the cited or implied source and confirm.
-   Sources: ~/dotfiles (.pi/agent/extensions, .pi/agent/extensions/lib, .pi/agent/skills,
+   Sources: <harness repo> (.pi/agent/extensions, .pi/agent/extensions/lib, .pi/agent/skills,
    .pi/agent/prompts, .claude/, .config/git/hooks, bin/, docs/plans, docs/research, git log),
-   ~/infra/<repo>, ~/infra/<repo>/llmc, ~/infra/<repo>, ~/infra/<repo> file:line refs must
+   <forgejo stack repo>, <llmc repo>, <knowledge-graph repo>, <resume repo>. file:line refs must
    point at the right line in the CURRENT file. Never read .env or sops-encrypted files; never print
    secret values.
 2. Every DELETED claim: was it actually wrong/unverifiable, or was a true, load-bearing fact lost?

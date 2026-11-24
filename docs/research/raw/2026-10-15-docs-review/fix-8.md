@@ -130,7 +130,7 @@ Fixed: 4 edits.
   offsets read back, fan curves with no software in the loop, telemetry and the
   stability search) with the commands and what each replaces, built from the
   TL;DR, the persistence section and the fan-chip section.
-- `line 158`: added `"How it was checked: MousePlotter recordings of the 8 kHz mouse 8k
+- `line 158`: added `"How it was checked: MousePlotter recordings of an 8 kHz gaming mouse
   on the RTX 5090 FE with driver 610.88, one configuration per run, mouse moving
   throughout."` under the sensor-polling table, closing the asymmetry with the
   fan-chip table above it. The preceding prose already names the tool and the

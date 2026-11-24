@@ -1,5 +1,5 @@
 # Layout & Hierarchy Research: Written Sources
-## 2026-11-10 · Raw sources for a card
+## 2026-11-10 · Raw sources for the site
 
 ---
 
@@ -210,7 +210,7 @@
 
 ## 14. Prior Research (lexicanum, 2026-11-10)
 
-**Path**: `~/<local path>/`
+**Path**: `docs/research/raw/2026-11-10-typography/`
 
 **Key findings -- Measure**:
 - Dyson & Haselgrove (2001): 55 cpl highest comprehension (empirical)

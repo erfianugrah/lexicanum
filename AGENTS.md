@@ -66,7 +66,7 @@ the gates only, no deploy.
   Footer, PageTitle, Sidebar, DiagramExpand) use the generic kit
   conventions. DiagramExpand, loaded from `src/components/Head.astro`,
   makes a Graphviz diagram rendered below its intrinsic size zoom in
-  place (click, ctrl+wheel or the ZOOM button; no overlay; a card,
+  place (click, ctrl+wheel or the ZOOM button; no overlay;
   `docs/research/2026-11-12-diagram-expand.md`). `src/lib/code-glue.mjs`
   (kit rehype plugin, last in `rehypePlugins`) wraps inline code and the
   characters touching it in `span.house-glue` (nowrap), because inline
@@ -94,7 +94,7 @@ the gates only, no deploy.
   step (house v0.1.21) holds running text to <= 100 characters per line
   (80 until v0.1.25, 90 until v0.1.28) and APCA Lc 90 at Newsreader
   18px. Body text is full ink (was 78%, Lc 69.9
-  in dark; a card). Layout (kit 0.1.25, tuned to 0.1.28, a card, chosen by side-by-side preview
+  in dark). Layout (kit 0.1.25, tuned to 0.1.28, chosen by side-by-side preview
   2026-11-10): two widths, fluid by screen size - running text on a
   centred reading column (~79 characters at 1280px to ~95 at 2560px,
   body 18 -> 20px, line height 1.6, one empty line between paragraphs),
@@ -418,11 +418,11 @@ negative parallelism, participle tails, rhythm triplets, metaphors) are a CI
 gate since 2026-11-18: the `prose-tells` job runs
 `bun run check:tells --changed <base>` (`scripts/tell-review.ts`, prompt in
 `scripts/tell-review-prompt.md`, gemini-4-argon via OpenRouter, repo secret
-`OPENROUTER_API_KEY` capped at 10 USD a month) on the paragraphs, titles and headings a push or PR
+`OPENROUTER_API_KEY`) on the paragraphs, titles and headings a push or PR
 touched, and any flag blocks `build-and-deploy`. Run it before pushing:
 `sx OPENROUTER_API_KEY=OPENROUTER_API_KEY -- bun run check:tells --changed`.
 With no revision it diffs against the upstream branch, the same base CI
-uses, so unpushed commits are covered (with `HEAD` as the base, run 15109
+uses, so unpushed commits are covered (with `HEAD` as the base, a CI run
 failed on a commit the local run never saw). The model varies run to run:
 a paragraph that passed once can draw a flag on the next run.
 Reword a real flag; clear a wrong one for that doc with
@@ -458,8 +458,7 @@ on the author.
 Run `bun run build` and confirm:
 - `tsc --noEmit` passes. It is the first step of `build` since 2026-10-30
   (`typescript` is a devDependency, so CI runs the same compiler); before that
-  typecheck sat outside the gate and five errors accumulated unnoticed
- . `src/types/hpcc-wasm-graphviz.d.ts` stands in for types the
+  typecheck sat outside the gate and five errors accumulated unnoticed. `src/types/hpcc-wasm-graphviz.d.ts` stands in for types the
   `@hpcc-js/wasm` package references but does not install.
 - exit 0. The page count is no longer a number to keep in your head: `tests/
   docs.test.ts` asserts built pages minus redirect stubs equals the doc count,
@@ -498,10 +497,10 @@ Run `bun run build` and confirm:
     the SLUG differs and rebuild (a rename that slugifies the same is a no-op canary).
     Restore the file from a backup copy afterwards, never `git checkout <file>`: it destroys
     uncommitted edits in the same file.
-  - `tests/identifiers.test.ts` - banned identifiers, read from `BANNED_IDENTIFIERS`
-    or `BANNED_IDENTIFIERS_FILE` (default `~/.config/lexicanum/banned-identifiers`)
-    so account ids never reach shell history or CI logs. An absent list FAILS; the
-    bash version reported PASS for weeks with the list unset.
+  - `tests/identifiers.test.ts` - banned identifiers, read from a CI secret or a
+    local file outside the repo, so the list never reaches shell history, CI logs
+    or the repo. An absent list FAILS; the bash version reported PASS for weeks
+    with the list unset.
   - `tests/links.test.ts` - external reachability, opt-in via
     `bun run verify:docs:links`. Never gates the build: someone else's 503 is not a
     defect here.

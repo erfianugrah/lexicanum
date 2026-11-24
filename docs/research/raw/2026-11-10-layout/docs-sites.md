@@ -2,7 +2,7 @@
 
 Raw dump. Worker: openrouter/deepseek/deepseek-v4-pro. Method: Playwright
 headless Chromium, 5 viewport widths, computed-styles measurements. Screenshots in
-`~/.<local path>/<site>-<width>.png`.
+`<local scratch>/lexicanum-layout-survey/<site>-<width>.png`.
 
 ## Sites measured
 
@@ -316,7 +316,7 @@ ongoing layout tension.
 
 ## Screenshots
 
-All at `~/.<local path>/<site>-<width>.png`:
+All at `<local scratch>/lexicanum-layout-survey/<site>-<width>.png`:
 `local only`. 55 files (11 sites × 5 widths).
 
 Measurements JSON: `measurements.json` (v1, coarse) and `measurements-v2.json`

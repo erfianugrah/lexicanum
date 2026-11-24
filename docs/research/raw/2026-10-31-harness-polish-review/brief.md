@@ -1,6 +1,6 @@
 # Brief: pi harness series polish
 
-Worktree: ~/<worktree> (branch agent/<card>-harness-polish).
+Worktree: .worktrees/<card>-harness-polish (branch agent/<card>-harness-polish).
 Work ONLY inside that worktree, and ONLY on the files assigned to you in your task prompt.
 Other writers are editing other pages in the SAME worktree at the same time - never touch
 a file outside your assignment (not the hub pi-harness-journey.mdx, not tests/pins.test.ts,
@@ -16,10 +16,10 @@ renaming any heading), footnotes, and frontmatter keys.
 
 ## Read first (mandatory)
 
-1. ~/.<local path> - the standing writer rules (hostnames, IPs,
+1. <skills dir>/lexicanum/writer-brief.md - the standing writer rules (hostnames, IPs,
    paths, verification, no commits). All of it applies, EXCEPT the build step (see Verify).
 2. The worktree's AGENTS.md - house style, citations, dot-fence boilerplate, AI-tell gate.
-3. ~/.<local path> - read it whole: "Kill the corpo tells",
+3. <skills dir>/erfi-voice/SKILL.md - read it whole: "Kill the corpo tells",
    "Structural AI tells", "Importance-announcing - long-form docs", "Voice characteristics",
    "British English", "Common mistakes".
 4. Style exemplars, read end to end before editing: src/content/docs/reference/cloudflare-supabase-architecture.mdx
@@ -74,10 +74,10 @@ Diagrams:
 
 Facts:
 - Do not add new numbers, dates, counts or claims unless you verify them in the source this
-  turn (the harness source is ~/dotfiles, read-only; .pi/agent/extensions, .pi/agent/skills,
+  turn (the harness source is <harness repo>, read-only; .pi/agent/extensions, .pi/agent/skills,
   .claude/, docs/plans, docs/research, git log). Cite file:line in your final message.
 - While editing, if a claim looks wrong or internally inconsistent (contradicts another
-  section of the same page, or the source), check it in ~/dotfiles. Fix verified errors;
+  section of the same page, or the source), check it in <harness repo>. Fix verified errors;
   list unverifiable ones in your final message instead of guessing.
 - Counts as of a date stay labelled with that date; do not silently refresh them.
 

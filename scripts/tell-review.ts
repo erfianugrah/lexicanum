@@ -286,8 +286,7 @@ async function main(argv: string[]): Promise<number> {
     const a = argv[i] ?? "";
     if (a === "--changed") {
       // Default to what CI will review: everything not yet on the upstream
-      // branch. HEAD alone missed unpushed commits and a push failed on them
-      // (run 15109).
+      // branch. HEAD alone missed unpushed commits and a push failed on them.
       const rev = argv[i + 1] && !argv[i + 1]?.startsWith("-") ? argv[++i] : defaultBase();
       const diff = git(["diff", "-U0", rev, "--", "src/content/docs"]);
       for (const [file, lines] of changedLines(diff)) {

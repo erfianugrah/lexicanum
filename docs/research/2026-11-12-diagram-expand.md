@@ -3,7 +3,7 @@
 > 2026-11-12. Problem: Graphviz diagrams are inline SVG scaled to the
 > content column; 151 of 240 render below their intrinsic size at a
 > 1152px column, and wide left-to-right ones (one is 2049x153 intrinsic
-> in a 1150px column) become unreadable. Card: a card. Raw worker
+> in a 1150px column) become unreadable. Raw worker
 > dumps: `raw/2026-11-12-diagram-expand/` (`docs-site-patterns.md`,
 > `techniques.md`).
 

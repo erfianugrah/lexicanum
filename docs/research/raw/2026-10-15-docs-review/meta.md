@@ -35,7 +35,7 @@ rehype-katex and `rehypeFootnoteLabelToReferences` claims (astro.config.mjs);
 `REJECTED_MARKERS` at :502; the math-intentional marker in
 guides/magic-wan-interop.mdx; all five test files' described checks
 (docs/pins/identifiers/links/harness, tests/lib/mdx.test.ts); the
-`~/.config/lexicanum/banned-identifiers` default (exists); `.prose-lint.json`
+the banned-identifiers list default (exists); `.prose-lint.json`
 and `.prose-terms-baseline.json` (exist); the cited exemplar and case-study
 docs (all exist); `src/components/TopicCards.astro` importing TAXONOMY.
 

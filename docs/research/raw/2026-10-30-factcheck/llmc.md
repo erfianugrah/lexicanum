@@ -1,6 +1,6 @@
-# Fact-check: commit 9c1f89e (a card B-C)
+# Fact-check: lexicanum commit 9c1f89e
 
-Checked 2026-10-30 against llmc repo `~/infra/<repo>/llmc` (git log, source,
+Checked 2026-10-30 against the llmc repo (git log, source,
 presets live), arXiv 2609.26333, Berth README, and existing lexicanum prose.
 
 ## Claims table
@@ -9,16 +9,16 @@ presets live), arXiv 2609.26333, Berth README, and existing lexicanum prose.
 |---|---|---|---|---|
 | 1 | Quality telemetry fields: `leak`, `unclosed`, `args_bad`, `truncated`, `effort`, `prompt_tok`, `completion_tok`, `reasoning_tok`, `reasoning_chars` | quality.go:27-48 (QualityRecord struct) | **Confirmed** | All nine fields present with matching JSON tags. |
 | 2 | "Writes go through a buffered channel and are dropped and counted when it is full" | quality.go:55-67 (NewQualityLogger + Emit) | **Confirmed** | Channel 1024, non-blocking send with select default, atomic `dropped` counter. |
-| 3 | "Since 2026-09-14 the proxy writes one JSONL record per tool-bearing LLM request" | Git: `<rev>` dated 2026-09-14 | **Confirmed** | First quality-telemetry commit on that date. |
-| 4 | "added 2026-09-20" for effort/token fields | Git: `<rev>` dated 2026-09-20 | **Confirmed** | "quality telemetry records the soak metrics" commit on that date. |
+| 3 | "Since 2026-09-14 the proxy writes one JSONL record per tool-bearing LLM request" | Git: commit dated 2026-09-14 | **Confirmed** | First quality-telemetry commit on that date. |
+| 4 | "added 2026-09-20" for effort/token fields | Git: commit dated 2026-09-20 | **Confirmed** | "quality telemetry records the soak metrics" commit on that date. |
 | 5 | Active-mode `/comfyui/*` or `/train/*` granted under lock | scheduler.go:530-534 (acquireMode) | **Confirmed** | `if s.st.Mode == mode { s.grant(ev, mode, ""); return }` |
 | 6 | Lock owner switching modes via `X-LLM-Lock-Owner` header | scheduler.go:536-541 (acquireMode) | **Confirmed** | `!s.isLockOwner(ev.req.Owner)` gate; owner passes through. |
 | 7 | Non-owner mode switch under lock refused with 503 | scheduler.go:537-538 + scheduler_test.go:790-795 | **Confirmed** | `s.reject(ev, 503, ...)` for non-owners; test `TestModeAcquireNonOwnerSwitchRefused` asserts 503. |
-| 8 | "Until 2026-10-27 any image or training request under any lock was refused" | Git: `<rev>` dated 2026-10-27, commit message | **Confirmed** | "acquireMode refused every /comfyui and /train acquire while any lock was held, even for the already active mode and for the lock owner" |
+| 8 | "Until 2026-10-27 any image or training request under any lock was refused" | Git: commit dated 2026-10-27, commit message | **Confirmed** | "acquireMode refused every /comfyui and /train acquire while any lock was held, even for the already active mode and for the lock owner" |
 | 9 | "duplicate model_id fails the whole reload" + "/v1/models keeps its last good state" | presets.go:448-453 (Reload loop) | **Confirmed** | Error returned before `s.presets = out` assignment; old map preserved. |
-| 10 | prefill_chunk: 43.4 s -> 35.1 s, 2.93k -> 3.62k tok/s, ~19%, 2026-09-14 | llmc: commit <rev> plan doc (wedge-mitigation.md lines 275-277) | **Confirmed** | Verbatim match: "took a 127k fresh prefill from 43.4s to 35.1s (2.93k -> 3.62k tok/s, ~19%)" |
+| 10 | prefill_chunk: 43.4 s -> 35.1 s, 2.93k -> 3.62k tok/s, ~19%, 2026-09-14 | llmc: plan doc (wedge-mitigation.md lines 275-277) | **Confirmed** | Verbatim match: "took a 127k fresh prefill from 43.4s to 35.1s (2.93k -> 3.62k tok/s, ~19%)" |
 | 11 | "set on every NInfer preset since" | grep: all 9 `.toml` files in `models/` with `prefill_chunk = 4096` | **Confirmed** | All nine ninfer presets carry the key. |
-| 12 | 2026-09-18: engine bump to f76e19c0 reads only v3; previous pin reads only v2 | Git: <rev> (2026-09-18, <rev> v3); <rev> (2026-09-19, f76e19c0); <rev> (2026-09-14, <rev> v2) | **Confirmed (date nuance)** | f76e19c0 config commit is 2026-09-19, not 2026-09-18. First v3 pin (<rev>) was 2026-09-18. AGENTS.md also says "(2026-09-18)" for f76e19c0. Upstream engine commit may itself be dated 2026-09-18. **Accept as correct.** |
+| 12 | 2026-09-18: engine bump reads only v3; previous pin reads only v2 | Git: pin commits dated 2026-09-18 (v3), 2026-09-19 (v3 engine bump) and 2026-09-14 (v2) | **Confirmed (date nuance)** | The engine-bump config commit is 2026-09-19, not 2026-09-18. The first v3 pin was 2026-09-18. AGENTS.md also says "(2026-09-18)" for f76e19c0. Upstream engine commit may itself be dated 2026-09-18. **Accept as correct.** |
 | 13 | "upstream re-released the stock artifact as v3 under the same filename that day" | AGENTS.md line 198-199 | **Confirmed** | "upstream re-released the baseline as native v3 (sha256 in its repo's SHA256SUMS/artifact-manifest.json)" |
 | 14 | Loop preset = Qwen3.8 27B dense, summarizer = Gemma 26B-A4B | `llmc models` output | **Confirmed** | loop: "Qwen3.8 27B Dense, agentic coding" (VRAM 20.5); summarizer: "Gemma 4 26B-A4B" (VRAM 24.0) |
 | 15 | Daily driver = qwen38-swift-ninfer, MTP, not GGUF | `llmc models` output (active preset `*` = qwen38-swift-ninfer) | **Confirmed** | Active preset: qwen38-swift-ninfer, NInfer engine, MTP. GGUF daily driver (qwen38-gguf) still exists but is not active. |
@@ -44,7 +44,7 @@ presets live), arXiv 2609.26333, Berth README, and existing lexicanum prose.
 - Lock owner with X-LLM-Lock-Owner header -> passes through (line 536)
 - Non-owner -> 503 (line 537-539)
 
-The pre-2026-10-27 behaviour (every non-LLM request under lock refused) is confirmed by commit <rev>'s message and red-to-green test structure. The doc correctly names the error text ("model lock active"); only the err_type field is `server_error` rather than `model_unavailable`, which the doc does not claim to quote.
+The pre-2026-10-27 behaviour (every non-LLM request under lock refused) is confirmed by the 2026-10-27 commit message and red-to-green test structure. The doc correctly names the error text ("model lock active"); only the err_type field is `server_error` rather than `model_unavailable`, which the doc does not claim to quote.
 
 ### Hypothesis 3: "duplicate model_id fails the whole reload" is wrong
 
@@ -52,11 +52,11 @@ The pre-2026-10-27 behaviour (every non-LLM request under lock refused) is confi
 
 ### Hypothesis 4: "prefill_chunk numbers are misquoted or misdated"
 
-**Assessment: Confirmed exact** - The wedge-mitigation plan doc records verbatim: "took a 127k fresh prefill from 43.4s to 35.1s (2.93k -> 3.62k tok/s, ~19%)". Date 2026-09-14 confirmed by commit <rev>. All 9 ninfer presets carry `prefill_chunk = 4096`.
+**Assessment: Confirmed exact** - The wedge-mitigation plan doc records verbatim: "took a 127k fresh prefill from 43.4s to 35.1s (2.93k -> 3.62k tok/s, ~19%)". Date 2026-09-14 confirmed by the commit that added it. All 9 ninfer presets carry `prefill_chunk = 4096`.
 
 ### Hypothesis 5: "v2/v3 artifact paragraph is misdated or inverted"
 
-**Assessment: Confirmed (date nuance only)** - The v2-to-v3 transition is correct (<rev> = v2, f76e19c0 = v3). First v3 pin (<rev>) is 2026-09-18; f76e19c0 config commit is 2026-09-19. The doc says "2026-09-18 bump to f76e19c0" - the AGENTS.md itself uses the same date. The f76e19c0 engine commit upstream may be dated 2026-09-18 even though the llmc config commit is 2026-09-19. **Accept as correct.**
+**Assessment: Confirmed (date nuance only)** - The v2-to-v3 transition is correct (the 2026-09-14 pin = v2, the 2026-09-19 pin = v3). The first v3 pin is 2026-09-18; the engine-bump config commit is 2026-09-19. The doc says "2026-09-18 bump to the v3 engine" - the AGENTS.md itself uses the same date. The engine commit upstream may be dated 2026-09-18 even though the llmc config commit is 2026-09-19. **Accept as correct.**
 
 ### Hypothesis 6: "The Aside's preset claims don't match `llmc models`"
 
@@ -78,4 +78,4 @@ Every assertion in the Aside matches live state.
 
 ## Verdict
 
-**No false claims found.** One minor omission (args_overflow field), one date nuance (f76e19c0 pin date), and one unverifiable claim (Berth's specific nvidia-smi flag). All 17 substantive factual claims - field names, numbers, dates, commit ids, HTTP status codes, behavioural statements - are confirmed by source code, git history, live preset state, or the arXiv abstract. The commit is safe to publish.
+**No false claims found.** One minor omission (args_overflow field), one date nuance (the engine-bump pin date), and one unverifiable claim (Berth's specific nvidia-smi flag). All 17 substantive factual claims - field names, numbers, dates, commit ids, HTTP status codes, behavioural statements - are confirmed by source code, git history, live preset state, or the arXiv abstract. The commit is safe to publish.

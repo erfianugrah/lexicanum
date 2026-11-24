@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# install-house.sh - install a pinned `house` release from the private
-# Forgejo repo <owner>/<repo>, sha256-verified against the release's
-# checksums.txt.
+# install-house.sh - install a pinned `house` release, sha256-verified
+# against the release's checksums.txt.
 #
 # usage: install-house.sh VERSION   (e.g. 0.1.0, no leading v)
 #
-# Needs HOUSE_TOKEN: a Forgejo token with read:repository scope (the
-# user-level Actions secret HOUSE_TOKEN; see <source file>). Installs to
+# Needs two Actions secrets: HOUSE_RELEASES, the Forgejo API URL of the
+# releases collection (.../api/v1/repos/OWNER/REPO/releases), and
+# HOUSE_TOKEN, a token with read:repository scope for it. Installs to
 # $HOME/.local/bin/house and adds that dir to $GITHUB_PATH when set.
 set -euo pipefail
 
 version="${1:?usage: install-house.sh VERSION}"
 version="${version#v}"
-host="${HOUSE_RELEASES}"
+releases="${HOUSE_RELEASES:?HOUSE_RELEASES not set}"
 auth="Authorization: token ${HOUSE_TOKEN:?HOUSE_TOKEN not set}"
 
 case "$(uname -m)" in
@@ -26,7 +26,7 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 curl -fsSL --retry 3 -H "$auth" -o "$tmp/release.json" \
-  "$releases/tags/v$version"
+  "${releases%/}/tags/v$version"
 asset_url() {
   jq -er --arg n "$1" '.assets[] | select(.name == $n) | .browser_download_url' "$tmp/release.json"
 }

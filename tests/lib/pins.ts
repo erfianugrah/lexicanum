@@ -712,8 +712,7 @@ export const pins: Pin[] = [
   },
   {
     // Public-reference anonymization: the generic names are the pinned state.
-    // The original home identifiers (SSIDs, MACs, subnets, hostnames) live in
-    // ~/.config/lexicanum/banned-identifiers, NOT here - this file is public.
+    // The original identifiers live in the banned list outside the repo, NOT here - this file is public.
     doc: "reference/home-iot-network",
     mustContain: [
       "SSID `home-iot`",
@@ -1388,8 +1387,8 @@ export const pins: Pin[] = [
   {
   doc: SECRETCTL,
   mustContain: [
-    // The `set`-canonicalisation fix and the commit that shipped it.
-    "fixed 2026-09-29 in commit `<rev>`",
+    // The `set`-canonicalisation fix and the date it shipped.
+    "destination (fixed 2026-09-29)",
     // Scope of that fix: dotenv/sops/bw-notes only, keyfile stays byte-for-byte.
     "the source byte-for-byte, trailing newline included",
     // The 2026-08-30 key-derivation invariant: hex string, not decoded bytes.
@@ -1479,7 +1478,7 @@ export const pins: Pin[] = [
   // New page (2026-09-29): the release/registry follow-up self-hosted-forgejo-router
   // named as planned. Pins cover the three-lane split, the two-flip policy history,
   // the registry decision's four reasons, the buildkit/QEMU cross-compile fix, and
-  // the per-repo evidence split (forgejo-cli proven; secretctl and router-cli workflow-only) -
+  // the per-repo evidence split (Forgejo CLI proven; secretctl and the router CLI workflow-only) -
   // the fact this page's own audit found and that a plan document elides by grouping
   // all three CLIs together as "done".
   doc: FORGEJO_RELEASES,
@@ -1502,8 +1501,8 @@ export const pins: Pin[] = [
     "FROM --platform=$BUILDPLATFORM",
     // The per-repo evidence split this page's own audit found - the fact most likely
     // to erode if a later edit assumes parity across the three lane-2 repos.
-    "only `forgejo-cli` is proven end to end as of this run",
-    "`secretctl` and `router-cli` have the workflow committed but have not fired it",
+    "only the Forgejo CLI is proven end to end as of this run",
+    "`secretctl` and the router CLI have the workflow committed but have not fired it",
   ],
   mustNotContain: [
     // Would overclaim parity across the three lane-2 repos - the plan document's
@@ -1736,7 +1735,7 @@ export const pins: Pin[] = [
     sections: [/^## Checklist$/m, /^## What was checked here$/m],
     linksTo: ["reference/openaq-pm25-home-assistant"],
   },
-  // 2026-10-26 lab runs (supabase-lab 4afd0b7). Each pin is a correction of a
+  // 2026-10-26 lab runs (supabase-lab). Each pin is a correction of a
   // claim the page carried before: the resending layer was "unidentified",
   // a function's statement_timeout "wins for every key", the same-region
   // split was "not measured", and the Realtime pool was compared against the

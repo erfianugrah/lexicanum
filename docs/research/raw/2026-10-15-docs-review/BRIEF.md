@@ -1,6 +1,6 @@
 # Docs review brief (2026-10-15)
 
-Shared instructions for every review worker. Repo: `~/lexicanum`
+Shared instructions for every review worker. Repo: `<repo root>`
 (Astro + Starlight docs site, MDX under `src/content/docs/{guides,reference}`).
 
 ## Read first (once)
@@ -8,7 +8,7 @@ Shared instructions for every review worker. Repo: `~/lexicanum`
 1. `AGENTS.md` - the authoring contract: doc types (guide = Diataxis how-to,
    reference = explanation-led architecture/decision doc), skeletons, citations,
    house style, the lab-backed-page rules.
-2. `~/.<local path>` - section "Structural AI tells"
+2. `<skills dir>/erfi-voice/SKILL.md` - section "Structural AI tells"
    (line ~89) and "Importance-announcing" right after it, including the `rg`
    sweep command there.
 3. `tests/lib/mdx.ts` - `LLM_MARKERS` (line ~339, already gated by the build)
@@ -61,7 +61,7 @@ D. Accuracy smells. Internal contradictions within the doc, a number quoted
 ## Verify your own files (only yours)
 
 ```bash
-cd ~/lexicanum
+cd <repo root>
 prose-lint --config .prose-lint.json --before HEAD --no-max <your edited files>
 prose-lint --config .prose-lint.json --no-max --no-counters --baseline .prose-terms-baseline.json <your edited files>
 bun test tests/docs.test.ts tests/pins.test.ts

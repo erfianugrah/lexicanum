@@ -61,8 +61,7 @@ describe.skipIf(!ENABLED)("external links", () => {
       const limited: string[] = [];
       let checked = 0;
       // 429 and the gateway errors are the host saying "not now", not "gone":
-      // github.com answered 112 cited URLs with 504 in one run (2026-11-09,
-      // a card) while every one of them loaded in a browser.
+      // github.com answered 112 cited URLs with 504 in one run (2026-11-09) while every one of them loaded in a browser.
       const TRANSIENT = new Set([429, 502, 503, 504]);
       const check = async (url: string, docs: string[]) => {
         let status = 0;

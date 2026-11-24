@@ -1,4 +1,4 @@
-# Sweep for a card (inline code glue): every page in dist/sitemap-0.xml at
+# Sweep for the inline code glue issue: every page in dist/sitemap-0.xml at
 # 390 and 1280px, with the glue ("fix") and with it disabled ("nofix").
 #   stranded       code/punctuation pairs ("(", ")", ",", "..") whose
 #                  character sits on a different line than the code
