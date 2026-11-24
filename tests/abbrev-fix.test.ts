@@ -3,7 +3,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { Glossary } from "./lib/abbrev";
-import { entryFor, fixSource, removeInsertions } from "../scripts/abbrev-fix";
+import { applyPinMoves, entryFor, fixSource, followPin, removeInsertions } from "../scripts/abbrev-fix";
 
 const g: Glossary = {
   terms: {
@@ -69,5 +69,24 @@ describe("fixSource", () => {
 
   test("removeInsertions detects a changed insertion", () => {
     expect(removeInsertions("a (xx) b", [{ at: 1, text: " (yy)", key: "K", line: 1 }])).toBeNull();
+  });
+});
+
+describe("pinned strings follow their sentence", () => {
+  const old = "The API answers. Keep: the API path is fixed.";
+  const ins = [{ at: old.indexOf("API path") + 3, text: " (application programming interface)", key: "API", line: 1 }];
+  test("an insertion inside a pin moves into the pin", () => {
+    expect(followPin(old, "the API path is fixed", ins)).toBe("the API (application programming interface) path is fixed");
+  });
+  test("an insertion at the pin's end leaves the pin unchanged", () => {
+    expect(followPin(old, "the API", ins)).toBe("the API");
+  });
+  test("a pin that is not unique is refused", () => {
+    expect(followPin("API x API x", "API x", ins)).toBeNull();
+  });
+  test("pins.ts literal is rewritten only on exactly one match", () => {
+    const src = `mustContain: ["the API path is fixed"],`;
+    expect(applyPinMoves(src, [{ from: "the API path is fixed", to: "the API (a b) path is fixed" }])).toBe(`mustContain: ["the API (a b) path is fixed"],`);
+    expect(Array.isArray(applyPinMoves(src + src, [{ from: "the API path is fixed", to: "x" }]))).toBe(true);
   });
 });

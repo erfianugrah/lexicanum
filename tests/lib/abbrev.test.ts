@@ -102,6 +102,8 @@ describe("what counts as an explanation", () => {
     ["API is used.", true],
     ["API (v2) is used.", true],
     ["The (API) is used.", true], // one word before the parenthesis
+    // an expansion the fixer inserted for an earlier term is read through
+    ["the programming (a b) interface (API) is used.", false],
     ["API (see below) is used.", false], // the check cannot read meaning; two words pass
     ["API, as they say, is used.", true], // only the three forms count
     ["API is the application programming interface.", true], // a later sentence is not a gloss

@@ -55,6 +55,22 @@ export interface FixResult {
   /** Set when the file was refused; nothing is written. */
   refused?: string;
   next?: string;
+  /**
+   * Pinned strings (tests/lib/pins.ts mustContain) an insertion landed inside,
+   * with the same insertion applied, so the pin keeps guarding the same sentence.
+   */
+  pinMoves?: { from: string; to: string }[];
+}
+
+/** The pinned string with every insertion that falls strictly inside it applied. */
+export function followPin(old: string, pin: string, ins: Insertion[]): string | null {
+  const o = old.indexOf(pin);
+  if (o < 0 || old.indexOf(pin, o + 1) >= 0) return null; // absent or not unique: refuse
+  let out = pin;
+  for (const i of [...ins].sort((a, b) => b.at - a.at)) {
+    if (i.at > o && i.at < o + pin.length) out = out.slice(0, i.at - o) + i.text + out.slice(i.at - o);
+  }
+  return out;
 }
 
 export function entryFor(g: Glossary, rel: string, key: string): TermEntry | undefined {
@@ -120,15 +136,35 @@ export function fixSource(rel: string, old: string, g: Glossary): FixResult {
   const syntax = mdxSyntaxError(next);
   if (syntax && !mdxSyntaxError(old)) return { ...res, refused: `new text does not parse as MDX: ${syntax}` };
   const slug = rel.replace(/\.mdx?$/, "");
+  const pinMoves: { from: string; to: string }[] = [];
   for (const p of pins.filter((x) => x.doc === slug)) {
     for (const s of p.mustContain ?? []) {
-      if (old.includes(s) && !next.includes(s)) return { ...res, refused: `pinned string no longer present: ${s.slice(0, 60)}` };
+      if (!old.includes(s) || next.includes(s)) continue;
+      const to = followPin(old, s, insertions);
+      if (!to || !next.includes(to)) return { ...res, refused: `pinned string no longer present: ${s.slice(0, 60)}` };
+      pinMoves.push({ from: s, to });
     }
   }
   const left = unexpandedFirstUses(parseMdx(rel, next), words).map((f) => f.key);
   const stuck = left.filter((k) => !unresolved.includes(k));
   if (stuck.length) return { ...res, refused: `still flagged after the fix: ${stuck.join(" ")}` };
-  return { ...res, next };
+  return { ...res, next, pinMoves };
+}
+
+/** Rewrite each moved pin's string literal in tests/lib/pins.ts (exactly one match each, or refuse). */
+export function applyPinMoves(src: string, moves: { from: string; to: string }[]): string | string[] {
+  const errs: string[] = [];
+  let out = src;
+  for (const m of moves) {
+    const lit = JSON.stringify(m.from);
+    const n = out.split(lit).length - 1;
+    if (n !== 1) {
+      errs.push(`${n} literal matches for pin ${lit.slice(0, 60)}`);
+      continue;
+    }
+    out = out.replace(lit, JSON.stringify(m.to));
+  }
+  return errs.length ? errs : out;
 }
 
 function main(argv: string[]): number {
@@ -143,6 +179,7 @@ function main(argv: string[]): number {
   let n = 0;
   let written = 0;
   let refused = 0;
+  const moves: { from: string; to: string }[] = [];
   const unresolved = new Map<string, number>();
   for (const rel of files) {
     const path = join(DOCS, rel);
@@ -157,7 +194,17 @@ function main(argv: string[]): number {
     if (!r.next) continue;
     n += r.insertions.length;
     if (!dry) writeFileSync(path, r.next);
+    moves.push(...(r.pinMoves ?? []));
     written++;
+  }
+  if (moves.length) {
+    const pinsPath = join(import.meta.dir, "../tests/lib/pins.ts");
+    const res = applyPinMoves(readFileSync(pinsPath, "utf8"), moves);
+    if (Array.isArray(res)) {
+      for (const e of res) console.error(`PIN ${e}`);
+      refused++;
+    } else if (!dry) writeFileSync(pinsPath, res);
+    console.log(`${dry ? "would move" : "moved"} ${moves.length} pinned strings in tests/lib/pins.ts`);
   }
   console.log(`${dry ? "would insert" : "inserted"} ${n} expansions in ${written} files, ${refused} refused`);
   if (unresolved.size) {

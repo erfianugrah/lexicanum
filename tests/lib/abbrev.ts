@@ -318,7 +318,10 @@ function isExpanded(masked: string, start: number, end: number): boolean {
   if (/^, short for\s+\S/.test(after)) return true;
   const before = masked.slice(0, start);
   if (before.endsWith("(") && after.startsWith(")")) {
-    const lead = before.slice(0, -1).replace(/[\s"'*_]+$/, "");
+    // Complete parentheticals inside the lead are read through, so an expansion
+    // inserted for an earlier term (`port VLAN (virtual local area network) ID
+    // (PVID)`) does not cut the run of words that explains this one.
+    const lead = before.slice(0, -1).replace(/\([^()]*\)/g, "").replace(/[\s"'*_]+$/, "");
     // The words just before the parenthesis, up to the previous sentence break.
     const run = lead.slice(lead.search(/[^.!?:;(]*$/));
     if (wordsIn(run) >= 2) return true;
