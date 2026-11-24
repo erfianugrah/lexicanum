@@ -1,12 +1,12 @@
 # Second adversarial review
 
-Repo: ~/lexicanum (main, commit c8aa999). READ-ONLY everywhere: do not edit, stage or commit anything.
-The commit dd5557e..c8aa999 rewrote agent-harness doc pages (presentation, diagrams, AI-prose cleanup)
+Repo: ~/lexicanum (main, commit bcfc8a9). READ-ONLY everywhere: do not edit, stage or commit anything.
+The commit 35cf98c..bcfc8a9 rewrote agent-harness doc pages (presentation, diagrams, AI-prose cleanup)
 and also changed facts. A first review pass by a small model found almost nothing, which is not
 credible for ~2,000 changed lines written by agents. Assume the diff contains fabricated or wrongly
 "corrected" facts, and find them.
 
-For each assigned file: `git -C ~/lexicanum diff dd5557e c8aa999 -- <file>`.
+For each assigned file: `git -C ~/lexicanum diff 35cf98c bcfc8a9 -- <file>`.
 
 1. Every ADDED or CHANGED factual claim (number, date, count, file:line reference, config value,
    flag, default, behaviour statement, quoted code): open the cited or implied source and confirm.
@@ -28,7 +28,7 @@ For each assigned file: `git -C ~/lexicanum diff dd5557e c8aa999 -- <file>`.
    that restate, decorative bold, moralising closers, rhythm triplets, "quietly"/"the catch"/
    "worth noting"/"crucially".
 
-Final message: per file, a table: line (in c8aa999) | claim | verdict (WRONG / LOST / UNSUPPORTED /
+Final message: per file, a table: line (in bcfc8a9) | claim | verdict (WRONG / LOST / UNSUPPORTED /
 INCONSISTENT / LEAK / TELL) | evidence (file:line or command + output excerpt) | corrected text.
 List problems only, then one line with the number of claims you checked and found OK. Do not pad
 with OK rows. If a check could not be done, say which and why.

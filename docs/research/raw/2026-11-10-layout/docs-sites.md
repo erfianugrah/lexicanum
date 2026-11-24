@@ -297,7 +297,7 @@ sites don't do it) nor desirable (it creates zigzag left edges).
 
 Concretely:
 - Set content column `max-width: 45rem` (720px, Starlight's default) and revert
-  the custom wide breakpoints added in e3ff505.
+  the custom wide breakpoints added in 8fbc6d5.
 - Everything - prose, tables, code blocks, diagrams - shares this width.
 - At 2560px, the column centres with large margins; sidebars don't grow.
 - Prose at Newsreader 18px in 45rem = ~84 CPL (within the 65-85 preferred

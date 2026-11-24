@@ -1,8 +1,8 @@
-# Fact-check: commit 3ec4737
+# Fact-check: commit 0601630
 
 Provenance: all commit dates cited below (2025-07-01, 2025-12-17, 2026-02-17, 2026-06-09, 2026-08-03, 2026-10-15, 2026-10-27) are from `gh api repos/supabase/supabase/commits` output received this session - confirmed as present in session tool output.
 
-Commit: `3ec4737` - "docs(privatelink): track the live Supabase guide"
+Commit: `0601630` - "docs(privatelink): track the live Supabase guide"
 Files: `reference/supabase-aws-privatelink.mdx`, `guides/supabase-aws-privatelink-tofu.mdx`
 
 ## Sources checked
@@ -17,7 +17,7 @@ Files: `reference/supabase-aws-privatelink.mdx`, `guides/supabase-aws-privatelin
 | Guide @ 972b477 | https://raw.githubusercontent.com/supabase/supabase/972b477/apps/docs/content/guides/platform/privatelink.mdx | 2025-07-01 ("privatelink feature" - alpha) |
 | Features page | https://supabase.com/features/privatelink | 2026-10-30 (live) |
 | Read replicas doc | https://supabase.com/docs/guides/platform/read-replicas | 2026-10-30 (live) |
-| Lexicanum corpus | `rg` across src/content/docs | HEAD @ 3ec4737 |
+| Lexicanum corpus | `rg` across src/content/docs | HEAD @ 0601630 |
 | Git log (guide) | gh api repos/supabase/supabase/commits?path=...privatelink.mdx | 30 commits, 2025-07 to 2026-10 |
 
 ## Findings table

@@ -1,4 +1,4 @@
-# Fact-check: lexicanum commit 9c1f89e
+# Fact-check: lexicanum commit e52faaa
 
 Checked 2026-10-30 against the llmc repo (git log, source,
 presets live), arXiv 2609.26333, Berth README, and existing lexicanum prose.

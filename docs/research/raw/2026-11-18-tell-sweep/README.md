@@ -1,6 +1,6 @@
 # AI prose tell sweep, 2026-11-18
 
-`scripts/tell-review.ts` over every doc in `src/content/docs` (guides, reference, index: 198 files), one process per doc, 6 in parallel, google/gemini-4-argon through OpenRouter, temperature 0. Base commit `3602d1a` plus the uncommitted tell-review files.
+`scripts/tell-review.ts` over every doc in `src/content/docs` (guides, reference, index: 198 files), one process per doc, 6 in parallel, google/gemini-4-argon through OpenRouter, temperature 0. Base commit `2394332` plus the uncommitted tell-review files.
 
 | File | What it is |
 |---|---|

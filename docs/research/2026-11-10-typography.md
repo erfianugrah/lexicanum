@@ -9,7 +9,7 @@ say about each?
 > prose links at Lc 91+, References 17px; house kit 0.1.22+). Change 1 (the
 > measure) shipped as a 34rem cap, then a centred reading axis (kit
 > 0.1.23); the owner rejected both and the layout was reverted to the
-> single wide column (kit 0.1.24, lexicanum 822f96b). It was redone from
+> single wide column (kit 0.1.24, lexicanum 520f756). It was redone from
 > research on established docs sites and shipped as a two-width fluid
 > layout (kit 0.1.25, tuned through 0.1.28): see
 > `2026-11-10-layout.md`. The `house check` type step (house v0.1.21)
@@ -55,7 +55,7 @@ Other ink levels: dark 85% -78.8, 90% -85.5, 95% -91.9; light 85% 86.2,
 
 Neither the 78% body tone nor the 80-96rem widths were evaluated when chosen.
 78% came from restoring the pre-restyle look (house 1278086, 2026-11-09). The
-wide breakpoints (lexicanum e3ff505, 2026-07-15) were added so wide screens
+wide breakpoints (lexicanum 8fbc6d5, 2026-07-15) were added so wide screens
 would not show empty margins; that commit says the 96rem cap avoids
 "200-char prose lines", and the cap still allows 188.
 
