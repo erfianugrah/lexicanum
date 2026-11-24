@@ -104,6 +104,18 @@ describe("what counts as an explanation", () => {
     ["The (API) is used.", true], // one word before the parenthesis
     // an expansion the fixer inserted for an earlier term is read through
     ["the programming (a b) interface (API) is used.", false],
+    // compound-only: explained after the whole compound (SHA-256 (...))
+    ["An API-key header is used.", true],
+    ["An API-key (application programming interface) header is used.", false],
+    ["The v2/API path is used.", true],
+    // the other term of a compound is still checked (API in XML-API (...))
+    ["An XML-API (two words) is used; API is used.", true],
+    // words inside a compound's explanation are part of it, not a first use
+    ["An AAAA-only (API address record) host, then API (application programming interface).", false],
+    // a sentence-final dot is not a compound joiner
+    ["It calls the API. Then it stops.", true],
+    // the standalone use after a compound one is the first use
+    ["An API-key header, then the API is used.", true],
     ["API (see below) is used.", false], // the check cannot read meaning; two words pass
     ["API, as they say, is used.", true], // only the three forms count
     ["API is the application programming interface.", true], // a later sentence is not a gloss

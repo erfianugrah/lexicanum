@@ -97,7 +97,7 @@ export function removeInsertions(next: string, ins: Insertion[]): string | null 
   return out;
 }
 
-export function fixSource(rel: string, old: string, g: Glossary): FixResult {
+export function fixOnce(rel: string, old: string, g: Glossary): FixResult {
   const doc = parseMdx(rel, old);
   const words = new Set(g.words);
   const starts: number[] = [];
@@ -117,7 +117,14 @@ export function fixSource(rel: string, old: string, g: Glossary): FixResult {
     const expansion = f.plural ? (e.plural ?? e.expansion) : e.expansion;
     const bad = badExpansion(expansion);
     if (bad) return { file: rel, insertions: [], unresolved, refused: `${f.key}: ${bad}` };
-    insertions.push({ at: starts[f.line - 1]! + f.end, text: ` (${expansion})`, key: f.key, line: f.line });
+    const at = starts[f.line - 1]! + f.end;
+    // Two terms in one compound (AES-GCM) share the insertion point: one
+    // parenthetical, expansions in reading order, joined by '; '.
+    const same = insertions.find((i) => i.at === at);
+    if (same) {
+      same.text = same.text.slice(0, -1) + `; ${expansion})`;
+      same.key += `+${f.key}`;
+    } else insertions.push({ at, text: ` (${expansion})`, key: f.key, line: f.line });
   }
   const res: FixResult = { file: rel, insertions, unresolved };
   if (insertions.length === 0) return res;
@@ -138,17 +145,78 @@ export function fixSource(rel: string, old: string, g: Glossary): FixResult {
   const slug = rel.replace(/\.mdx?$/, "");
   const pinMoves: { from: string; to: string }[] = [];
   for (const p of pins.filter((x) => x.doc === slug)) {
-    for (const s of p.mustContain ?? []) {
+    // htmlContains strings that also appear in the source follow their sentence too.
+    for (const s of [...(p.mustContain ?? []), ...(p.htmlContains ?? [])]) {
       if (!old.includes(s) || next.includes(s)) continue;
       const to = followPin(old, s, insertions);
       if (!to || !next.includes(to)) return { ...res, refused: `pinned string no longer present: ${s.slice(0, 60)}` };
       pinMoves.push({ from: s, to });
     }
   }
-  const left = unexpandedFirstUses(parseMdx(rel, next), words).map((f) => f.key);
-  const stuck = left.filter((k) => !unresolved.includes(k));
-  if (stuck.length) return { ...res, refused: `still flagged after the fix: ${stuck.join(" ")}` };
   return { ...res, next, pinMoves };
+}
+
+/**
+ * Run the insertion pass until nothing is left to insert (at most 4 rounds):
+ * an insertion can move a term's first use (a compound's new explanation now
+ * holds an earlier occurrence), which only the next round sees. Each round is
+ * checked as above; the rounds' insertions are then re-verified together
+ * against the original text, so the whole result is still insertions only.
+ */
+export function fixSource(rel: string, old: string, g: Glossary): FixResult {
+  const words = new Set(g.words);
+  let cur = old;
+  const all: Insertion[] = [];
+  const moves: { from: string; to: string }[] = [];
+  let unresolved: string[] = [];
+  for (let round = 0; round < 4; round++) {
+    const r = fixOnce(rel, cur, g);
+    unresolved = r.unresolved;
+    if (r.refused) return { file: rel, insertions: [], unresolved, refused: r.refused };
+    if (!r.next) break;
+    // Map this round's offsets (in `cur`) back to offsets in `old`.
+    const prior = [...all];
+    for (const i of r.insertions) all.push({ ...i, at: toOldOffset(prior, i.at) });
+    for (const m of r.pinMoves ?? []) {
+      const prev = moves.find((x) => x.to === m.from);
+      if (prev) prev.to = m.to;
+      else moves.push(m);
+    }
+    cur = r.next;
+  }
+  const left = unexpandedFirstUses(parseMdx(rel, cur), words).map((f) => f.key);
+  const stuck = left.filter((k) => !unresolved.includes(k));
+  if (stuck.length) return { file: rel, insertions: [], unresolved, refused: `still flagged after the fix: ${stuck.join(" ")}` };
+  if (all.length === 0) return { file: rel, insertions: [], unresolved };
+  // Insertions at the same old offset from different rounds apply in round order.
+  if (applyAll(old, all) !== cur || removeInsertions(cur, all) !== old) {
+    return { file: rel, insertions: [], unresolved, refused: "removing the insertions does not give the old file" };
+  }
+  return { file: rel, insertions: all, unresolved, next: cur, pinMoves: moves };
+}
+
+/** An offset in the text after earlier rounds' insertions, mapped to the original text. */
+function toOldOffset(prior: Insertion[], at: number): number {
+  let shift = 0;
+  for (const p of [...prior].sort((a, b) => a.at - b.at)) {
+    // A prior insertion counts when it sits at or before `at` in the current text.
+    if (p.at + shift + p.text.length <= at) shift += p.text.length;
+    else if (p.at + shift >= at) break;
+    else throw new Error("insertion inside an earlier insertion");
+  }
+  return at - shift;
+}
+
+/** Apply insertions to the original text; same-offset ones keep their order in the list. */
+function applyAll(old: string, ins: Insertion[]): string {
+  const sorted = ins.map((x, k) => ({ ...x, k })).sort((a, b) => a.at - b.at || a.k - b.k);
+  let out = "";
+  let pos = 0;
+  for (const i of sorted) {
+    out += old.slice(pos, i.at) + i.text;
+    pos = i.at;
+  }
+  return out + old.slice(pos);
 }
 
 /** Rewrite each moved pin's string literal in tests/lib/pins.ts (exactly one match each, or refuse). */

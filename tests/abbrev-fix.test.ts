@@ -90,3 +90,19 @@ describe("pinned strings follow their sentence", () => {
     expect(Array.isArray(applyPinMoves(src + src, [{ from: "the API path is fixed", to: "x" }]))).toBe(true);
   });
 });
+
+describe("compounds", () => {
+  const cg: Glossary = { ...g, terms: { ...g.terms, AES: { expansion: "Advanced Encryption Standard" }, GCM: { expansion: "Galois Counter Mode" } } };
+  test("a compound-only term is explained after the whole compound", () => {
+    const r = fixSource("guides/x.mdx", "Keys use AES-256 here.\n", cg);
+    expect(r.next).toBe("Keys use AES-256 (Advanced Encryption Standard) here.\n");
+  });
+  test("two terms in one compound share one parenthetical", () => {
+    const r = fixSource("guides/x.mdx", "Cipher: AES-GCM is used.\n", cg);
+    expect(r.next).toBe("Cipher: AES-GCM (Advanced Encryption Standard; Galois Counter Mode) is used.\n");
+  });
+  test("a standalone use after a compound one takes the expansion", () => {
+    const r = fixSource("guides/x.mdx", "An API-key header, then the API is used.\n", g);
+    expect(r.next).toBe("An API-key header, then the API (application programming interface) is used.\n");
+  });
+});

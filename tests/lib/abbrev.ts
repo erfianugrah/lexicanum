@@ -19,7 +19,9 @@
  * the expansion and a reader meets the paragraph's text first. A term that
  * never occurs in paragraph prose uses its first table cell instead; a term
  * that occurs only in headings has no prose to explain it in and is exempt
- * (rule `heading-only`).
+ * (rule `heading-only`). An occurrence joined to letters or digits by
+ * - . / + & (FR-4, MS-01, GL.iNet, PM2.5, USB-C) is part of a name and never
+ * the first use; a term seen only that way is exempt (rule `compound-only`).
  *
  * Never inspected: frontmatter, code fences, inline code spans, MDX comments,
  * URLs and link targets, HTML/JSX tags and attributes, footnote definitions
@@ -80,6 +82,19 @@ export interface Occurrence {
   expanded: boolean;
   /** Name of the exemption rule that removes it from the check, if any. */
   exempt: string | null;
+  /**
+   * Joined to letters or digits by - . / + & (FR-4, MS-01, GL.iNet, PM2.5,
+   * USB-C, RX/TX): part of a name or compound. Such an occurrence is never the
+   * first use and never takes an insertion, because `FR (flame retardant)-4`
+   * splits the name; the next standalone occurrence is the first use. A term
+   * that only ever appears inside compounds is explained after the WHOLE
+   * compound instead (`SHA-256 (Secure Hash Algorithm)`): see `compoundEnd`.
+   */
+  compound: boolean;
+  /** For a compound occurrence: column just after the whole compound (insertion point). */
+  compoundEnd: number;
+  /** For a compound occurrence: the compound already carries an explanation after it. */
+  compoundExpanded: boolean;
 }
 
 export interface Finding {
@@ -89,6 +104,8 @@ export interface Finding {
   end: number;
   plural: boolean;
   context: Context;
+  /** The first use sits inside a compound; `end` is the end of the whole compound. */
+  compound?: boolean;
 }
 
 /** What a rule sees: the token and the masked text around it on its line. */
@@ -182,7 +199,7 @@ export const EXEMPTIONS: Exemption[] = [
   },
   {
     name: "capitalised-word",
-    reason: "a word or brand name in capitals that stands for nothing (HIT, NVIDIA); the list is data/abbreviations.json `words`, reviewed by hand",
+    reason: "a word, brand or identifier in capitals that a reader does not need expanded (HIT, NVIDIA, EUR, a register name used across docs); the list is data/abbreviations.json `words`, reviewed by hand",
     test: (i, words) => words.has(i.key),
     term: "HIT",
     exempt: "The status is HIT here.",
@@ -310,6 +327,18 @@ export function badExpansion(s: string): string | null {
   return null;
 }
 
+/** Compound flags for the occurrence at [start, end) of the masked line. */
+function compoundInfo(masked: string, start: number, end: number): { compound: boolean; compoundEnd: number; compoundExpanded: boolean } {
+  const compound = /[A-Za-z0-9][-./+&]$/.test(masked.slice(0, start)) || /^[-./+&][A-Za-z0-9]/.test(masked.slice(end));
+  if (!compound) return { compound, compoundEnd: end, compoundExpanded: false };
+  // Back to the compound's first character, then forward over the whole compound.
+  let s = start;
+  while (s > 0 && /[A-Za-z0-9]/.test(masked[s - 1]!) || (s > 1 && /[-./+&]/.test(masked[s - 1]!) && /[A-Za-z0-9]/.test(masked[s - 2]!))) s--;
+  const m = masked.slice(s).match(/^[A-Za-z0-9]+(?:[-./+&][A-Za-z0-9]+)*/);
+  const compoundEnd = s + (m ? m[0].length : 0);
+  return { compound, compoundEnd, compoundExpanded: isExpanded(masked, s, compoundEnd) };
+}
+
 /** The occurrence carries one of the three accepted explanations. */
 function isExpanded(masked: string, start: number, end: number): boolean {
   const after = masked.slice(end);
@@ -368,15 +397,26 @@ export function occurrences(doc: Doc, words: Set<string> = glossaryWords()): Occ
     // The words of an inline explanation `ABBR (expansion)` are part of that
     // explanation: `JWT (JSON Web Token)` does not make JSON used before its
     // own explanation.
+    // [skipFrom, skipUntil): the parenthetical of an inline explanation. Only
+    // tokens inside the parentheses belong to it; the rest of the compound
+    // (`HC` in `MPC-HC (Home Cinema)`) is still a term of its own.
+    let skipFrom = 0;
     let skipUntil = 0;
     for (const m of masked.matchAll(WORD)) {
       const t = parseToken(m[0]);
       if (!t) continue;
       const start = m.index!;
-      if (start < skipUntil) continue;
+      if (start >= skipFrom && start < skipUntil) continue;
       const end = start + m[0].length;
-      const inline = masked.slice(end).match(/^ ?\(([^()]*)\)/);
-      if (inline && explainsInline(inline[1]!)) skipUntil = end + inline[0].length;
+      const comp = compoundInfo(masked, start, end);
+      // The explanation sits right after the token, or after the whole compound
+      // (`AAAA-only (IPv6 address record)`); its words belong to it either way.
+      const at = comp.compound ? comp.compoundEnd : end;
+      const inline = masked.slice(at).match(/^ ?\(([^()]*)\)/);
+      if (inline && explainsInline(inline[1]!) && at + inline[0].length > skipUntil) {
+        skipFrom = at;
+        skipUntil = at + inline[0].length;
+      }
       const info: Info = {
         key: t.key,
         prefix: t.prefix,
@@ -397,6 +437,7 @@ export function occurrences(doc: Doc, words: Set<string> = glossaryWords()): Occ
         context,
         expanded: isExpanded(masked, start, end),
         exempt: rule?.name ?? null,
+        ...comp,
       });
     }
   }
@@ -411,15 +452,21 @@ export function unexpandedFirstUses(doc: Doc, words: Set<string> = glossaryWords
   const ok = ignoreOk ? new Set<string>() : okTerms(doc);
   const first = new Map<string, Occurrence>();
   const live = occurrences(doc, words).filter((o) => !o.exempt && !ok.has(o.key));
-  for (const ctx of ["paragraph", "table"] as const) {
-    for (const o of live) {
-      if (o.context === ctx && !first.has(o.key)) first.set(o.key, o);
+  // Standalone occurrences first; a term that never stands alone takes its
+  // first compound occurrence, explained after the whole compound.
+  for (const compound of [false, true]) {
+    for (const ctx of ["paragraph", "table"] as const) {
+      for (const o of live) {
+        if (o.compound === compound && o.context === ctx && !first.has(o.key)) first.set(o.key, o);
+      }
     }
   }
   // Headings never set a first use: a key seen only there is the `heading-only` exemption.
   return [...first.values()]
-    .filter((o) => !o.expanded)
-    .map(({ key, line, start, end, plural, context }) => ({ key, line, start, end, plural, context }))
+    .filter((o) => !(o.compound ? o.compoundExpanded : o.expanded))
+    .map(({ key, line, start, end, plural, context, compound, compoundEnd }) =>
+      compound ? { key, line, start, end: compoundEnd, plural: false, context, compound } : { key, line, start, end, plural, context },
+    )
     .sort((a, b) => a.line - b.line || a.start - b.start);
 }
 
