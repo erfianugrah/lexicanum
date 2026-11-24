@@ -20,6 +20,9 @@ const taxonomy = z.object({
 	// Old published URLs for this doc (leading slash, no trailing slash) -
 	// emitted as Astro redirects. Use when renaming or moving the doc.
 	aliases: z.array(z.string()).optional(),
+	// Abbreviations this doc deliberately leaves unexplained at first use
+	// (tests/lib/abbrev.ts). Rare; the abbreviations test fails on a stale entry.
+	'abbreviations-ok': z.array(z.string()).optional(),
 });
 
 export const collections = {
