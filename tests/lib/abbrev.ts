@@ -225,6 +225,24 @@ export const EXEMPTIONS: Exemption[] = [
     flaggedKey: "TL",
   },
   {
+    name: "attached-paren",
+    reason: "a token with a parenthesis attached, no space (HTTP(S), COM(2026)), is a name or reference whose parenthesis is part of it",
+    test: (i) => i.after.startsWith("("),
+    term: "COM",
+    exempt: "See COM(2026) 502 final.",
+    flagged: "See COM 502 final.",
+    flaggedKey: "COM",
+  },
+  {
+    name: "currency-prefix",
+    reason: "a country prefix on a currency amount (US\\$146) is part of the currency, not a term",
+    test: (i) => /^\\?\$\d/.test(i.after),
+    term: "US",
+    exempt: "It costs US\\$146 here.",
+    flagged: "It ships from the US here.",
+    flaggedKey: "US",
+  },
+  {
     name: "roman-numeral",
     reason: "a Roman numeral after a numbering word (Part IV, Phase II) numbers a section",
     test: (i) => ROMAN.test(i.key) && NUMBERING_WORD.test(i.before),
@@ -342,11 +360,12 @@ function compoundInfo(masked: string, start: number, end: number): { compound: b
 /** The occurrence carries one of the three accepted explanations. */
 function isExpanded(masked: string, start: number, end: number): boolean {
   const after = masked.slice(end);
-  const a = after.match(/^ ?\(([^()]*)\)/);
+  const a = after.match(/^\s?\(([^()]*)\)/);
   if (a && explainsInline(a[1]!)) return true;
   if (/^, short for\s+\S/.test(after)) return true;
   const before = masked.slice(0, start);
-  if (before.endsWith("(") && after.startsWith(")")) {
+  // `expansion (ABBR)` and `expansion (ABBR - gloss)` / `(ABBR, ...)`.
+  if (before.endsWith("(") && /^(?:\)|\s?[-,;:]\s)/.test(after)) {
     // Complete parentheticals inside the lead are read through, so an expansion
     // inserted for an earlier term (`port VLAN (virtual local area network) ID
     // (PVID)`) does not cut the run of words that explains this one.
@@ -389,59 +408,101 @@ export function occurrences(doc: Doc, words: Set<string> = glossaryWords()): Occ
     inFootnote: false,
     math: doc.lines.some((l) => l.kind === "comment" && /prose-dollar: math-intentional/.test(l.raw)),
   };
+  // Masked prose lines, grouped into blocks the reader meets as one unit: a
+  // paragraph or list item is consecutive paragraph lines (an explanation may
+  // wrap onto the next line); a heading or a table row is a block of its own.
+  type Row = { n: number; masked: string; context: Context };
+  const blocks: Row[][] = [];
+  let cur: Row[] = [];
   for (const l of doc.lines) {
-    if (l.kind !== "prose") continue;
-    const masked = maskLine(l.raw, st);
-    if (masked.trim() === "") continue;
+    const masked = l.kind === "prose" ? maskLine(l.raw, st) : "";
     const context = contextOf(l.raw);
-    // The words of an inline explanation `ABBR (expansion)` are part of that
-    // explanation: `JWT (JSON Web Token)` does not make JSON used before its
-    // own explanation.
+    const listItem = /^\s*(?:[-*+]|\d+[.)])\s/.test(l.raw);
+    if (masked.trim() === "" || context !== "paragraph" || listItem) {
+      if (cur.length) blocks.push(cur);
+      cur = [];
+      if (masked.trim() === "") continue;
+      if (context !== "paragraph") {
+        blocks.push([{ n: l.n, masked, context }]);
+        continue;
+      }
+    }
+    cur.push({ n: l.n, masked, context });
+  }
+  if (cur.length) blocks.push(cur);
+
+  for (const rows of blocks) {
+    // One string per block, lines joined by "\n"; quotations blanked so a quoted
+    // message (`"JWT expired"`) is never a first use and never takes an insertion.
+    const text = blankQuotes(rows.map((r) => r.masked).join("\n"));
+    const lineStart: number[] = [];
+    let p = 0;
+    for (const r of rows) {
+      lineStart.push(p);
+      p += r.masked.length + 1;
+    }
+    const where = (pos: number) => {
+      let i = lineStart.length - 1;
+      while (i > 0 && lineStart[i]! > pos) i--;
+      return { row: rows[i]!, col: pos - lineStart[i]! };
+    };
     // [skipFrom, skipUntil): the parenthetical of an inline explanation. Only
     // tokens inside the parentheses belong to it; the rest of the compound
     // (`HC` in `MPC-HC (Home Cinema)`) is still a term of its own.
     let skipFrom = 0;
     let skipUntil = 0;
-    for (const m of masked.matchAll(WORD)) {
+    for (const m of text.matchAll(WORD)) {
       const t = parseToken(m[0]);
       if (!t) continue;
       const start = m.index!;
       if (start >= skipFrom && start < skipUntil) continue;
-      const end = start + m[0].length;
-      const comp = compoundInfo(masked, start, end);
+      // A joined suffix belongs to the token: SFP+, PKCS#7.
+      const tail = text.slice(start + m[0].length).match(/^(?:\+(?![A-Za-z0-9])|#\d+)/);
+      const end = start + m[0].length + (tail ? tail[0].length : 0);
+      const comp = compoundInfo(text, start, end);
       // The explanation sits right after the token, or after the whole compound
       // (`AAAA-only (IPv6 address record)`); its words belong to it either way.
       const at = comp.compound ? comp.compoundEnd : end;
-      const inline = masked.slice(at).match(/^ ?\(([^()]*)\)/);
+      const inline = text.slice(at).match(/^\s?\(([^()]*)\)/);
       if (inline && explainsInline(inline[1]!) && at + inline[0].length > skipUntil) {
         skipFrom = at;
         skipUntil = at + inline[0].length;
       }
+      const { row, col } = where(start);
       const info: Info = {
         key: t.key,
         prefix: t.prefix,
         core: t.core,
         suffix: t.suffix,
-        before: masked.slice(0, start),
-        after: masked.slice(end),
-        context,
+        before: text.slice(0, start),
+        after: text.slice(end),
+        context: row.context,
       };
       const rule = EXEMPTIONS.find((r) => r.test(info, words));
+      // Insertion points must stay on the token's own line: a compound never
+      // spans a line break (WORD and the joiners exclude "\n").
       out.push({
         key: t.key,
         token: t.key,
         plural: t.plural,
-        line: l.n,
-        start,
-        end,
-        context,
-        expanded: isExpanded(masked, start, end),
+        line: row.n,
+        start: col,
+        end: col + (end - start),
+        context: row.context,
+        expanded: isExpanded(text, start, end),
         exempt: rule?.name ?? null,
-        ...comp,
+        compound: comp.compound,
+        compoundEnd: col + (comp.compoundEnd - start),
+        compoundExpanded: comp.compoundExpanded,
       });
     }
   }
   return out;
+}
+
+/** Blank double-quoted spans (same length), so quotations stay verbatim. */
+function blankQuotes(s: string): string {
+  return s.replace(/"[^"]{1,400}"/g, (q) => q.replace(/[^\n]/g, " "));
 }
 
 /**

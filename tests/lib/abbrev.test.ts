@@ -108,6 +108,16 @@ describe("what counts as an explanation", () => {
     ["An API-key header is used.", true],
     ["An API-key (application programming interface) header is used.", false],
     ["The v2/API path is used.", true],
+    // an explanation that wraps onto the next line of the paragraph
+    ["The API (application programming\ninterface) is used.", false],
+    // `expansion (ABBR - gloss)`
+    ["application programming interface (API - the contract) is used.", false],
+    // a quotation is never a first use
+    ['The error "API expired" appears; the API (application programming interface) is used.', false],
+    // a term only seen in a quotation is not flagged
+    ['The error "API expired" appears.', false],
+    // a joined suffix belongs to the token: API+ takes the explanation after the +
+    ["An API+ (application programming interface) card.", false],
     // the other term of a compound is still checked (API in XML-API (...))
     ["An XML-API (two words) is used; API is used.", true],
     // words inside a compound's explanation are part of it, not a first use
