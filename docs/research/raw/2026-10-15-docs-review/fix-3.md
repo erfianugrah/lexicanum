@@ -203,7 +203,7 @@ the author's vocabulary, reported in round 1 and left alone here.
 
 ### guides/wsl2-disk-reclaim.mdx
 A: `## File reference` added (meta's `F`) - the two VHDX path patterns plus Docker Desktop's,
-`.wslconfig`, `/etc/wsl.conf`, `/etc/fstab`, `vhd-script.ps1` and `%TEMP%`, all from the doc's own
+`.wslconfig`, `/etc/wsl.conf`, `/etc/fstab`, the VHD compaction script and `%TEMP%`, all from the doc's own
 parts. C (soft note, left as authored): "my dotfiles" here against the sibling docs' "the
 dotfiles repo". That is first-person voice, not a rotation.
 

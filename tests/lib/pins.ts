@@ -1414,8 +1414,8 @@ export const pins: Pin[] = [
     // matters here: `secretctl set`'s dotenv-newline refusal was overly
     // strict until 2026-09-29 (it did not canonicalise a trailing newline
     // before checking, unlike fp/cmp) and was fixed the same day; this page
-    // states the fixed behaviour, re-verified this run against HEAD
-    // `<rev>`, and must not describe the old refusal as a still-open
+    // states the fixed behaviour, re-verified this run against the
+    // then-current HEAD, and must not describe the old refusal as a still-open
     // trap. It also keeps the Postgres role-rotation aside generic (no
     // named stack), per the same HELD list.
     doc: SECRETCTL_ROTATION,

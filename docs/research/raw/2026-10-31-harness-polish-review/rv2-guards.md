@@ -53,7 +53,7 @@ Checked and found OK, about 70 claims. They include:
 - The server gate: 10 repos plus a canary, `-o leak-gate.skip`, 120 s timeout, fails closed, server-own gitleaks config, `git log -p --format` plus `grep -v`.
 - `leak-gate-terms-sync` run by hand.
 - Push protection on 12 repos.
-- The 2026-10-20 worker reversal (<rev>).
+- The 2026-10-20 worker reversal.
 - Session report as a notification on `agent_end`.
 - The visibility-cache fallback and the 7-day staleness rule.
 - Signing and identity bypass flags.

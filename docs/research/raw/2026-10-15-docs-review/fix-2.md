@@ -125,7 +125,7 @@ Files edited: 19 of the 23 in `batches/batch-2.txt`. No git operations run.
   rule 14 (the round-1 fallback omitted `forward_r14`); Gotchas and lessons
   learned (14 bullets from the doc's Asides, `:::danger` blocks and Part 6
   findings) and Related docs (Traefik on k3s, ARM64 k3s cluster operations,
-  Gloryhole DoT / VyOS) added. B: the ad-copy lede sentence rewritten; the
+  Glory-Hole DoT / VyOS) added. B: the ad-copy lede sentence rewritten; the
   three capsule labels (`**Critical configuration details:**`, `**Gotchas:**`,
   `**Diagnosis flow:**`) removed, leaving their tables; the two `<Aside>`
   blocks converted to `:::caution[...]` and the now-unused Starlight import

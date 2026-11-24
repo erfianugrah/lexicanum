@@ -124,7 +124,7 @@ Large (1164 lines) stack walkthrough, pre-contract.
   commands are in `## Build and test` / `## Deploy workflow` instead of a verification table.
   Pre-contract, so report only.
 - B:
-  - `Note that the wafctl stage (5) compiles the sidecar binary ...` - importance-announcing
+  - `Note that the sidecar stage (5) compiles the sidecar binary ...` - importance-announcing
     frame on the `note the` pattern the erfi-voice sweep names. **Fixed.**
   - `This makes the dashboard Settings panel the single source of truth for WAF mode,
     preventing configuration drift.` - present-participle tail stating a consequence the
@@ -138,7 +138,7 @@ Large (1164 lines) stack walkthrough, pre-contract.
 - C: em-dash 0, semicolons 3, no smart punctuation. `---` separators throughout (pre-contract
   house position).
 - D: versions internal to the doc agree (the pinned Caddy image tag, the Coraza fork commit
-  `<fork-commit>`, CRS v4.21.0 to v4.23.0, one cron job, IPsum refresh by the Go scheduler not
+  the fork commit, CRS v4.21.0 to v4.23.0, one cron job, IPsum refresh by the Go scheduler not
   cron). No cross-doc check of the live stack was in scope.
 - Fixes applied: dropped `Note that`, keeping every fact and the `**not**` emphasis.
 - Local verify: prose-lint slop 0.04, referent-rotation 1 (pre-existing), no gate; build green.
@@ -251,7 +251,7 @@ verification table, gotchas, file reference, related docs.
   - Not touched: `The public-backup set is not a list maintained by hand at conversion time;
     it is read from the tool's own configuration` - an honest contrast carrying real
     information about where the list lives.
-- C: `fleet-migrate` as a bare CLI name in prose (backticked in the table, unbackticked in the
+- C: the fleet script as a bare CLI name in prose (backticked in the table, unbackticked in the
   closing sentences) - cosmetic, report. Otherwise clean.
 - D: verification table (`47 of 47`, `269` repositories, `206` push mirrors) is internally
   consistent, and the run date (2026-09-29) matches the wave chronology (last pull mirror

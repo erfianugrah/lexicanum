@@ -215,7 +215,7 @@ the most secure method.`; C: broken `description:` clause; D: provider 4.5.2 vs 
 - A: nothing missing. B: already fixed in the previous pass. The remaining review items are the
   `Two things made the visibility pass ... worth re-checking:` count-plus-subject frame (the
   reviewer judged any rewrite a wash, and the sentence carries the reason for the re-check) and
-  the `fleet-migrate` mention in the `## Part 2` heading, which the frontmatter and prose spell
+  the fleet-script mention in the `## Part 2` heading, which the frontmatter and prose spell
   consistently between themselves; backticking the heading is a text change beyond casing, which
   the brief forbids. Reported, not applied.
 - The `mean-sentence-ceiling` gate failure (mean 33.5) is pre-existing; see "Not applied".
