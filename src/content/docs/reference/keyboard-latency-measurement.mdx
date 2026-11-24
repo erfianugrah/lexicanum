@@ -1,0 +1,250 @@
+---
+title: "Measuring keyboard latency on High-Speed USB: rig, instruments and method"
+description: How to measure key-to-wire latency for an 8 kHz High-Speed USB keyboard - where the clock starts and stops, polling quantisation at 1 ms and 125 us, what an oscilloscope, a logic analyser and a USB analyser can each see, putting an external trigger on the USB packet timeline with a Cynthion, firmware event pins, hardware SOF output, the regression that removes threshold differences between firmwares, calibration with a known-delay device, run protocol and statistics, and the test access to design into the next board.
+author: Erfi Anugrah
+category: hardware
+---
+
+How to measure the time from a key press to the keyboard's report on a USB 2.0 High-Speed wire, for a keyboard that reports every 125 us microframe (8 kHz). It is written for someone with an oscilloscope and a keyboard whose firmware they can change, and it uses [GRIDDLE LX](/reference/griddle-lx-hall-effect-keyboard/), a 5x12 Hall-effect board on an AT32F405, as the worked example.
+
+Provenance: this is the method as worked out on 2026-11-24 for the GRIDDLE LX rig, before the rig's first run. One number on this page is measured (the scan's phase lock to the USB frame, read from the firmware's own log on one rev 1 board); every other number is either documented (cited) or derived (formula given). The instruments are a Rigol MHO954 oscilloscope, a 24 MHz FX2 logic analyser, a Faultier (a fault-injection board, used here as a programmable delay generator) and a Great Scott Gadgets Cynthion USB analyser.
+
+**TL;DR:**
+
+- Start the clock at the key stem (an optical sensor on the stem) and stop it at the report packet on the USB wire. Anything in between (the Hall sensor output, a firmware timestamp, the host's input event) is a proxy with its own offset.
+- Polling alone spreads a measurement by frame / sqrt(12): about 289 us at 1 ms frames and about 36 us at 125 us microframes (derived). An 8 kHz device measured through a 1 ms host is mostly measuring the host.
+- An oscilloscope sees voltages, not packets: the MHO954 has no USB decoder, so on a High-Speed link it shows burst envelopes only. A USB analyser decodes the wire but a stock Cynthion cannot record an external signal. A small gateware change puts a trigger input on the analyser's 60 MHz packet clock; that is what joins the two, so far proven only in simulation.
+- Firmware event pins (scan frame end, SOF, report written, press decided) show where the time goes inside the device; a hardware SOF output from the USB core (documented for the AT32F405, not yet tried) avoids the interrupt latency of an interrupt-raised pin.
+- Two firmwares may decide "pressed" at different sensor voltages, so compare them with a regression on press speed, not raw means.
+- Calibrate the rig with a device whose delay you set yourself, and repeat every run after a replug: if two runs of the same board differ by more than the within-run 95% interval, the rig is the problem.
+
+## Topology
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  { rank=same; stem [label="key stem\n(optical flag)"]; hall [label="Hall sensor\noutput"]; }
+  { rank=same; mcu [label="keyboard MCU\nscan -> decide -> report"]; pins [label="event pins\nframe end, SOF,\nreport written, press"]; }
+  { rank=same; wire [label="USB 2.0 HS wire\n125 us microframes"]; host [label="PC (host)"]; }
+  { rank=same; scope [label="oscilloscope\n(voltages)"]; ana [label="USB analyser\n(packets + trigger in)"]; }
+
+  stem -> hall [label="magnet moves"];
+  hall -> mcu [label="mux, ADC"];
+  mcu -> pins;
+  mcu -> wire [label="IN token -> DATA"];
+  wire -> host;
+  stem -> scope [label="sensor edge", style=dashed];
+  stem -> ana [label="same edge\n(trigger input)", style=dashed];
+  pins -> scope [style=dashed];
+  wire -> ana [label="inline", style=dashed];
+}
+```
+
+The stem sensor's edge goes to both instruments. The analyser gives edge-to-packet on the wire; the scope gives everything inside the keyboard relative to the same edge. The shared edge is what lets the two be added.
+
+## Which instrument answers which question
+
+| Question | Instrument | Why that one |
+|---|---|---|
+| When does the report reach the wire after the stem moves? | USB analyser with a trigger input, stem sensor on the trigger | decodes the High-Speed packet and stamps the edge on the same clock |
+| Does the device answer every microframe, with no gaps? | USB analyser alone | counts IN tokens and DATA packets per microframe; no trigger needed |
+| Where inside the firmware does the time go? | oscilloscope on the event pins plus the stem or Hall signal | edges inside the MCU are invisible on the wire |
+| Is the rig itself right? | known-delay reference device plus a delay generator, read on the scope | a delay the rig did not choose |
+| Long unattended runs of digital edges | logic analyser | cheaper to leave running than a scope; at 24 MSa/s it resolves 41.7 ns, too slow for USB data |
+
+## What latency means here
+
+The start point is the stem passing the switch's actuation point, seen by an optical sensor with a flag on the stem. The end point is the first bit of the DATA packet that carries the press, on the wire between the keyboard and the host. The GRIDDLE LX rig has no stem sensor yet; its first plan uses the Hall sensor output crossing a trigger voltage as the stand-in, with the regression in [Comparing two firmwares](#comparing-two-firmwares-on-the-same-hardware) to remove the threshold difference.
+
+Each common substitute moves one end:
+
+| Substitute | What it adds or hides |
+|---|---|
+| Hall sensor output crossing a voltage | hides the magnet-to-voltage step; the crossing voltage differs per firmware threshold |
+| A firmware timestamp | measures only the code after the timestamp |
+| The host's interrupt or input event | adds the host controller, driver and scheduling; a late deferred procedure call merges reports ([Fixing merged reports from an 8 kHz mouse on Windows](/guides/8khz-mouse-merged-reports-windows/)) |
+| Burst length on a scope probe at D+ | works only when an idle device answers NAK and a press answers DATA; a device that sends DATA every poll gives no visible change |
+
+An optical sensor has its own fixed delay. A fixed delay subtracts out once calibrated on the scope; only its jitter limits the result.
+
+## Polling quantisation
+
+A press lands at a random phase inside the polling interval. With the phase uniform over one interval T, the wait has mean T/2 and standard deviation T/sqrt(12) (derived):
+
+| Polling | Interval | Mean wait | SD of the wait |
+|---|---|---|---|
+| 1 kHz (Full-Speed frame) | 1 ms | 500 us | 289 us |
+| 8 kHz (High-Speed microframe) | 125 us | 62.5 us | 36 us |
+
+High-Speed USB divides each 1 ms frame into eight 125 us microframes.[^usb2] The 1 kHz spread is larger than every electrical error in the rig, so a rig with a Full-Speed host cannot resolve an 8 kHz device. Report distributions with the polling phase logged per sample, never a mean alone.
+
+## Where the end stamp is taken
+
+| Method | End stamp | Example |
+|---|---|---|
+| Analyser on the wire | the packet itself, on the analyser's packet clock | Beagle USB 480 (digital input changes timestamped when the analyser interprets them)[^beagle-io]; Cynthion with a trigger input (below) |
+| The rig is the USB host | the host controller's interrupt in the rig's MCU | XLAT: electrical click to the USB packet at its own host, reported in microseconds[^xlat] |
+| The PC | an OS input event | adds the whole PC; useful for end-to-end, not for the device |
+
+A rig that is its own host should stamp when the packet lands in the receive FIFO, not at transfer complete. On the AT32F405's OTG controller the receive-FIFO-level (RXFLVL) interrupt fires as the IN packet arrives, before the transfer-complete interrupt.[^at32-rm] The offset between that stamp and the packet's last bit on the wire is a calibration constant to measure, not to assume.
+
+## The oscilloscope's limits
+
+The MHO954 is a 4-channel, 500 MHz, 12-bit scope that samples at 4 GSa/s on one channel, 2 GSa/s each on two and 1 GSa/s each on four; its included serial decoders are I2C, SPI, RS232/UART, CAN and LIN.[^mho954] On a 480 Mb/s link it shows burst envelopes and timing between bursts, not decoded packets. Uses that work:
+
+- sensor and marker edges against each other, at nanosecond resolution once the probes are deskewed;
+- D+ activity against the press, single-ended, for "a burst appeared" and burst spacing (with the device set to 8 kHz, a 125 us cadence confirms High-Speed and a 1 ms cadence means the link fell back to Full-Speed);
+- the actuator's turn-on and the sensor's delay, for the calibration table.
+
+A probe on a live High-Speed pair loads it. Read D+ for activity and timing only, never for signal quality.
+
+## Putting a trigger on the USB packet timeline
+
+A stock Cynthion runs as a passive analyser between its TARGET C port (to the host) and TARGET A port (to the device), with captures sent out of the CONTROL port to Packetry.[^cynthion-tut] Packetry's non-packet events cover events on the bus and in the capture process; its pull request says logic signals on the Cynthion's Pmod ports are out of scope for that mechanism because they can occur mid-packet.[^packetry-227]
+
+| Option | External signal in the capture | Price seen 2026-11-24 |
+|---|---|---|
+| Cynthion, stock gateware | no | - |
+| Cynthion with a trigger-input gateware change | yes: Pmod A pin 1 edges stamped on the analyser's 60 MHz clock, exact when the edge lands mid-packet (simulation only so far) | the Cynthion |
+| Total Phase Beagle USB 480 | yes: four digital inputs, each change stamped; one input event per active packet, the rest handled after the packet[^beagle-io] | - |
+| ataradov usb-sniffer (open hardware) | yes, through a filtered trigger input that is written as a status record[^usb-sniffer] | the cost of building one |
+
+The gateware change works because the Cynthion analyser already writes non-packet events as records with a cycle delta on its 60 MHz USB clock.[^cynthion-analyzer] A trigger edge is one more event source. An edge that arrives while a packet is being written is held in a pending slot with an age counter and written after the packet with the time minus its age, so the timestamp stays on the edge. If another record already went out after the edge, the edge is marked late and analysis discards it rather than mis-time it. The offset from the pin to the wire (input synchroniser plus the PHY's receive latency) still has to be calibrated on the scope.
+
+The same FPGA can drive a Pmod output as well: a pulse when a DATA packet follows an IN token to the keyboard's address and endpoint, and another on every SOF, puts the report and the wire's SOF on the scope's own timeline, as the Beagle's digital outputs do on PID, address and endpoint matches.[^beagle-io] Design only; not built.
+
+Building that change in simulation also turned up an upstream timestamp bug: the packet-start branch resets the cycle counter to 0 where the event branch uses 1, and in simulation every packet after the first was stamped one 60 MHz cycle (16.67 ns) early, the error accumulating over a capture. No capture from stock hardware has been checked for it yet; until then, do not compare absolute times between the stock bitstream and a fixed one. Not yet filed upstream as of 2026-11-24.
+
+The Pmod pins are 3.3 V LVCMOS on the ECP5 FPGA.[^cynthion-pmod] Feed the trigger input from a 3.3 V logic output, with its ground on a Pmod ground pin.
+
+## Firmware event pins and a hardware SOF
+
+On a board whose firmware you own, put the internal events on GPIOs and read them on the scope against the stem edge:
+
+| Event | Raised when |
+|---|---|
+| scan frame end | the last mux channel of a scan frame is processed |
+| SOF | the USB interrupt sees a start of frame |
+| report written | the keyboard report is written to the IN endpoint's FIFO |
+| press decided | a key goes from released to pressed in the decided state |
+
+Raise each with one write to the port's set register and drop them all with one write at the next scan interrupt, so the rising edge is the timestamp and the cost is one store per event. Each event pin still adds a store per event, so keep these builds out of A/B comparisons.
+
+An SOF pin raised by the interrupt includes the interrupt entry latency. The AT32F405 can drive the SOF pulse from the USB core itself: the OTGHS SOF signal is an alternate function of PA4, enabled by the SOFOUTEN bit in the OTG global configuration register.[^at32-rm] That is documented and not yet tried on this board, and the core sees the SOF after the PHY, so it is still a constant offset from the wire's SOF. On GRIDDLE LX rev 1, PA4 is a mux output into the ADC, so rev 1 only has the interrupt-raised SOF; the next board keeps PA4 free for it.
+
+## Phase-locking the scan to the USB frame
+
+"Frame sync" means aligning the keyboard's scan clock with the host's polling clock. The only signal a USB device gets about the host's polling phase is the SOF. Locking the scan to it buys sample age, not peak speed: if a scan frame is shorter than the polling interval, and the host's IN token sits at a stable offset inside the microframe, the average age of the sample in the report drops by about half a scan period and its jitter shrinks (derived: a free-running scan finishes at a random phase before the IN token, so the sample waits half a scan period on average; a locked scan finishes a fixed lead before it).
+
+An in-house firmware running on one GRIDDLE LX rev 1 board (in place of libhmk) runs two scan frames per microframe and nudges its scan timer toward a target a fixed lead before each SOF. Measured: on 2026-11-24, with the lead target set to 62 us, the firmware's own log over its last 64 SOFs showed a phase error between -38 and +44 timer ticks at 216 MHz (-0.18 to +0.20 us), median 1 tick, locked. Whether 62 us is the right lead has not been measured. That is the firmware's self-report from its own timestamps, not an external measurement; the event pins above are how the scope checks it.
+
+## Comparing two firmwares on the same hardware
+
+Two firmwares may decide "pressed" at different sensor voltages, so the time from a fixed scope trigger level to the report differs by the threshold difference divided by how fast the voltage rose. Record the slope s of the sensor signal at the trigger crossing for each press and fit:
+
+`t_burst - t_cross = t_fw + (V_act - V_level) / s`
+
+Across presses of different speeds, the intercept t_fw is the firmware's latency independent of where it thresholds, and the slope term is its threshold offset. Report t_fw per firmware, plus the raw crossing-to-burst mean and p99. Same board batch, key position, switch, magnet, cable, host port and probe positions on both sides.
+
+## Calibration
+
+| Term | How to get it |
+|---|---|
+| Probe skew | deskew the scope channels on one shared edge |
+| Stem sensor delay | the sensor output against a known mechanical or electrical edge on the scope |
+| Rig end stamp vs the wire | a marker pin toggled in the same interrupt as the stamp, against the analyser capture |
+| Analyser trigger pin vs the wire | the trigger edge against the D+ burst start on the scope; expected a constant with about one 60 MHz cycle of jitter |
+| The whole chain | a High-Speed reference device: an 8 kHz board whose report follows a GPIO edge and logs edge, SOF and IN-complete times; drive that GPIO from a delay generator a known time after a reference edge |
+| Cross-tester | the same device on two rigs, deltas published with the run files |
+
+The delay generator matters because the rig then measures a delay it did not choose.
+
+## Run protocol and statistics
+
+1. Pilot: 30 presses per board. Pass when every press yields exactly one DATA packet in the window and the microframe spacing is 125 us on every capture.
+2. Full run: 1,000 presses per run, 3 runs per board, with a replug between runs.
+3. Repeatability: the difference between two runs of the same board must be smaller than the within-run 95% half-width; that difference is the rig's uncertainty. If it is larger, stop and fix the rig before comparing firmwares.
+4. Keep every sample. Report p50, p99 and max with the distribution, not a mean.
+5. Flag faults per sample and keep the faulted samples: a microframe that passed with no IN token (a poll gap), a press with no report, two reports for one press.
+6. Dither the actuation time and log the SOF phase per sample. A rig timer and the USB clock on one crystal will otherwise lock to a fixed phase and report one point of the distribution.
+7. Measure release as well as press.
+8. For a solenoid actuator on Hall-effect keys: prefer a non-ferrous push rod, and run a null test per session (fire the coil with the key out of reach; the device must report nothing).
+
+## Proposed test access for the next board
+
+What the first rig plan needed and rev 1 did not have, as proposals: the next board's controller is not chosen yet, so the pins below are the AT32F405's.
+
+| Want | Rev 1 | Next board |
+|---|---|---|
+| SOF from the USB core | PA4 used by a mux output | PA4 free, routed to a test point |
+| Event pins | bare 0.5 mm LQFP legs, two of them adjacent | one labelled header with a ground beside each signal, laid out as a 2x6 Pmod so one cable reaches the analyser's trigger input |
+| Reference key's sensor output | a SOT-23 pad on the bottom side, next to the analog supply pad | a top-side test pad |
+| Reference-device input | a bare leg | a test pad with ground |
+| Debug | a 3-pin connector plus scattered pads | one keyed connector with SWD, reset and ground |
+| D+/D- | not probed | still not probed: stubs on a 480 Mb/s pair; an inline analyser does the wire timing |
+
+## Decision guide
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.5;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  q1 [label="Need the absolute\nkey-to-wire number?", shape=diamond];
+  q2 [label="Need to know where\nthe time goes inside?", shape=diamond];
+  q3 [label="Only checking the\npolling rate?", shape=diamond];
+  a1 [label="stem sensor + analyser\nwith trigger input"];
+  a2 [label="scope: stem or Hall +\nevent pins"];
+  a3 [label="analyser alone"];
+  a4 [label="calibrate first:\nknown-delay device"];
+
+  q1 -> a1 [label="yes"];
+  q1 -> q2 [label="no"];
+  q2 -> a2 [label="yes"];
+  q2 -> q3 [label="no"];
+  q3 -> a3 [label="yes"];
+  q3 -> a4 [label="no: checking the rig"];
+}
+```
+
+1. An absolute key-to-wire number: optical stem sensor into both a scope channel and the analyser's trigger input, analyser inline.
+2. Where the time goes inside the device: scope on the stem or Hall signal plus the firmware event pins.
+3. Only the polling rate and gaps: the analyser alone, stock gateware is enough.
+4. Doubting the rig: the known-delay reference device driven by the delay generator.
+
+## Evidence
+
+| Claim | Status | How it was checked |
+|---|---|---|
+| Scan phase lock: -0.18 to +0.20 us, 62 us lead | measured (firmware self-report) | the firmware's phase log read over SWD, one rev 1 board, 2026-11-24 |
+| Polling SD 289 us / 36 us | derived | T / sqrt(12) for a uniform phase |
+| Packetry leaves Pmod logic signals out of non-packet events | documented | [packetry PR #227](https://github.com/greatscottgadgets/packetry/pull/227) |
+| Beagle USB 480 stamps four digital inputs | documented | [Total Phase digital I/O note](https://www.totalphase.com/solutions/apps/digital-i-o-connecting-external-outputs/) |
+| Cynthion analyser USB clock 60 MHz; Pmod LVCMOS33 | documented | [analyzer.py](https://github.com/greatscottgadgets/cynthion/blob/main/cynthion/python/src/gateware/analyzer/analyzer.py), [cynthion_r1_4.py](https://github.com/greatscottgadgets/cynthion/blob/main/cynthion/python/src/gateware/platform/cynthion_r1_4.py) |
+| Trigger edge stamped exactly mid-packet | design, simulation only | gateware tests in simulation; no hardware run yet |
+| Stock analyser 16.67 ns per packet drift | found in simulation | a regression test against the upstream analyser; not filed upstream |
+| AT32F405 OTGHS SOF on PA4 (SOFOUTEN); RXFLVL before transfer complete | documented, not tried | [AT32F402/405 reference manual](https://www.arterychip.com/download/RM/RM_AT32F402_405_EN_V2.01.pdf), OTG chapter |
+| High-Speed known-delay reference device | built, host-tested, not run on hardware | firmware image exists; no hardware run |
+| Trigger output from the analyser | design only | not built |
+| Firmware A/B regression, run protocol | design only | the rig has not run |
+
+## Related docs
+
+The board this rig measures, and why it needs a High-Speed PHY at all, is in [GRIDDLE LX: a 5x12 Hall-effect keyboard](/reference/griddle-lx-hall-effect-keyboard/). What happens to 8 kHz reports on the PC side, after they leave the wire, is in [Fixing merged reports from an 8 kHz mouse on Windows](/guides/8khz-mouse-merged-reports-windows/). The netlist and placement gates the next board's test access would go through are in [A PCB as code, and proving its checks](/reference/pcb-as-code-verification/).
+
+[^usb2]: USB Implementers Forum, "Universal Serial Bus 2.0 Specification," usb.org. https://www.usb.org/document-library/usb-20-specification
+[^beagle-io]: Total Phase, "Using Digital I/O Ports on Beagle USB Protocol Analyzers to Connect to External Outputs," totalphase.com. https://www.totalphase.com/solutions/apps/digital-i-o-connecting-external-outputs/
+[^xlat]: Finalmouse, "XLAT Mouse Latency Measurement Tool," GitHub. https://github.com/teamfinalmouse/xlat
+[^at32-rm]: Artery, "AT32F402/405 Series Reference Manual," arterychip.com. https://www.arterychip.com/download/RM/RM_AT32F402_405_EN_V2.01.pdf
+[^mho954]: Batronix, "Rigol MHO954," batronix.com. https://www.batronix.com/shop/oscilloscopes/Rigol-MHO954.html
+[^cynthion-tut]: Great Scott Gadgets, "USB Analysis," Cynthion documentation. https://cynthion.readthedocs.io/en/latest/tutorials/usb_analysis.html
+[^packetry-227]: Great Scott Gadgets, "Non-packet events from Cynthion USB analyzer (pull request #227)," GitHub. https://github.com/greatscottgadgets/packetry/pull/227
+[^usb-sniffer]: Alex Taradov, "usb-sniffer," GitHub. https://github.com/ataradov/usb-sniffer
+[^cynthion-analyzer]: Great Scott Gadgets, "analyzer.py," cynthion repository, GitHub. https://github.com/greatscottgadgets/cynthion/blob/main/cynthion/python/src/gateware/analyzer/analyzer.py
+[^cynthion-pmod]: Great Scott Gadgets, "cynthion_r1_4.py," cynthion repository, GitHub. https://github.com/greatscottgadgets/cynthion/blob/main/cynthion/python/src/gateware/platform/cynthion_r1_4.py
