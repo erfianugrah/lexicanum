@@ -331,6 +331,25 @@ Cite the source path when answering from docs.erfi.io in chat, too.
   wit is fine sparingly and in passing ("learned the hard way") - never a bit
   you build up to. When a step has a measured delta, give the delta and the
   command that reproduces it; that IS the persuasion.
+- **Explain every abbreviation the first time each doc uses it** (owner,
+  2026-11-24). No site-wide list of "well-known" terms: API, HTTP, URL and CPU
+  are expanded once per doc like any other. Write `ABBR (expansion)`, or
+  `expansion (ABBR)`, or `ABBR, short for ...`, at the first use in a paragraph
+  or list item (headings and table cells are not a first use; a term only in
+  tables is explained at its first cell). A term only seen inside a compound
+  (`SHA-256`, `AES-GCM`) is explained after the whole compound:
+  `AES-GCM (Advanced Encryption Standard; Galois/Counter Mode)`. Not
+  abbreviations, so exempt: a unit after a number, identifiers with two or more
+  digits (`ES256`, module ids), HTTP methods, SQL keywords, capitals for
+  emphasis, all-caps file names, TL;DR, numbered Roman numerals, and the
+  hand-reviewed `words` list in `data/abbreviations.json` (brands, names). A
+  deliberate exception (a register or model name) goes in frontmatter
+  `abbreviations-ok: [TERM]`. Enforced by `tests/abbreviations.test.ts` (rules
+  in `tests/lib/abbrev.ts`). To fix a doc, add the term to
+  `data/abbreviations.json` (or a per-doc override when it means something else
+  there) and run `bun run abbrev:fix <doc>`: it only inserts ` (expansion)` and
+  refuses any other change. `bun run abbrev:glossary` drafts entries for new
+  terms with a model; review them by hand before running the fixer.
 - **One name for one thing.** Do not mix an abbreviation with its expansion in
   the same doc (config/configuration, database/db, auth/authentication). Pick
   the form the doc already uses most and hold it; introducing a third form is
