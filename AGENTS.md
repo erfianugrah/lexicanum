@@ -152,6 +152,20 @@ the gates only, no deploy.
   2026-10-21, 3 at 2026-11-18). Link one of those and remove it from the baseline in the same
   commit - a stale entry fails too.
 
+## Public surface
+
+The repo is mirrored to a public GitHub repository and every page is public.
+Write so an outside reader gets the technique but no thread to private work:
+no card references (`name#123`), private commit hashes (use the date), local
+paths, LAN-only or login-app hostnames (use `example.com` placeholders), or
+names of private tools that have no page of their own (use a role:
+`<forgejo-cli>`, "the router CLI"). Reverse-engineering pages name the chip,
+not the product: no vendor or model names, USB VID/PID, vendor firmware
+versions, or vendor command and marker bytes. Renaming a page for this reason
+drops its old slug instead of adding it to `aliases:`, since the redirect page
+would publish the old name. History was rewritten on 2026-11-24 for the same
+reason; do not reintroduce removed literals from an old clone.
+
 ## Two traps in this repo
 
 - **Do not assert "zero KaTeX spans" site-wide.** `guides/magic-wan-interop` renders
