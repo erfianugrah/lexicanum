@@ -522,6 +522,10 @@ Run `bun run build` and confirm:
     that neither reaches the search index. `tests/site-links.test.ts` unit-
     tests `src/lib/links.mjs`, including a real Graphviz render, and
     `tests/code-glue.test.ts` unit-tests the kit's `src/lib/code-glue.mjs`.
+  - `tests/anchors.test.ts` (built pass only) - every body link with a `#fragment`,
+    to another page or the same one, names an `id` that exists on the target page.
+    A renamed or removed heading fails here; keep the old slug with an explicit
+    `<a id="old-slug"></a>` (see the renames rule above) or fix the linking doc.
   - `tests/pins.test.ts` - per-doc pins: corrections that must not regress, claims
     that must not creep back, required sections, and the anchors other docs link to.
     Adding a pin is a row in the table in `tests/lib/pins.ts`, which `scripts/tell-fix.ts` also reads.
