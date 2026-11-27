@@ -15,7 +15,10 @@ convention, house style). Read it before adding or editing docs.
 .
 ├── scripts/
 │   ├── new-doc.ts           # `bun run new` doc scaffolder
-│   └── purge-cache.ts       # post-deploy Cloudflare zone cache purge
+│   ├── purge-cache.ts       # post-deploy Cloudflare zone cache purge
+│   ├── tell-review.ts, tell-fix.ts       # prose-tells gate and its rewriter (AGENTS.md)
+│   ├── abbrev-glossary.ts, abbrev-fix.ts # first-use abbreviation glossary + fixer
+│   └── rentry-export.ts, ...            # export and one-off helpers
 ├── src/
 │   ├── content/
 │   │   └── docs/
@@ -26,7 +29,7 @@ convention, house style). Read it before adding or editing docs.
 │   │   └── taxonomy.mjs     # TAXONOMY table + sidebar/redirect generators
 │   ├── content.config.ts    # docs collection + taxonomy frontmatter schema
 │   └── styles/custom.css
-├── tests/                   # All doc checks; run inside `bun run build`
+├── tests/                   # Doc checks + script unit tests; run inside `bun run build`
 ├── astro.config.mjs
 └── package.json
 ```

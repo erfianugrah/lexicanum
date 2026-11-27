@@ -349,7 +349,11 @@ Cite the source path when answering from docs.erfi.io in chat, too.
   `data/abbreviations.json` (or a per-doc override when it means something else
   there) and run `bun run abbrev:fix <doc>`: it only inserts ` (expansion)` and
   refuses any other change. `bun run abbrev:glossary` drafts entries for new
-  terms with a model; review them by hand before running the fixer.
+  terms with a model (`ABBREV_MODEL`, default `google/gemini-4-argon`, via
+  OpenRouter: `sx OPENROUTER_API_KEY=OPENROUTER_API_KEY -- ...`); review them
+  by hand before running the fixer. It skips terms already in the file, so
+  hand fixes survive; `--redo` asks about every unexplained term again,
+  `--max N` caps how many terms pass 1 asks about.
 - **One name for one thing.** Do not mix an abbreviation with its expansion in
   the same doc (config/configuration, database/db, auth/authentication). Pick
   the form the doc already uses most and hold it; introducing a third form is
@@ -465,7 +469,8 @@ sees touched paragraphs, so an old doc's existing tells block nothing until
 someone edits that paragraph; the 2026-11-18 corpus sweep is in
 `docs/research/raw/2026-11-18-tell-sweep/`. To clear flags in bulk, use
 `sx OPENROUTER_API_KEY=OPENROUTER_API_KEY -- bun scripts/tell-fix.ts <docs>`:
-it rewrites only flagged paragraphs (kimi-k3.1-pro) and refuses any rewrite
+it rewrites only flagged paragraphs (`TELL_FIX_MODEL`, default
+`moonshotai/kimi-k3.1-pro`; the re-review uses `TELL_MODEL`) and refuses any rewrite
 that changes a number, code span, URL, link or footnote, drops over 40% of
 the words, removes a string pinned in `tests/lib/pins.ts`, or still draws a
 flag. It cannot see meaning: on 2026-11-18 a reviewer model reading the
