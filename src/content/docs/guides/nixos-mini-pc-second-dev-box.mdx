@@ -1,0 +1,295 @@
+---
+title: A NixOS mini PC as a second dev box beside a WSL2 desktop
+description: Turning a mini PC into a full copy of a WSL2 development setup - installed from a disk image written on Windows, joined to an existing NixOS fleet, given the same dotfiles, tools, keys and repos, checked against the desktop with a parity script, and wired back to the desktop's Windows side over OpenSSH so hardware tools, the KiCad GUI and an agent front all work from it. Includes the NixOS traps a WSL-shaped setup hits.
+author: Erfi Anugrah
+category: homelab
+group: hosts
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+This guide builds a second development machine next to a Windows desktop whose development environment lives in WSL2 (Windows Subsystem for Linux 2): a mini PC (personal computer) running NixOS that carries the same shell, tools, keys and repositories, runs coding agents and long builds while the desktop sleeps or games, and still reaches the USB (Universal Serial Bus) devices, GPU-bound services and signed-in browser sessions that only exist on the desktop. Prerequisites: a NixOS fleet repository the new host can join (the layout in [Three NixOS hosts, one deploy interface](/reference/nixos-fleet/)), a tailnet both machines are on ([the tailnet layout](/reference/tailscale-homelab/)), a dotfiles repository that already sets up the WSL (Windows Subsystem for Linux) side, and admin rights on Windows.
+
+<Aside type="note" title="Provenance">
+  Built and checked in one day, 2026-11-28. Mini PC: Intel Core i5-1235U (12 threads), 15 GiB of RAM (random-access memory), a 256 GB NVMe (Non-Volatile Memory Express) drive, six 2.5G Ethernet ports; NixOS 26.05. Desktop: Windows with WSL2 running Arch Linux, the existing development environment. Every number below was read from logs, test runs or command output that day.
+</Aside>
+
+**TL;DR:**
+
+- Install from a disk image built on the desktop and written to the drive with Rufus. Installing straight onto the drive through usbipd failed twice.
+- Join the fleet the same way as every other host: its own repository, a library flake input, `make diff` before every `make deploy`.
+- Treat "copy my setup" as a measurement. A parity script compares the two machines (commands, user bin directories, editor plugins, configs, enabled user units, stow state), and an ignore list records every deliberate difference with its reason. The written package lists missed a good part of what the desktop really runs.
+- Reach the desktop's Windows side over OpenSSH, locked to the mini PC's tailnet address and to one dedicated key. Small shims named like the WSL interop commands (`cmd.exe`, a device CLI (command-line interface)'s `.exe`) let scripts written for WSL run unchanged.
+- Keep one SSH (Secure Shell) key per direction, so either can be revoked alone.
+
+## Architecture
+
+```dot
+digraph {
+  rankdir=TB; bgcolor="transparent"; nodesep=0.3; ranksep=0.7;
+  fontname="Helvetica,Arial,sans-serif";
+  node [fontname="Helvetica,Arial,sans-serif", fontsize=11, shape=box];
+  edge [fontname="Helvetica,Arial,sans-serif", fontsize=9];
+
+  subgraph cluster_desk {
+    label="Desktop";
+    win [label="Windows\nUSB devices, hub driver,\nsigned-in browser, sshd"];
+    wsl [label="WSL2\nGPU services, original dev setup"];
+    term [label="WezTerm"];
+  }
+  subgraph cluster_mini {
+    label="Mini PC (NixOS)";
+    dev [label="dev setup\nrepos, tools, agents, builds"];
+    shims [label="win + interop-named shims"];
+    kicad [label="KiCad + xpra"];
+  }
+  forge [label="Forgejo\nrepos, deploy keys"];
+  term -> dev [label="ssh (default domain)"];
+  shims -> win [label="OpenSSH, one key,\nfirewalled to the mini PC"];
+  dev -> forge [label="git (own key)"];
+  browser [label="browser on the desktop"];
+  kicad -> browser [label="xpra HTML5", style=dashed];
+}
+```
+
+The desktop keeps three things the mini PC cannot have: the USB hardware and its drivers, the GPU (graphics processing unit) and the services bound to it, and browser sessions that are logged in. Everything else moves. The mini PC drives the first and third over SSH and leaves the GPU stack where it is.
+
+| Stays on the desktop | Moves to the mini PC |
+|---|---|
+| USB devices, the USB-over-network hub driver, firmware flashing | Repositories, builds, tests, coding agents and their loops |
+| GPU services (local models, image generation, transcription) | Shell, editor, dotfiles, CLI tools, language toolchains |
+| Browser sessions a tool drives (the PCB vendor cart) | Agent front end, session history, memory store sync |
+| The graphical session itself | KiCad, headless and (through xpra) with its GUI |
+
+## Part 1: install from a disk image
+
+The obvious path, putting the NVMe drive in a USB enclosure, attaching it to WSL with usbipd and running the NixOS installer onto it, failed twice. Under a sustained write the enclosure came up as USB 2, SCSI (Small Computer System Interface) commands hit the 30 s timeout, the kernel reset the device 9 times, the final flush failed after 101 s with I/O errors and ext4 remounted read-only. On the retry the enclosure stopped answering until it was unplugged. WSL's own `wsl --mount` did not see the USB disk at all.
+
+Installing into an image file on the WSL side and writing the image from Windows worked, because the Windows USB stack does not go through usbipd.
+
+1. Describe the disk with disko (one ESP (EFI system partition), an ext4 root that fills the disk) and let the root grow on first boot, because the image is smaller than the drive. An excerpt:
+
+   ```nix
+   boot.growPartition = true;
+   fileSystems."/".autoResize = true;
+   disko.devices.disk.main = {
+     device = lib.mkDefault "/dev/nvme0n1";
+     content.type = "gpt";
+     content.partitions.ESP = { size = "1G"; type = "EF00"; content = { type = "filesystem"; format = "vfat"; mountpoint = "/boot"; }; };
+     content.partitions.root = { size = "100%"; content = { type = "filesystem"; format = "ext4"; mountpoint = "/"; }; };
+   };
+   ```
+
+2. Build the system, `nixos-install` and a disko script that targets a loop device, as your normal user. On a single-user Nix install a build run as root leaves root-owned paths in your store:
+
+   ```bash
+   nix build --out-link system .#nixosConfigurations.mini.config.system.build.toplevel
+   nix build --out-link nixos-install .#nixosConfigurations.mini.config.system.build.nixos-install
+   nix build --impure --out-link disko-format --expr '((builtins.getFlake "git+file://'$PWD'").nixosConfigurations.mini.extendModules { modules = [ { disko.devices.disk.main.device = "/dev/loop7"; disko.rootMountPoint = "/mnt/mini"; } ]; }).config.system.build.diskoScript'
+   ```
+
+   Mount under `/mnt/<name>`, not `/mnt`: on WSL `/mnt` holds `/mnt/c` and `/mnt/wsl`.
+
+3. As root, create a sparse image, attach it, format and install, then hand any root-created store paths back to your user (root needs the user's `nix` on `PATH`):
+
+   ```bash
+   OWNER=me; export PATH=/home/$OWNER/.nix-profile/bin:$PATH
+   truncate -s 32G mini.img && losetup -P /dev/loop7 mini.img
+   ./disko-format
+   ./nixos-install/bin/nixos-install --system "$(readlink -f system)" --root /mnt/mini --no-root-passwd --no-channel-copy
+   umount -R /mnt/mini && losetup -d /dev/loop7
+   find /nix -xdev -user root -exec chown -h "$OWNER": {} +
+   ```
+
+   Size the image for the final system. The first install fit in 8 GiB; once KiCad with its 3D models, LLVM (Low Level Virtual Machine), Chromium and three JDKs (Java Development Kits) were added, it would not.
+
+4. Set `boot.loader.efi.canTouchEfiVariables = false`. The install runs on another machine, so the firmware boots the removable fallback path `EFI/BOOT/BOOTX64.EFI`, which systemd-boot also writes.
+
+5. Copy the image to a Windows drive and write it with Rufus in DD (disk dump, a raw byte-for-byte copy) mode. From WSL, `cp` to `/mnt/d` failed part way with "Cannot allocate memory"; `Copy-Item` from PowerShell worked. Rufus hides USB hard drives until you press Alt-F.
+
+On first boot growpart expanded the root from 7 GiB to the whole 234 GiB.
+
+## Part 2: join the fleet
+
+The mini PC gets its own repository with the same shape as the other hosts: a flake with one `nixosConfigurations` entry, the shared profiles as a flake input that follows the host's nixpkgs, and the same `make check` / `make diff` / `make deploy` targets.
+
+- Root's read-only Forgejo deploy key goes on the host repository and on every private flake input (the shared profiles, a forked package). Forgejo allows one deploy key on several repositories; GitHub does not.
+- Replace the generic hardware module with `nixos-generate-config --show-hardware-config` after first boot, and pin the network interface with an explicit MTU (maximum transmission unit), as the fleet's net profile requires.
+- Give it a DHCP (Dynamic Host Configuration Protocol) reservation and decide its LAN (local area network) reach on purpose. The router's firewall let only the desktop cross VLANs (virtual LANs); until the mini PC was added to that list it reached other subnets only on tailnet-joined hosts. The router's rule for tailnet sources covers subnet-routed traffic, and a host that does not accept routes never sends any.
+- One NixOS release is not enough for every tool. KiCad 10.0.4 in nixos-26.05 lacked a `pcbnew` API (application programming interface) the project's tests call and failed 9 of them; taking KiCad and the Python environment from nixos-unstable (10.0.8, the desktop's version) brought the suite to 626 passed, 0 failed. Compare versions with the desktop before debugging a repository.
+
+## Part 3: the dev layer in Nix
+
+The pieces a WSL-shaped setup takes for granted have to be declared on NixOS:
+
+```nix
+programs.nix-ld.enable = true;             # prebuilt CLIs (the agent, uv pythons, rustup, bun) need a loader
+users.users.me.linger = true;              # loops and tmux sessions outlive the SSH session
+security.sudo.wheelNeedsPassword = false;  # key-only login, no password to type
+zramSwap.enable = true;                    # 15 GiB of RAM, no swap partition
+
+# One PATH for interactive shells, `ssh host cmd`, and user units.
+environment.extraInit = ''export PATH="${userPath}:$PATH"'';
+systemd.user.extraConfig = ''
+  DefaultEnvironment="PATH=${userPath}:/run/wrappers/bin:/etc/profiles/per-user/me/bin:/run/current-system/sw/bin"
+'';
+```
+
+`userPath` is the list of user bin directories (`~/.local/bin`, `~/bin`, `~/go/bin`, `~/.cargo/bin`, the npm and bun global directories). Without `extraInit`, `ssh host rbw unlock` fails with "command not found", because zsh reads `.zshrc` only for interactive shells. Without `DefaultEnvironment`, stow-managed user timers start with `PATH=/no-such-path`. A unit declared in Nix gets its own explicit `PATH` that overrides the default, so give such units a `path = [ pkgs.openssh ]` or similar for what they call.
+
+The desktop's distribution package list maps onto nixpkgs almost one to one. Keep it in its own module that mirrors the list, with a comment block for what is left out and why (WSL glue, AUR (Arch User Repository) helpers, desktop-only GUI (graphical user interface) apps, fonts that render on the client).
+
+## Part 4: the user layer
+
+1. Run the full dotfiles stow before anything creates `~/bin` or another stowed directory. On the desktop `~/bin` is a single folded symlink into the dotfiles; created first as a real directory, stow linked files one by one and missed a gitignored binary.
+2. Generate keys on the mini PC, one per direction: the desktop's key logs in to the mini PC and is never stored on it; the mini PC has its own key for Forgejo (which also signs commits, `gpg.format = ssh` in a host-local git config) and another for the desktop's Windows side.
+3. Unlock the password vault over SSH with a curses pinentry (`ssh -t mini rbw unlock`, after each reboot), then restore the machine-only state the dotfiles do not carry (CLI logins, the sops age key, repository `.env` files) from its encrypted backup.
+4. Clone every repository the desktop has checked out, at the same paths, with the same remotes and branches. A small script on the desktop lists them (every directory with a `.git` whose Forgejo repository exists), and another on the mini PC clones, fills submodules and Git LFS (Large File Storage) objects, and fast-forwards clean checkouts on later runs. The first run cloned 137 repositories, 154 once archived ones were included.
+5. Copy what git does not carry: the gitignored files inside repositories (2.5 GB without bulk data) and the agent scratch area (85 GB without bulk data, SDKs (software development kits) and training environments).
+
+## Part 5: measure parity
+
+"Make it the same as the desktop" took several rounds of me finding something missing, because each round compared against a list instead of against the desktop. The written package lists did not mention the bun global language servers, the rustup components and cross targets, a hand-copied formatter binary, gitignored builds inside the dotfiles, the editor's extra language servers, or Python libraries from a `pip --user` step that never ran on NixOS.
+
+A parity script run on the desktop lists, per category, what the desktop has and the mini PC lacks:
+
+| Category | Compared |
+|---|---|
+| commands | every binary the desktop's distribution packages install, looked up on the mini PC's `PATH` |
+| user bins | `~/.local/bin`, `~/go/bin`, `~/.cargo/bin`, npm and bun globals (missing only if absent from `PATH` too) |
+| editor and shell | lazy.nvim plugins, Mason tools, zinit plugins, tmux plugins |
+| state | `~/.config`, `~/.local/share`, uv tools, rustup components, Python modules, enabled user units |
+| stow | the dotfiles stow drift check |
+
+Deliberate differences go in an ignore file, one line each with a reason ("WSL only", "Arch tooling", "GPU stays on the desktop", "nixpkgs names it differently"). The script exits 1 when anything unignored is missing and 2 when the mini PC is unreachable, so a weekly job can file a card on drift. Run it with `shopt -s lastpipe`: without it, the function that sets the "missing" flag runs at the end of a pipeline, in a subshell, and the script exits 0 whatever it finds, which is what the first version did.
+
+## Part 6: drive the desktop's Windows side
+
+OpenSSH Server on Windows, configured in this order so it never serves an open configuration:
+
+1. Firewall first: remove Microsoft's default `OpenSSH-Server-In-TCP` rule (any address) and allow TCP (Transmission Control Protocol) 22 from the mini PC's tailnet address only.
+2. Generate host keys with `ssh-keygen -A` while the service is stopped, then set `PasswordAuthentication no` and `KbdInteractiveAuthentication no` in `C:\ProgramData\ssh\sshd_config`.
+3. For an administrator account, keys go in `C:\ProgramData\ssh\administrators_authorized_keys`, readable only by SYSTEM and Administrators (`icacls ... /inheritance:r /grant SYSTEM:F /grant *S-1-5-32-544:F`); sshd ignores the file otherwise. Put only the mini PC's dedicated key there.
+4. Start the service and set it to automatic. Exit 1 on any failure, so a half-configured run is visible.
+
+PowerShell 7.7 ships as an MSIX (Microsoft Installer package format for Store-style apps) package and winget refused its machine scope on this desktop; the MSIX alias also does not resolve inside an SSH session. The release zip, checked against the release's `hashes.sha256` and unpacked to `%LOCALAPPDATA%\Programs\PowerShell7` on the user `PATH`, works. Leave Windows PowerShell 5.1 as the SSH default shell.
+
+On the mini PC, one wrapper runs any Windows program, and shims named like the WSL interop commands call it:
+
+```bash
+# Excerpt of the `win` script. win <program> [args...]: each argument single-quoted for PowerShell, the
+# script sent as -EncodedCommand (UTF-16LE base64) so stdin reaches the program.
+q() { local s=${1//\'/\'\'}; printf "'%s'" "$s"; }
+cmd="& $(q "$1")"; shift
+for a in "$@"; do cmd="$cmd $(q "$a")"; done
+script="\$ErrorActionPreference = 'Stop'; try { $cmd; if (\$null -eq \$LASTEXITCODE) { exit 0 } else { exit \$LASTEXITCODE } } catch { [Console]::Error.WriteLine(\$_); exit 1 }"
+b64=$(printf '%s' "$script" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
+exec ssh -o BatchMode=yes desktop-win pwsh -NoLogo -NoProfile -NonInteractive -EncodedCommand "$b64"
+```
+
+The first version piped the script on stdin and ended with `exit $LASTEXITCODE`: a program that did not exist exited 0, because `$LASTEXITCODE` is `$null` when no native program ran, and nothing could pipe input to the program. With that fixed, a device CLI listed the USB hub's ports and read all 18 diagnostic pages of a wireless mouse from the mini PC; the 6 base pages took 4.6 to 5.7 ms per round trip.
+
+Three limits:
+
+- File arguments are Windows paths. A script that turns a Linux path into a Windows one with `wslpath` has to copy the file across (scp to the Windows side) instead.
+- Do not provide a `powershell.exe` shim. Several build scripts take `command -v powershell.exe` to mean "this is WSL" and then use `/mnt/c` and `wslpath`; a review caught that the shim would have broken a PCB (printed circuit board) order target, and it was removed.
+- Input capture through Windows Raw Input is expected to see nothing from a process started in an SSH session (not tested from the mini PC yet), so it stays on the desktop's console.
+
+## Part 7: WezTerm opens the mini PC
+
+On the desktop, make the mini PC WezTerm's default domain, so opening a terminal never starts WSL:
+
+```lua
+-- ssh_home: the profile path, or its 8.3 short name when it has a space (below)
+config.ssh_domains = {
+  {
+    name = "mini",
+    remote_address = "100.64.0.11",
+    username = "me",
+    multiplexing = "None",        -- tmux on the mini PC keeps sessions
+    ssh_option = {
+      identityfile = ssh_home .. "/.ssh/id_mini",
+      userknownhostsfile = ssh_home .. "/.ssh/known_hosts",
+    },
+  },
+}
+config.default_domain = "mini"
+```
+
+Two details:
+
+- WezTerm's SSH library splits paths at a space. With a profile directory like `C:\Users\First Last` it tried to open `C:\Users\First` for `known_hosts`. Use the profile's 8.3 short name for `ssh_home` (`for %I in ("%USERPROFILE%") do @echo %~sI` prints it).
+- If the WezTerm config lives in the WSL dotfiles, the Windows-side loader can only read it while WSL runs. Keep a Windows copy and have the loader refresh it after every successful read of the live file, so a closed WSL still gets the current config.
+
+No `default_cwd` for the SSH domain: a Windows path means nothing on the mini PC.
+
+## Part 8: the KiCad GUI
+
+X11 forwarding into WSLg (Windows Subsystem for Linux GUI) shows plain X applications, but WSLg offers no usable indirect GLX (OpenGL extension to the X Window System) visual over forwarded X11, and KiCad's editors draw with OpenGL. So the session runs on the mini PC: xpra starts a virtual X server with Mesa (llvmpipe), launches KiCad in it and serves the windows to its HTML5 (HyperText Markup Language version 5) client over the tailnet, behind a password file (plain HTTP (Hypertext Transfer Protocol); the tailnet's encryption is the transport security):
+
+```bash
+xpra start --daemon=no --bind-tcp="100.64.0.11:14500,auth=file:filename=$HOME/.config/xpra/kicad.pass" \
+  --html="<xpra-html5>/share/xpra/www" --start-child="kicad" --exit-with-children=yes
+```
+
+With the desktop's KiCad configuration copied, the session opened the last project. `hardware.graphics.enable = true` gives Mesa its drivers.
+
+## Keeping two machines in step
+
+One-time copies drift within hours: a repository cloned in the morning was two commits behind by the afternoon.
+
+| State | How it stays shared |
+|---|---|
+| Repositories | a daily user timer fast-forwards every clean checkout; dirty or diverged ones are listed, never touched; new repositories come from the desktop's clone script |
+| Shell history | atuin against a self-hosted sync server, from a 15-minute timer on both machines. The shell-hook auto-sync had not run on the desktop for a year; the first manual sync uploaded 67,053 records |
+| Agent memory store | a git repository both machines clone; the memory tool pulls before it reads or writes and rebases a rejected push, and the session-store sync pulls before it mirrors the file (the mirror deletes rows missing from it, so a stale clone would delete new memories) |
+| Everything else | the weekly parity run files a card on drift |
+
+Agents run on the machine their session runs on. A session on the mini PC once started agent workers on the desktop through `wsl.exe`; they ran with no session record, no budget and no completion message, and were killed.
+
+## Verification
+
+```bash
+make parity                                      # exit 0: nothing missing beyond the ignore list
+ssh mini 'systemctl --failed --no-legend; systemctl --user --failed --no-legend'   # both empty
+ssh mini stow-drift                              # 0 drifted, 0 unlinked, 0 missing
+ssh mini 'win cmd.exe /c echo %COMPUTERNAME%'    # the desktop's name
+ssh mini 'win does-not-exist.exe; echo $?'       # 1
+ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/old-shared-key -o User=me 100.64.0.4 true   # Permission denied (publickey) once only the dedicated key is authorised
+```
+
+## Gotchas and lessons learned
+
+- NixOS has no `/bin/bash`; a `#!/bin/bash` hook in the dotfiles' git template failed every commit until it became `#!/usr/bin/env bash`.
+- npm's default global prefix on NixOS is node's read-only store path. A dotfiles installer that redirects globals to `~/.npm-global` only for `/usr` prefixes failed every package.
+- uv tool environments built on the system Python broke, all 10 of them, when that Python moved from 3.13 to 3.14 for KiCad. Install uv tools with `--python-preference only-managed`.
+- Python from nixpkgs cannot `pip install --user`; with pip on `PATH`, a dotfiles step that saves the user package list would have overwritten it with an empty one. Leave pip out and make savers refuse to write an empty result.
+- The deploy target's activation-plan filter (`grep -v`) exits 1 on an empty plan and failed no-op deploys. Scope the fallback to the filter, `{ grep ... || true; }`, so a failed build still fails.
+- A reused IP (Internet Protocol) reservation can collide with a stale SSH host stanza: the mini PC's new address was still listed under another machine in the reference SSH config.
+- gitleaks' generic-key rule matches an SSH host-key fingerprint (`SHA256:...`) in a comment; keep fingerprints out of tracked config.
+- A LAN-only web front and a tailnet-only one are two names for a phone to choose between, and the tailnet name resolves only with Tailscale on. One name everywhere needs split DNS (Domain Name System) on the tailnet and the router advertising the subnet the reverse proxy lives on.
+
+## File reference
+
+| Path | Holds |
+|---|---|
+| `modules/disko.nix` | disk layout, growpart |
+| `modules/dev.nix` | nix-ld, PATH, linger, sudo, zram, the repo fast-forward timer, the agent front's units |
+| `modules/network.nix`, `hardware-configuration.nix` | the pinned interface and MTU, the generated hardware profile |
+| `modules/devtools.nix` | the desktop's package list in nixpkgs, with exclusions |
+| `pkgs/win.nix` | `win` and the interop-named shims |
+| `pkgs/kicad-gui.nix` | the xpra wrapper for the KiCad GUI |
+| `pkgs/ff-repos.nix` | the repository fast-forward |
+| `pkgs/pi.nix`, `pkgs/rbw.nix` | the coding agent from its release bundle, the vault client from a fork |
+| `home/` | host-local SSH config, git config, root's SSH config |
+| `scripts/install-image.sh` | the image install |
+| `scripts/repos-tsv.sh`, `scripts/clone-repos.sh` | the repository clone |
+| `scripts/parity.sh`, `scripts/parity-ignore.txt` | the parity check and its reasons |
+
+## Related docs
+
+- [Three NixOS hosts, one deploy interface](/reference/nixos-fleet/) - the fleet layout and deploy conventions this host joins.
+- [Tailscale homelab reference](/reference/tailscale-homelab/) - the tailnet both machines use and how its addresses and names are laid out.
+- [Unlocking rbw with a YubiKey touch on Linux and WSL2](/guides/rbw-yubikey-unlock/) - the desktop's vault unlock; the mini PC uses a curses pinentry over SSH instead.
+- [Resuming any coding-agent session from any directory](/reference/resume-agent-sessions/) - the session store that lets a session started on one machine continue on the other.
+- [Subagents, worktrees, and parallel agent work](/reference/agent-subagents-and-worktrees/) - why agent workers belong to the session that dispatched them.
